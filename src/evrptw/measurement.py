@@ -348,6 +348,11 @@ class Stage03Trace:
         init=False,
         repr=False,
     )
+    _runtime_semantic_terminal_imported: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
 
     @property
     def runtime_semantic_events(self) -> tuple[dict[str, object], ...]:
@@ -366,16 +371,25 @@ class Stage03Trace:
             return 0
         if not semantic_stream:
             raise ValueError("runtime semantic stream name cannot be empty")
+        if self._runtime_semantic_terminal_imported:
+            raise RuntimeError("runtime semantic journal is already terminated")
         event_id = len(self._runtime_semantic_events) + 1
-        if "semantic_event_id" in event or "semantic_stream" in event:
+        if (
+            "semantic_event_id" in event
+            or "runtime_causal_event_id" in event
+            or "semantic_stream" in event
+        ):
             raise ValueError("runtime semantic identity is owned by Stage03Trace")
         self._runtime_semantic_events.append(
             {
                 **dict(event),
                 "semantic_stream": semantic_stream,
                 "semantic_event_id": event_id,
+                "runtime_causal_event_id": event_id,
             }
         )
+        if semantic_stream == "termination":
+            self._runtime_semantic_terminal_imported = True
         return event_id
 
     def snapshot_runtime_semantic_journal(self) -> int:
@@ -391,6 +405,11 @@ class Stage03Trace:
         ):
             raise ValueError("runtime semantic journal checkpoint is invalid")
         del self._runtime_semantic_events[checkpoint:]
+        self._runtime_semantic_terminal_imported = bool(
+            self._runtime_semantic_events
+            and self._runtime_semantic_events[-1].get("semantic_stream")
+            == "termination"
+        )
 
     def replace_runtime_semantic_journal(
         self,
@@ -406,12 +425,65 @@ class Stage03Trace:
                 )
             return
         self._runtime_semantic_events.clear()
+        self._runtime_semantic_terminal_imported = False
         try:
             for stream, event in replacement:
                 self.record_runtime_semantic_event(stream, event)
         except Exception:
             self._runtime_semantic_events.clear()
+            self._runtime_semantic_terminal_imported = False
             raise
+
+    def import_runtime_semantic_journal(
+        self,
+        events: Iterable[tuple[int, str, Mapping[str, object]]],
+    ) -> None:
+        """Atomically import an already ordered external causal journal."""
+
+        replacement = tuple(events)
+        if not self.runtime_semantic_enabled:
+            if replacement:
+                raise ValueError(
+                    "runtime semantic import requires enabled recording"
+                )
+            return
+        imported: list[dict[str, object]] = []
+        terminal_seen = False
+        for expected_id, row in enumerate(replacement, start=1):
+            causal_id, semantic_stream, event = row
+            if (
+                isinstance(causal_id, bool)
+                or not isinstance(causal_id, int)
+                or causal_id != expected_id
+            ):
+                raise ValueError(
+                    "runtime semantic causal IDs must be unique and contiguous"
+                )
+            if not semantic_stream:
+                raise ValueError("runtime semantic stream name cannot be empty")
+            if terminal_seen:
+                raise ValueError(
+                    "runtime semantic journal cannot contain events after termination"
+                )
+            if (
+                "semantic_event_id" in event
+                or "runtime_causal_event_id" in event
+                or "semantic_stream" in event
+            ):
+                raise ValueError(
+                    "runtime semantic identity is owned by Stage03Trace"
+                )
+            imported.append(
+                {
+                    **dict(event),
+                    "semantic_stream": semantic_stream,
+                    "semantic_event_id": causal_id,
+                    "runtime_causal_event_id": causal_id,
+                }
+            )
+            terminal_seen = semantic_stream == "termination"
+        self._runtime_semantic_events = imported
+        self._runtime_semantic_terminal_imported = terminal_seen
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
@@ -1091,7 +1163,10 @@ class Stage03Trace:
                 self.result_summary["candidate_transaction_statistics"] = cast(
                     Any, result
                 ).candidate_transaction_statistics
-            if self.runtime_semantic_enabled:
+            if (
+                self.runtime_semantic_enabled
+                and not self._runtime_semantic_terminal_imported
+            ):
                 termination_status = str(
                     getattr(result, "termination_reason", "unknown")
                 )
@@ -1687,6 +1762,37 @@ class Stage03Trace:
         trace._runtime_semantic_events = [
             dict(event) for event in runtime_semantic_payload
         ]
+        termination_rows = [
+            index
+            for index, event in enumerate(trace._runtime_semantic_events)
+            if event.get("semantic_stream") == "termination"
+        ]
+        if termination_rows and termination_rows != [
+            len(trace._runtime_semantic_events) - 1
+        ]:
+            raise ValueError(
+                "runtime semantic termination must be the final event"
+            )
+        trace._runtime_semantic_terminal_imported = bool(termination_rows)
+        causal_ids = [
+            event.get("runtime_causal_event_id")
+            for event in trace._runtime_semantic_events
+        ]
+        if any(causal_id is not None for causal_id in causal_ids):
+            expected_ids = list(
+                range(1, len(trace._runtime_semantic_events) + 1)
+            )
+            if (
+                causal_ids != expected_ids
+                or [
+                    event.get("semantic_event_id")
+                    for event in trace._runtime_semantic_events
+                ]
+                != expected_ids
+            ):
+                raise ValueError(
+                    "runtime semantic causal IDs must be unique and contiguous"
+                )
         trace.finished_at = (
             None if payload.get("finished_at") is None else float(payload["finished_at"])
         )

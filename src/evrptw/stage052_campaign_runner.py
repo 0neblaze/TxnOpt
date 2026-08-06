@@ -163,15 +163,15 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "6d97a5c45c2fc944c0d4651ae316a8e890d3cd222bd273cfe53ff8582fda6d85"
+        "336dad1e7bb55104a61ce5845d04dcc458b7ed1189166d49319010ee98c4677e"
     ),
     "cpp/native_host_scheduler.cpp": (
-        "bb30bf8122f8d4e8bea9fe1d4dd5cb957aa43d0f3a31e48bd81eb4b7071b132c"
+        "9842bc69c1747c271a25453fbb0abc3f24bb324310b616a99e907f881175b468"
     ),
     "cpp/native_kernel_client.hpp": (
-        "a80236e0a024d264e5af4eacb1bcced000cfd4ec8ef50c4c1fe8a8dc24a5a6f1"
+        "0e95505bf7f2faa904ee089e0f392410794f26ba1135406a52b339fca6a7014c"
     ),
-    "src/evrptw/alns.py": "d3beec236d9df9abb949a040c770786420c95f9084dfbd222fea1d9c353f6099",
+    "src/evrptw/alns.py": "71d404c219d8a802b3e2b646b20e54fec4706a0edd868795f8467f03d8a7051e",
     "src/evrptw/cache_incremental.py": (
         "babe9c2f6315c73a81fbb4c7cbb6d673035cc62c903aa19ee3d430c94e09bdaa"
     ),
@@ -182,7 +182,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
         "7299f13a15571ecd6a1617299b8d769baba6a8c3773947304231cdce11438fb8"
     ),
     "src/evrptw/measurement.py": (
-        "9d3e1253f78c33ef91e590971d6eaa4ab65c90c6be1260aac3c6e920f43f239f"
+        "d0d335afdac7dd064eb457463cb805f41a124208e36834a409c1c8e34bc4f936"
     ),
     "tests/test_alns_wall_clock_only.py": (
         "0bf741d1e4929564882dd8ff48775f0c589e957328aa00c7309176656fd16481"

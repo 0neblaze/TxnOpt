@@ -9,7 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -20,6 +22,7 @@
 #include <vector>
 
 #include "native_concurrency.hpp"
+#include "native_candidate_transaction_executor.hpp"
 #include "native_kernel_protocol.hpp"
 #include "native_search_core.hpp"
 #include "native_sha256.hpp"
@@ -34,6 +37,222 @@ std::atomic<std::uint64_t> segment_counter{0};
 std::string scheduler_run_nonce;
 std::string production_fault;
 std::atomic<bool> production_fault_consumed{false};
+
+class CandidateSessionRegistry final {
+public:
+    struct Session final {
+        static constexpr std::int64_t transaction_idle = 0;
+        static constexpr std::int64_t transaction_pending = 1;
+        static constexpr std::int64_t transaction_committed = 2;
+        static constexpr std::int64_t transaction_rolled_back = 3;
+
+        pid_t owner_pid = 0;
+        evrptw::native_search::RequestV2 request;
+        evrptw::native_search::InitialStateV2 initial_state;
+        std::unique_ptr<evrptw::native_search::CandidateTransactionStateV2>
+            transaction_state;
+        std::optional<evrptw::native_search::SearchBudgetStateV2::Snapshot>
+            pending_budget_snapshot;
+        bool pending_exact_protocol = false;
+        bool pending_negative_store = false;
+        bool pending_attempted_mark = false;
+        std::int64_t transaction_resolution = transaction_idle;
+        std::mutex mutex;
+
+        void commit_pending() {
+            if (!pending_budget_snapshot.has_value() || !transaction_state) {
+                throw std::runtime_error(
+                    "native candidate session commit has no pending transaction; "
+                    "resolution=" + std::to_string(transaction_resolution));
+            }
+            transaction_state->exact_cache()
+                .commit_protocol_transaction_noexcept();
+            if (pending_negative_store) {
+                transaction_state->negative_cache()
+                    .commit_store_batch_noexcept();
+            }
+            if (pending_attempted_mark) {
+                transaction_state->attempted_plans()
+                    .commit_mark_batch_noexcept();
+            }
+            clear_pending();
+            transaction_resolution = transaction_committed;
+        }
+
+        void rollback_pending() {
+            if (!pending_budget_snapshot.has_value() || !transaction_state) {
+                throw std::runtime_error(
+                    "native candidate session rollback has no pending transaction; "
+                    "resolution=" + std::to_string(transaction_resolution));
+            }
+            if (pending_attempted_mark) {
+                transaction_state->attempted_plans()
+                    .rollback_mark_batch_noexcept();
+            }
+            if (pending_negative_store) {
+                transaction_state->negative_cache()
+                    .rollback_store_batch_noexcept();
+            }
+            if (pending_exact_protocol) {
+                transaction_state->exact_cache()
+                    .rollback_protocol_transaction_noexcept();
+            }
+            transaction_state->budget().rollback_preserving_exact(
+                *pending_budget_snapshot, true);
+            clear_pending();
+            transaction_resolution = transaction_rolled_back;
+        }
+
+        void clear_pending() noexcept {
+            pending_budget_snapshot.reset();
+            pending_exact_protocol = false;
+            pending_negative_store = false;
+            pending_attempted_mark = false;
+        }
+    };
+
+    struct OpenResult final {
+        std::string token;
+        std::shared_ptr<Session> session;
+    };
+
+    [[nodiscard]] OpenResult open(
+        const pid_t owner_pid,
+        evrptw::native_search::RequestV2 request) {
+        if (owner_pid <= 0) {
+            throw std::invalid_argument(
+                "native candidate session owner is invalid");
+        }
+        auto session = std::make_shared<Session>();
+        session->owner_pid = owner_pid;
+        session->initial_state = evrptw::native_search::initialize_state(request);
+        session->request = std::move(request);
+        session->transaction_state = std::make_unique<
+            evrptw::native_search::CandidateTransactionStateV2>(
+                session->request, session->initial_state);
+        const auto ordinal = next_id_.fetch_add(1, std::memory_order_relaxed);
+        std::string identity("stage05.2-native-candidate-session-v2");
+        identity.append(scheduler_run_nonce);
+        identity.append(
+            reinterpret_cast<const char*>(&owner_pid), sizeof(owner_pid));
+        identity.append(
+            reinterpret_cast<const char*>(&ordinal), sizeof(ordinal));
+        identity.append(session->request.sha256());
+        const auto token = protocol::native_sha256_hex(identity);
+        std::lock_guard lock(mutex_);
+        if (!sessions_.emplace(token, session).second) {
+            throw std::runtime_error(
+                "native candidate session identity collision");
+        }
+        return {token, std::move(session)};
+    }
+
+    void close(const pid_t owner_pid, const std::string_view token) {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(std::string(token));
+        if (found == sessions_.end() || found->second->owner_pid != owner_pid) {
+            throw std::runtime_error(
+                "native candidate session close identity mismatch");
+        }
+        std::lock_guard session_lock(found->second->mutex);
+        if (found->second->pending_budget_snapshot.has_value()) {
+            found->second->rollback_pending();
+        }
+        sessions_.erase(found);
+    }
+
+    [[nodiscard]] std::shared_ptr<Session> lookup(
+        const pid_t owner_pid,
+        const std::string_view token) {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(std::string(token));
+        if (found == sessions_.end() || found->second->owner_pid != owner_pid) {
+            throw std::runtime_error(
+                "native candidate session execute identity mismatch");
+        }
+        return found->second;
+    }
+
+    void rollback_open_noexcept(
+        const pid_t owner_pid,
+        const std::string_view token) noexcept {
+        std::lock_guard lock(mutex_);
+        const auto found = sessions_.find(std::string(token));
+        if (found != sessions_.end() && found->second->owner_pid == owner_pid) {
+            sessions_.erase(found);
+        }
+    }
+
+    [[nodiscard]] bool rollback_pending_noexcept(
+        const pid_t owner_pid,
+        const std::string_view token) noexcept {
+        try {
+            auto session = lookup(owner_pid, token);
+            std::lock_guard session_lock(session->mutex);
+            if (session->pending_budget_snapshot.has_value()) {
+                session->rollback_pending();
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void commit_pending(
+        const pid_t owner_pid,
+        const std::string_view token) {
+        auto session = lookup(owner_pid, token);
+        std::lock_guard session_lock(session->mutex);
+        session->commit_pending();
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
+    std::atomic<std::uint64_t> next_id_{1};
+};
+
+class SchedulerCandidateTransactionKernelsV2 final
+    : public evrptw::native_search::CandidateTransactionKernelsV2 {
+public:
+    explicit SchedulerCandidateTransactionKernelsV2(NativeWorkPool& pool)
+        : pool_(pool) {}
+
+    [[nodiscard]] std::vector<kernels::ScreenOutput> screen(
+        const evrptw::native_search::ProblemV2& problem,
+        const evrptw::native_search::RouteBatchViewV2 routes,
+        const double epsilon) override {
+        routes.validate("scheduler candidate transaction screening");
+        std::vector<kernels::ScreenOutput> output(routes.route_count());
+        pool_.parallel_for(routes.route_count(), [&](const std::size_t row) {
+            const auto route = routes.route(row);
+            const std::array<std::int64_t, 2> offsets{
+                0, static_cast<std::int64_t>(route.size())};
+            evrptw::native_search::LocalCandidateTransactionKernelsV2 local;
+            auto screened = local.screen(
+                problem, {offsets, route}, epsilon);
+            if (screened.size() != 1) {
+                throw std::logic_error(
+                    "scheduler candidate screening task lost its result");
+            }
+            output[row] = std::move(screened.front());
+        });
+        return output;
+    }
+
+    [[nodiscard]] kernels::ExactBatchOutput exact(
+        const evrptw::native_search::ProblemV2& problem,
+        const evrptw::native_search::RouteBatchViewV2 routes,
+        const double deadline_remaining,
+        const std::int64_t batch_size) override {
+        evrptw::native_search::LocalCandidateTransactionKernelsV2 local;
+        return local.exact(
+            problem, routes, deadline_remaining, batch_size);
+    }
+
+private:
+    NativeWorkPool& pool_;
+};
 
 struct SchedulerConcurrencySnapshot final {
     std::size_t peak_active_requests;
@@ -551,7 +770,12 @@ std::vector<std::uint8_t> run_screen_routes(
 std::vector<std::uint8_t> execute(
     const protocol::PayloadView& input,
     double queue_wait_seconds,
-    std::size_t queue_depth) {
+    std::size_t queue_depth,
+    const pid_t peer_pid,
+    CandidateSessionRegistry& candidate_sessions,
+    NativeWorkPool& pool,
+    std::optional<std::string>& pending_candidate_transaction,
+    std::optional<std::string>& pending_commit_session) {
     switch (input.header().operation) {
     case protocol::KernelOperation::exact_charging:
         return run_exact(input, queue_wait_seconds, queue_depth);
@@ -626,6 +850,200 @@ std::vector<std::uint8_t> execute(
             telemetry.size(), telemetry.size());
         return builder.finish();
     }
+    case protocol::KernelOperation::candidate_transaction_wire: {
+        const auto wire = evrptw::native_search::
+            candidate_plan_transaction_wire_from_payload_v2(input);
+        const auto decoded = evrptw::native_search::
+            decode_candidate_plan_transaction_v2(wire);
+        evrptw::native_search::validate_candidate_plan_transaction_v2(
+            decoded);
+        const auto canonical = evrptw::native_search::
+            encode_candidate_plan_transaction_v2(decoded);
+        const bool double_values_equal =
+            canonical.double_values.size() == wire.double_values.size()
+            && (canonical.double_values.empty()
+                || std::memcmp(
+                       canonical.double_values.data(),
+                       wire.double_values.data(),
+                       canonical.double_values.size() * sizeof(double)) == 0);
+        if (canonical.integer_offsets != wire.integer_offsets
+            || canonical.integer_values != wire.integer_values
+            || canonical.double_offsets != wire.double_offsets
+            || !double_values_equal
+            || canonical.byte_offsets != wire.byte_offsets
+            || canonical.byte_values != wire.byte_values) {
+            throw std::runtime_error(
+                "native candidate-plan transaction payload is not canonical");
+        }
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
+        return evrptw::native_search::
+            candidate_plan_transaction_wire_payload_v2(
+                canonical, input.header().request_id, telemetry);
+    }
+    case protocol::KernelOperation::candidate_session_open: {
+        auto request = evrptw::native_search::request_from_payload(input);
+        auto opened = candidate_sessions.open(peer_pid, std::move(request));
+        const auto& state = opened.session->initial_state;
+        const auto route_count = state.exact.statuses.size();
+        const auto sha256 = state.sha256();
+        protocol::PayloadBuilder builder(
+            protocol::KernelOperation::candidate_session_open,
+            input.header().request_id);
+        builder.add(protocol::NumericType::int64,
+            state.exact.path_offsets.data(), state.exact.path_offsets.size(),
+            state.exact.path_offsets.size());
+        builder.add(protocol::NumericType::int64,
+            state.exact.path_indices.data(), state.exact.path_indices.size(),
+            state.exact.path_indices.size());
+        builder.add(protocol::NumericType::int64, state.exact.statuses.data(),
+            state.exact.statuses.size(), state.exact.statuses.size());
+        builder.add(protocol::NumericType::int64, state.exact.reasons.data(),
+            state.exact.reasons.size(), state.exact.reasons.size());
+        builder.add(protocol::NumericType::float64, state.exact.metrics.data(),
+            state.exact.metrics.size(), route_count, 4);
+        builder.add(protocol::NumericType::int64,
+            state.exact.label_counters.data(),
+            state.exact.label_counters.size(), route_count, 3);
+        builder.add(protocol::NumericType::int64,
+            state.exact.batch_counters.data(),
+            state.exact.batch_counters.size(),
+            state.exact.batch_counters.size());
+        builder.add(protocol::NumericType::int64,
+            state.objective_integer.data(), state.objective_integer.size(),
+            state.objective_integer.size());
+        builder.add(protocol::NumericType::float64,
+            state.objective_float.data(), state.objective_float.size(),
+            state.objective_float.size());
+        builder.add(protocol::NumericType::int64, state.accounting.data(),
+            state.accounting.size(), state.accounting.size());
+        builder.add(protocol::NumericType::uint8, sha256.data(), sha256.size(),
+            sha256.size());
+        builder.add(protocol::NumericType::int64,
+            state.exact.completion_order.data(),
+            state.exact.completion_order.size(),
+            state.exact.completion_order.size());
+        builder.add(protocol::NumericType::uint8, opened.token.data(),
+            opened.token.size(), opened.token.size());
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
+        builder.add(protocol::NumericType::float64, telemetry.data(),
+            telemetry.size(), telemetry.size());
+        return builder.finish();
+    }
+    case protocol::KernelOperation::candidate_session_close: {
+        const auto token = evrptw::native_search::
+            candidate_session_token_from_payload_v2(input);
+        candidate_sessions.close(peer_pid, token);
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
+        return evrptw::native_search::candidate_session_token_payload_v2(
+            protocol::KernelOperation::candidate_session_close, token,
+            input.header().request_id, telemetry);
+    }
+    case protocol::KernelOperation::candidate_transaction_execute: {
+        auto transaction = evrptw::native_search::
+            candidate_transaction_execute_from_payload_v2(input);
+        auto session = candidate_sessions.lookup(
+            peer_pid, transaction.token);
+        std::unique_lock session_lock(session->mutex, std::try_to_lock);
+        if (!session_lock.owns_lock()) {
+            throw std::runtime_error(
+                "native candidate session already has an active transaction");
+        }
+        if (!session->transaction_state) {
+            throw std::logic_error(
+                "native candidate session lost its transaction state");
+        }
+        if (session->pending_budget_snapshot.has_value()) {
+            throw std::runtime_error(
+                "native candidate session has an unresolved transaction");
+        }
+        const auto session_remaining = session->request.config.deadline[1]
+            - std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (session_remaining <= 0.0) {
+            throw evrptw::native_search::CandidateTransactionDeadlineV2(
+                "native candidate session deadline expired before transaction");
+        }
+        transaction.round.deadline_remaining = std::min(
+            transaction.round.deadline_remaining, session_remaining);
+        SchedulerCandidateTransactionKernelsV2 kernels(pool);
+        evrptw::native_search::CandidateTransactionExecutorV2 executor(
+            session->request, *session->transaction_state, kernels);
+        const auto budget_snapshot =
+            session->transaction_state->budget().snapshot();
+        if (transaction.options.defer_commit) {
+            pending_candidate_transaction = transaction.token;
+        }
+        const auto execution = executor.execute_with_trace(
+            std::move(transaction.round), transaction.options);
+        if (transaction.options.defer_commit) {
+            session->pending_budget_snapshot = budget_snapshot;
+            session->pending_exact_protocol =
+                execution.trace.exact_protocol_active;
+            session->pending_negative_store =
+                execution.trace.negative_store_active;
+            session->pending_attempted_mark =
+                execution.trace.attempted_mark_active;
+            session->transaction_resolution =
+                CandidateSessionRegistry::Session::transaction_pending;
+        }
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
+        return evrptw::native_search::
+            candidate_transaction_execution_payload_v2(
+                execution, input.header().request_id, telemetry);
+    }
+    case protocol::KernelOperation::candidate_transaction_commit:
+    case protocol::KernelOperation::candidate_transaction_rollback: {
+        const auto operation = input.header().operation;
+        const auto token = evrptw::native_search::
+            candidate_session_token_from_payload_v2(input);
+        auto session = candidate_sessions.lookup(peer_pid, token);
+        std::unique_lock session_lock(session->mutex, std::try_to_lock);
+        if (!session_lock.owns_lock()) {
+            throw std::runtime_error(
+                "native candidate session already has an active transaction");
+        }
+        if (operation
+           == protocol::KernelOperation::candidate_transaction_commit) {
+            if (!session->pending_budget_snapshot.has_value()) {
+                throw std::runtime_error(
+                    "native candidate session has no pending transaction; resolution="
+                    + std::to_string(session->transaction_resolution));
+            }
+            pending_candidate_transaction = token;
+            pending_commit_session = token;
+        } else {
+            session->rollback_pending();
+        }
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
+        return evrptw::native_search::candidate_session_token_payload_v2(
+            operation, token, input.header().request_id, telemetry);
+    }
+    case protocol::KernelOperation::candidate_transaction_status: {
+        const auto token = evrptw::native_search::
+            candidate_session_token_from_payload_v2(input);
+        auto session = candidate_sessions.lookup(peer_pid, token);
+        std::unique_lock session_lock(session->mutex, std::try_to_lock);
+        if (!session_lock.owns_lock()) {
+            throw std::runtime_error(
+                "native candidate session already has an active transaction");
+        }
+        const std::array<double, 7> telemetry{
+            queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
+            0.0, 0.0, 0.0};
+        return evrptw::native_search::candidate_session_status_payload_v2(
+            token, session->transaction_resolution,
+            input.header().request_id, telemetry);
+    }
     }
     throw std::runtime_error("native scheduler operation is invalid");
 }
@@ -674,8 +1092,13 @@ void handle_connection(
     double queue_wait_seconds,
     std::size_t queue_depth,
     bool allow_fault_injection,
-    SchedulerConcurrencyTelemetry& concurrency_telemetry) noexcept {
+    SchedulerConcurrencyTelemetry& concurrency_telemetry,
+    CandidateSessionRegistry& candidate_sessions) noexcept {
     std::uint64_t request_id = 0;
+    pid_t peer_pid = 0;
+    std::optional<std::string> pending_open_session;
+    std::optional<std::string> pending_candidate_transaction;
+    std::optional<std::string> pending_commit_session;
     try {
         ucred peer_credentials{};
         socklen_t peer_credentials_size = sizeof(peer_credentials);
@@ -687,6 +1110,7 @@ void handle_connection(
             throw std::runtime_error(
                 "native scheduler peer credentials are invalid");
         }
+        peer_pid = peer_credentials.pid;
         protocol::ControlFrame request;
         if (!read_exact(descriptor, &request, sizeof(request))) {
             ::close(descriptor);
@@ -733,6 +1157,9 @@ void handle_connection(
         if (!test_request && allow_fault_injection
             && !production_fault.empty()
             && production_fault != "exact_path_offset_oob"
+            && production_fault != "candidate_execute_output_failure"
+            && production_fault != "candidate_commit_release_loss"
+            && production_fault != "candidate_commit_before_apply_crash"
             && !production_fault_consumed.exchange(
                 true, std::memory_order_acq_rel)) {
             injected_fault = production_fault;
@@ -767,6 +1194,23 @@ void handle_connection(
                 true, std::memory_order_acq_rel)) {
             injected_fault = production_fault;
         }
+        if (!test_request && allow_fault_injection
+            && production_fault == "candidate_execute_output_failure"
+            && input_view.header().operation
+                == protocol::KernelOperation::candidate_transaction_execute
+            && !production_fault_consumed.exchange(
+                true, std::memory_order_acq_rel)) {
+            injected_fault = production_fault;
+        }
+        if (!test_request && allow_fault_injection
+            && (production_fault == "candidate_commit_release_loss"
+                || production_fault == "candidate_commit_before_apply_crash")
+            && input_view.header().operation
+                == protocol::KernelOperation::candidate_transaction_commit
+            && !production_fault_consumed.exchange(
+                true, std::memory_order_acq_rel)) {
+            injected_fault = production_fault;
+        }
         if (injected_fault == "worker_exception") {
             throw std::runtime_error(
                 "injected native scheduler worker exception");
@@ -790,11 +1234,17 @@ void handle_connection(
                     request_peak_active_tasks = pool.active_task_count();
                     output_bytes = execute(
                         input_view, queue_wait_seconds + pool_wait_seconds,
-                        queue_depth);
+                        queue_depth, peer_credentials.pid,
+                        candidate_sessions, pool, pending_candidate_transaction,
+                        pending_commit_session);
                     request_peak_active_tasks = std::max(
                         request_peak_active_tasks, pool.active_task_count());
                 });
             }
+        }
+        if (injected_fault == "candidate_execute_output_failure") {
+            throw std::runtime_error(
+                "injected native candidate execute output failure");
         }
         if (injected_fault == "initial_state_path_offset_oob") {
             const protocol::PayloadView output_view(
@@ -829,6 +1279,16 @@ void handle_connection(
         patch_pool_telemetry(
             output_bytes, pool, request_peak_active_tasks,
             concurrency_telemetry.snapshot(), peer_credentials.pid);
+        if (input_view.header().operation
+            == protocol::KernelOperation::candidate_session_open) {
+            const protocol::PayloadView output_view(
+                output_bytes.data(), output_bytes.size());
+            const auto* token = output_view.data<std::uint8_t>(
+                12, protocol::NumericType::uint8);
+            pending_open_session.emplace(
+                reinterpret_cast<const char*>(token),
+                static_cast<std::size_t>(output_view.descriptor(12).count));
+        }
         const auto output_name = "/evrptw-s52-kernel-" + std::to_string(::getpid())
             + "-" + scheduler_run_nonce + "-"
             + std::to_string(segment_counter.fetch_add(1));
@@ -862,12 +1322,38 @@ void handle_connection(
                 != output_sha) {
             throw std::runtime_error("native scheduler acknowledgement mismatch");
         }
+        if (injected_fault == "candidate_commit_before_apply_crash") {
+            ::_exit(86);
+        }
+        if (pending_commit_session.has_value()) {
+            candidate_sessions.commit_pending(
+                peer_pid, *pending_commit_session);
+            pending_candidate_transaction.reset();
+            pending_commit_session.reset();
+        }
+        if (injected_fault == "candidate_commit_release_loss") {
+            throw std::runtime_error(
+                "injected candidate commit release loss");
+        }
         protocol::ControlFrame released;
         released.message = protocol::ControlMessage::released;
         released.request_id = request_id;
         send_exact(descriptor, &released, sizeof(released));
+        pending_open_session.reset();
     } catch (const std::exception& error) {
-        send_failure(descriptor, request_id, error.what());
+        std::string failure(error.what());
+        if (pending_candidate_transaction.has_value()) {
+            if (!candidate_sessions.rollback_pending_noexcept(
+                    peer_pid, *pending_candidate_transaction)) {
+                failure.append("; pending transaction rollback failed");
+                std::cerr << failure << '\n';
+            }
+        }
+        if (pending_open_session.has_value()) {
+            candidate_sessions.rollback_open_noexcept(
+                peer_pid, *pending_open_session);
+        }
+        send_failure(descriptor, request_id, failure);
     }
     ::close(descriptor);
 }
@@ -948,7 +1434,13 @@ int main(int argc, char** argv) {
                 || (production_fault != "pause_before_execute"
                     && production_fault
                         != "initial_state_path_offset_oob"
-                    && production_fault != "exact_path_offset_oob"))) {
+                    && production_fault != "exact_path_offset_oob"
+                    && production_fault
+                        != "candidate_execute_output_failure"
+                    && production_fault
+                        != "candidate_commit_release_loss"
+                    && production_fault
+                        != "candidate_commit_before_apply_crash"))) {
             throw std::invalid_argument(
                 "native scheduler production fault is invalid");
         }
@@ -959,6 +1451,7 @@ int main(int argc, char** argv) {
         NativeWorkPool pool(worker_threads);
         NativeRequestQueue queue;
         SchedulerConcurrencyTelemetry concurrency_telemetry;
+        CandidateSessionRegistry candidate_sessions;
         std::atomic<bool> stopping{false};
         listener = make_listener(socket_path);
         std::vector<std::thread> request_threads;
@@ -984,7 +1477,8 @@ int main(int argc, char** argv) {
                     handle_connection(
                         request->descriptor, pool, stopping, listener,
                         queue_wait_seconds, request->queue_depth_on_submit,
-                        allow_fault_injection, concurrency_telemetry);
+                        allow_fault_injection, concurrency_telemetry,
+                        candidate_sessions);
                 }
             });
         }

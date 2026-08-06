@@ -203,6 +203,7 @@ class NativeCandidateRoundRequest:
     compute_threads: int = 1
     full_screening: bool = True
     incremental: npt.NDArray[np.float64] | None = None
+    incremental_state: NativeCandidateIncrementalState | None = None
 
     def __post_init__(self) -> None:
         if not self.candidates:
@@ -219,6 +220,43 @@ class NativeCandidateRoundRequest:
             raise ValueError("native candidate-round batch size must be positive")
         if self.compute_threads <= 0:
             raise ValueError("native candidate-round compute threads must be positive")
+        if self.incremental is not None and self.incremental_state is not None:
+            raise ValueError(
+                "native candidate round cannot mix precomputed and typed incremental state"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class NativeCandidateIncrementalState:
+    """Contiguous base-snapshot SoA consumed inside the single native round call."""
+
+    chain_offsets: npt.NDArray[np.int64]
+    chain_indices: npt.NDArray[np.int64]
+    edge_offsets: npt.NDArray[np.int64]
+    edge_values: npt.NDArray[np.float64]
+    earliest_offsets: npt.NDArray[np.int64]
+    earliest_values: npt.NDArray[np.float64]
+    latest_offsets: npt.NDArray[np.int64]
+    latest_values: npt.NDArray[np.float64]
+
+
+@dataclass(frozen=True, slots=True)
+class NativeIncrementalPropagationReceipt:
+    """Typed propagation result returned by the candidate-round entry point."""
+
+    status_code: int
+    reason_code: int
+    failed_check_code: int
+    forward_feasible: bool
+    backward_feasible: bool
+    reused_prefix_edges: int
+    reused_suffix_edges: int
+    recomputed_forward_edges: int
+    recomputed_backward_edges: int
+    accepted: bool
+    distance_lower_bound: float
+    min_time_window_slack: float
+    finish_time: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +305,7 @@ class NativeCandidateRoundResult:
     transaction_sha256: str
     audit: CandidateTransactionAudit
     resource_receipt: NativeCandidateResourceReceipt
+    incremental_propagation: tuple[NativeIncrementalPropagationReceipt, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +345,7 @@ class FullNativeALNSResult:
     route_cache_statistics: Mapping[str, int]
     screening_statistics: Mapping[str, object]
     causal_journal: NativeCausalJournal
+    canonical_event_journal: NativeCanonicalEventJournal
     initial_state_receipt: NativeInitialStateReceipt
 
 
@@ -343,6 +383,24 @@ class NativeCausalJournal:
         terminal_reason = int(self.status_codes[terminal_rows[0]])
         expected_deadline_rows = 1 if terminal_reason in {1, 2, 3} else 0
         return int(self.stream_counts[6]) == expected_deadline_rows
+
+
+@dataclass(frozen=True, slots=True)
+class NativeCanonicalEventJournal:
+    """Native-owned source identity for every canonical runtime event."""
+
+    event_ids: npt.NDArray[np.int64]
+    stream_codes: npt.NDArray[np.int64]
+    event_codes: npt.NDArray[np.int64]
+    lane_ids: npt.NDArray[np.int64]
+    operator_ids: npt.NDArray[np.int64]
+    iterations: npt.NDArray[np.int64]
+    transaction_ids: npt.NDArray[np.int64]
+    subject_ids: npt.NDArray[np.int64]
+    status_codes: npt.NDArray[np.int64]
+    flags: npt.NDArray[np.int64]
+    stream_counts: npt.NDArray[np.int64]
+    transaction_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +450,79 @@ class NativeThreeLaneSemanticStream:
     stage04_control: npt.NDArray[np.int64] | None = None
     initial_temperature: float | None = None
     operator_replay_events: tuple[Mapping[str, object], ...] = ()
+
+
+def _decode_native_stage04_control_events(
+    boundary_value: object,
+    *,
+    iteration: int,
+    previous_control: npt.NDArray[np.int64] | None,
+    name: str,
+) -> tuple[tuple[Mapping[str, object], ...], npt.NDArray[np.int64]]:
+    """Decode every Stage 4 control transition through one canonical seam."""
+
+    if not isinstance(boundary_value, tuple) or len(boundary_value) != 6:
+        raise RuntimeError(f"native {name} Stage 4 boundary has an invalid tuple")
+    control = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            boundary_value[4],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name=f"{name} Stage 4 control",
+        ),
+    )
+    control_float = cast(
+        npt.NDArray[np.float64],
+        _require_array(
+            boundary_value[5],
+            dtype=np.dtype(np.float64),
+            shape=(1,),
+            name=f"{name} Stage 4 control float",
+        ),
+    )
+    if (
+        np.any(control < 0)
+        or int(control[0]) not in (0, 1)
+        or int(control[2]) not in (0, 1)
+        or int(control[4]) not in (0, 1)
+        or not math.isfinite(float(control_float[0]))
+        or float(control_float[0]) < 0.0
+    ):
+        raise RuntimeError(f"native {name} Stage 4 control is invalid")
+    events: list[Mapping[str, object]] = []
+    if bool(control[0]):
+        events.append(
+            {
+                "type": "stage04_reheat",
+                "iteration": iteration,
+                "reheat_count": int(control[1]),
+                "reheat_floor": float(control_float[0]),
+                "stagnation_iterations": int(control[6]),
+            }
+        )
+    if bool(control[2]):
+        events.append(
+            {
+                "type": "stage04_restart",
+                "iteration": iteration,
+                "restart_count": int(control[3]),
+                "intensification": bool(control[4]),
+                "stagnation_at_trigger": 0,
+            }
+        )
+    if (
+        previous_control is not None
+        and bool(previous_control[4])
+        and not bool(control[4])
+    ):
+        events.append(
+            {
+                "type": "stage04_intensification_end",
+                "iteration": iteration,
+            }
+        )
+    return tuple(events), _readonly_copy(control)
 
 
 def _append_u64(evidence: bytearray, value: int) -> None:
@@ -2626,16 +2757,42 @@ def decode_native_three_lane_semantic_stream(
             removal[0], removal[1], "rejected constraint partial"
         )
         repair = require_tuple(constraint_probe[1], 3, "rejected constraint repair")
-        repaired_routes = unpack_routes(
-            repair[0], repair[1], "rejected constraint repaired"
+        repair_metadata = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                repair[2],
+                dtype=np.dtype(np.int64),
+                shape=(7,),
+                name="rejected constraint repair metadata",
+            ),
         )
-        constraint_transaction = require_plan_transaction(
-            constraint_probe[2], 1, "rejected constraint"
-        )
-        constraint_objective = replay_objective(repaired_routes)
-        constraint_key = reported_objective(
-            constraint_transaction, 0, constraint_objective, "rejected constraint"
-        )
+        repair_failed = bool(repair_metadata[0])
+        repaired_routes: tuple[CustomerSequence, ...] = ()
+        constraint_transaction: tuple[object, ...] | None = None
+        constraint_objective = initial_objective
+        constraint_key: tuple[int, float, float, int] | tuple[()] = ()
+        if repair_failed:
+            if (
+                _require_vector(repair[0], "rejected failed repair offsets").tolist()
+                != [0]
+                or len(_require_vector(repair[1], "rejected failed repair indices"))
+                != 0
+                or constraint_probe[2] is not None
+            ):
+                raise RuntimeError(
+                    "native three-lane rejected failed repair payload is invalid"
+                )
+        else:
+            repaired_routes = unpack_routes(
+                repair[0], repair[1], "rejected constraint repaired"
+            )
+            constraint_transaction = require_plan_transaction(
+                constraint_probe[2], 1, "rejected constraint"
+            )
+            constraint_objective = replay_objective(repaired_routes)
+            constraint_key = reported_objective(
+                constraint_transaction, 0, constraint_objective, "rejected constraint"
+            )
         constraint_outcome = cast(
             npt.NDArray[np.int64],
             _require_array(
@@ -2661,22 +2818,33 @@ def decode_native_three_lane_semantic_stream(
             if before != after
         )
         candidate_ready = bool(constraint_outcome[2])
-        constraint_statuses = _require_vector(
-            constraint_transaction[1], "rejected constraint statuses"
+        constraint_statuses = (
+            _require_vector(
+                constraint_transaction[1], "rejected constraint statuses"
+            )
+            if constraint_transaction is not None
+            else np.empty(0, dtype=np.int64)
         )
-        constraint_exact_rows = _require_vector(
-            constraint_transaction[5], "rejected constraint exact rows"
+        constraint_exact_rows = (
+            _require_vector(
+                constraint_transaction[5], "rejected constraint exact rows"
+            )
+            if constraint_transaction is not None
+            else np.empty(0, dtype=np.int64)
         )
-        if len(constraint_statuses) != 1:
+        if (not repair_failed and len(constraint_statuses) != 1) or (
+            repair_failed and (candidate_ready or np.any(constraint_outcome[3:] != 0))
+        ):
             raise RuntimeError(
                 "native three-lane rejected constraint status count is invalid"
             )
         no_change = (
             not candidate_ready
+            and not repair_failed
             and int(constraint_statuses[0]) == 5
             and repaired_routes == initial_customer_sequences
         )
-        if not candidate_ready and not no_change:
+        if not candidate_ready and not no_change and not repair_failed:
             raise RuntimeError(
                 "native three-lane rejected constraint lost a non-incumbent candidate"
             )
@@ -2704,7 +2872,27 @@ def decode_native_three_lane_semantic_stream(
                 removal_trigger="stagnation_baseline",
             )
         )
-        if no_change:
+        if repair_failed:
+            rejected_events.append(
+                event(
+                    operator,
+                    "failed",
+                    (
+                        "constraint_removal_no_existing_route_insertion"
+                        if int(repair_metadata[0]) == 1
+                        else "constraint_singleton_route_screening_rejected"
+                    ),
+                    removed_customers=removed_customers,
+                    prefilter_passed=True,
+                    track="constraint_lane",
+                    constraint_category=operator,
+                    removal_tier="small" if int(selection[0]) == 0 else "",
+                    removal_size_requested=int(selection[1]),
+                    removal_size_actual=int(selection[2]),
+                    removal_trigger="stagnation_baseline",
+                )
+            )
+        elif no_change:
             if len(constraint_exact_rows) != 0:
                 raise RuntimeError(
                     "native three-lane rejected no-change constraint started exact work"
@@ -2988,6 +3176,15 @@ def decode_native_three_lane_semantic_stream(
     removed_customers = tuple(name_by_index[int(index)] for index in removed_indices)
     remaining_routes = unpack_routes(removal[0], removal[1], "constraint partial")
     repair = require_tuple(constraint_probe[1], 3, "constraint repair")
+    repair_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            repair[2],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="constraint repair metadata",
+        ),
+    )
     repaired_routes = unpack_routes(repair[0], repair[1], "constraint repaired")
     constraint_transaction = require_plan_transaction(
         constraint_probe[2], 1, "constraint"
@@ -3110,6 +3307,11 @@ def decode_native_three_lane_semantic_stream(
                 if constraint_prepared
                 else "constraint_removal_no_change"
                 if constraint_exact_feasible
+                # This decoder branch has a completed repair transaction.  A
+                # non-feasible transaction therefore failed during candidate
+                # exact evaluation, matching Python's public fallback reason;
+                # the repair metadata is internal telemetry and must not
+                # relabel the candidate-level outcome.
                 else "constraint_repair_infeasible"
             ),
             affected_route_indices=(
@@ -3248,6 +3450,12 @@ def decode_native_three_lane_semantic_stream(
     best = require_tuple(payload[9], 5, "best")
     if unpack_routes(best[0], best[1], "best") != expected_best_routes:
         raise RuntimeError("native three-lane best trajectory replay is invalid")
+    stage04_events, stage04_control = _decode_native_stage04_control_events(
+        payload[5],
+        iteration=0,
+        previous_control=None,
+        name="three-lane bootstrap",
+    )
 
     return NativeThreeLaneSemanticStream(
         neighborhood_events=tuple(operator_events),
@@ -3258,6 +3466,8 @@ def decode_native_three_lane_semantic_stream(
         operator_activity=_readonly_copy(activity_from_events(operator_events)),
         termination=_readonly_copy(termination),
         transaction_sha256=producer_sha256,
+        stage04_events=stage04_events,
+        stage04_control=stage04_control,
         initial_temperature=initial_temperature,
     )
 
@@ -4038,6 +4248,12 @@ def decode_native_three_lane_search_semantic_stream(
     prior_quality_objective = replay_objective(prior_quality)
     prior_constraint_objective = replay_objective(prior_constraint)
     prior_best_objective = replay_objective(prior_best)
+    control_events, control = _decode_native_stage04_control_events(
+        second_payload[5],
+        iteration=1,
+        previous_control=first.stage04_control,
+        name="three-lane second iteration",
+    )
 
     quality = require_tuple(second_payload[2], 4, "quality")
     quality_pool = require_tuple(quality[0], 5, "quality pool")
@@ -4073,7 +4289,17 @@ def decode_native_three_lane_search_semantic_stream(
             seen_quality.add(plan)
             quality_plans.append(plan)
             quality_sources.append(candidate)
-    quality_transaction = transaction(quality[1], len(quality_plans), "quality")
+    quality_transaction: tuple[object, ...] | None
+    if quality[1] is None:
+        if quality_plans:
+            raise RuntimeError(
+                "native three-lane follow-up quality transaction is missing"
+            )
+        quality_transaction = None
+    else:
+        quality_transaction = transaction(
+            quality[1], len(quality_plans), "quality"
+        )
     quality_outcome = cast(
         npt.NDArray[np.int64],
         _require_array(
@@ -4098,6 +4324,10 @@ def decode_native_three_lane_search_semantic_stream(
         quality_source: int | None = None
         quality_moved: tuple[str, ...] = ()
     else:
+        if quality_transaction is None:
+            raise RuntimeError(
+                "native three-lane follow-up selected quality transaction is missing"
+            )
         quality_routes = quality_plans[selected_quality]
         quality_objective = replay_objective(quality_routes)
         quality_key = objective_key(
@@ -4128,8 +4358,36 @@ def decode_native_three_lane_search_semantic_stream(
     constraint_removed = tuple(node_names[int(index)] for index in removed_indices)
     constraint_partial = unpack_routes(removal[0], removal[1], "constraint partial")
     repair = require_tuple(constraint_probe[1], 3, "constraint repair")
-    constraint_routes = unpack_routes(repair[0], repair[1], "constraint repaired")
-    constraint_transaction = transaction(constraint_probe[2], 1, "constraint")
+    repair_metadata = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            repair[2],
+            dtype=np.dtype(np.int64),
+            shape=(7,),
+            name="follow-up constraint repair metadata",
+        ),
+    )
+    repair_failed = bool(repair_metadata[0])
+    constraint_routes: tuple[CustomerSequence, ...] = ()
+    constraint_transaction: tuple[object, ...] | None = None
+    if repair_failed:
+        if (
+            _require_vector(repair[0], "failed constraint repair offsets").tolist()
+            != [0]
+            or len(_require_vector(repair[1], "failed constraint repair indices"))
+            != 0
+            or constraint_probe[2] is not None
+        ):
+            raise RuntimeError(
+                "native three-lane follow-up failed constraint repair is invalid"
+            )
+    else:
+        constraint_routes = unpack_routes(
+            repair[0], repair[1], "constraint repaired"
+        )
+        constraint_transaction = transaction(
+            constraint_probe[2], 1, "constraint"
+        )
     constraint_outcome = cast(
         npt.NDArray[np.int64],
         _require_array(
@@ -4141,17 +4399,35 @@ def decode_native_three_lane_search_semantic_stream(
     )
     if int(constraint_outcome[0]) != 1:
         raise RuntimeError("native three-lane follow-up constraint operator is invalid")
-    constraint_statuses = _require_vector(
-        constraint_transaction[1], "follow-up constraint statuses"
+    constraint_statuses = (
+        _require_vector(
+            constraint_transaction[1], "follow-up constraint statuses"
+        )
+        if constraint_transaction is not None
+        else np.empty(0, dtype=np.int64)
     )
     constraint_prepared = bool(constraint_outcome[2])
-    constraint_exact_feasible = int(constraint_statuses[0]) == 5
+    constraint_exact_feasible = (
+        not repair_failed
+        and len(constraint_statuses) == 1
+        and int(constraint_statuses[0]) == 5
+    )
+    if repair_failed and (
+        constraint_prepared or np.any(constraint_outcome[3:] != 0)
+    ):
+        raise RuntimeError(
+            "native three-lane follow-up failed constraint flags are invalid"
+        )
     if constraint_prepared and not constraint_exact_feasible:
         raise RuntimeError(
             "native three-lane follow-up constraint candidate state is invalid"
         )
     constraint_key: tuple[int, float, float, int] | tuple[()]
     if constraint_prepared:
+        if constraint_transaction is None:
+            raise RuntimeError(
+                "native three-lane follow-up prepared constraint lost its transaction"
+            )
         constraint_objective = replay_objective(constraint_routes)
         constraint_key = objective_key(
             constraint_transaction, 0, constraint_objective, "constraint"
@@ -4185,7 +4461,7 @@ def decode_native_three_lane_search_semantic_stream(
         or int(legacy_metadata[1]) not in range(3)
         or int(legacy_metadata[2]) <= 0
         or int(legacy_metadata[3]) != 0
-        or int(legacy_metadata[4]) != 0
+        or int(legacy_metadata[4]) < 0
         or int(legacy_metadata[5]) != 0
         or int(legacy_metadata[6]) < 0
         or int(legacy_metadata[7]) != -2
@@ -4276,7 +4552,13 @@ def decode_native_three_lane_search_semantic_stream(
     ):
         raise RuntimeError("native three-lane follow-up acceptance replay mismatch")
 
-    expected_legacy = legacy_routes if legacy_accepted else prior_legacy
+    expected_legacy = (
+        prior_best
+        if bool(control[2])
+        else legacy_routes
+        if legacy_accepted
+        else prior_legacy
+    )
     expected_quality = quality_routes if quality_accepted else prior_quality
     expected_constraint = constraint_routes if constraint_accepted else prior_constraint
     expected_best = (
@@ -4330,40 +4612,53 @@ def decode_native_three_lane_search_semantic_stream(
         if quality_source is not None
         else ()
     )
+    quality_events = (
+        (
+            event("swap", "not_applicable", "only_one_route"),
+        )
+        if len(prior_quality) == 1
+        else (
+            event(
+                "swap",
+                "candidate_pool_aggregate",
+                "swap_complete_candidate_pool",
+                aggregate_count=len(quality_plans),
+                candidate_pool_hash=pool_hash.hexdigest(),
+                candidate_objective_key=quality_key,
+            ),
+            event(
+                "swap",
+                "candidate_proposed"
+                if quality_selected
+                else "candidate_control_skipped",
+                "swap_candidate"
+                if quality_selected
+                else "no_selected_complete_plan_feasible",
+                route_indices=quality_changed,
+                affected_route_indices=quality_changed,
+                removed_customers=quality_moved,
+                candidate_route_sequences=(
+                    tuple(quality_routes[index] for index in quality_changed)
+                    if quality_selected
+                    else ()
+                ),
+                candidate_vehicle_delta=(
+                    len(quality_routes) - len(prior_quality)
+                    if quality_selected
+                    else None
+                ),
+                candidate_feasible=quality_selected,
+                prefilter_passed=quality_selected,
+                accepted=quality_accepted,
+                distance_improvement=quality_selected
+                and quality_objective.total_distance
+                < prior_quality_objective.total_distance - 1e-9,
+                candidate_objective_key=quality_key,
+            ),
+        )
+    )
     followup_events = (
-        event(
-            "swap",
-            "candidate_pool_aggregate",
-            "swap_complete_candidate_pool",
-            aggregate_count=len(quality_plans),
-            candidate_pool_hash=pool_hash.hexdigest(),
-            candidate_objective_key=quality_key,
-        ),
-        event(
-            "swap",
-            "candidate_proposed" if quality_selected else "candidate_control_skipped",
-            "swap_candidate" if quality_selected else "no_selected_complete_plan_feasible",
-            route_indices=quality_changed,
-            affected_route_indices=quality_changed,
-            removed_customers=quality_moved,
-            candidate_route_sequences=(
-                tuple(quality_routes[index] for index in quality_changed)
-                if quality_selected
-                else ()
-            ),
-            candidate_vehicle_delta=(
-                len(quality_routes) - len(prior_quality)
-                if quality_selected
-                else None
-            ),
-            candidate_feasible=quality_selected,
-            prefilter_passed=quality_selected,
-            accepted=quality_accepted,
-            distance_improvement=quality_selected
-            and quality_objective.total_distance
-            < prior_quality_objective.total_distance - 1e-9,
-            candidate_objective_key=quality_key,
-        ),
+        *quality_events,
         event(
             "time_window_conflict",
             "candidate_proposed",
@@ -4393,7 +4688,11 @@ def decode_native_three_lane_search_semantic_stream(
                 if constraint_prepared
                 else "constraint_removal_no_change"
                 if constraint_exact_feasible
-                else "constraint_repair_infeasible"
+                else (
+                    "constraint_removal_no_existing_route_insertion"
+                    if int(repair_metadata[0]) == 1
+                    else "constraint_repair_infeasible"
+                )
             ),
             affected_route_indices=(
                 constraint_affected
@@ -4403,7 +4702,7 @@ def decode_native_three_lane_search_semantic_stream(
             removed_customers=constraint_removed,
             candidate_route_sequences=(
                 constraint_routes
-                if constraint_prepared or not constraint_exact_feasible
+                if constraint_prepared
                 else ()
             ),
             candidate_vehicle_delta=(
@@ -4414,8 +4713,12 @@ def decode_native_three_lane_search_semantic_stream(
             candidate_feasible=constraint_prepared,
             prefilter_passed=True,
             exact_route_evaluations=(
-                len(_require_vector(constraint_transaction[5], "constraint exact rows"))
-                if constraint_prepared
+                len(
+                    _require_vector(
+                        constraint_transaction[5], "constraint exact rows"
+                    )
+                )
+                if constraint_prepared and constraint_transaction is not None
                 else 0
             ),
             track="constraint_lane",
@@ -4540,6 +4843,8 @@ def decode_native_three_lane_search_semantic_stream(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=producer_sha256,
+        stage04_events=(*first.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=first.initial_temperature,
     )
     if len(iteration_payloads) == 2:
@@ -4725,9 +5030,15 @@ def decode_native_three_lane_search_semantic_stream(
             vehicle_operator_config=vehicle_operator_config,
         )
     else:
+        ninth_kind = _native_three_lane_legacy_payload_kind(ninth_legacy)
         ninth_is_route_elimination = (
-            isinstance(ninth_metadata, np.ndarray)
-            and ninth_metadata.shape == (2,)
+            ninth_kind == "route_elimination"
+            or (
+                ninth_kind == "simple_rejection"
+                and isinstance(ninth_metadata, np.ndarray)
+                and ninth_metadata.shape == (4,)
+                and int(ninth_metadata[1]) == 2
+            )
         )
         ninth_stream = _decode_native_three_lane_rejection_only_iteration(
             ninth_payload,
@@ -5618,6 +5929,12 @@ def _decode_native_three_lane_third_general(
 ) -> NativeThreeLaneSemanticStream:
     """Replay a general two-route third iteration without fixture assumptions."""
 
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5], iteration=2,
+        previous_control=previous_stream.stage04_control,
+        name="three-lane third general",
+    )
+
     def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
         if not isinstance(value, tuple) or len(value) != size:
             raise RuntimeError(f"native three-lane third general {name} is invalid")
@@ -5750,10 +6067,21 @@ def _decode_native_three_lane_third_general(
             seen_quality.add(plan)
             quality_plans.append(plan)
             quality_sources.append(candidate)
-    quality_transaction = require_tuple(quality[1], 13, "quality transaction")
-    quality_statuses = _require_vector(
-        quality_transaction[1], "third general quality statuses"
-    )
+    quality_transaction: tuple[object, ...] | None
+    if quality[1] is None:
+        if quality_plans:
+            raise RuntimeError(
+                "native three-lane third general quality transaction is missing"
+            )
+        quality_transaction = None
+        quality_statuses = np.empty(0, dtype=np.int64)
+    else:
+        quality_transaction = require_tuple(
+            quality[1], 13, "quality transaction"
+        )
+        quality_statuses = _require_vector(
+            quality_transaction[1], "third general quality statuses"
+        )
     quality_outcome = cast(
         npt.NDArray[np.int64],
         _require_array(
@@ -5776,7 +6104,10 @@ def _decode_native_three_lane_third_general(
     quality_source: int | None = None
     quality_key: tuple[int, float, float, int] | tuple[()] = ()
     if selected_quality >= 0:
-        if int(quality_statuses[selected_quality]) != 5:
+        if (
+            quality_transaction is None
+            or int(quality_statuses[selected_quality]) != 5
+        ):
             raise RuntimeError(
                 "native three-lane third general selected quality status is invalid"
             )
@@ -5819,7 +6150,10 @@ def _decode_native_three_lane_third_general(
         else ()
     )
     quality_events = (
-        event(
+        (event("two_opt_star", "not_applicable", "only_one_route"),)
+        if len(prior_quality) == 1
+        else (
+            event(
             "two_opt_star",
             "candidate_pool_aggregate",
             "two_opt_star_complete_candidate_pool",
@@ -5827,7 +6161,7 @@ def _decode_native_three_lane_third_general(
             candidate_pool_hash=quality_hash.hexdigest(),
             candidate_objective_key=quality_key,
         ),
-        event(
+            event(
             "two_opt_star",
             "candidate_proposed"
             if quality_source is not None
@@ -5853,6 +6187,7 @@ def _decode_native_three_lane_third_general(
             < prior_quality_objective.total_distance - 1e-9,
             candidate_objective_key=quality_key,
         ),
+        )
     )
 
     constraint = require_tuple(payload[3], 3, "constraint")
@@ -6087,7 +6422,13 @@ def _decode_native_three_lane_third_general(
                 if constraint_prepared
                 else "constraint_removal_no_change"
                 if no_change
-                else "constraint_repair_infeasible"
+                else (
+                    "constraint_removal_no_existing_route_insertion"
+                    if repair_failed and int(repair_metadata[0]) == 1
+                    else "constraint_singleton_route_screening_rejected"
+                    if repair_failed
+                    else "constraint_repair_infeasible"
+                )
             ),
             affected_route_indices=(
                 tuple(
@@ -6103,7 +6444,7 @@ def _decode_native_three_lane_third_general(
             removed_customers=removed,
             candidate_route_sequences=(
                 repaired_routes
-                if constraint_prepared or not constraint_exact_feasible
+                if constraint_prepared
                 else ()
             ),
             candidate_vehicle_delta=(
@@ -6150,8 +6491,23 @@ def _decode_native_three_lane_third_general(
     merge_plan_offsets = _require_vector(
         plan_payload[0], "route-merge plan offsets"
     )
+    merge_route_offsets = _require_vector(
+        plan_payload[1], "route-merge route offsets"
+    )
+    merge_route_indices = _require_vector(
+        plan_payload[2], "route-merge route indices"
+    )
     merge_plan_count = len(merge_plan_offsets) - 1
     pruning = _require_vector(merge_pool[3], "route-merge pruning")
+    merge_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            legacy[5],
+            dtype=np.dtype(np.int64),
+            shape=(5,),
+            name="third general route-merge outcome",
+        ),
+    )
     if (
         legacy_metadata.tolist()
         != [2, 3, len(prior_legacy), len(merge_offsets) - 1]
@@ -6160,8 +6516,9 @@ def _decode_native_three_lane_third_general(
         or len(pruning) != 2
         or int(merge_plan_offsets[0]) != 0
         or int(merge_plan_offsets[-1])
-        != len(_require_vector(plan_payload[1], "route-merge route offsets")) - 1
-        or cast(npt.NDArray[np.int64], legacy[5]).tolist() != [-1] * 5
+        != len(merge_route_offsets) - 1
+        or int(merge_route_offsets[0]) != 0
+        or int(merge_route_offsets[-1]) != len(merge_route_indices)
     ):
         raise RuntimeError("native three-lane third general route-merge journal is invalid")
     merge_transaction: tuple[object, ...] | None = None
@@ -6175,7 +6532,10 @@ def _decode_native_three_lane_third_general(
         merge_statuses = _require_vector(
             merge_transaction[1], "route-merge statuses"
         )
-        if len(merge_statuses) != merge_plan_count or np.any(merge_statuses == 5):
+        if (
+            len(merge_statuses) != merge_plan_count
+            or np.any((merge_statuses < 0) | (merge_statuses > 5))
+        ):
             raise RuntimeError(
                 "native three-lane third general merge selection is invalid"
             )
@@ -6200,6 +6560,85 @@ def _decode_native_three_lane_third_general(
         raise RuntimeError(
             "native three-lane third general merge candidate order diverged"
         )
+    merge_selected = int(merge_outcome[0])
+    merge_routes = prior_legacy
+    merge_objective = replay(prior_legacy)
+    merge_key: tuple[int, float, float, int] | tuple[()] = ()
+    merge_source = -1
+    merge_acceptance: tuple[object, ...] | None = None
+    if merge_selected >= 0:
+        if (
+            merge_transaction is None
+            or merge_selected >= merge_plan_count
+            or int(merge_statuses[merge_selected]) != 5
+            or int(merge_outcome[1]) != -2
+            or np.any(merge_outcome[2:4] != 0)
+        ):
+            raise RuntimeError(
+                "native three-lane third general selected merge is invalid"
+            )
+        first_route = int(merge_plan_offsets[merge_selected])
+        last_route = int(merge_plan_offsets[merge_selected + 1])
+        selected_offsets = np.ascontiguousarray(
+            merge_route_offsets[first_route : last_route + 1]
+            - int(merge_route_offsets[first_route]),
+            dtype=np.int64,
+        )
+        selected_indices = np.ascontiguousarray(
+            merge_route_indices[
+                int(merge_route_offsets[first_route]) : int(
+                    merge_route_offsets[last_route]
+                )
+            ],
+            dtype=np.int64,
+        )
+        merge_routes = unpack_soa(
+            selected_offsets, selected_indices, "selected route-merge plan"
+        )
+        merge_objective = replay(merge_routes)
+        merge_integers = cast(npt.NDArray[np.int64], merge_transaction[2])
+        merge_floats = cast(npt.NDArray[np.float64], merge_transaction[3])
+        reported_merge = SolutionObjective(
+            int(merge_integers[merge_selected, 0]),
+            float(merge_floats[merge_selected, 0]),
+            float(merge_floats[merge_selected, 1]),
+            int(merge_integers[merge_selected, 1]),
+        )
+        if reported_merge.key != merge_objective.key:
+            raise RuntimeError(
+                "native three-lane third general merge objective mismatch"
+            )
+        merge_source = int(merge_outcome[4])
+        if (
+            merge_source < 0
+            or merge_source >= len(native_candidates)
+            or merge_source != int(source_candidates[merge_selected])
+        ):
+            raise RuntimeError(
+                "native three-lane third general merge source is invalid"
+            )
+        merged, left, right = canonical_candidates[merge_selected]
+        expected_routes = list(prior_legacy)
+        expected_routes[left] = merged
+        del expected_routes[right]
+        if merge_routes != tuple(expected_routes):
+            raise RuntimeError(
+                "native three-lane third general selected merge plan diverged"
+            )
+        merge_key = merge_objective.key
+        merge_acceptance = require_tuple(payload[4], 3, "route-merge acceptance")
+        if any(value not in (0, 1) for value in merge_acceptance):
+            raise RuntimeError(
+                "native three-lane third general merge acceptance is invalid"
+            )
+    elif (
+        merge_outcome.tolist() != [-1] * 5
+        or payload[4] is not None
+        or (merge_transaction is not None and np.any(merge_statuses == 5))
+    ):
+        raise RuntimeError(
+            "native three-lane third general unselected merge is invalid"
+        )
     merge_events: list[dict[str, object]] = [
         event(
             "route_merge",
@@ -6207,6 +6646,7 @@ def _decode_native_three_lane_third_general(
             reason,
             aggregate_count=count,
             candidate_pool_hash=prefilter_sha256,
+            candidate_objective_key=merge_key,
         )
         for reason, count in sorted(reason_counts.items())
     ]
@@ -6216,14 +6656,32 @@ def _decode_native_three_lane_third_general(
         )
         result_counts: dict[tuple[str, str], int] = {}
         result_digest = hashlib.sha256()
-        for merged, _, _ in canonical_candidates:
+        for merge_plan_index, (merged, _, _) in enumerate(canonical_candidates):
+            native_status = int(merge_statuses[merge_plan_index])
             exact = solve_exact_charging(instance, merged)
-            if exact.feasible:
-                raise RuntimeError(
-                    "native three-lane third general omitted a feasible merge"
-                )
-            status = "exact_infeasible"
-            reason = exact.failure_reason or "exact_charging_infeasible"
+            if native_status == 5:
+                if not exact.feasible:
+                    raise RuntimeError(
+                        "native three-lane third general feasible merge replay failed"
+                    )
+                status = "feasible_candidate"
+                reason = "exact_charging_feasible"
+            elif native_status == 4:
+                if exact.feasible:
+                    raise RuntimeError(
+                        "native three-lane third general rejected a feasible exact merge"
+                    )
+                status = "exact_infeasible"
+                reason = exact.failure_reason or "exact_charging_infeasible"
+            elif native_status == 3:
+                status = "candidate_control_skipped"
+                reason = "candidate_control:round_budget_exhausted"
+            elif native_status == 2:
+                status = "candidate_control_skipped"
+                reason = "candidate_control:not_selected"
+            else:
+                status = "prefilter_rejected"
+                reason = screen_route_candidate(instance, merged, full=True).reason
             result_counts[(status, reason)] = (
                 result_counts.get((status, reason), 0) + 1
             )
@@ -6240,11 +6698,44 @@ def _decode_native_three_lane_third_general(
                     f"{status}_aggregate",
                     reason,
                     aggregate_count=count,
+                    candidate_feasible=status == "feasible_candidate",
                     prefilter_passed=True,
                     candidate_pool_hash=result_digest.hexdigest(),
+                    candidate_objective_key=merge_key,
                 )
                 for (status, reason), count in sorted(result_counts.items())
             ]
+        )
+    merge_accepted = bool(merge_acceptance[0]) if merge_acceptance is not None else False
+    merge_best = bool(merge_acceptance[1]) if merge_acceptance is not None else False
+    merge_vehicle_reduction = (
+        bool(merge_acceptance[2]) if merge_acceptance is not None else False
+    )
+    if merge_selected >= 0:
+        merged, left, right = canonical_candidates[merge_selected]
+        merge_events.append(
+            event(
+                "route_merge",
+                "candidate_proposed",
+                "route_merged",
+                route_indices=(left, right),
+                candidate_customer_sequence=merged,
+                candidate_vehicle_delta=-1,
+                candidate_feasible=True,
+                prefilter_passed=True,
+                exact_route_evaluations=len(
+                    _require_vector(
+                        merge_transaction[5], "route-merge exact rows"
+                    )
+                )
+                if merge_transaction is not None
+                else 0,
+                accepted=merge_accepted,
+                vehicle_reduction=merge_vehicle_reduction,
+                distance_improvement=merge_objective.total_distance
+                < replay(prior_legacy).total_distance - 1e-9,
+                candidate_objective_key=merge_key,
+            )
         )
 
     expected_quality = quality_routes if quality_accepted else prior_quality
@@ -6257,13 +6748,25 @@ def _decode_native_three_lane_third_general(
     )
     if bool(outcome[4]) != constraint_best:
         raise RuntimeError("native three-lane third constraint best flag is invalid")
-    expected_best = (
+    best_before_merge = (
         repaired_routes
         if constraint_best
         else quality_routes
         if quality_best
         else prior_best
     )
+    best_before_merge_objective = replay(best_before_merge)
+    if merge_selected >= 0 and (
+        merge_objective.vehicle_count >= len(prior_legacy)
+        or not merge_accepted
+        or not merge_vehicle_reduction
+        or merge_best != (merge_objective.key < best_before_merge_objective.key)
+    ):
+        raise RuntimeError(
+            "native three-lane third general merge acceptance diverged"
+        )
+    expected_best = merge_routes if merge_best else best_before_merge
+    expected_legacy = merge_routes if merge_accepted else prior_legacy
     final_states = (
         unpack_state(payload[6], "final legacy"),
         unpack_state(payload[7], "final quality"),
@@ -6271,16 +6774,12 @@ def _decode_native_three_lane_third_general(
         unpack_state(payload[9], "final best"),
     )
     if final_states != (
-        prior_legacy,
+        expected_legacy,
         expected_quality,
         expected_constraint,
         expected_best,
     ) or replay(final_states[3]).key != (
-        constraint_objective.key
-        if constraint_best
-        else quality_objective.key
-        if quality_best
-        else prior_best_objective.key
+        merge_objective.key if merge_best else best_before_merge_objective.key
     ):
         raise RuntimeError("native three-lane third general lane state mismatch")
 
@@ -6345,6 +6844,8 @@ def _decode_native_three_lane_third_general(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -6359,6 +6860,12 @@ def _decode_native_three_lane_third_iteration(
     search_sha256: str,
 ) -> NativeThreeLaneSemanticStream:
     """Replay the route-merge/two-opt-star/energy third iteration."""
+
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5], iteration=2,
+        previous_control=previous_stream.stage04_control,
+        name="three-lane third iteration",
+    )
 
     _verify_native_three_lane_semantic_hash(payload)
     if len(payload) != 14:
@@ -6571,15 +7078,40 @@ def _decode_native_three_lane_third_iteration(
             name="third constraint outcome",
         ),
     )
-    if outcome.tolist()[:1] != [2] or not bool(outcome[3]):
+    if (
+        int(outcome[0]) != 2
+        or not 0 <= int(outcome[1]) < 2**32
+        or np.any((outcome[2:] < 0) | (outcome[2:] > 1))
+    ):
         raise RuntimeError("native three-lane third constraint decision is invalid")
+    constraint_statuses = _require_vector(
+        transaction[1], "third constraint statuses"
+    )
+    if len(constraint_statuses) != 1 or np.any(
+        (constraint_statuses < 0) | (constraint_statuses > 5)
+    ):
+        raise RuntimeError("native three-lane third constraint statuses are invalid")
+    constraint_prepared = bool(outcome[2])
+    constraint_accepted = bool(outcome[3])
+    constraint_improved_global_best = bool(outcome[4])
+    if (
+        (constraint_accepted and not constraint_prepared)
+        or (constraint_improved_global_best and not constraint_accepted)
+        or (bool(outcome[5]) and not constraint_prepared)
+    ):
+        raise RuntimeError("native three-lane third constraint flags are invalid")
     removed_indices = _require_vector(removal[2], "third constraint removed")
     removed = tuple(node_names[int(index)] for index in removed_indices)
     partial_state = (removal[0], removal[1], None, None)
     repaired_state = (repair[0], repair[1], None, None)
     partial_routes = unpack_routes(partial_state, "constraint partial")
     repaired_routes = unpack_routes(repaired_state, "constraint repaired")
-    candidate_objective = replay(repaired_routes)
+    exact_feasible = constraint_statuses.tolist() == [5]
+    candidate_objective = (
+        replay(repaired_routes)
+        if constraint_prepared or exact_feasible
+        else prior_constraint_objective
+    )
     objective_integer = cast(npt.NDArray[np.int64], transaction[2])
     objective_float = cast(npt.NDArray[np.float64], transaction[3])
     reported = SolutionObjective(
@@ -6588,8 +7120,20 @@ def _decode_native_three_lane_third_iteration(
         float(objective_float[0, 1]),
         int(objective_integer[0, 1]),
     )
-    if reported.key != candidate_objective.key:
+    if (constraint_prepared or exact_feasible) and (
+        reported.key != candidate_objective.key
+    ):
         raise RuntimeError("native three-lane third constraint objective mismatch")
+    no_change = (
+        not constraint_prepared
+        and exact_feasible
+        and repaired_routes == prior_constraint
+    )
+    if not constraint_prepared and (
+        np.any(outcome[3:] != 0) or (exact_feasible and not no_change)
+    ):
+        raise RuntimeError("native three-lane third rejected constraint is invalid")
+    candidate_key = candidate_objective.key if constraint_prepared else ()
     affected = tuple(
         index
         for index, (before, after) in enumerate(
@@ -6599,19 +7143,26 @@ def _decode_native_three_lane_third_iteration(
     )
     route_indices = _require_vector(removal[5], "third constraint routes")
     scores = cast(npt.NDArray[np.float64], removal[4])
+    quality_events = (
+        (event("two_opt_star", "not_applicable", "only_one_route"),)
+        if len(prior_quality) == 1
+        else (
+            event(
+                "two_opt_star",
+                "candidate_pool_aggregate",
+                "two_opt_star_complete_candidate_pool",
+                aggregate_count=len(quality_plans),
+                candidate_pool_hash=quality_pool_hash.hexdigest(),
+            ),
+            event(
+                "two_opt_star",
+                "candidate_control_skipped",
+                "no_selected_complete_plan_feasible",
+            ),
+        )
+    )
     followup_events = (
-        event(
-            "two_opt_star",
-            "candidate_pool_aggregate",
-            "two_opt_star_complete_candidate_pool",
-            aggregate_count=len(quality_plans),
-            candidate_pool_hash=quality_pool_hash.hexdigest(),
-        ),
-        event(
-            "two_opt_star",
-            "candidate_control_skipped",
-            "no_selected_complete_plan_feasible",
-        ),
+        *quality_events,
         event(
             "worst_energy_detour",
             "candidate_proposed",
@@ -6631,17 +7182,31 @@ def _decode_native_three_lane_third_iteration(
             removal_trigger="stagnation_baseline",
             reset_observed=bool(selection[6]),
             ranking_score=float(scores[0]),
-            candidate_objective_key=candidate_objective.key,
+            candidate_objective_key=candidate_key,
         ),
         event(
             "worst_energy_detour",
-            "candidate_proposed",
-            "constraint_removal_repaired",
-            affected_route_indices=affected,
+            "candidate_proposed" if constraint_prepared else "failed",
+            (
+                "constraint_removal_repaired"
+                if constraint_prepared
+                else "constraint_removal_no_change"
+                if no_change
+                else "constraint_repair_infeasible"
+            ),
+            affected_route_indices=affected if constraint_prepared else (),
             removed_customers=removed,
-            candidate_route_sequences=repaired_routes,
-            candidate_vehicle_delta=len(repaired_routes) - len(prior_constraint),
-            candidate_feasible=True,
+            candidate_route_sequences=(
+                repaired_routes
+                if constraint_prepared or not exact_feasible
+                else ()
+            ),
+            candidate_vehicle_delta=(
+                len(repaired_routes) - len(prior_constraint)
+                if constraint_prepared
+                else None
+            ),
+            candidate_feasible=constraint_prepared,
             prefilter_passed=True,
             exact_route_evaluations=len(
                 _require_vector(transaction[5], "third constraint exact rows")
@@ -6654,23 +7219,41 @@ def _decode_native_three_lane_third_iteration(
             stagnation_iterations=int(selection[4]),
             removal_trigger="stagnation_baseline",
             reset_observed=bool(selection[6]),
-            accepted=True,
-            vehicle_reduction=candidate_objective.vehicle_count
-            < prior_constraint_objective.vehicle_count,
-            distance_improvement=candidate_objective.total_distance
+            accepted=constraint_accepted,
+            vehicle_reduction=bool(outcome[5]),
+            distance_improvement=constraint_prepared
+            and candidate_objective.total_distance
             < prior_constraint_objective.total_distance - 1e-9,
-            candidate_objective_key=candidate_objective.key,
+            candidate_objective_key=candidate_key,
         ),
         event("route_merge", "not_applicable", "only_one_route"),
     )
-    expected_states = (prior_legacy, prior_quality, repaired_routes, prior_best)
+    expected_legacy = prior_best if bool(control[2]) else prior_legacy
+    expected_constraint = (
+        repaired_routes if constraint_accepted else prior_constraint
+    )
+    expected_best = (
+        repaired_routes if constraint_improved_global_best else prior_best
+    )
+    expected_states = (
+        expected_legacy,
+        prior_quality,
+        expected_constraint,
+        expected_best,
+    )
     final_states = (
         unpack_routes(payload[6], "final legacy"),
         unpack_routes(payload[7], "final quality"),
         unpack_routes(payload[8], "final constraint"),
         unpack_routes(payload[9], "final best"),
     )
-    if final_states != expected_states or replay(final_states[3]).key != prior_best_objective.key:
+    expected_best_objective = (
+        candidate_objective if constraint_improved_global_best else prior_best_objective
+    )
+    if (
+        final_states != expected_states
+        or replay(final_states[3]).key != expected_best_objective.key
+    ):
         raise RuntimeError("native three-lane third lane state mismatch")
 
     stage04 = require_tuple(payload[12], 4, "Stage 4")
@@ -6729,6 +7312,8 @@ def _decode_native_three_lane_third_iteration(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -6743,6 +7328,12 @@ def _decode_native_three_lane_fourth_general(
     search_sha256: str,
 ) -> NativeThreeLaneSemanticStream:
     """Independently project a real route-merge fourth iteration."""
+
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5], iteration=3,
+        previous_control=previous_stream.stage04_control,
+        name="three-lane fourth general",
+    )
 
     def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
         if not isinstance(value, tuple) or len(value) != size:
@@ -6855,7 +7446,8 @@ def _decode_native_three_lane_fourth_general(
     prior_quality = unpack_state(previous_payload[7], "prior quality")
     prior_constraint = unpack_state(previous_payload[8], "prior constraint")
     prior_best = unpack_state(previous_payload[9], "prior best")
-    prior_best_objective = replay(prior_best)
+    prior_legacy_objective = replay(prior_legacy)
+    prior_constraint_objective = replay(prior_constraint)
 
     quality = require_tuple(payload[2], 7, "quality")
     if (
@@ -7138,42 +7730,97 @@ def _decode_native_three_lane_fourth_general(
     constraint_exact_rows = _require_vector(
         constraint_transaction[5], "fourth general constraint exact rows"
     )
+    if (
+        int(constraint_outcome[0]) != 3
+        or np.any((constraint_outcome[2:] != 0) & (constraint_outcome[2:] != 1))
+        or not constraint_route_indices
+    ):
+        raise RuntimeError(
+            "native three-lane fourth general constraint decision is invalid"
+        )
+    constraint_objective = replay(constraint_routes)
+    constraint_affected = tuple(
+        index
+        for index, (before, after) in enumerate(
+            zip(prior_constraint, constraint_routes, strict=False)
+        )
+        if before != after
+    )
+    constraint_prepared = bool(constraint_outcome[2])
+    constraint_key: tuple[int, float, float, int] | tuple[()] = ()
+    if constraint_prepared:
+        constraint_integers = cast(
+            npt.NDArray[np.int64], constraint_transaction[2]
+        )
+        constraint_floats = cast(
+            npt.NDArray[np.float64], constraint_transaction[3]
+        )
+        if constraint_statuses.tolist() != [5]:
+            raise RuntimeError(
+                "native three-lane fourth general prepared constraint is invalid"
+            )
+        reported_constraint = SolutionObjective(
+            int(constraint_integers[0, 0]),
+            float(constraint_floats[0, 0]),
+            float(constraint_floats[0, 1]),
+            int(constraint_integers[0, 1]),
+        )
+        if reported_constraint.key != constraint_objective.key:
+            raise RuntimeError(
+                "native three-lane fourth general constraint objective mismatch"
+            )
+        constraint_key = reported_constraint.key
     constraint_no_change = (
-        int(constraint_outcome[0]) == 3
-        and not bool(constraint_outcome[2])
+        not constraint_prepared
         and constraint_statuses.tolist() == [5]
         and len(constraint_exact_rows) == 0
         and constraint_routes == prior_constraint
     )
-    if (
-        not constraint_no_change
-        or np.any(constraint_outcome[3:] != 0)
-        or not constraint_route_indices
-    ):
-        raise RuntimeError(
-            "native three-lane fourth general constraint journal is invalid"
+    constraint_infeasible = (
+        not constraint_prepared
+        and not constraint_no_change
+        and len(
+            _require_vector(
+                constraint_transaction[11],
+                "fourth general constraint feasible",
+            )
         )
-    constraint_events = (
-        event(
-            "shaw_related",
-            "candidate_proposed",
-            "constraint_ranked_removal",
-            route_indices=constraint_route_indices,
-            affected_route_indices=constraint_route_indices,
-            removed_customers=constraint_removed,
-            candidate_route_sequences=constraint_partial,
-            prefilter_passed=True,
-            selection_rank=1,
-            track="constraint_lane",
-            constraint_category="shaw_related",
-            removal_tier="small",
-            removal_size_requested=int(selection[1]),
-            removal_size_actual=int(selection[2]),
-            stagnation_iterations=int(selection[4]),
-            removal_trigger="stagnation_baseline",
-            reset_observed=bool(selection[6]),
-            ranking_score=float(constraint_scores[0]),
-        ),
+        == 0
+        and np.all(constraint_statuses != 5)
+    )
+    if not constraint_prepared and not constraint_no_change and not constraint_infeasible:
+        raise RuntimeError(
+            "native three-lane fourth general constraint journal is invalid: "
+            f"outcome={constraint_outcome.tolist()}, "
+            f"statuses={constraint_statuses.tolist()}, "
+            f"exact_rows={constraint_exact_rows.tolist()}, "
+            f"routes={constraint_routes!r}, prior={prior_constraint!r}, "
+            f"route_indices={constraint_route_indices!r}"
+        )
+    constraint_ranked_event = event(
+        "shaw_related",
+        "candidate_proposed",
+        "constraint_ranked_removal",
+        route_indices=constraint_route_indices,
+        affected_route_indices=constraint_route_indices,
+        removed_customers=constraint_removed,
+        candidate_route_sequences=constraint_partial,
+        prefilter_passed=True,
+        selection_rank=1,
+        track="constraint_lane",
+        constraint_category="shaw_related",
+        removal_tier="small",
+        removal_size_requested=int(selection[1]),
+        removal_size_actual=int(selection[2]),
+        stagnation_iterations=int(selection[4]),
+        removal_trigger="stagnation_baseline",
+        reset_observed=bool(selection[6]),
+        ranking_score=float(constraint_scores[0]),
+        candidate_objective_key=()
+        if constraint_no_change
+        else constraint_key,
+    )
+    constraint_result_event = (
         event(
             "shaw_related",
             "failed",
@@ -7188,8 +7835,55 @@ def _decode_native_three_lane_fourth_general(
             stagnation_iterations=int(selection[4]),
             removal_trigger="stagnation_baseline",
             reset_observed=bool(selection[6]),
-        ),
+        )
+        if constraint_no_change
+        else event(
+            "shaw_related",
+            "failed",
+            "constraint_repair_infeasible",
+            affected_route_indices=constraint_affected,
+            removed_customers=constraint_removed,
+            candidate_route_sequences=constraint_routes,
+            prefilter_passed=True,
+            exact_route_evaluations=len(constraint_exact_rows),
+            track="constraint_lane",
+            constraint_category="shaw_related",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+        )
+        if constraint_infeasible
+        else event(
+            "shaw_related",
+            "candidate_proposed",
+            "constraint_removal_repaired",
+            affected_route_indices=constraint_affected,
+            removed_customers=constraint_removed,
+            candidate_route_sequences=constraint_routes,
+            candidate_vehicle_delta=len(constraint_routes) - len(prior_constraint),
+            candidate_feasible=True,
+            prefilter_passed=True,
+            exact_route_evaluations=len(constraint_exact_rows),
+            track="constraint_lane",
+            constraint_category="shaw_related",
+            removal_tier="small",
+            removal_size_requested=int(selection[1]),
+            removal_size_actual=int(selection[2]),
+            stagnation_iterations=int(selection[4]),
+            removal_trigger="stagnation_baseline",
+            reset_observed=bool(selection[6]),
+            accepted=bool(constraint_outcome[3]),
+            vehicle_reduction=constraint_objective.vehicle_count
+            < prior_constraint_objective.vehicle_count,
+            distance_improvement=constraint_objective.total_distance
+            < prior_constraint_objective.total_distance - 1e-9,
+            candidate_objective_key=constraint_key,
+        )
     )
+    constraint_events = (constraint_ranked_event, constraint_result_event)
 
     legacy = require_tuple(payload[0], 7, "route merge")
     legacy_metadata = cast(
@@ -7209,6 +7903,15 @@ def _decode_native_three_lane_fourth_general(
         legacy[2], "fourth general merge screening reasons"
     )
     plan_payload = require_tuple(legacy[3], 4, "route-merge plans")
+    merge_plan_offsets = _require_vector(
+        plan_payload[0], "fourth general merge plan offsets"
+    )
+    merge_route_offsets = _require_vector(
+        plan_payload[1], "fourth general merge route offsets"
+    )
+    merge_route_indices = _require_vector(
+        plan_payload[2], "fourth general merge route indices"
+    )
     source_candidates = _require_vector(
         plan_payload[3], "fourth general merge source candidates"
     )
@@ -7248,7 +7951,10 @@ def _decode_native_three_lane_fourth_general(
         or merge_metadata.shape != (merge_count, 5)
         or len(screening_reasons) != merge_count
         or len(source_candidates) != len(merge_statuses)
-        or payload[4] is not None
+        or int(merge_plan_offsets[0]) != 0
+        or int(merge_plan_offsets[-1]) != len(merge_route_offsets) - 1
+        or int(merge_route_offsets[0]) != 0
+        or int(merge_route_offsets[-1]) != len(merge_route_indices)
     ):
         raise RuntimeError(
             "native three-lane fourth general route-merge journal is invalid"
@@ -7275,6 +7981,77 @@ def _decode_native_three_lane_fourth_general(
             "native three-lane fourth general merge candidate order diverged"
         )
 
+    merge_selected = int(merge_outcome[0])
+    merge_routes = prior_legacy
+    merge_objective = prior_legacy_objective
+    merge_key: tuple[int, float, float, int] | tuple[()] = ()
+    merge_acceptance: tuple[object, ...] | None = None
+    if merge_selected >= 0:
+        if (
+            merge_transaction is None
+            or merge_selected >= len(source_candidates)
+            or int(merge_statuses[merge_selected]) != 5
+            or int(merge_outcome[1]) != -2
+            or np.any(merge_outcome[2:4] != 0)
+        ):
+            raise RuntimeError(
+                "native three-lane fourth general selected merge is invalid"
+            )
+        first_route = int(merge_plan_offsets[merge_selected])
+        last_route = int(merge_plan_offsets[merge_selected + 1])
+        selected_offsets = np.ascontiguousarray(
+            merge_route_offsets[first_route : last_route + 1]
+            - int(merge_route_offsets[first_route]),
+            dtype=np.int64,
+        )
+        selected_indices = np.ascontiguousarray(
+            merge_route_indices[
+                int(merge_route_offsets[first_route]) : int(
+                    merge_route_offsets[last_route]
+                )
+            ],
+            dtype=np.int64,
+        )
+        merge_routes = unpack_soa(
+            selected_offsets, selected_indices, "selected route-merge plan"
+        )
+        merge_objective = replay(merge_routes)
+        merge_integers = cast(npt.NDArray[np.int64], merge_transaction[2])
+        merge_floats = cast(npt.NDArray[np.float64], merge_transaction[3])
+        reported_merge = SolutionObjective(
+            int(merge_integers[merge_selected, 0]),
+            float(merge_floats[merge_selected, 0]),
+            float(merge_floats[merge_selected, 1]),
+            int(merge_integers[merge_selected, 1]),
+        )
+        if reported_merge.key != merge_objective.key:
+            raise RuntimeError(
+                "native three-lane fourth general merge objective mismatch"
+            )
+        merge_source = int(merge_outcome[4])
+        if merge_source != int(source_candidates[merge_selected]):
+            raise RuntimeError(
+                "native three-lane fourth general merge source is invalid"
+            )
+        merged, left, right = canonical_candidates[merge_selected]
+        expected_routes = list(prior_legacy)
+        expected_routes[left] = merged
+        del expected_routes[right]
+        if merge_routes != tuple(expected_routes):
+            raise RuntimeError(
+                "native three-lane fourth general selected merge plan diverged"
+            )
+        merge_key = merge_objective.key
+        merge_acceptance = require_tuple(payload[4], 3, "route-merge acceptance")
+        if any(value not in (0, 1) for value in merge_acceptance):
+            raise RuntimeError(
+                "native three-lane fourth general merge acceptance is invalid"
+            )
+    elif merge_outcome.tolist() != [-1] * 5 or payload[4] is not None:
+        raise RuntimeError(
+            "native three-lane fourth general unselected merge is invalid"
+        )
+
     merge_events: list[dict[str, object]] = [
         event(
             "route_merge",
@@ -7282,27 +8059,38 @@ def _decode_native_three_lane_fourth_general(
             reason,
             aggregate_count=count,
             candidate_pool_hash=prefilter_sha256,
+            candidate_objective_key=merge_key,
         )
         for reason, count in sorted(prefilter_counts.items())
     ]
     result_counts: dict[tuple[str, str], int] = {}
     result_digest = hashlib.sha256()
-    feasible: list[tuple[SolutionObjective, CustomerSequence, int, int, int]] = []
-    for plan, (merged, left, right) in enumerate(canonical_candidates):
+    for plan, (merged, _left, _right) in enumerate(canonical_candidates):
+        native_status = int(merge_statuses[plan])
         exact = solve_exact_charging(instance, merged)
-        if exact.feasible:
+        if native_status == 5:
+            if not exact.feasible:
+                raise RuntimeError(
+                    "native three-lane fourth general feasible merge replay failed"
+                )
             status = "feasible_candidate"
             reason = "exact_charging_feasible"
-            objective = SolutionObjective.from_route(
-                instance,
-                exact.route,
-                total_distance=exact.distance,
-                total_charging_time=exact.charging_time,
-            )
-            feasible.append((objective, merged, left, right, plan))
-        else:
+        elif native_status == 4:
+            if exact.feasible:
+                raise RuntimeError(
+                    "native three-lane fourth general rejected a feasible exact merge"
+                )
             status = "exact_infeasible"
             reason = exact.failure_reason or "exact_charging_infeasible"
+        elif native_status == 3:
+            status = "candidate_control_skipped"
+            reason = "candidate_control:round_budget_exhausted"
+        elif native_status == 2:
+            status = "candidate_control_skipped"
+            reason = "candidate_control:not_selected"
+        else:
+            status = "prefilter_rejected"
+            reason = screen_route_candidate(instance, merged, full=True).reason
         result_counts[(status, reason)] = result_counts.get((status, reason), 0) + 1
         result_digest.update(
             json.dumps((status, reason, merged), separators=(",", ":")).encode()
@@ -7316,19 +8104,34 @@ def _decode_native_three_lane_fourth_general(
             prefilter_passed=True,
             aggregate_count=count,
             candidate_pool_hash=result_digest.hexdigest(),
+            candidate_objective_key=merge_key,
         )
         for (status, reason), count in sorted(result_counts.items())
     )
-    if feasible:
-        raise RuntimeError(
-            "native three-lane fourth general feasible merge is not implemented"
-        )
-    if (
-        merge_outcome.tolist() != [-1, -1, -1, -1, -1]
-        or np.any((merge_statuses != 1) & (merge_statuses != 4))
-    ):
-        raise RuntimeError(
-            "native three-lane fourth general merge decision is invalid"
+    merge_accepted = bool(merge_acceptance[0]) if merge_acceptance is not None else False
+    merge_best = bool(merge_acceptance[1]) if merge_acceptance is not None else False
+    merge_vehicle_reduction = (
+        bool(merge_acceptance[2]) if merge_acceptance is not None else False
+    )
+    if merge_selected >= 0:
+        merged, left, right = canonical_candidates[merge_selected]
+        merge_events.append(
+            event(
+                "route_merge",
+                "candidate_proposed",
+                "route_merged",
+                route_indices=(left, right),
+                candidate_customer_sequence=merged,
+                candidate_vehicle_delta=-1,
+                candidate_feasible=True,
+                prefilter_passed=True,
+                exact_route_evaluations=len(merge_exact_rows),
+                accepted=merge_accepted,
+                vehicle_reduction=merge_vehicle_reduction,
+                distance_improvement=merge_objective.total_distance
+                < prior_legacy_objective.total_distance - 1e-9,
+                candidate_objective_key=merge_key,
+            )
         )
     if len(merge_exact_rows) == 0 and canonical_candidates:
         merge_events.append(
@@ -7345,12 +8148,34 @@ def _decode_native_three_lane_fourth_general(
         unpack_state(payload[8], "final constraint"),
         unpack_state(payload[9], "final best"),
     )
+    expected_legacy = merge_routes if merge_accepted else prior_legacy
+    expected_constraint = (
+        constraint_routes if bool(constraint_outcome[3]) else prior_constraint
+    )
+    best_before_merge = (
+        constraint_routes
+        if bool(constraint_outcome[4])
+        else quality_expected_state
+        if bool(quality_outcome[2])
+        else prior_best
+    )
+    best_before_merge_objective = replay(best_before_merge)
+    if merge_selected >= 0 and (
+        not merge_accepted
+        or not merge_vehicle_reduction
+        or merge_objective.vehicle_count >= prior_legacy_objective.vehicle_count
+        or merge_best != (merge_objective.key < best_before_merge_objective.key)
+    ):
+        raise RuntimeError(
+            "native three-lane fourth general merge acceptance diverged"
+        )
+    expected_best = merge_routes if merge_best else best_before_merge
     if final_states != (
-        prior_legacy,
+        expected_legacy,
         quality_expected_state,
-        prior_constraint,
-        prior_best,
-    ) or replay(final_states[3]).key != prior_best_objective.key:
+        expected_constraint,
+        expected_best,
+    ) or replay(final_states[3]).key != replay(expected_best).key:
         raise RuntimeError(
             "native three-lane fourth general lane state mismatch"
         )
@@ -7394,8 +8219,14 @@ def _decode_native_three_lane_fourth_general(
         )
     activity = np.zeros((operator_count, 8), dtype=np.int64)
     by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    feasible_repair_groups: dict[tuple[int, str], bool] = {}
     for item in all_events:
-        index = by_name[str(item["operator"])]
+        operator = str(item["operator"])
+        index = by_name[operator]
+        group = (cast(int, item["iteration"]), operator)
+        feasible_repair_groups[group] = feasible_repair_groups.get(
+            group, False
+        ) or bool(item.get("_operator_feasible_repair", item["candidate_feasible"]))
         activity[index, 0] = max(
             int(activity[index, 0]), int(bool(item["candidate_feasible"]))
         )
@@ -7424,6 +8255,8 @@ def _decode_native_three_lane_fourth_general(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -7439,10 +8272,21 @@ def _decode_native_three_lane_fourth_iteration(
 ) -> NativeThreeLaneSemanticStream:
     """Replay the standard/route-segment/Shaw fourth iteration."""
 
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5], iteration=3,
+        previous_control=previous_stream.stage04_control,
+        name="three-lane fourth iteration",
+    )
+
     _verify_native_three_lane_semantic_hash(payload)
     if len(payload) != 14:
         raise RuntimeError("native three-lane fourth iteration is invalid")
-    if isinstance(payload[0], tuple) and len(payload[0]) == 7:
+    if (
+        isinstance(payload[0], tuple)
+        and len(payload[0]) == 7
+        and isinstance(payload[0][0], np.ndarray)
+        and payload[0][0].shape == (4,)
+    ):
         return _decode_native_three_lane_fourth_general(
             instance,
             payload,
@@ -7602,77 +8446,156 @@ def _decode_native_three_lane_fourth_iteration(
     prior_constraint_objective = replay(prior_constraint)
     prior_best_objective = replay(prior_best)
 
-    legacy = require_tuple(payload[0], 8, "legacy")
-    legacy_metadata = cast(
-        npt.NDArray[np.int64],
-        _require_array(
-            legacy[0],
-            dtype=np.dtype(np.int64),
-            shape=(8,),
-            name="fourth legacy metadata",
-        ),
-    )
-    if legacy_metadata.tolist()[:5] != [3, 0, 0, 1, 1]:
-        raise RuntimeError("native three-lane fourth standard selection is invalid")
-    legacy_removed_indices = _require_vector(legacy[1], "fourth legacy removed")
-    legacy_removed = tuple(node_names[int(index)] for index in legacy_removed_indices)
-    if len(legacy_removed) != 1:
-        raise RuntimeError("native three-lane fourth standard removal is invalid")
-    unpack_soa(legacy[2], legacy[3], "legacy partial")
-    repair = require_tuple(legacy[4], 3, "legacy repair")
-    legacy_routes = unpack_soa(repair[0], repair[1], "legacy repaired")
-    if legacy[5] is not None:
-        raise RuntimeError(
-            "native three-lane fourth standard selection was replayed twice"
-        )
-    insertion_transaction = require_tuple(legacy[6], 13, "insertion transaction")
-    insertion_count = len(
-        _require_vector(insertion_transaction[1], "fourth insertion statuses")
-    )
-    transaction(insertion_transaction, insertion_count, "insertion")
-    insertion_exact_rows = _require_vector(
-        insertion_transaction[5], "fourth insertion exact rows"
-    )
-    insertion_counters = cast(
-        npt.NDArray[np.int64],
-        _require_array(
-            insertion_transaction[7],
-            dtype=np.dtype(np.int64),
-            shape=(8,),
-            name="fourth insertion counters",
-        ),
-    )
-    if (
-        int(insertion_counters[0]) != insertion_count
-        or int(insertion_counters[5]) != len(insertion_exact_rows)
-        or np.any(insertion_exact_rows < 0)
-        or len(set(int(row) for row in insertion_exact_rows))
-        != len(insertion_exact_rows)
-    ):
-        raise RuntimeError("native three-lane fourth insertion charging is invalid")
-    selected_insertion = int(legacy_metadata[6])
-    legacy_selected = selected_insertion >= 0
+    legacy_kind = _native_three_lane_legacy_payload_kind(payload[0])
+    if legacy_kind not in {"simple_rejection", "weighted"}:
+        raise RuntimeError("native three-lane fourth legacy is invalid")
+    legacy = cast(tuple[object, ...], payload[0])
+    simple_legacy_rejection = legacy_kind == "simple_rejection"
     legacy_key: tuple[int, float, float, int] | tuple[()] = ()
     legacy_objective = prior_legacy_objective
-    if legacy_selected:
-        if selected_insertion >= insertion_count:
-            raise RuntimeError("native three-lane fourth insertion selection is invalid")
-        legacy_objective = replay(legacy_routes)
-        legacy_key = reported_objective(
-            insertion_transaction, selected_insertion, legacy_objective, "legacy"
+    if simple_legacy_rejection:
+        legacy_metadata = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                legacy[0],
+                dtype=np.dtype(np.int64),
+                shape=(4,),
+                name="fourth simple legacy metadata",
+            ),
         )
-        legacy_acceptance = require_tuple(payload[4], 3, "legacy acceptance")
-        if any(value not in (0, 1) for value in legacy_acceptance):
-            raise RuntimeError("native three-lane fourth legacy acceptance mismatch")
-        legacy_accepted = bool(legacy_acceptance[0])
-    else:
         if (
-            selected_insertion != -1
-            or len(_require_vector(insertion_transaction[11], "insertion feasible"))
+            legacy_metadata.tolist() != [3, 3, len(prior_legacy), 0]
+            or unpack_state(legacy[1], "simple legacy incumbent") != prior_legacy
             or payload[4] is not None
         ):
-            raise RuntimeError("native three-lane fourth insertion rejection is invalid")
+            raise RuntimeError(
+                "native three-lane fourth simple legacy rejection is invalid"
+            )
+        legacy_removed: tuple[str, ...] = ()
+        legacy_routes = prior_legacy
+        insertion_exact_rows = np.empty(0, dtype=np.int64)
+        legacy_selected = False
         legacy_accepted = False
+    else:
+        legacy_metadata = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                legacy[0],
+                dtype=np.dtype(np.int64),
+                shape=(8,),
+                name="fourth legacy metadata",
+            ),
+        )
+        full_standard_valid = (
+            len(legacy) == 8
+            and legacy_metadata.tolist()[:5] == [3, 0, 0, 1, 1]
+        )
+        compact_repair_valid = (
+            len(legacy) == 7
+            and int(legacy_metadata[0]) == 3
+            and int(legacy_metadata[1]) in range(3)
+            and int(legacy_metadata[2]) > 0
+            and not np.any(legacy_metadata[3:6] != 0)
+            and int(legacy_metadata[6]) >= 0
+            and int(legacy_metadata[7]) == -2
+        )
+        if not full_standard_valid and not compact_repair_valid:
+            raise RuntimeError(
+                "native three-lane fourth standard selection is invalid"
+            )
+        legacy_removed_indices = _require_vector(
+            legacy[1], "fourth legacy removed"
+        )
+        legacy_removed = tuple(
+            node_names[int(index)] for index in legacy_removed_indices
+        )
+        if len(legacy_removed) != 1:
+            raise RuntimeError(
+                "native three-lane fourth standard removal is invalid"
+            )
+        unpack_soa(legacy[2], legacy[3], "legacy partial")
+        repair = require_tuple(legacy[4], 3, "legacy repair")
+        legacy_routes = unpack_soa(repair[0], repair[1], "legacy repaired")
+        if len(legacy) == 8:
+            if legacy[5] is not None:
+                raise RuntimeError(
+                    "native three-lane fourth standard selection was replayed twice"
+                )
+            insertion_transaction = require_tuple(
+                legacy[6], 13, "insertion transaction"
+            )
+        else:
+            insertion_transaction = require_tuple(
+                legacy[5], 13, "insertion transaction"
+            )
+            if unpack_state(legacy[6], "legacy incumbent") != prior_legacy:
+                raise RuntimeError(
+                    "native three-lane fourth compact legacy incumbent diverged"
+                )
+        insertion_count = len(
+            _require_vector(
+                insertion_transaction[1], "fourth insertion statuses"
+            )
+        )
+        transaction(insertion_transaction, insertion_count, "insertion")
+        insertion_exact_rows = _require_vector(
+            insertion_transaction[5], "fourth insertion exact rows"
+        )
+        insertion_counters = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                insertion_transaction[7],
+                dtype=np.dtype(np.int64),
+                shape=(8,),
+                name="fourth insertion counters",
+            ),
+        )
+        if (
+            int(insertion_counters[0]) != insertion_count
+            or int(insertion_counters[5]) != len(insertion_exact_rows)
+            or np.any(insertion_exact_rows < 0)
+            or len(set(int(row) for row in insertion_exact_rows))
+            != len(insertion_exact_rows)
+        ):
+            raise RuntimeError(
+                "native three-lane fourth insertion charging is invalid"
+            )
+        selected_insertion = int(legacy_metadata[6])
+        legacy_selected = selected_insertion >= 0
+        if legacy_selected:
+            if selected_insertion >= insertion_count:
+                raise RuntimeError(
+                    "native three-lane fourth insertion selection is invalid"
+                )
+            legacy_objective = replay(legacy_routes)
+            legacy_key = reported_objective(
+                insertion_transaction,
+                selected_insertion,
+                legacy_objective,
+                "legacy",
+            )
+            legacy_acceptance = require_tuple(
+                payload[4], 3, "legacy acceptance"
+            )
+            if any(value not in (0, 1) for value in legacy_acceptance):
+                raise RuntimeError(
+                    "native three-lane fourth legacy acceptance mismatch"
+                )
+            legacy_accepted = bool(legacy_acceptance[0])
+        else:
+            if (
+                selected_insertion != -1
+                or len(
+                    _require_vector(
+                        insertion_transaction[11], "insertion feasible"
+                    )
+                )
+                or payload[4] is not None
+            ):
+                raise RuntimeError(
+                    "native three-lane fourth insertion rejection is invalid"
+                )
+            legacy_accepted = False
 
     quality = require_tuple(payload[2], 7, "quality")
     if (
@@ -7739,20 +8662,37 @@ def _decode_native_three_lane_fourth_iteration(
                 "native three-lane fourth route-segment order is invalid"
             )
         selected_repair = require_tuple(quality[3], 3, "quality repair")
-        quality_routes = unpack_soa(
+        quality_candidate_routes = unpack_soa(
             selected_repair[0], selected_repair[1], "quality repaired"
         )
         quality_transaction = transaction(quality[4], 1, "quality")
-        quality_objective = replay(quality_routes)
-        quality_key = reported_objective(
-            quality_transaction, 0, quality_objective, "quality"
+        quality_statuses = _require_vector(
+            quality_transaction[1], "fourth quality statuses"
         )
         if (
-            int(quality_outcome[0]) != 0
+            int(quality_outcome[0]) not in (-1, 0)
             or np.any((quality_outcome[1:] != 0) & (quality_outcome[1:] != 1))
         ):
             raise RuntimeError(
                 "native three-lane fourth quality acceptance mismatch"
+            )
+        quality_selected = int(quality_outcome[0]) == 0
+        if quality_selected:
+            if quality_statuses.tolist() != [5]:
+                raise RuntimeError(
+                    "native three-lane fourth selected quality status is invalid"
+                )
+            quality_routes = quality_candidate_routes
+            quality_objective = replay(quality_routes)
+            quality_key = reported_objective(
+                quality_transaction, 0, quality_objective, "quality"
+            )
+        elif (
+            np.any(quality_outcome[1:] != 0)
+            or quality_statuses.tolist() == [5]
+        ):
+            raise RuntimeError(
+                "native three-lane fourth rejected quality state is invalid"
             )
 
     constraint = require_tuple(payload[3], 3, "constraint")
@@ -7881,7 +8821,11 @@ def _decode_native_three_lane_fourth_iteration(
     quality_affected = tuple(
         index
         for index, (before, after) in enumerate(
-            zip(prior_quality, quality_routes, strict=False)
+            zip(
+                prior_quality,
+                quality_candidate_routes if len(attempts) else quality_routes,
+                strict=False,
+            )
         )
         if before != after
     )
@@ -7903,16 +8847,26 @@ def _decode_native_three_lane_fourth_iteration(
                 route_indices=(int(selected_attempt[0]),),
                 affected_route_indices=quality_affected,
                 removed_customers=quality_removed[-1],
-                candidate_route_sequences=quality_routes,
-                candidate_vehicle_delta=len(quality_routes) - len(prior_quality),
+                candidate_route_sequences=(
+                    quality_candidate_routes
+                    if len(attempts)
+                    else quality_routes
+                ),
+                candidate_vehicle_delta=(
+                    len(quality_candidate_routes) - len(prior_quality)
+                    if len(attempts)
+                    else len(quality_routes) - len(prior_quality)
+                ),
                 candidate_feasible=True,
                 prefilter_passed=True,
                 selection_rank=int(selected_attempt[5]),
                 segment_length=int(selected_attempt[2]),
                 accepted=bool(quality_outcome[1]),
-                vehicle_reduction=quality_objective.vehicle_count
+                vehicle_reduction=quality_selected
+                and quality_objective.vehicle_count
                 < prior_quality_objective.vehicle_count,
-                distance_improvement=quality_objective.total_distance
+                distance_improvement=quality_selected
+                and quality_objective.total_distance
                 < prior_quality_objective.total_distance - 1e-9,
                 candidate_objective_key=quality_key,
             )
@@ -8003,11 +8957,33 @@ def _decode_native_three_lane_fourth_iteration(
             candidate_objective_key=constraint_key,
         )
     )
-    followup_events = (
-        *quality_events,
-        constraint_ranked_event,
-        constraint_result_event,
+    legacy_event = (
+        event("route_merge", "not_applicable", "only_one_route")
+        if simple_legacy_rejection
+        else
         event(
+            "vehicle_count_aware_repair",
+            "candidate_proposed",
+            "existing_route_repair",
+            removed_customers=legacy_removed,
+            _operator_destroy_name=("random", "worst", "related")[
+                int(legacy_metadata[1])
+            ],
+            candidate_vehicle_delta=len(legacy_routes) - len(prior_legacy),
+            candidate_feasible=legacy_selected,
+            new_routes_created=int(legacy_metadata[4]),
+            exact_route_evaluations=len(insertion_exact_rows),
+            accepted=legacy_accepted,
+            vehicle_reduction=legacy_selected
+            and legacy_objective.vehicle_count
+            < prior_legacy_objective.vehicle_count,
+            distance_improvement=legacy_selected
+            and legacy_objective.total_distance
+            < prior_legacy_objective.total_distance - 1e-9,
+            candidate_objective_key=legacy_key,
+        )
+        if len(legacy) == 7
+        else event(
             "standard",
             "proposal",
             "random+regret2",
@@ -8021,7 +8997,13 @@ def _decode_native_three_lane_fourth_iteration(
             and legacy_objective.total_distance
             < prior_legacy_objective.total_distance - 1e-9,
             candidate_objective_key=legacy_key,
-        ),
+        )
+    )
+    followup_events = (
+        *quality_events,
+        constraint_ranked_event,
+        constraint_result_event,
+        legacy_event,
     )
     all_events = (*previous_stream.neighborhood_events, *followup_events)
 
@@ -8089,8 +9071,14 @@ def _decode_native_three_lane_fourth_iteration(
 
     activity = np.zeros((operator_count, 8), dtype=np.int64)
     by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+    feasible_repair_groups: dict[tuple[int, str], bool] = {}
     for item in all_events:
-        index = by_name[str(item["operator"])]
+        operator = str(item["operator"])
+        index = by_name[operator]
+        group = (cast(int, item["iteration"]), operator)
+        feasible_repair_groups[group] = feasible_repair_groups.get(
+            group, False
+        ) or bool(item.get("_operator_feasible_repair", item["candidate_feasible"]))
         activity[index, 0] = max(
             int(activity[index, 0]), int(bool(item["candidate_feasible"]))
         )
@@ -8100,10 +9088,13 @@ def _decode_native_three_lane_fourth_iteration(
         activity[index, 4] += _semantic_event_aggregate(item, "candidate_feasible")
         activity[index, 5] += int(bool(item["vehicle_reduction"]))
         activity[index, 6] += int(bool(item["distance_improvement"]))
-    activity[by_name["standard"], 0] = int(legacy_selected)
     refinement_index = FULL_NATIVE_OPERATOR_NAMES.index(
         "vehicle_reduction_refinement"
     )
+    activity[:, 0] = 0
+    for (_, operator), feasible_repair in feasible_repair_groups.items():
+        if operator != "vehicle_reduction_refinement":
+            activity[by_name[operator], 0] += int(feasible_repair)
     activity[refinement_index, 5] = 0
     activity[refinement_index, 0] = previous_stream.operator_activity[
         refinement_index, 0
@@ -8120,6 +9111,8 @@ def _decode_native_three_lane_fourth_iteration(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -8134,6 +9127,12 @@ def _decode_native_three_lane_fifth_general(
     search_sha256: str,
 ) -> NativeThreeLaneSemanticStream:
     """Replay a real route-elimination/ejection-chain fifth iteration."""
+
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5], iteration=4,
+        previous_control=previous_stream.stage04_control,
+        name="three-lane fifth general",
+    )
 
     def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
         if not isinstance(value, tuple) or len(value) != size:
@@ -8602,6 +9601,8 @@ def _decode_native_three_lane_fifth_general(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -8616,6 +9617,12 @@ def _decode_native_three_lane_fifth_iteration(
     search_sha256: str,
 ) -> NativeThreeLaneSemanticStream:
     """Replay the related/energy and ejection-chain fifth iteration."""
+
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5], iteration=4,
+        previous_control=previous_stream.stage04_control,
+        name="three-lane fifth iteration",
+    )
 
     _verify_native_three_lane_semantic_hash(payload)
     if len(payload) != 14:
@@ -9259,6 +10266,8 @@ def _decode_native_three_lane_fifth_iteration(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -10370,6 +11379,17 @@ def _decode_native_three_lane_seventh_general(
                 "stagnation_at_trigger": 0,
             }
         )
+    if (
+        previous_stream.stage04_control is not None
+        and bool(previous_stream.stage04_control[4])
+        and not bool(control[4])
+    ):
+        stage04_events.append(
+            {
+                "type": "stage04_intensification_end",
+                "iteration": iteration,
+            }
+        )
     stage04 = require_tuple(payload[12], 4, "Stage 4")
     operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
     weights = cast(npt.NDArray[np.float64], stage04[0])
@@ -10883,6 +11903,17 @@ def _decode_native_three_lane_seventh_iteration(
             }
         )
 
+    if (
+        previous_stream.stage04_control is not None
+        and bool(previous_stream.stage04_control[4])
+        and not bool(control[4])
+    ):
+        stage04_events.append(
+            {
+                "type": "stage04_intensification_end",
+                "iteration": iteration,
+            }
+        )
     stage04 = require_tuple(payload[12], 4, "Stage 4")
     operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
     weights = cast(
@@ -11262,6 +12293,17 @@ def _decode_native_three_lane_rejection_only_iteration(
             }
         )
 
+    if (
+        previous_stream.stage04_control is not None
+        and bool(previous_stream.stage04_control[4])
+        and not bool(control[4])
+    ):
+        stage04_events.append(
+            {
+                "type": "stage04_intensification_end",
+                "iteration": iteration,
+            }
+        )
     event: dict[str, object] = {
         "operator": operator,
         "status": "not_applicable",
@@ -11914,6 +12956,17 @@ def _decode_native_three_lane_constraint_no_change_iteration(
                 "stagnation_at_trigger": 0,
             }
         )
+    if (
+        previous_stream.stage04_control is not None
+        and bool(previous_stream.stage04_control[4])
+        and not bool(control[4])
+    ):
+        stage04_events.append(
+            {
+                "type": "stage04_intensification_end",
+                "iteration": iteration,
+            }
+        )
     stage04 = require_tuple(payload[12], 4, "Stage 4")
     operator_count = len(FULL_NATIVE_OPERATOR_NAMES)
     weights = cast(
@@ -12207,6 +13260,12 @@ def _decode_native_three_lane_standard_energy_rejection_iteration(
         or float(control_float[0]) < 0.0
     ):
         raise RuntimeError("native standard-energy reheat state is invalid")
+    control_events, control = _decode_native_stage04_control_events(
+        payload[5],
+        iteration=iteration,
+        previous_control=previous_stream.stage04_control,
+        name="standard-energy",
+    )
 
     event: dict[str, object] = {
         "operator": "standard",
@@ -12337,36 +13396,8 @@ def _decode_native_three_lane_standard_energy_rejection_iteration(
         operator_activity=_readonly_copy(activity),
         termination=_readonly_copy(termination),
         transaction_sha256=search_sha256,
-        stage04_events=(
-            *previous_stream.stage04_events,
-            *(
-                (
-                    {
-                        "type": "stage04_reheat",
-                        "iteration": iteration,
-                        "reheat_count": int(control[1]),
-                        "reheat_floor": float(control_float[0]),
-                        "stagnation_iterations": int(control[6]),
-                    },
-                )
-                if bool(control[0])
-                else ()
-            ),
-            *(
-                (
-                    {
-                        "type": "stage04_restart",
-                        "iteration": iteration,
-                        "restart_count": int(control[3]),
-                        "intensification": bool(control[4]),
-                        "stagnation_at_trigger": 0,
-                    },
-                )
-                if bool(control[2])
-                else ()
-            ),
-        ),
-        stage04_control=_readonly_copy(control),
+        stage04_events=(*previous_stream.stage04_events, *control_events),
+        stage04_control=control,
         initial_temperature=previous_stream.initial_temperature,
     )
 
@@ -12462,7 +13493,7 @@ def _decode_full_native_exact_journal(
     events: list[Mapping[str, object]] = []
     total_routes = 0
     for batch_ordinal, batch_value in enumerate(batches_value):
-        if not isinstance(batch_value, tuple) or len(batch_value) != 10:
+        if not isinstance(batch_value, tuple) or len(batch_value) != 12:
             raise RuntimeError("full native exact journal batch is invalid")
         _append_native_nested_evidence(evidence, batch_value)
         context = cast(
@@ -12485,6 +13516,25 @@ def _decode_full_native_exact_journal(
             batch_value[9], "full native exact journal completion order"
         )
         completion_order = [int(value) for value in completion_order_array]
+        transaction_id_array = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                batch_value[10],
+                dtype=np.dtype(np.int64),
+                shape=(1,),
+                name="full native exact journal transaction ID",
+            ),
+        )
+        transaction_id = int(transaction_id_array[0])
+        canonical_event_ids = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                batch_value[11],
+                dtype=np.dtype(np.int64),
+                shape=(route_count * 2 + 1,),
+                name="full native exact journal canonical event IDs",
+            ),
+        )
         if (
             route_count <= 0
             or int(route_offsets[0]) != 0
@@ -12494,6 +13544,9 @@ def _decode_full_native_exact_journal(
             or np.any(route_indices >= len(native_runtime.context.node_names))
             or len(completion_order) != route_count
             or sorted(completion_order) != list(range(route_count))
+            or transaction_id < 0
+            or np.any(canonical_event_ids <= 0)
+            or np.any(canonical_event_ids[:-1] >= canonical_event_ids[1:])
         ):
             raise RuntimeError("full native exact journal route SoA is invalid")
         try:
@@ -12541,6 +13594,10 @@ def _decode_full_native_exact_journal(
                 "lane": lane,
                 "iteration": iteration,
                 "operator": operator,
+                "_native_transaction_id": transaction_id,
+                "_native_first_canonical_result_event_id": int(
+                    canonical_event_ids[0]
+                ),
                 "sequences": [list(sequence) for sequence in sequences],
             }
         )
@@ -12596,8 +13653,16 @@ def _decode_full_native_exact_journal(
         raise RuntimeError("full native exact journal SHA-256 mismatch")
     if total_routes == 0:
         raise RuntimeError("full native exact journal contains no completed work")
+    public_candidate_work = tuple(
+        {
+            key: value
+            for key, value in event.items()
+            if not key.startswith("_native_")
+        }
+        for event in candidate_work
+    )
     return (
-        stable_candidate_payload_hash(candidate_work),
+        stable_candidate_payload_hash(public_candidate_work),
         stable_candidate_payload_hash(route_results),
         tuple(events),
         producer_sha256,
@@ -12622,7 +13687,7 @@ def _decode_full_native_control_journal(
     if not isinstance(payload, tuple) or len(payload) != 3:
         raise RuntimeError("full native control journal has an invalid envelope")
     batches_value, screening_payload, producer_sha256 = payload
-    if not isinstance(screening_payload, tuple) or len(screening_payload) != 11:
+    if not isinstance(screening_payload, tuple) or len(screening_payload) != 13:
         raise RuntimeError("full native screening payload is invalid")
     (
         screening_statistics_value,
@@ -12636,6 +13701,8 @@ def _decode_full_native_control_journal(
         screening_metrics_value,
         screening_flags_value,
         screening_occupancies_value,
+        screening_transaction_ids_value,
+        screening_canonical_event_ids_value,
     ) = screening_payload
     if not isinstance(batches_value, tuple):
         raise RuntimeError("full native control journal batches are invalid")
@@ -12949,6 +14016,24 @@ def _decode_full_native_control_journal(
         ),
     )
     screening_row_count = screening_contexts.shape[0]
+    screening_transaction_ids = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            screening_transaction_ids_value,
+            dtype=np.dtype(np.int64),
+            shape=(screening_row_count,),
+            name="full native screening transaction IDs",
+        ),
+    )
+    screening_canonical_event_ids = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            screening_canonical_event_ids_value,
+            dtype=np.dtype(np.int64),
+            shape=(screening_row_count,),
+            name="full native screening canonical event IDs",
+        ),
+    )
     screening_route_offsets = _require_vector(
         screening_route_offsets_value, "full native screening route offsets"
     )
@@ -13002,6 +14087,8 @@ def _decode_full_native_control_journal(
             (screening_flags[:, :3] != 0) & (screening_flags[:, :3] != 1)
         )
         or np.any(screening_flags[:, 3] < 0)
+        or np.any(screening_transaction_ids < 0)
+        or np.any(screening_canonical_event_ids <= 0)
         or screening_row_count != int(screening_statistics_array[0])
         or int(np.count_nonzero(screening_flags[:, 0] & screening_flags[:, 2]))
         != int(screening_statistics_array[5])
@@ -13062,6 +14149,10 @@ def _decode_full_native_control_journal(
                 "lane": lane,
                 "iteration": int(screening_contexts[row, 2]),
                 "operator": operator,
+                "transaction_id": int(screening_transaction_ids[row]),
+                "canonical_event_id": int(
+                    screening_canonical_event_ids[row]
+                ),
                 "customer_sequence": list(sequence),
                 "first_failed_check": (
                     _SCREEN_CHECK_BY_CODE.get(failed_check_code, "")
@@ -13291,6 +14382,170 @@ def _decode_full_native_causal_journal(payload: object) -> NativeCausalJournal:
         raise RuntimeError("full native causal journal SHA-256 mismatch")
     readonly = tuple(_readonly_copy(column) for column in columns)
     return NativeCausalJournal(
+        event_ids=readonly[0],
+        stream_codes=readonly[1],
+        event_codes=readonly[2],
+        lane_ids=readonly[3],
+        operator_ids=readonly[4],
+        iterations=readonly[5],
+        transaction_ids=readonly[6],
+        subject_ids=readonly[7],
+        status_codes=readonly[8],
+        flags=readonly[9],
+        stream_counts=_readonly_copy(stream_counts),
+        transaction_sha256=producer_sha256,
+    )
+
+
+def _decode_full_native_canonical_event_journal(
+    payload: object,
+) -> NativeCanonicalEventJournal:
+    """Decode the native-owned one-row-per-runtime-event identity journal."""
+
+    if not isinstance(payload, tuple) or len(payload) != 12:
+        raise RuntimeError("full native canonical event journal has an invalid envelope")
+    columns = tuple(
+        _require_vector(value, f"full native canonical event column {index}")
+        for index, value in enumerate(payload[:10])
+    )
+    event_count = len(columns[0])
+    if any(len(column) != event_count for column in columns):
+        raise RuntimeError("full native canonical event journal columns do not align")
+    if not np.array_equal(
+        columns[0], np.arange(1, event_count + 1, dtype=np.int64)
+    ):
+        raise RuntimeError("full native canonical event IDs are not contiguous")
+    if np.any(columns[1] < 0) or np.any(columns[1] >= 11):
+        raise RuntimeError("full native canonical event stream code is invalid")
+    if np.any(columns[2] < 1) or np.any(columns[2] > 20):
+        raise RuntimeError("full native canonical event code is invalid")
+    expected_stream_by_event = np.asarray(
+        [-1, 3, 3, 7, 6, 3, 4, 3, 3, 5, 3, 3, 2, 3, 1, 0, 2, 3, 8, 9, 10],
+        dtype=np.int64,
+    )
+    if not np.array_equal(columns[1], expected_stream_by_event[columns[2]]):
+        raise RuntimeError("full native canonical event/stream pairing is invalid")
+    if (
+        np.any(columns[3] < -1)
+        or np.any(columns[4] < -1)
+        or np.any(columns[5] < -1)
+        or np.any(columns[6] < -1)
+        or np.any(columns[7] < -1)
+        or np.any(columns[8] < 0)
+        or np.any(columns[9] < 0)
+        or np.any(columns[9][columns[2] != 3] > 7)
+    ):
+        raise RuntimeError("full native canonical event fields are invalid")
+    boundary_rows = np.isin(columns[2], np.asarray([18, 19], dtype=np.int64))
+    if np.any(
+        (columns[3][boundary_rows] != -1)
+        | (columns[4][boundary_rows] != -1)
+        | (columns[6][boundary_rows] != -1)
+        | (columns[7][boundary_rows] != -1)
+    ):
+        raise RuntimeError("full native canonical boundary context is invalid")
+    if np.any(columns[3][~boundary_rows] < 0) or np.any(
+        columns[4][~boundary_rows] < 0
+    ):
+        raise RuntimeError("full native canonical contextual fields are invalid")
+    deadline_rows = columns[2] == 18
+    termination_rows = columns[2] == 19
+    if (
+        np.any(columns[9][deadline_rows] != 1)
+        or np.any(columns[9][termination_rows] != 0)
+        or int(np.count_nonzero(termination_rows)) != 1
+        or not bool(termination_rows[-1])
+    ):
+        raise RuntimeError("full native canonical terminal boundary is invalid")
+    terminal_row = int(np.flatnonzero(termination_rows)[0])
+    terminal_reason = int(columns[8][terminal_row])
+    deadline_indices = np.flatnonzero(deadline_rows)
+    expected_deadline_count = 0 if terminal_reason == 0 else 1
+    if (
+        terminal_reason not in {0, 1, 2, 3}
+        or len(deadline_indices) != expected_deadline_count
+        or (
+            expected_deadline_count == 1
+            and (
+                int(deadline_indices[0]) != terminal_row - 1
+                or int(columns[8][int(deadline_indices[0])]) != terminal_reason
+                or int(columns[5][int(deadline_indices[0])])
+                != int(columns[5][terminal_row])
+            )
+        )
+    ):
+        raise RuntimeError(
+            "full native canonical deadline and termination are inconsistent"
+        )
+    exact_work_rows = columns[2] == 6
+    if np.any(columns[7][exact_work_rows] <= 0) or np.any(
+        columns[8][exact_work_rows] != columns[7][exact_work_rows]
+    ) or np.any(columns[9][exact_work_rows] != 1):
+        raise RuntimeError("full native canonical exact-work fields are invalid")
+    for row, event_code in enumerate(columns[2]):
+        event = int(event_code)
+        subject = int(columns[7][row])
+        status = int(columns[8][row])
+        flags = int(columns[9][row])
+        valid = {
+            1: subject == 0 and status == 0 and flags == 0,
+            2: subject >= 0 and status <= 5 and flags <= 3,
+            3: subject >= 0 and status in (0, 1),
+            4: subject >= 0 and status in (0, 1) and flags == 1,
+            5: subject > 0 and status == 1 and flags == 0,
+            6: subject > 0 and status == subject and flags == 1,
+            7: subject >= 0 and status <= 4 and flags in (3, 7),
+            8: subject > 0 and status == 0 and flags == 0,
+            9: subject >= 0 and status <= 4 and flags == 0,
+            10: subject >= 0 and status == 5 and flags == 0,
+            11: subject == 0 and status == 1 and flags == 0,
+            12: subject == 0 and status == 0 and flags == 0,
+            13: subject == int(columns[5][row]) and status == 0 and flags == 0,
+            14: subject >= 0 and status in (0, 1) and flags in (0, 1),
+            15: subject >= 0 and status in (0, 1) and flags in (0, 1),
+            16: subject >= 0 and status in (0, 1) and flags in (0, 1),
+            17: subject == int(columns[5][row]) and status == 0 and flags == 0,
+            18: status <= 3,
+            19: status <= 3,
+            20: True,
+        }[event]
+        if not valid:
+            raise RuntimeError("full native canonical event-specific fields are invalid")
+    transaction_optional = np.isin(
+        columns[2], np.asarray([12, 13, 16, 17, 18, 19, 20], dtype=np.int64)
+    )
+    if np.any(columns[6][~transaction_optional] < 0):
+        raise RuntimeError("full native canonical transaction identity is missing")
+    positive_transactions = [
+        int(value) for value in columns[6] if int(value) >= 0
+    ]
+    unique_transactions = sorted(set(positive_transactions))
+    if unique_transactions != list(range(len(unique_transactions))):
+        raise RuntimeError("full native canonical transaction identity has gaps")
+    stream_counts = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            payload[10],
+            dtype=np.dtype(np.int64),
+            shape=(11,),
+            name="full native canonical event stream counts",
+        ),
+    )
+    observed_counts = np.bincount(columns[1], minlength=11).astype(np.int64, copy=False)
+    if not np.array_equal(stream_counts, observed_counts):
+        raise RuntimeError("full native canonical event stream counts do not reconcile")
+    producer_sha256 = payload[11]
+    evidence = bytearray(b"stage05.2-native-canonical-event-journal-v2")
+    for column in (*columns, stream_counts):
+        _append_typed_array(evidence, column)
+    if (
+        not isinstance(producer_sha256, str)
+        or not _is_sha256(producer_sha256)
+        or hashlib.sha256(evidence).hexdigest() != producer_sha256
+    ):
+        raise RuntimeError("full native canonical event journal SHA-256 mismatch")
+    readonly = tuple(_readonly_copy(column) for column in columns)
+    return NativeCanonicalEventJournal(
         event_ids=readonly[0],
         stream_codes=readonly[1],
         event_codes=readonly[2],
@@ -13803,7 +15058,7 @@ def execute_full_native_alns(
         operator_integer,
         operator_float,
     )
-    if not isinstance(payload, tuple) or len(payload) != 13:
+    if not isinstance(payload, tuple) or len(payload) != 14:
         raise RuntimeError("full native ALNS returned an invalid payload tuple")
     route_offsets = _require_vector(payload[0], "full native route offsets")
     route_indices = _require_vector(payload[1], "full native route indices")
@@ -13848,7 +15103,7 @@ def execute_full_native_alns(
     if any(float(value) != int(value) for value in telemetry_values):
         raise RuntimeError("full native ALNS concurrency telemetry is not integral")
     initial_state_receipt = _decode_native_initial_state_receipt(
-        payload[12],
+        payload[13],
         expected_seed=seed,
         expected_node_kind=context.node_kind,
         expected_exact_batch_size=batch_size,
@@ -13978,6 +15233,7 @@ def execute_full_native_alns(
         node_names=context.node_names,
     )
     causal_journal = _decode_full_native_causal_journal(payload[11])
+    canonical_event_journal = _decode_full_native_canonical_event_journal(payload[12])
     expected_sha256 = _full_native_digest(
         route_offsets=route_offsets,
         route_indices=route_indices,
@@ -13989,6 +15245,7 @@ def execute_full_native_alns(
         exact_journal_sha256=exact_journal_sha256,
         control_journal_sha256=control_journal_sha256,
         causal_journal_sha256=causal_journal.transaction_sha256,
+        canonical_event_journal_sha256=canonical_event_journal.transaction_sha256,
         initial_state_receipt=initial_state_receipt,
     )
     if transaction_sha256 != expected_sha256:
@@ -14104,6 +15361,7 @@ def execute_full_native_alns(
         route_cache_statistics=route_cache_statistics,
         screening_statistics=screening_statistics,
         causal_journal=causal_journal,
+        canonical_event_journal=canonical_event_journal,
         initial_state_receipt=initial_state_receipt,
     )
 
@@ -14212,6 +15470,85 @@ def _execute_native_candidate_round(
             ),
         )
     )
+    incremental_state = request.incremental_state
+    empty_i64 = np.empty(0, dtype=np.int64)
+    empty_f64 = np.empty(0, dtype=np.float64)
+    if incremental_state is None:
+        base_chain_offsets = np.zeros(len(request.candidates) + 1, dtype=np.int64)
+        base_chain_indices = empty_i64
+        base_edge_offsets = np.zeros(len(request.candidates) + 1, dtype=np.int64)
+        base_edge_values = empty_f64
+        base_earliest_offsets = np.zeros(len(request.candidates) + 1, dtype=np.int64)
+        base_earliest_values = empty_f64
+        base_latest_offsets = np.zeros(len(request.candidates) + 1, dtype=np.int64)
+        base_latest_values = empty_f64
+    else:
+        base_chain_offsets = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                incremental_state.chain_offsets,
+                dtype=np.dtype(np.int64),
+                shape=(len(request.candidates) + 1,),
+                name="incremental base chain offsets",
+            ),
+        )
+        base_chain_indices = _require_vector(
+            incremental_state.chain_indices, "incremental base chain indices"
+        )
+        base_edge_offsets = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                incremental_state.edge_offsets,
+                dtype=np.dtype(np.int64),
+                shape=(len(request.candidates) + 1,),
+                name="incremental base edge offsets",
+            ),
+        )
+        base_edge_values = cast(
+            npt.NDArray[np.float64],
+            _require_array(
+                incremental_state.edge_values,
+                dtype=np.dtype(np.float64),
+                shape=(len(incremental_state.edge_values),),
+                name="incremental base edge values",
+            ),
+        )
+        base_earliest_offsets = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                incremental_state.earliest_offsets,
+                dtype=np.dtype(np.int64),
+                shape=(len(request.candidates) + 1,),
+                name="incremental base earliest offsets",
+            ),
+        )
+        base_earliest_values = cast(
+            npt.NDArray[np.float64],
+            _require_array(
+                incremental_state.earliest_values,
+                dtype=np.dtype(np.float64),
+                shape=(len(incremental_state.earliest_values),),
+                name="incremental base earliest values",
+            ),
+        )
+        base_latest_offsets = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                incremental_state.latest_offsets,
+                dtype=np.dtype(np.int64),
+                shape=(len(request.candidates) + 1,),
+                name="incremental base latest offsets",
+            ),
+        )
+        base_latest_values = cast(
+            npt.NDArray[np.float64],
+            _require_array(
+                incremental_state.latest_values,
+                dtype=np.dtype(np.float64),
+                shape=(len(incremental_state.latest_values),),
+                name="incremental base latest values",
+            ),
+        )
     negative_offsets, negative_indices, negative_reason_codes = (
         transaction_runtime.packed_negative_cache(
             negative_cache,
@@ -14251,6 +15588,14 @@ def _execute_native_candidate_round(
         lexical_rank,
         options,
         incremental,
+        base_chain_offsets,
+        base_chain_indices,
+        base_edge_offsets,
+        base_edge_values,
+        base_earliest_offsets,
+        base_earliest_values,
+        base_latest_offsets,
+        base_latest_values,
         negative_offsets,
         negative_indices,
         negative_reason_codes,
@@ -14261,8 +15606,50 @@ def _execute_native_candidate_round(
         context_ids,
         resource_receipt_values,
     )
-    if not isinstance(payload, tuple) or len(payload) != 10:
+    if not isinstance(payload, tuple) or len(payload) != 12:
         raise RuntimeError("native candidate round returned an invalid payload tuple")
+    propagation_codes = _require_array(
+        payload[10],
+        dtype=np.dtype(np.int64),
+        shape=(len(request.candidates), 10),
+        name="incremental propagation codes",
+    )
+    propagation_metrics = _require_array(
+        payload[11],
+        dtype=np.dtype(np.float64),
+        shape=(len(request.candidates), 3),
+        name="incremental propagation metrics",
+    )
+    propagation: list[NativeIncrementalPropagationReceipt] = []
+    for codes, metrics in zip(propagation_codes, propagation_metrics, strict=True):
+        status_code = int(codes[0])
+        if (
+            status_code not in {0, 1, 2}
+            or int(codes[1]) not in range(6)
+            or int(codes[2]) not in range(5)
+            or any(int(codes[index]) not in {0, 1} for index in (3, 4, 9))
+            or any(int(codes[index]) < 0 for index in range(5, 9))
+            or bool(codes[9]) != (bool(codes[3]) and bool(codes[4]))
+            or any(not math.isfinite(float(value)) for value in metrics)
+        ):
+            raise RuntimeError("native candidate round returned invalid propagation rows")
+        propagation.append(
+            NativeIncrementalPropagationReceipt(
+                status_code=status_code,
+                reason_code=int(codes[1]),
+                failed_check_code=int(codes[2]),
+                forward_feasible=bool(codes[3]),
+                backward_feasible=bool(codes[4]),
+                reused_prefix_edges=int(codes[5]),
+                reused_suffix_edges=int(codes[6]),
+                recomputed_forward_edges=int(codes[7]),
+                recomputed_backward_edges=int(codes[8]),
+                accepted=bool(codes[9]),
+                distance_lower_bound=float(metrics[0]),
+                min_time_window_slack=float(metrics[1]),
+                finish_time=float(metrics[2]),
+            )
+        )
     screening = decode_native_candidate_screening_payload(
         payload[0],
         candidates=request.candidates,
@@ -14340,6 +15727,8 @@ def _execute_native_candidate_round(
         exact_payload=payload[6],
         screening_sha256=screening.candidate_pool_hash,
         counters=counters_array,
+        propagation_codes=propagation_codes,
+        propagation_metrics=propagation_metrics,
     )
     if transaction_sha256 != expected_transaction_sha256:
         raise RuntimeError("native candidate round transaction SHA-256 mismatch")
@@ -14439,6 +15828,7 @@ def _execute_native_candidate_round(
         transaction_sha256=transaction_sha256,
         audit=audit,
         resource_receipt=resource_receipt,
+        incremental_propagation=tuple(propagation),
     )
 
 
@@ -14536,6 +15926,12 @@ def _stable_int63(value: str) -> int:
     return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
 
+def native_semantic_context_id(value: str) -> int:
+    """Return the shared Python/C++ stable identifier for a semantic name."""
+
+    return _stable_int63(value)
+
+
 def _require_array(
     value: object,
     *,
@@ -14579,6 +15975,8 @@ def _candidate_round_digest(
     exact_payload: object,
     screening_sha256: str,
     counters: npt.NDArray[np.generic],
+    propagation_codes: npt.NDArray[np.generic] | None = None,
+    propagation_metrics: npt.NDArray[np.generic] | None = None,
 ) -> str:
     if not isinstance(exact_payload, tuple) or len(exact_payload) != 7:
         raise RuntimeError("native candidate round exact payload has an invalid schema")
@@ -14640,7 +16038,23 @@ def _candidate_round_digest(
     add_i64(13, exact_payload[6])
     add_bytes(14, screening_sha256.encode("ascii"))
     add_i64(15, counters)
-    return hashlib.sha256(evidence).hexdigest()
+    base_digest = hashlib.sha256(evidence).hexdigest()
+    if propagation_codes is None and propagation_metrics is None:
+        return base_digest
+    if propagation_codes is None or propagation_metrics is None:
+        raise RuntimeError("candidate propagation evidence is incomplete")
+    if (
+        propagation_codes.dtype != np.dtype(np.int64)
+        or propagation_metrics.dtype != np.dtype(np.float64)
+        or not propagation_codes.flags.c_contiguous
+        or not propagation_metrics.flags.c_contiguous
+    ):
+        raise RuntimeError("candidate propagation evidence is not typed contiguous SoA")
+    propagation_evidence = bytearray(b"stage05.2-candidate-round-propagation-v2")
+    propagation_evidence.extend(base_digest.encode("ascii"))
+    propagation_evidence.extend(propagation_codes.tobytes(order="C"))
+    propagation_evidence.extend(propagation_metrics.tobytes(order="C"))
+    return hashlib.sha256(propagation_evidence).hexdigest()
 
 
 def _full_native_digest(
@@ -14655,6 +16069,7 @@ def _full_native_digest(
     exact_journal_sha256: str,
     control_journal_sha256: str,
     causal_journal_sha256: str,
+    canonical_event_journal_sha256: str,
     initial_state_receipt: NativeInitialStateReceipt,
 ) -> str:
     evidence = bytearray(b"stage05.2-full-native-alns-v2")
@@ -14686,6 +16101,9 @@ def _full_native_digest(
     if not _is_sha256(causal_journal_sha256):
         raise RuntimeError("full native ALNS causal journal SHA-256 is invalid")
     evidence.extend(causal_journal_sha256.encode("ascii"))
+    if not _is_sha256(canonical_event_journal_sha256):
+        raise RuntimeError("full native canonical event journal SHA-256 is invalid")
+    evidence.extend(canonical_event_journal_sha256.encode("ascii"))
     flags = np.ascontiguousarray(
         [int(initial_state_receipt.host_owned), initial_state_receipt.operation_count],
         dtype=np.int64,

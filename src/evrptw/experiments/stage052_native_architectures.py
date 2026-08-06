@@ -1016,10 +1016,30 @@ def _canonical_semantic_streams(result: ALNSResult) -> dict[str, list[dict[str, 
         stream_name = raw_event.get("semantic_stream")
         if not isinstance(stream_name, str) or stream_name not in streams:
             raise ValueError("runtime semantic event names an unknown stream")
+        source_runtime_event_id = raw_event.get("runtime_causal_event_id")
+        if (
+            isinstance(source_runtime_event_id, bool)
+            or not isinstance(source_runtime_event_id, int)
+            or source_runtime_event_id != raw_event.get("semantic_event_id")
+        ):
+            raise ValueError(
+                "runtime semantic event lost its causal source identity"
+            )
         event = {
             key: value
             for key, value in raw_event.items()
-            if key != "semantic_stream"
+            if key
+            not in {
+                "semantic_stream",
+                "runtime_causal_event_id",
+                "runtime_native_lane_id",
+                "runtime_native_operator_id",
+                "runtime_native_iteration",
+                "runtime_native_transaction_id",
+                "runtime_native_subject_id",
+                "runtime_native_status_code",
+                "runtime_native_flags",
+            }
         }
         canonical = _evidence_json_value(_canonical_trace_event(event))
         if not isinstance(canonical, dict):

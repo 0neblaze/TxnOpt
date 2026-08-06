@@ -323,6 +323,7 @@ class NativeSearchEngineV2:
         npt.NDArray[np.float64],
         npt.NDArray[np.int64],
     ]: ...
+    def inject_initial_mirror_schema_failure_once(self, code: int) -> None: ...
     def evaluate_plans(
         self,
         plan_offsets: npt.NDArray[np.int64],
@@ -640,6 +641,16 @@ class NativeSearchEngineV2:
     def cache_execution_coverage_receipt(
         self,
     ) -> tuple[npt.NDArray[np.int64], str]: ...
+    def candidate_plan_transaction_wire_payload(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.uint8],
+    ]: ...
     def solution_state(
         self,
     ) -> tuple[
@@ -783,6 +794,27 @@ def two_opt_delta(
     points: Sequence[Point], route: Sequence[int], first: int, second: int
 ) -> float: ...
 def exact_charging_batch_numeric(
+    node_kind: npt.NDArray[np.int64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    order_offsets: npt.NDArray[np.int64],
+    order_indices: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    batch_size: npt.NDArray[np.int64],
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
+def exact_charging_batch_host_v2(
+    socket_path: str,
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],
     due_date: npt.NDArray[np.float64],
@@ -959,6 +991,14 @@ def candidate_round_transaction_v2(
     lexical_rank: npt.NDArray[np.int64],
     options: npt.NDArray[np.float64],
     incremental: npt.NDArray[np.float64],
+    base_chain_offsets: npt.NDArray[np.int64],
+    base_chain_indices: npt.NDArray[np.int64],
+    base_edge_offsets: npt.NDArray[np.int64],
+    base_edge_values: npt.NDArray[np.float64],
+    base_earliest_offsets: npt.NDArray[np.int64],
+    base_earliest_values: npt.NDArray[np.float64],
+    base_latest_offsets: npt.NDArray[np.int64],
+    base_latest_values: npt.NDArray[np.float64],
     negative_offsets: npt.NDArray[np.int64],
     negative_indices: npt.NDArray[np.int64],
     negative_reason_codes: npt.NDArray[np.int64],
@@ -995,6 +1035,8 @@ def candidate_round_transaction_v2(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
     str,
+    npt.NDArray[np.int64],
+    npt.NDArray[np.float64],
 ]: ...
 def full_native_alns_v1(
     node_kind: npt.NDArray[np.int64],
@@ -1144,6 +1186,20 @@ def full_native_alns_v2(
         npt.NDArray[np.int64],
         str,
     ],
+    tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        str,
+    ],
     tuple[npt.NDArray[np.int64], str, str, str, str, object],
 ]: ...
 def native_search_request_host_receipt_v2(
@@ -1210,6 +1266,53 @@ def native_search_initial_state_host_v2(
     str,
     str,
 ]: ...
+def candidate_session_open_host_v2(
+    socket_path: str,
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    lexical_rank: npt.NDArray[np.int64],
+    node_name_offsets: npt.NDArray[np.int64],
+    node_name_bytes: npt.NDArray[np.uint8],
+    initial_route_offsets: npt.NDArray[np.int64],
+    initial_route_indices: npt.NDArray[np.int64],
+    control: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    protocol_control: npt.NDArray[np.int64],
+    protocol_options: npt.NDArray[np.float64],
+    stage04_integer: npt.NDArray[np.int64],
+    stage04_float: npt.NDArray[np.float64],
+    operator_integer: npt.NDArray[np.int64],
+    operator_float: npt.NDArray[np.float64],
+) -> tuple[tuple[object, ...], str]: ...
+def candidate_session_close_host_v2(
+    socket_path: str,
+    token: str,
+    deadline_remaining: float,
+) -> None: ...
+def candidate_session_execute_host_v2(
+    socket_path: str,
+    token: str,
+    plan_offsets: object,
+    route_offsets: object,
+    route_indices: object,
+    context: object,
+    deadline_remaining: float,
+    batch_size: int,
+    expected_customers: object,
+    protocol_flags: object,
+) -> tuple[object, ...]: ...
+def candidate_session_finish_transaction_host_v2(
+    socket_path: str,
+    token: str,
+    commit: bool,
+    deadline_remaining: float,
+) -> None: ...
 def full_native_alns_host_v2(
     socket_path: str,
     node_kind: npt.NDArray[np.int64],
@@ -1236,7 +1339,38 @@ def full_native_alns_host_v2(
 ) -> tuple[object, ...]: ...
 
 def _test_native_kernel_fault_v2(socket_path: str, fault: str) -> None: ...
+def _test_candidate_session_execute_ack_loss_v2(
+    socket_path: str,
+    token: str,
+    plan_offsets: object,
+    route_offsets: object,
+    route_indices: object,
+    context: object,
+    deadline_remaining: float,
+    batch_size: int,
+    expected_customers: object,
+    protocol_flags: object,
+) -> tuple[object, ...]: ...
+def _test_candidate_session_production_ack_loss_once_v2() -> None: ...
 def _test_full_native_initial_mirror_fault_v2(code: int) -> None: ...
+def validate_candidate_plan_transaction_wire_v2(
+    integer_offsets: npt.NDArray[np.int64],
+    integer_values: npt.NDArray[np.int64],
+    double_offsets: npt.NDArray[np.int64],
+    double_values: npt.NDArray[np.float64],
+    byte_offsets: npt.NDArray[np.int64],
+    byte_values: npt.NDArray[np.uint8],
+) -> tuple[npt.NDArray[np.int64], str]: ...
+def candidate_plan_transaction_wire_host_roundtrip_v2(
+    socket_path: str,
+    integer_offsets: npt.NDArray[np.int64],
+    integer_values: npt.NDArray[np.int64],
+    double_offsets: npt.NDArray[np.int64],
+    double_values: npt.NDArray[np.float64],
+    byte_offsets: npt.NDArray[np.int64],
+    byte_values: npt.NDArray[np.uint8],
+    deadline_remaining: float,
+) -> None: ...
 def full_native_initialize_v2(
     node_kind: npt.NDArray[np.int64],
     ready_time: npt.NDArray[np.float64],

@@ -218,6 +218,34 @@ def test_complete_plan_ranking_is_vehicle_first_and_budget_is_atomic() -> None:
     assert runtime.round_remaining == 2
 
 
+def test_route_candidate_projection_is_pure_until_explicit_commit() -> None:
+    runtime = CandidateControlRuntime(
+        CandidateControlConfig(
+            proposal_top_k=1,
+            max_exact_calls_per_round=2,
+            worker_count=1,
+        )
+    )
+    candidates = (
+        (0, ("C2",), 2.0),
+        (1, ("C1",), 1.0),
+    )
+    events_before = tuple(runtime.events)
+
+    selected, projected = runtime.project_route_candidates(
+        candidates,
+        lane="constraint",
+        iteration=7,
+        operator="relocate",
+    )
+
+    assert selected == (1,)
+    assert tuple(runtime.events) == events_before
+    assert [event["status"] for event in projected] == ["selected", "not_selected"]
+    runtime.commit_route_candidate_projection(projected)
+    assert tuple(runtime.events) == projected
+
+
 def test_controlled_parallelism_preserves_fixed_work_semantics() -> None:
     def run(worker_count: int):
         return solve_alns(

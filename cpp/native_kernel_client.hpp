@@ -22,11 +22,14 @@
 #include <vector>
 
 #include "native_kernel_protocol.hpp"
+#include "native_candidate_transaction_executor.hpp"
 #include "native_search_core.hpp"
 #include "native_sha256.hpp"
 #include "native_solver_kernels.hpp"
 
 namespace evrptw::native_client {
+
+inline thread_local bool candidate_session_ack_loss_once = false;
 
 namespace protocol = evrptw::native_protocol;
 namespace kernels = evrptw::native_kernels;
@@ -363,6 +366,30 @@ inline void acknowledge(
     }
 }
 
+inline bool acknowledge_irreversible_commit(
+    Socket& socket,
+    const protocol::ControlFrame& response) {
+    if (socket.deadline_expired()) {
+        throw std::runtime_error(
+            "native kernel scheduler acknowledgement crossed its deadline");
+    }
+    socket.refresh_timeout();
+    protocol::ControlFrame acknowledgement;
+    acknowledgement.message = protocol::ControlMessage::acknowledgement;
+    acknowledgement.request_id = response.request_id;
+    acknowledgement.segment_name = response.segment_name;
+    acknowledgement.sha256 = response.sha256;
+    send_exact(socket.get(), &acknowledgement, sizeof(acknowledgement));
+
+    protocol::ControlFrame released;
+    return read_exact(socket.get(), &released, sizeof(released))
+        && released.magic == protocol::kernel_magic
+        && released.version == protocol::kernel_protocol_version
+        && released.message == protocol::ControlMessage::released
+        && released.request_id == response.request_id
+        && !socket.deadline_expired();
+}
+
 struct SearchRequestReceipt final {
     std::array<std::int64_t, 8> counts{};
     std::string sha256;
@@ -409,6 +436,214 @@ inline SearchRequestReceipt search_request_receipt(
     record_telemetry(output, 2);
     acknowledge(socket, response);
     return receipt;
+}
+
+inline evrptw::native_search::CandidatePlanTransactionWireV2
+candidate_plan_transaction_wire_roundtrip(
+    std::string_view socket_path,
+    const evrptw::native_search::CandidatePlanTransactionWireV2& wire,
+    const double deadline_remaining) {
+    if (!std::isfinite(deadline_remaining) || deadline_remaining <= 0.0) {
+        throw std::invalid_argument(
+            "native candidate-plan transaction deadline is invalid");
+    }
+    const auto request_id = request_counter.fetch_add(1);
+    const auto deadline_absolute = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        + deadline_remaining;
+    Socket socket(
+        socket_path,
+        std::min(deadline_absolute, transaction_deadline_absolute));
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::candidate_plan_transaction_wire_payload_v2(
+            wire, request_id),
+        output_mapping, response, socket);
+    if (output.header().request_id != response.request_id
+        || output.header().array_count != 7) {
+        throw std::runtime_error(
+            "native candidate-plan transaction response schema is invalid");
+    }
+    auto received = evrptw::native_search::
+        candidate_plan_transaction_wire_from_payload_v2(output);
+    const bool double_values_equal =
+        received.double_values.size() == wire.double_values.size()
+        && (received.double_values.empty()
+            || std::memcmp(
+                   received.double_values.data(), wire.double_values.data(),
+                   received.double_values.size() * sizeof(double)) == 0);
+    if (received.integer_offsets != wire.integer_offsets
+        || received.integer_values != wire.integer_values
+        || received.double_offsets != wire.double_offsets
+        || !double_values_equal
+        || received.byte_offsets != wire.byte_offsets
+        || received.byte_values != wire.byte_values) {
+        throw std::runtime_error(
+            "native candidate-plan transaction response changed the payload");
+    }
+    record_telemetry(output, 6);
+    acknowledge(socket, response);
+    return received;
+}
+
+inline evrptw::native_search::CandidateTransactionExecutionV2
+execute_candidate_session_transaction_with_trace_v2(
+    const std::string_view socket_path,
+    const std::string_view token,
+    const evrptw::native_search::CandidateRoundRequestV2& round,
+    const evrptw::native_search::CandidateTransactionOptionsV2 options = {},
+    const bool acknowledge_response = true) {
+    round.validate();
+    const auto request_id = request_counter.fetch_add(1);
+    const auto deadline_absolute = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        + round.deadline_remaining;
+    Socket socket(
+        socket_path,
+        std::min(deadline_absolute, transaction_deadline_absolute));
+    if (socket.deadline_expired()) {
+        throw std::runtime_error(
+            "native candidate session transaction deadline expired before IPC");
+    }
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::candidate_transaction_execute_payload_v2(
+            token, round, options, request_id),
+        output_mapping, response, socket);
+    if (output.header().operation
+            != protocol::KernelOperation::candidate_transaction_execute
+        || output.header().request_id != response.request_id
+        || output.header().array_count != 11) {
+        throw std::runtime_error(
+            "native candidate session transaction response schema is invalid");
+    }
+    auto execution = evrptw::native_search::
+        candidate_transaction_execution_from_payload_v2(output);
+    record_telemetry(output, 10);
+    if (std::exchange(candidate_session_ack_loss_once, false)) {
+        if (!options.defer_commit) {
+            throw std::logic_error(
+                "production candidate ACK-loss injection requires deferred commit");
+        }
+        throw std::runtime_error(
+            "injected production candidate acknowledgement loss without fallback");
+    }
+    if (!acknowledge_response) {
+        throw std::runtime_error(
+            "native candidate session acknowledgement loss without fallback");
+    }
+    acknowledge(socket, response);
+    return execution;
+}
+
+inline evrptw::native_search::CandidatePlanTransactionResultV2
+execute_candidate_session_transaction_v2(
+    const std::string_view socket_path,
+    const std::string_view token,
+    const evrptw::native_search::CandidateRoundRequestV2& round,
+    const evrptw::native_search::CandidateTransactionOptionsV2 options = {},
+    const bool acknowledge_response = true) {
+    return execute_candidate_session_transaction_with_trace_v2(
+        socket_path, token, round, options, acknowledge_response).result;
+}
+
+inline evrptw::native_search::InitialStateV2 initial_state_from_response_v2(
+    const protocol::PayloadView& output,
+    const protocol::ControlFrame& response,
+    const evrptw::native_search::RequestV2& request,
+    const protocol::KernelOperation expected_operation,
+    const std::size_t expected_array_count) {
+    const auto route_count = request.problem.route_count();
+    for (const auto index : {
+             std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{3},
+             std::size_t{6}, std::size_t{7}, std::size_t{8}, std::size_t{9},
+             std::size_t{10}, std::size_t{11}}) {
+        const auto& descriptor = output.descriptor(index);
+        if (descriptor.dimensions != 1
+            || descriptor.shape[0] != descriptor.count
+            || descriptor.shape[1] != 0) {
+            throw std::runtime_error(
+                "native initial-search-state vector descriptor is invalid");
+        }
+    }
+    if (output.header().operation != expected_operation
+        || output.header().request_id != response.request_id
+        || output.header().array_count != expected_array_count
+        || output.descriptor(0).count != route_count + 1
+        || output.descriptor(2).count != route_count
+        || output.descriptor(3).count != route_count
+        || output.descriptor(4).count != route_count * 4
+        || output.descriptor(4).dimensions != 2
+        || output.descriptor(4).shape[0] != route_count
+        || output.descriptor(4).shape[1] != 4
+        || output.descriptor(5).count != route_count * 3
+        || output.descriptor(5).dimensions != 2
+        || output.descriptor(5).shape[0] != route_count
+        || output.descriptor(5).shape[1] != 3
+        || output.descriptor(6).count != 10
+        || output.descriptor(7).count != 2
+        || output.descriptor(8).count != 2
+        || output.descriptor(9).count != 4
+        || output.descriptor(10).count != 64
+        || output.descriptor(11).count != route_count) {
+        throw std::runtime_error(
+            "native initial-search-state response schema is invalid");
+    }
+    evrptw::native_search::InitialStateV2 state;
+    state.request_sha256 = request.sha256();
+    const auto copy_vector = [&output]<typename T>(
+        const std::size_t index, const protocol::NumericType type) {
+        const auto count = static_cast<std::size_t>(
+            output.descriptor(index).count);
+        const auto* values = output.data<T>(index, type);
+        return std::vector<T>(values, values + count);
+    };
+    state.exact.path_offsets = copy_vector.template operator()<std::int64_t>(
+        0, protocol::NumericType::int64);
+    state.exact.path_indices = copy_vector.template operator()<std::int64_t>(
+        1, protocol::NumericType::int64);
+    state.exact.statuses = copy_vector.template operator()<std::int64_t>(
+        2, protocol::NumericType::int64);
+    state.exact.reasons = copy_vector.template operator()<std::int64_t>(
+        3, protocol::NumericType::int64);
+    state.exact.metrics = copy_vector.template operator()<double>(
+        4, protocol::NumericType::float64);
+    state.exact.label_counters =
+        copy_vector.template operator()<std::int64_t>(
+            5, protocol::NumericType::int64);
+    state.exact.batch_counters =
+        copy_vector.template operator()<std::int64_t>(
+            6, protocol::NumericType::int64);
+    state.exact.completion_order =
+        copy_vector.template operator()<std::int64_t>(
+            11, protocol::NumericType::int64);
+    const auto* objective_integer = output.data<std::int64_t>(
+        7, protocol::NumericType::int64);
+    std::copy(
+        objective_integer, objective_integer + 2,
+        state.objective_integer.begin());
+    const auto* objective_float = output.data<double>(
+        8, protocol::NumericType::float64);
+    std::copy(
+        objective_float, objective_float + 2,
+        state.objective_float.begin());
+    const auto* accounting = output.data<std::int64_t>(
+        9, protocol::NumericType::int64);
+    std::copy(accounting, accounting + 4, state.accounting.begin());
+    const auto* sha256 = output.data<std::uint8_t>(
+        10, protocol::NumericType::uint8);
+    const std::string remote_sha256(
+        reinterpret_cast<const char*>(sha256), 64);
+    state.validate(request);
+    if (state.sha256() != remote_sha256) {
+        throw std::runtime_error(
+            "native initial-search-state response hash mismatch");
+    }
+    return state;
 }
 
 inline evrptw::native_search::InitialStateV2 search_initial_state(
@@ -524,6 +759,165 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
     record_telemetry(output, 12, false, true);
     acknowledge(socket, response);
     return state;
+}
+
+struct CandidateSessionHandleV2 final {
+    std::string token;
+    evrptw::native_search::InitialStateV2 initial_state;
+};
+
+inline CandidateSessionHandleV2 open_candidate_session_v2(
+    std::string_view socket_path,
+    const evrptw::native_search::RequestV2& request) {
+    const auto request_id = request_counter.fetch_add(1);
+    Socket socket(
+        socket_path,
+        std::min(request.config.deadline[1], transaction_deadline_absolute));
+    if (socket.deadline_expired()) {
+        throw std::runtime_error(
+            "native candidate session deadline expired before open");
+    }
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::request_payload(
+            request, request_id,
+            protocol::KernelOperation::candidate_session_open),
+        output_mapping, response, socket);
+    auto initial_state = initial_state_from_response_v2(
+        output, response, request,
+        protocol::KernelOperation::candidate_session_open, 14);
+    const auto& token_descriptor = output.descriptor(12);
+    if (token_descriptor.type != protocol::NumericType::uint8
+        || token_descriptor.dimensions != 1 || token_descriptor.count != 64
+        || token_descriptor.shape[0] != 64
+        || token_descriptor.shape[1] != 0) {
+        throw std::runtime_error(
+            "native candidate session open token schema is invalid");
+    }
+    const auto* token_bytes = output.data<std::uint8_t>(
+        12, protocol::NumericType::uint8);
+    std::string token(
+        reinterpret_cast<const char*>(token_bytes),
+        static_cast<std::size_t>(token_descriptor.count));
+    record_telemetry(output, 13, false, true);
+    acknowledge(socket, response);
+    return {std::move(token), std::move(initial_state)};
+}
+
+inline void close_candidate_session_v2(
+    std::string_view socket_path,
+    const std::string_view token,
+    const double deadline_remaining) {
+    if (!std::isfinite(deadline_remaining) || deadline_remaining <= 0.0) {
+        throw std::invalid_argument(
+            "native candidate session close deadline is invalid");
+    }
+    const auto request_id = request_counter.fetch_add(1);
+    const auto deadline_absolute = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        + deadline_remaining;
+    Socket socket(
+        socket_path,
+        std::min(deadline_absolute, transaction_deadline_absolute));
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::candidate_session_token_payload_v2(
+            protocol::KernelOperation::candidate_session_close, token,
+            request_id),
+        output_mapping, response, socket);
+    if (output.header().request_id != response.request_id
+        || output.header().array_count != 2
+        || evrptw::native_search::candidate_session_token_from_payload_v2(
+               output) != token) {
+        throw std::runtime_error(
+            "native candidate session close receipt is invalid");
+    }
+    record_telemetry(output, 1);
+    acknowledge(socket, response);
+}
+
+inline std::int64_t candidate_session_transaction_status_v2(
+    const std::string_view socket_path,
+    const std::string_view token,
+    const double deadline_remaining) {
+    const auto request_id = request_counter.fetch_add(1);
+    const auto deadline_absolute = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        + deadline_remaining;
+    Socket socket(
+        socket_path,
+        std::min(deadline_absolute, transaction_deadline_absolute));
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::candidate_session_token_payload_v2(
+            protocol::KernelOperation::candidate_transaction_status, token,
+            request_id),
+        output_mapping, response, socket);
+    if (output.header().operation
+            != protocol::KernelOperation::candidate_transaction_status
+        || output.header().request_id != response.request_id
+        || evrptw::native_search::candidate_session_token_from_payload_v2(
+               output) != token) {
+        throw std::runtime_error(
+            "native candidate transaction status receipt is invalid");
+    }
+    const auto status = evrptw::native_search::
+        candidate_session_status_from_payload_v2(output);
+    record_telemetry(output, 2);
+    static_cast<void>(acknowledge_irreversible_commit(socket, response));
+    return status;
+}
+
+inline void finish_candidate_session_transaction_v2(
+    const std::string_view socket_path,
+    const std::string_view token,
+    const bool commit,
+    const double deadline_remaining) {
+    if (!std::isfinite(deadline_remaining) || deadline_remaining <= 0.0) {
+        throw std::invalid_argument(
+            "native candidate transaction finish deadline is invalid");
+    }
+    const auto operation = commit
+        ? protocol::KernelOperation::candidate_transaction_commit
+        : protocol::KernelOperation::candidate_transaction_rollback;
+    const auto request_id = request_counter.fetch_add(1);
+    const auto deadline_absolute = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        + deadline_remaining;
+    Socket socket(
+        socket_path,
+        std::min(deadline_absolute, transaction_deadline_absolute));
+    protocol::SharedMapping output_mapping;
+    protocol::ControlFrame response;
+    const auto output = transact(
+        socket_path,
+        evrptw::native_search::candidate_session_token_payload_v2(
+            operation, token, request_id),
+        output_mapping, response, socket);
+    if (output.header().operation != operation
+        || output.header().request_id != response.request_id
+        || output.header().array_count != 2
+        || evrptw::native_search::candidate_session_token_from_payload_v2(
+               output) != token) {
+        throw std::runtime_error(
+            "native candidate transaction finish receipt is invalid");
+    }
+    record_telemetry(output, 1);
+    if (!acknowledge_irreversible_commit(socket, response)) {
+        const auto status = candidate_session_transaction_status_v2(
+            socket_path, token, deadline_remaining);
+        const auto expected_status = commit ? std::int64_t{2} : std::int64_t{3};
+        if (status != expected_status) {
+            throw std::runtime_error(
+                "native candidate transaction commit point is unresolved");
+        }
+    }
 }
 
 inline kernels::ExactBatchOutput exact_charging(

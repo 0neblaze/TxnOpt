@@ -116,6 +116,7 @@ def test_runtime_semantic_journal_is_explicit_and_round_trips() -> None:
             "status": "completed_feasible",
             "semantic_stream": "exact_result",
             "semantic_event_id": 1,
+            "runtime_causal_event_id": 1,
         }
     ]
     assert Stage03Trace.from_dict(payload).runtime_semantic_events == (
@@ -139,11 +140,47 @@ def test_runtime_semantic_journal_rolls_back_atomically() -> None:
             "event_type": "before",
             "semantic_stream": "operator",
             "semantic_event_id": 1,
+            "runtime_causal_event_id": 1,
         },
     )
     assert trace.record_runtime_semantic_event(
         "deadline", {"event_type": "deadline"}
     ) == 2
+
+
+def test_runtime_semantic_import_preserves_external_causal_ids_atomically() -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
+    trace.record_runtime_semantic_event("operator", {"event_type": "old"})
+
+    trace.import_runtime_semantic_journal(
+        (
+            (1, "operator", {"event_type": "first"}),
+            (2, "exact_work", {"event_type": "second"}),
+        )
+    )
+
+    assert [
+        event["runtime_causal_event_id"]
+        for event in trace.runtime_semantic_events
+    ] == [1, 2]
+    assert [
+        event["semantic_event_id"] for event in trace.runtime_semantic_events
+    ] == [1, 2]
+
+    before = trace.runtime_semantic_events
+    with pytest.raises(
+        ValueError,
+        match="unique and contiguous",
+    ):
+        trace.import_runtime_semantic_journal(
+            (
+                (1, "operator", {"event_type": "first"}),
+                (3, "exact_work", {"event_type": "gap"}),
+            )
+        )
+    assert trace.runtime_semantic_events == before
 
 
 def test_runtime_semantic_journal_rejects_hidden_payload() -> None:
@@ -159,6 +196,24 @@ def test_runtime_semantic_journal_rejects_hidden_payload() -> None:
     with pytest.raises(
         ValueError,
         match="require their explicit measurement flag",
+    ):
+        Stage03Trace.from_dict(payload)
+
+
+def test_runtime_semantic_journal_rejects_corrupt_persisted_causal_ids() -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(record_runtime_semantic_events=True)
+    )
+    trace.record_runtime_semantic_event("operator", {"event_type": "first"})
+    trace.record_runtime_semantic_event("exact_work", {"event_type": "second"})
+    payload = trace.to_dict()
+    runtime_events = payload["runtime_semantic_events"]
+    assert isinstance(runtime_events, list)
+    runtime_events[1]["runtime_causal_event_id"] = 3
+
+    with pytest.raises(
+        ValueError,
+        match="unique and contiguous",
     ):
         Stage03Trace.from_dict(payload)
 

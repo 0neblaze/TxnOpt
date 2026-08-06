@@ -279,9 +279,31 @@ class CandidateControlRuntime:
         iteration: int | None,
         operator: str,
     ) -> tuple[int, ...]:
+        """Select route candidates and commit the corresponding audit events."""
+
+        selected, events = self.project_route_candidates(
+            candidates,
+            lane=lane,
+            iteration=iteration,
+            operator=operator,
+        )
+        self.commit_route_candidate_projection(events)
+        return selected
+
+    def project_route_candidates(
+        self,
+        candidates: Sequence[tuple[int, tuple[str, ...], float]],
+        *,
+        lane: str,
+        iteration: int | None,
+        operator: str,
+    ) -> tuple[tuple[int, ...], tuple[dict[str, object], ...]]:
+        """Project deterministic selection evidence without mutating runtime state."""
+
         ordered = sorted(candidates, key=lambda item: (item[2], item[1], item[0]))
         selected = tuple(item[0] for item in ordered[: self.config.proposal_top_k])
         selected_set = set(selected)
+        projected_events: list[dict[str, object]] = []
         skipped_payload: list[dict[str, object]] = []
         for rank, (index, sequence, lower_bound) in enumerate(ordered, start=1):
             if index not in selected_set:
@@ -294,7 +316,7 @@ class CandidateControlRuntime:
                     }
                 )
                 continue
-            self.events.append(
+            projected_events.append(
                 {
                     "event_type": "candidate_control_decision",
                     "status": "selected",
@@ -308,7 +330,7 @@ class CandidateControlRuntime:
                 }
             )
         if skipped_payload:
-            self.events.append(
+            projected_events.append(
                 {
                     "event_type": "candidate_control_decision_aggregate",
                     "status": "not_selected",
@@ -322,14 +344,22 @@ class CandidateControlRuntime:
                     "candidate_pool_hash": _stable_hash(skipped_payload),
                 }
             )
-        return selected
+        return selected, tuple(projected_events)
+
+    def commit_route_candidate_projection(
+        self,
+        events: Sequence[dict[str, object]],
+    ) -> None:
+        """Commit a previously verified route-selection projection."""
+
+        self.events.extend(dict(event) for event in events)
 
     def select_plans(
         self,
         plans: Sequence[CandidatePlan],
         *,
         lane: str,
-        iteration: int,
+        iteration: int | None,
         operator: str,
     ) -> tuple[CandidatePlan, ...]:
         """Select never-attempted complete plans by the formal rank key."""

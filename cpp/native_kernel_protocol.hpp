@@ -33,6 +33,13 @@ enum class KernelOperation : std::uint32_t {
     screen_routes = 3,
     search_request_receipt = 4,
     search_initial_state = 5,
+    candidate_transaction_wire = 6,
+    candidate_session_open = 7,
+    candidate_session_close = 8,
+    candidate_transaction_execute = 9,
+    candidate_transaction_commit = 10,
+    candidate_transaction_rollback = 11,
+    candidate_transaction_status = 12,
 };
 
 enum class NumericType : std::uint32_t {
@@ -187,7 +194,21 @@ public:
                 && header_.operation
                     != KernelOperation::search_request_receipt
                 && header_.operation
-                    != KernelOperation::search_initial_state)) {
+                    != KernelOperation::search_initial_state
+                && header_.operation
+                    != KernelOperation::candidate_transaction_wire
+                && header_.operation
+                    != KernelOperation::candidate_session_open
+                && header_.operation
+                    != KernelOperation::candidate_session_close
+                && header_.operation
+                    != KernelOperation::candidate_transaction_execute
+                && header_.operation
+                    != KernelOperation::candidate_transaction_commit
+                && header_.operation
+                    != KernelOperation::candidate_transaction_rollback
+                && header_.operation
+                    != KernelOperation::candidate_transaction_status)) {
             throw std::runtime_error("native kernel payload header is invalid");
         }
         std::size_t previous_end = sizeof(PayloadHeader);

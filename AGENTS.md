@@ -728,20 +728,21 @@ this repository or one of its subdirectories.
   `per_solve_runtime` protocol is `candidate_round_soa_v2`: six shard
   processes are capped at four compute threads each, and each candidate round
   crosses the Python/native boundary exactly once with contiguous SoA inputs
-  and structured screening, ranking, cache-journal, exact-result, completion,
-  timing, and SHA-256 outputs. Python independently replays the transaction
+  (including typed base propagation snapshots) and structured propagation,
+  screening, ranking, cache-journal, exact-result, completion, timing, and
+  SHA-256 outputs. Python independently replays the transaction
   hash and commits cache/control state only after the complete result passes.
   Worker, deadline, integrity, or cache-commit failure rolls back the complete
   transaction and never opens the historical worker pool or another backend.
   `full_native_alns` uses `full_solve_soa_v2` and crosses the Python/C++
-  boundary once per instance/seed. It currently emits an independently hashed
-  route/exact-result/trajectory transaction and exposes the current operator
-  identifiers through simplified deterministic native route transformations.
-  It is experimental evidence only: the actual Stage 2.3 operator behavior and
-  lane control, Python RNG, cache lifecycle, Candidate Control, refinement, and
-  Stage 4 segment semantics are not yet ported. Raw results must record those
-  semantic gates as incomplete, and the fixed-work differential reviewer must
-  reject qualification until every one is implemented and replayed.
+  boundary once per instance/seed. Its `NativeSearchEngine` owns the current
+  Stage 2.3 lanes and operators, Python-compatible RNG, Candidate Control,
+  exact budget/deadline and cache lifecycle, refinement, lexicographic
+  objective, and Stage 4 segment/search-control semantics. The complete native
+  search loop runs with the Python GIL released and returns typed SoA route,
+  exact, trajectory, cache, control, causal, and canonical-event journals for
+  independent replay. Capability receipts remain fail-closed until the matching
+  differential, thread-equivalence, fault, sanitizer, and full-suite gates pass.
   `host_scheduler` uses `unix_shm_scheduler_v2`: a run-owned temporary service
   accepts framed Unix-domain control messages, maps contiguous POSIX shared
   memory arrays, and dispatches the same all-or-nothing C++ solve ABI through a
@@ -749,14 +750,21 @@ this repository or one of its subdirectories.
   output loss fails the transaction without local recovery or fallback. The
   Unix-domain service loop, bounded IPC reads/writes, queue, and 24 worker
   threads are C++ owned; Python only starts/stops the temporary service and
-  validates the returned transaction. The current result transport is one
-  pickle-encoded shared-memory blob and each worker holds the Python GIL while
-  executing the Python-aware full-solve ABI, so native search concurrency is
-  effectively one even though the request-control plane has 24 workers. Host
-  scheduling therefore has the requested native control plane but not the
-  requested cross-shard compute parallelism or structured output descriptors;
-  it also inherits the incomplete full-native ALNS semantics above. These
-  experimental protocols do not select a default or promote Stage 5.2 readiness.
+  validates the returned transaction. Input and output transport uses fixed
+  binary headers plus typed shared-memory SoA descriptors; JSON, pickle, NumPy,
+  and Python shared-memory workers are not part of the service path. The host
+  scheduler and local full-native mode share the same native transaction and
+  work-pool interfaces. Candidate sessions isolate RNG, budget, cache, deadline,
+  and transaction state; disconnect, partial IPC, ACK loss, schema/hash failure,
+  worker failure, or service loss rolls back affected pending work and fails
+  without fallback. For an explicit commit/rollback request, RELEASE is the
+  primary server-side commit receipt. If RELEASE is lost after the client ACK,
+  the client queries the isolated session's typed transaction status and
+  commits local state only when the server reports the matching committed or
+  rolled-back outcome; service loss or any unresolved status fails fast. These
+  experimental protocols do not select a default or
+  promote Stage 5.2 readiness; qualification still requires the new five-mode
+  Paired/Pilot evidence and independent review.
 - Five-mode comparisons use
   `evrptw.experiments.stage052_native_architectures` and independent replay in
   `stage052_native_architecture_review`. Paired scope is exactly 360 axes and

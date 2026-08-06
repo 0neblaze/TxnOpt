@@ -65,25 +65,23 @@ from tools.native_build_attestation import (
 )
 
 
-def test_native_campaign_gate_names_every_incomplete_architecture_capability() -> None:
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "host_candidate_transaction_scheduler, "
-            "whole_search_gil_released, runtime_semantic_event_journal"
-        ),
-    ):
-        _require_native_architecture_capabilities()
+def test_native_campaign_gate_accepts_complete_architecture_capabilities() -> None:
+    assert _require_native_architecture_capabilities() == {
+        "host_candidate_transaction_scheduler": True,
+        "whole_search_gil_released": True,
+        "single_host_24_thread_compute_pool": True,
+        "runtime_semantic_event_journal": True,
+    }
 
 
 def test_native_capability_receipt_confirms_single_host_compute_pool() -> None:
     from evrptw import _core as native_core
 
     assert native_core.stage052_native_architecture_capabilities_v2().tolist() == [
-        0,
-        0,
         1,
-        0,
+        1,
+        1,
+        1,
     ]
 
 

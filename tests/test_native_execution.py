@@ -66,6 +66,7 @@ from evrptw.native_execution import (
     NativeCandidateRoundResult,
     Stage052NativeExecutionConfig,
     _append_typed_array,
+    _decode_full_native_canonical_event_journal,
     _decode_full_native_causal_journal,
     _decode_native_initial_state_receipt,
     _full_native_digest,
@@ -200,12 +201,42 @@ def _candidate_plan_fixture() -> Instance:
     )
 
 
+def _feasible_route_merge_fixture() -> Instance:
+    return Instance(
+        "feasible_route_merge_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 1_000.0, 0.0),
+            Node("A", NodeType.CUSTOMER, 10.0, 0.0, 8.0, 0.0, 1_000.0, 0.0),
+            Node("B", NodeType.CUSTOMER, 1.0, 0.0, 4.0, 0.0, 1_000.0, 0.0),
+            Node("C", NodeType.CUSTOMER, 2.0, 0.0, 4.0, 0.0, 1_000.0, 0.0),
+        ),
+        Vehicle(100.0, 10.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+
+
 def _native_lexical_rank(context: NativeInstanceContext) -> np.ndarray:
     ordered_names = sorted(context.node_names)
     rank_by_name = {name: rank for rank, name in enumerate(ordered_names)}
     return np.asarray(
         [rank_by_name[name] for name in context.node_names],
         dtype=np.int64,
+    )
+
+
+def _empty_candidate_incremental_state(
+    candidate_count: int,
+) -> tuple[np.ndarray, ...]:
+    offsets = np.zeros(candidate_count + 1, dtype=np.int64)
+    return (
+        offsets.copy(),
+        np.empty(0, dtype=np.int64),
+        offsets.copy(),
+        np.empty(0, dtype=np.float64),
+        offsets.copy(),
+        np.empty(0, dtype=np.float64),
+        offsets.copy(),
+        np.empty(0, dtype=np.float64),
     )
 
 
@@ -257,6 +288,74 @@ def _full_native_solve_kwargs() -> dict[str, object]:
         "cache_incremental_config": CacheIncrementalConfig(enabled=True),
         "stage04_config": Stage04Config(),
     }
+
+
+@pytest.mark.parametrize("max_iterations", [3, 4])
+def test_full_native_feasible_route_merge_matches_python_candidate_control(
+    max_iterations: int,
+) -> None:
+    from evrptw.neighborhoods import VehicleOperatorConfig
+
+    instance = _feasible_route_merge_fixture()
+    solve_kwargs = {
+        "seed": 2,
+        "max_iterations": max_iterations,
+        "time_limit_seconds": 30.0,
+        "initial_customer_sequences": (("A",), ("B",), ("C",)),
+        "screening_config": CheapScreeningConfig(),
+        "cache_incremental_config": CacheIncrementalConfig(enabled=True),
+        "stage04_config": Stage04Config(),
+        "vehicle_operator_config": VehicleOperatorConfig(
+            max_route_elimination_attempts=1
+        ),
+    }
+    python_result = solve_alns(
+        instance,
+        **solve_kwargs,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        instance,
+        **solve_kwargs,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.neighborhood_events == python_result.neighborhood_events
+    assert native_result.stage04_event_log == python_result.stage04_event_log
+    accepted_merges = [
+        event
+        for event in native_result.neighborhood_events
+        if event["operator"] == "route_merge"
+        and event["status"] == "candidate_proposed"
+        and event["accepted"] is True
+    ]
+    assert len(accepted_merges) == 1
+    assert accepted_merges[0]["vehicle_reduction"] is True
+
+
+def test_full_native_feasible_route_merge_has_canonical_semantic_journal() -> None:
+    from evrptw.neighborhoods import VehicleOperatorConfig
+
+    result = solve_alns(
+        _feasible_route_merge_fixture(),
+        seed=2,
+        max_iterations=3,
+        time_limit_seconds=30.0,
+        initial_customer_sequences=(("A",), ("B",), ("C",)),
+        screening_config=CheapScreeningConfig(),
+        cache_incremental_config=CacheIncrementalConfig(enabled=True),
+        stage04_config=Stage04Config(),
+        vehicle_operator_config=VehicleOperatorConfig(
+            max_route_elimination_attempts=1
+        ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert result.measurement_trace is not None
+    assert result.measurement_trace.runtime_semantic_events
 
 
 def _solve_host_scheduler_process(
@@ -398,7 +497,7 @@ def test_explicit_native_protocol_is_the_only_guard_bypass() -> None:
         solve_alns(
             instance,
             seed=2014,
-            max_iterations=1,
+            max_iterations=2,
             time_limit_seconds=2.0,
             native_kernel_config=native,
             candidate_control_config=control,
@@ -559,6 +658,7 @@ def test_native_candidate_round_is_one_structured_soa_call() -> None:
             [1.0, context.reachability_epsilon, 0.0, 0.0], dtype=np.float64
         ),
         np.zeros((len(candidates), 6), dtype=np.float64),
+        *_empty_candidate_incremental_state(len(candidates)),
         np.asarray([0], dtype=np.int64),
         np.asarray([], dtype=np.int64),
         np.asarray([], dtype=np.int64),
@@ -588,6 +688,8 @@ def test_native_candidate_round_is_one_structured_soa_call() -> None:
         exact_payload=exact_payload_v2,
         screening_sha256=screening_v2[6],
         counters=counters_v2,
+        propagation_codes=payload_v2[10],
+        propagation_metrics=payload_v2[11],
     )
     assert recomputed == transaction_sha256_v2
     assert _candidate_round_digest(
@@ -600,6 +702,8 @@ def test_native_candidate_round_is_one_structured_soa_call() -> None:
         exact_payload=exact_payload_v2,
         screening_sha256=screening_v2[6],
         counters=counters_v2,
+        propagation_codes=payload_v2[10],
+        propagation_metrics=payload_v2[11],
     ) != transaction_sha256_v2
     changed_counters = counters_v2.copy()
     changed_counters[9] = 1
@@ -613,7 +717,80 @@ def test_native_candidate_round_is_one_structured_soa_call() -> None:
         exact_payload=exact_payload_v2,
         screening_sha256=screening_v2[6],
         counters=changed_counters,
+        propagation_codes=payload_v2[10],
+        propagation_metrics=payload_v2[11],
     ) != transaction_sha256_v2
+
+
+def test_native_candidate_round_owned_plan_covers_ties_duplicates_and_budget_edge() -> None:
+    from evrptw import _core as native_core
+
+    instance = Instance(
+        "candidate_round_owned_plan_fixture",
+        (
+            Node("D0", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+            Node("C2", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(10.0, 100.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    route_offsets = np.asarray([0, 1, 2, 3], dtype=np.int64)
+    route_indices = np.asarray(
+        [
+            context.name_to_index["C2"],
+            context.name_to_index["C1"],
+            context.name_to_index["C1"],
+        ],
+        dtype=np.int64,
+    )
+    candidate_ids = np.asarray([41, 17, 99], dtype=np.int64)
+
+    def run(exact_budget: int) -> tuple[object, ...]:
+        receipt = np.asarray([2, 0, 0, 0, 0, 0], dtype=np.int64)
+        return native_core.candidate_round_transaction_v2(
+            context.node_kind,
+            context.demand,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.reachable,
+            context.vehicle,
+            route_offsets,
+            route_indices,
+            candidate_ids,
+            _native_lexical_rank(context),
+            np.asarray(
+                [1.0, context.reachability_epsilon, 0.0, 0.0],
+                dtype=np.float64,
+            ),
+            np.zeros((3, 6), dtype=np.float64),
+            *_empty_candidate_incremental_state(3),
+            np.asarray([0], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+            np.zeros(3, dtype=np.int64),
+            np.asarray([2, exact_budget, 1], dtype=np.int64),
+            np.asarray([10.0], dtype=np.float64),
+            np.asarray([128], dtype=np.int64),
+            np.asarray([7, 11, 13], dtype=np.int64),
+            receipt,
+        )
+
+    exact = run(2)
+    assert exact[1].tolist() == [2, 2, 5]
+    assert exact[2].tolist() == [-1, -1, 17]
+    assert exact[4].tolist() == [17, 41]
+    assert exact[7].tolist() == [3, 2, 2, 0, 0, 0, 2, 0, 1, 0]
+
+    one_short = run(1)
+    assert one_short[1].tolist() == [4, 4, 4]
+    assert one_short[2].tolist() == [-1, -1, 17]
+    assert one_short[4].tolist() == []
+    assert one_short[3][:, 1].tolist() == [3, 3, 6]
+    assert one_short[7].tolist() == [3, 2, 2, 0, 0, 0, 0, 2, 1, 0]
 
 
 def test_native_candidate_round_thread_launch_failure_joins_and_preserves_receipt() -> None:
@@ -962,10 +1139,12 @@ def test_evaluator_per_solve_protocol_crosses_python_native_boundary_once(
     monkeypatch.setattr(native_core, "candidate_round_transaction_v2", counted)
     monkeypatch.setattr(native_core, "screen_route_batch_transaction_v2", forbidden)
     monkeypatch.setattr(native_core, "exact_charging_batch_numeric", forbidden)
+    monkeypatch.setattr(native_core, "propagate_routes_numeric", forbidden)
 
     results = evaluator.candidate_route_batch(
         (("C1",), ("C2",), ("C2", "C1")),
         exact_budget=1,
+        base_sequences=(("C1",), ("C2",), ("C1", "C2")),
     )
 
     assert invocations == 1
@@ -975,6 +1154,7 @@ def test_evaluator_per_solve_protocol_crosses_python_native_boundary_once(
     assert transaction_runtime.transaction_count == 1
     assert transaction_runtime.protocol_invocations == 1
     assert control_runtime._pool is None
+    assert evaluator.incremental_propagations == 3
 
 
 def test_per_solve_fixed_work_round_matches_python_candidate_control() -> None:
@@ -1179,8 +1359,10 @@ def test_per_solve_preserves_python_prescreened_ranking_semantics() -> None:
     assert native_control.route_result_hash == python_control.route_result_hash
 
 
+@pytest.mark.parametrize("corruption", ("hash", "propagation"))
 def test_native_candidate_round_hash_mismatch_fails_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
 ) -> None:
     from evrptw import _core as native_core
 
@@ -1193,7 +1375,11 @@ def test_native_candidate_round_hash_mismatch_fails_without_fallback(
 
     def corrupt_hash(*args: object) -> tuple[object, ...]:
         payload = original(*args)
-        return (*payload[:-1], "0" * 64)
+        if corruption == "propagation":
+            metrics = np.array(payload[11], copy=True)
+            metrics[0, 0] += 1.0
+            return (*payload[:11], metrics)
+        return (*payload[:9], "0" * 64, *payload[10:])
 
     monkeypatch.setattr(native_core, "candidate_round_transaction_v2", corrupt_hash)
 
@@ -1338,21 +1524,21 @@ def test_native_candidate_round_failure_does_not_refund_started_exact_work(
 
     failure_message = f"injected {failure_stage} failure"
     if failure_stage == "python_replay":
-        original_selection = CandidateControlRuntime.select_route_candidates
+        original_projection = CandidateControlRuntime.project_route_candidates
 
-        def fail_selection(
+        def fail_projection(
             runtime: CandidateControlRuntime,
             *args: object,
             **kwargs: object,
-        ) -> tuple[int, ...]:
+        ) -> tuple[tuple[int, ...], tuple[dict[str, object], ...]]:
             if runtime is control_runtime:
                 raise RuntimeError(failure_message)
-            return original_selection(runtime, *args, **kwargs)  # type: ignore[arg-type]
+            return original_projection(runtime, *args, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(
             CandidateControlRuntime,
-            "select_route_candidates",
-            fail_selection,
+            "project_route_candidates",
+            fail_projection,
         )
     elif failure_stage == "cache_commit":
         def fail_commit() -> None:
@@ -1498,7 +1684,7 @@ def test_native_candidate_round_validation_failure_does_not_refund_started_exact
             assert isinstance(receipt, np.ndarray)
             receipt[:] = np.asarray([2, 4, 0, 0, 0, 0], dtype=np.int64)
             return payload
-        return (*payload[:-1], "0" * 64)
+        return (*payload[:9], "0" * 64, *payload[10:])
 
     monkeypatch.setattr(native_core, "candidate_round_transaction_v2", corrupt_hash)
 
@@ -3186,7 +3372,63 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
     native_plan_transaction_receipts[worker_count] = receipt
 
 
-def test_native_plan_transaction_reports_typed_cache_execution_coverage() -> None:
+def test_native_initialization_failure_rolls_back_before_same_engine_retry() -> None:
+    """A late initialization failure must leave the public engine pristine."""
+
+    from evrptw import _core as native_core
+
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        10,
+        2,
+        16,
+        1_000_000,
+        16,
+        1,
+        context.reachability_epsilon,
+        1,
+    )
+    initialize_args = (
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        np.arange(len(context.node_names), dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 10], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+
+    engine.inject_initial_mirror_schema_failure_once(1)
+    with pytest.raises(ValueError, match="unexpected number of dimensions"):
+        engine.initialize(*initialize_args)
+    assert engine.initialized() is False
+    failed_cache, failed_budget, failed_attempted, failed_negative = engine.state()
+    assert failed_cache.tolist() == [0] * 11
+    assert failed_budget.tolist()[5:8] == [0, 0, 0]
+    assert failed_attempted == 0
+    assert failed_negative.tolist() == [0] * 5
+
+    engine.initialize(*initialize_args)
+    assert engine.initialized() is True
+    retry_cache, retry_budget, retry_attempted, retry_negative = engine.state()
+    assert retry_cache.tolist()[3] == 1
+    assert retry_budget.tolist()[5:8] == [1, 1, 0]
+    assert retry_attempted == 1
+    assert retry_negative.tolist() == [0] * 5
+
+
+def test_native_plan_transaction_reports_typed_cache_execution_coverage(
+    native_host_scheduler_socket: str,
+) -> None:
     """The lifetime receipt reports typed-path coverage without claiming ownership."""
 
     from evrptw import _core as native_core
@@ -3237,6 +3479,31 @@ def test_native_plan_transaction_reports_typed_cache_execution_coverage() -> Non
         np.asarray([1, 2], dtype=np.int64),
     )
     assert transaction[0].tolist() == [0]
+
+    wire = engine.candidate_plan_transaction_wire_payload()
+    counts, wire_digest = native_core.validate_candidate_plan_transaction_wire_v2(
+        *wire
+    )
+    assert counts.tolist()[:6] == [28, len(wire[1]), 4, len(wire[3]), 3, len(wire[5])]
+    assert counts.tolist()[6:] == [len(wire[5][wire[4][0] : wire[4][1]]) // 32, 1]
+    assert wire_digest == transaction[12]
+    native_core.candidate_plan_transaction_wire_host_roundtrip_v2(
+        native_host_scheduler_socket, *wire, 30.0
+    )
+
+    invalid_offsets = wire[0].copy()
+    invalid_offsets[1] = -1
+    with pytest.raises(RuntimeError, match="wire layout is invalid"):
+        native_core.validate_candidate_plan_transaction_wire_v2(
+            invalid_offsets, *wire[1:]
+        )
+
+    invalid_digest = wire[5].copy()
+    invalid_digest[-1] ^= np.uint8(1)
+    with pytest.raises(RuntimeError, match="wire digest mismatch"):
+        native_core.validate_candidate_plan_transaction_wire_v2(
+            *wire[:5], invalid_digest
+        )
 
     flags, digest = engine.cache_execution_coverage_receipt()
     # negative lookup, exact-cache lookup, exact dispatch, exact-cache store,
@@ -4974,6 +5241,7 @@ def test_full_native_v2_one_route_global_multi_round_semantics_match_python(
         time_limit_seconds=10.0,
         **solve_kwargs,
         candidate_control_config=control,
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
     )
     native_result = solve_alns(
         instance,
@@ -4985,6 +5253,7 @@ def test_full_native_v2_one_route_global_multi_round_semantics_match_python(
             _native_config("full_native_alns"),
             candidate_control_config=control,
         ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
     )
 
     assert native_result.feasible == python_result.feasible
@@ -6213,6 +6482,179 @@ def test_native_three_lane_followup_exact_deadline_returns_terminal_payload() ->
     np.testing.assert_allclose(best_after[4], best_before[4])
 
 
+def test_native_three_lane_bootstrap_ordinary_failure_rolls_back_for_retry() -> None:
+    """A late non-deadline bootstrap failure must restore the whole engine."""
+
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        100,
+        100,
+        256,
+        10_000_000,
+        256,
+        100,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    thresholds = np.asarray([4, 8, 3], dtype=np.int64)
+    fractions = np.asarray(
+        [0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64
+    )
+    deadline = np.asarray([30.0], dtype=np.float64)
+    batch = np.asarray([128], dtype=np.int64)
+    state_before = tuple(
+        value.copy() if hasattr(value, "copy") else value
+        for value in engine.state()
+    )
+    lanes_before = tuple(
+        tuple(value.copy() for value in engine.lane_solution_state(lane))
+        for lane in range(3)
+    )
+    best_before = engine.best_solution_payload()
+    stage04_before = tuple(value.copy() for value in engine.full_stage04_state())
+    engine.inject_stage04_boundary_projection_failure_once()
+
+    with pytest.raises(RuntimeError, match="Stage 4 boundary projection"):
+        engine.run_three_lane_bootstrap(
+            3, 512, -1, thresholds, fractions, deadline, batch
+        )
+
+    for expected, observed in zip(state_before, engine.state(), strict=True):
+        np.testing.assert_equal(observed, expected)
+    for lane, expected_state in enumerate(lanes_before):
+        for expected, observed in zip(
+            expected_state, engine.lane_solution_state(lane), strict=True
+        ):
+            np.testing.assert_equal(observed, expected)
+    best_after = engine.best_solution_payload()
+    for index in (0, 1, 3, 4):
+        np.testing.assert_equal(best_after[index], best_before[index])
+    for expected, observed in zip(
+        stage04_before, engine.full_stage04_state(), strict=True
+    ):
+        np.testing.assert_equal(observed, expected)
+    assert engine.run_three_lane_bootstrap(
+        3, 512, -1, thresholds, fractions, deadline, batch
+    )[11].tolist()[0] == 0
+
+
+def test_native_three_lane_followup_ordinary_failure_rolls_back_for_retry() -> None:
+    """A late non-deadline follow-up failure must restore the whole engine."""
+
+    from evrptw import _core as native_core
+
+    instance = _candidate_plan_fixture()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    engine = _native_search_engine(
+        native_core,
+        context,
+        100,
+        100,
+        256,
+        10_000_000,
+        256,
+        100,
+        context.reachability_epsilon,
+        1,
+    )
+    engine.initialize(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        _native_lexical_rank(context),
+        np.asarray([0, 2, 4], dtype=np.int64),
+        np.asarray([1, 2, 3, 4], dtype=np.int64),
+        np.asarray([2014, 10, 128, 1, 100], dtype=np.int64),
+        np.asarray([30.0], dtype=np.float64),
+    )
+    stage04_integer, stage04_float = _native_stage04_arrays(Stage04Config())
+    engine.configure_stage04(stage04_integer, stage04_float)
+    thresholds = np.asarray([4, 8, 3], dtype=np.int64)
+    fractions = np.asarray(
+        [0.05, 0.10, 0.10, 0.20, 0.20, 0.35], dtype=np.float64
+    )
+    deadline = np.asarray([30.0], dtype=np.float64)
+    batch = np.asarray([128], dtype=np.int64)
+    engine.run_three_lane_bootstrap(
+        3, 512, -1, thresholds, fractions, deadline, batch
+    )
+    state_before = tuple(
+        value.copy() if hasattr(value, "copy") else value
+        for value in engine.state()
+    )
+    lanes_before = tuple(
+        tuple(value.copy() for value in engine.lane_solution_state(lane))
+        for lane in range(3)
+    )
+    best_before = engine.best_solution_payload()
+    stage04_before = tuple(value.copy() for value in engine.full_stage04_state())
+    followup_args = (
+        1,
+        10,
+        0.1,
+        3,
+        512,
+        2,
+        4,
+        50,
+        128,
+        3,
+        2,
+        -1,
+        thresholds,
+        fractions,
+        deadline,
+        batch,
+    )
+    engine.inject_stage04_boundary_projection_failure_once()
+
+    with pytest.raises(RuntimeError, match="Stage 4 boundary projection"):
+        engine.run_three_lane_followup(*followup_args)
+
+    for expected, observed in zip(state_before, engine.state(), strict=True):
+        np.testing.assert_equal(observed, expected)
+    for lane, expected_state in enumerate(lanes_before):
+        for expected, observed in zip(
+            expected_state, engine.lane_solution_state(lane), strict=True
+        ):
+            np.testing.assert_equal(observed, expected)
+    best_after = engine.best_solution_payload()
+    for index in (0, 1, 3, 4):
+        np.testing.assert_equal(best_after[index], best_before[index])
+    for expected, observed in zip(
+        stage04_before, engine.full_stage04_state(), strict=True
+    ):
+        np.testing.assert_equal(observed, expected)
+    assert engine.run_three_lane_followup(*followup_args)[11].tolist()[0] == 0
+
+
 def test_native_global_search_returns_deadline_terminal_without_partial_iteration() -> None:
     from evrptw import _core as native_core
 
@@ -6709,6 +7151,78 @@ def test_full_native_v2_matches_real_c101c5_warm_start(
 
 
 @pytest.mark.external_data
+def test_full_native_v2_releases_gil_during_whole_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from threading import Event
+
+    from evrptw import _core as native_core
+
+    instance_path = Path("data/schneider/c101C5.txt")
+    if not instance_path.exists():
+        pytest.skip("Schneider benchmark data are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    entered_native = Event()
+    returned_native = Event()
+    stop_observer = Event()
+    progress_times_ns: list[int] = []
+    original = native_core.full_native_alns_v2
+
+    def observed_entrypoint(*args: object) -> object:
+        entered_native.set()
+        try:
+            return original(*args)
+        finally:
+            returned_native.set()
+
+    def observe_python_progress() -> None:
+        if not entered_native.wait(timeout=2.0):
+            return
+        while not stop_observer.is_set():
+            if not returned_native.is_set():
+                progress_times_ns.append(time.perf_counter_ns())
+            time.sleep(0)
+
+    monkeypatch.setattr(native_core, "full_native_alns_v2", observed_entrypoint)
+    control = CandidateControlConfig(
+        worker_count=1,
+        max_exact_calls_per_round=100,
+        proposal_top_k=100,
+    )
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C12", "C100"),
+        ("C64", "C30", "C85"),
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        observer = executor.submit(observe_python_progress)
+        try:
+            result = solve_alns(
+                instance,
+                seed=2014,
+                max_iterations=30,
+                time_limit_seconds=10.0,
+                **solve_kwargs,
+                native_execution_config=replace(
+                    _native_config("full_native_alns"),
+                    candidate_control_config=control,
+                ),
+            )
+        finally:
+            stop_observer.set()
+        observer.result(timeout=2.0)
+
+    assert result.objective.vehicle_count > 0
+    assert entered_native.is_set()
+    assert returned_native.is_set()
+    # A single pre-call thread handoff could produce a trivial observation even
+    # if the native body retained the GIL. A sustained observation window proves
+    # that the Python thread ran while the native call was still active.
+    assert len(progress_times_ns) > 1
+    assert progress_times_ns[-1] - progress_times_ns[0] > 10_000_000
+
+
+@pytest.mark.external_data
 @pytest.mark.parametrize("max_iterations", [4, 5, 6, 7, 8, 9, 10, 11, 12, 22, 30])
 def test_full_native_v2_matches_real_c101_21_followup_iterations(
     max_iterations: int,
@@ -6975,9 +7489,11 @@ def test_host_scheduler_v2_paired_fixed_work_matches_python_candidate_control(
 @pytest.mark.external_data
 @pytest.mark.parametrize("instance_name", ["c101C5", "c101_21", "r101_21", "rc101_21"])
 @pytest.mark.parametrize("seed", [2014, 2015, 2016])
+@pytest.mark.parametrize("compute_threads", [1, 4])
 def test_full_native_v2_paired_fixed_work_matches_python_candidate_control(
     instance_name: str,
     seed: int,
+    compute_threads: int,
 ) -> None:
     instance_path = Path(f"data/schneider/{instance_name}.txt")
     warm_start_path = Path(
@@ -7021,6 +7537,8 @@ def test_full_native_v2_paired_fixed_work_matches_python_candidate_control(
         native_execution_config=replace(
             _native_config("full_native_alns"),
             candidate_control_config=control,
+            shard_processes=24 // compute_threads,
+            compute_threads_per_shard=compute_threads,
         ),
     )
 
@@ -8536,7 +9054,7 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
         initial_four_lane_state_sha256 = hashlib.sha256(search_evidence).hexdigest()
         receipts.append((counts, request_sha256))
         full_payload = original(*args)
-        initial_receipt = full_payload[12]
+        initial_receipt = full_payload[13]
         assert isinstance(initial_receipt, tuple) and len(initial_receipt) == 6
         flags = initial_receipt[0]
         assert isinstance(flags, np.ndarray)
@@ -8651,6 +9169,290 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
         host_state = native_core.native_search_initial_state_host_v2(
             str(endpoint), *captured[0]
         )
+        session_state, session_token = native_core.candidate_session_open_host_v2(
+            str(endpoint), *captured[0]
+        )
+        assert len(session_token) == 64
+        initial_route_offsets = np.asarray(captured[0][11], dtype=np.int64)
+        initial_route_indices = np.asarray(captured[0][12], dtype=np.int64)
+        candidate_indices = np.ascontiguousarray(
+            initial_route_indices[::-1], dtype=np.int64
+        )
+        customer_indices = np.flatnonzero(
+            np.asarray(captured[0][0], dtype=np.int64) == 1
+        ).astype(np.int64)
+        lexical_rank = np.asarray(captured[0][8], dtype=np.int64)
+        expected_customers = np.ascontiguousarray(
+            customer_indices[np.argsort(lexical_rank[customer_indices])],
+            dtype=np.int64,
+        )
+        base_control = np.asarray(captured[0][13], dtype=np.int64)
+        protocol_control = np.asarray(captured[0][15], dtype=np.int64)
+        protocol_options = np.asarray(captured[0][16], dtype=np.float64)
+        request_context = NativeKernelRuntime.build(
+            _fixture_instance(), NativeKernelConfig()
+        ).context
+        local_engine = _native_search_engine(
+            native_core,
+            request_context,
+            int(base_control[4]),
+            int(protocol_control[2]),
+            int(protocol_control[7]),
+            int(protocol_control[8]),
+            int(protocol_control[7]),
+            int(protocol_control[1]),
+            float(protocol_options[1]),
+            1,
+        )
+        local_engine.initialize(
+            *captured[0][:9],
+            captured[0][11],
+            captured[0][12],
+            captured[0][13],
+            np.asarray([30.0], dtype=np.float64),
+        )
+        shared_engine = _native_search_engine(
+            native_core,
+            request_context,
+            int(base_control[4]),
+            int(protocol_control[2]),
+            int(protocol_control[7]),
+            int(protocol_control[8]),
+            int(protocol_control[7]),
+            int(protocol_control[1]),
+            float(protocol_options[1]),
+            1,
+        )
+        shared_engine.initialize(
+            *captured[0][:9],
+            captured[0][11],
+            captured[0][12],
+            captured[0][13],
+            np.asarray([30.0], dtype=np.float64),
+        )
+        shared_transaction_wire = (
+            shared_engine._test_evaluate_plans_shared_executor(
+                np.asarray(
+                    [0, len(initial_route_offsets) - 1], dtype=np.int64
+                ),
+                initial_route_offsets,
+                candidate_indices,
+                np.asarray([1, 2, 0], dtype=np.int64),
+                np.asarray([30.0], dtype=np.float64),
+                np.asarray([int(base_control[2])], dtype=np.int64),
+                expected_customers,
+            )
+        )
+        local_engine.evaluate_plans(
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 0], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([int(base_control[2])], dtype=np.int64),
+            expected_customers,
+        )
+        local_transaction_wire = (
+            local_engine.candidate_plan_transaction_wire_payload()
+        )
+        transaction_wire = native_core.candidate_session_execute_host_v2(
+            str(endpoint),
+            session_token,
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 0], dtype=np.int64),
+            30.0,
+            int(np.asarray(captured[0][13], dtype=np.int64)[2]),
+            expected_customers,
+            np.asarray([0, 0, 1, 0], dtype=np.int64),
+        )
+        wire_counts, wire_digest = (
+            native_core.validate_candidate_plan_transaction_wire_v2(
+                *transaction_wire
+            )
+        )
+        assert wire_counts[6] == 2
+        assert wire_counts[7] == 1
+        assert len(wire_digest) == 64
+        for actual, expected in zip(
+            transaction_wire, local_transaction_wire, strict=True
+        ):
+            assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+        for actual, expected in zip(
+            shared_transaction_wire, local_transaction_wire, strict=True
+        ):
+            assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+        repeated_wire = native_core.candidate_session_execute_host_v2(
+            str(endpoint),
+            session_token,
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 1], dtype=np.int64),
+            30.0,
+            int(np.asarray(captured[0][13], dtype=np.int64)[2]),
+            expected_customers,
+            np.asarray([0, 0, 1, 0], dtype=np.int64),
+        )
+        local_engine.evaluate_plans(
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 1], dtype=np.int64),
+            np.asarray([30.0], dtype=np.float64),
+            np.asarray([int(base_control[2])], dtype=np.int64),
+            expected_customers,
+        )
+        repeated_local_wire = (
+            local_engine.candidate_plan_transaction_wire_payload()
+        )
+        repeated_shared_wire = (
+            shared_engine._test_evaluate_plans_shared_executor(
+                np.asarray(
+                    [0, len(initial_route_offsets) - 1], dtype=np.int64
+                ),
+                initial_route_offsets,
+                candidate_indices,
+                np.asarray([1, 2, 1], dtype=np.int64),
+                np.asarray([30.0], dtype=np.float64),
+                np.asarray([int(base_control[2])], dtype=np.int64),
+                expected_customers,
+            )
+        )
+        repeated_integer_offsets = np.asarray(repeated_wire[0], dtype=np.int64)
+        repeated_integer_values = np.asarray(repeated_wire[1], dtype=np.int64)
+        np.testing.assert_array_equal(
+            repeated_integer_values[
+                repeated_integer_offsets[8] : repeated_integer_offsets[9]
+            ],
+            np.asarray([1], dtype=np.int64),
+        )
+        repeated_counts, _ = (
+            native_core.validate_candidate_plan_transaction_wire_v2(
+                *repeated_wire
+            )
+        )
+        assert repeated_counts[6] == 2
+        for actual, expected in zip(
+            repeated_wire, repeated_local_wire, strict=True
+        ):
+            assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+        for actual, expected in zip(
+            repeated_shared_wire, repeated_local_wire, strict=True
+        ):
+            assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
+        _, rollback_token = native_core.candidate_session_open_host_v2(
+            str(endpoint), *captured[0]
+        )
+        deferred_flags = np.asarray([0, 0, 1, 0, 1], dtype=np.int64)
+        deferred_wire = native_core.candidate_session_execute_host_v2(
+            str(endpoint),
+            rollback_token,
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 0], dtype=np.int64),
+            30.0,
+            int(base_control[2]),
+            expected_customers,
+            deferred_flags,
+        )
+        with pytest.raises(RuntimeError, match="unresolved transaction"):
+            native_core.candidate_session_execute_host_v2(
+                str(endpoint),
+                rollback_token,
+                np.asarray(
+                    [0, len(initial_route_offsets) - 1], dtype=np.int64
+                ),
+                initial_route_offsets,
+                candidate_indices,
+                np.asarray([1, 2, 1], dtype=np.int64),
+                30.0,
+                int(base_control[2]),
+                expected_customers,
+                deferred_flags,
+            )
+        native_core.candidate_session_finish_transaction_host_v2(
+            str(endpoint), rollback_token, False, 30.0
+        )
+        replayed_wire = native_core.candidate_session_execute_host_v2(
+            str(endpoint),
+            rollback_token,
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 0], dtype=np.int64),
+            30.0,
+            int(base_control[2]),
+            expected_customers,
+            deferred_flags,
+        )
+        for candidate_wire in (deferred_wire, replayed_wire):
+            counts, digest = (
+                native_core.validate_candidate_plan_transaction_wire_v2(
+                    *candidate_wire
+                )
+            )
+            assert counts[6] == 2
+            assert len(digest) == 64
+        native_core.candidate_session_finish_transaction_host_v2(
+            str(endpoint), rollback_token, True, 30.0
+        )
+        _, ack_loss_token = native_core.candidate_session_open_host_v2(
+            str(endpoint), *captured[0]
+        )
+        with pytest.raises(RuntimeError, match="acknowledgement loss without fallback"):
+            native_core._test_candidate_session_execute_ack_loss_v2(
+                str(endpoint),
+                ack_loss_token,
+                np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+                initial_route_offsets,
+                candidate_indices,
+                np.asarray([1, 2, 0], dtype=np.int64),
+                30.0,
+                int(base_control[2]),
+                expected_customers,
+                deferred_flags,
+            )
+        ack_loss_replayed = None
+        retry_deadline = time.monotonic() + 2.0
+        while ack_loss_replayed is None:
+            try:
+                ack_loss_replayed = native_core.candidate_session_execute_host_v2(
+                    str(endpoint),
+                    ack_loss_token,
+                    np.asarray(
+                        [0, len(initial_route_offsets) - 1], dtype=np.int64
+                    ),
+                    initial_route_offsets,
+                    candidate_indices,
+                    np.asarray([1, 2, 0], dtype=np.int64),
+                    30.0,
+                    int(base_control[2]),
+                    expected_customers,
+                    deferred_flags,
+                )
+            except RuntimeError as error:
+                if "unresolved transaction" not in str(error) or time.monotonic() >= retry_deadline:
+                    raise
+                time.sleep(0.01)
+        native_core.candidate_session_finish_transaction_host_v2(
+            str(endpoint), ack_loss_token, False, 30.0
+        )
+        native_core.candidate_session_close_host_v2(
+            str(endpoint), ack_loss_token, 30.0
+        )
+        native_core.candidate_session_close_host_v2(
+            str(endpoint), rollback_token, 30.0
+        )
+        native_core.candidate_session_close_host_v2(
+            str(endpoint), session_token, 30.0
+        )
+        with pytest.raises(RuntimeError, match="close identity mismatch"):
+            native_core.candidate_session_close_host_v2(
+                str(endpoint), session_token, 30.0
+            )
         insufficient_budget = list(captured[0])
         budget_control = np.array(insufficient_budget[13], copy=True)
         budget_control[4] = 0
@@ -8665,14 +9467,53 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
             )
         )
 
+    serialization_endpoint = tmp_path / "candidate-output-failure.sock"
+    with NativeHostScheduler(
+        serialization_endpoint,
+        enable_fault_injection=True,
+        production_fault="candidate_execute_output_failure",
+    ):
+        _, serialization_token = native_core.candidate_session_open_host_v2(
+            str(serialization_endpoint), *captured[0]
+        )
+        execute_arguments = (
+            str(serialization_endpoint),
+            serialization_token,
+            np.asarray([0, len(initial_route_offsets) - 1], dtype=np.int64),
+            initial_route_offsets,
+            candidate_indices,
+            np.asarray([1, 2, 0], dtype=np.int64),
+            30.0,
+            int(base_control[2]),
+            expected_customers,
+            deferred_flags,
+        )
+        with pytest.raises(RuntimeError, match="candidate execute output failure"):
+            native_core.candidate_session_execute_host_v2(*execute_arguments)
+        replay_after_output_failure = (
+            native_core.candidate_session_execute_host_v2(*execute_arguments)
+        )
+        assert len(replay_after_output_failure) == 6
+        native_core.candidate_session_finish_transaction_host_v2(
+            str(serialization_endpoint), serialization_token, False, 30.0
+        )
+        native_core.candidate_session_close_host_v2(
+            str(serialization_endpoint), serialization_token, 30.0
+        )
+
     np.testing.assert_array_equal(host_counts, local_counts)
     assert host_sha256 == local_sha256
     np.testing.assert_array_equal(recovered_counts, local_counts)
     assert recovered_sha256 == local_sha256
     assert host_state[4:] == local_state[4:]
+    assert session_state[4:] == local_state[4:]
     for actual, expected in zip(host_state[0], local_state[0], strict=True):
         np.testing.assert_array_equal(actual, expected)
     for actual, expected in zip(host_state[1:4], local_state[1:4], strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    for actual, expected in zip(session_state[0], local_state[0], strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    for actual, expected in zip(session_state[1:4], local_state[1:4], strict=True):
         np.testing.assert_array_equal(actual, expected)
 
 
@@ -8729,11 +9570,24 @@ def test_host_initial_state_rejects_self_hashed_invalid_path_before_ack(
 def test_host_exact_rejects_self_hashed_invalid_path_before_ack(
     tmp_path: Path,
 ) -> None:
+    from evrptw import _core as native_core
+
     endpoint = tmp_path / "native-exact-corruption.sock"
     before = _stage052_shared_memory_names()
-    config = replace(
-        _native_config("host_scheduler"),
-        scheduler_socket_path=str(endpoint),
+    context = NativeKernelRuntime.build(
+        _fixture_instance(), NativeKernelConfig()
+    ).context
+    exact_args = (
+        context.node_kind,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.vehicle,
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2.0], dtype=np.float64),
+        np.asarray([128], dtype=np.int64),
     )
     with NativeHostScheduler(
         endpoint,
@@ -8741,25 +9595,15 @@ def test_host_exact_rejects_self_hashed_invalid_path_before_ack(
         production_fault="exact_path_offset_oob",
     ):
         with pytest.raises(RuntimeError, match="exact output schema is invalid"):
-            solve_alns(
-                _fixture_instance(),
-                seed=2014,
-                max_iterations=1,
-                time_limit_seconds=2.0,
-                **_full_native_solve_kwargs(),
-                native_execution_config=config,
+            native_core.exact_charging_batch_host_v2(
+                str(endpoint), *exact_args
             )
-        # The production fault is one-shot.  A second solve proves that the
+        # The production fault is one-shot. A second exact request proves that the
         # scheduler reclaimed the unacknowledged output and stayed healthy.
-        recovered = solve_alns(
-            _fixture_instance(),
-            seed=2014,
-            max_iterations=1,
-            time_limit_seconds=2.0,
-            **_full_native_solve_kwargs(),
-            native_execution_config=config,
+        recovered = native_core.exact_charging_batch_host_v2(
+            str(endpoint), *exact_args
         )
-        assert recovered.feasible
+        assert recovered[2].tolist() == [0]
 
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -8945,6 +9789,114 @@ def test_full_native_v2_causal_journal_differential_matches_python_control() -> 
     )
 
 
+@pytest.mark.parametrize("max_iterations", [1, 2, 12])
+def test_full_native_runtime_semantic_events_keep_native_causal_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    max_iterations: int,
+) -> None:
+    """Every rich canonical row must retain its one-to-one native source ID."""
+
+    import evrptw.alns as alns_module
+
+    captured: dict[str, FullNativeALNSResult] = {}
+    original = alns_module.execute_full_native_alns
+
+    def capture(
+        *args: object,
+        **kwargs: object,
+    ) -> FullNativeALNSResult:
+        result = original(*args, **kwargs)  # type: ignore[arg-type]
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(alns_module, "execute_full_native_alns", capture)
+    instance = _fixture_instance() if max_iterations == 1 else _candidate_plan_fixture()
+    solve_kwargs = _full_native_solve_kwargs()
+    if max_iterations > 1:
+        solve_kwargs["initial_customer_sequences"] = (
+            ("C1", "C2", "C3"),
+            ("C4",),
+        )
+        solve_kwargs["stage04_config"] = replace(
+            solve_kwargs["stage04_config"],  # type: ignore[arg-type]
+            auto_temperature=False,
+        )
+    result = solve_alns(
+        instance,
+        seed=2014,
+        max_iterations=max_iterations,
+        time_limit_seconds=30.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            100,
+            watchdog_seconds=30.0,
+        ),
+        measurement_config=MeasurementConfig(
+            record_runtime_semantic_events=True,
+        ),
+        **solve_kwargs,
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    runtime_events = trace.runtime_semantic_events
+    native_journal = captured["result"].canonical_event_journal
+    assert len(runtime_events) == len(native_journal.event_ids)
+    assert [event.get("runtime_causal_event_id") for event in runtime_events] == [
+        int(event_id) for event_id in native_journal.event_ids
+    ]
+
+
+def test_full_native_stage04_segment_events_have_native_source_rows() -> None:
+    """Every emitted Stage 4 update/skip must be owned by the native journal."""
+
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C1", "C2", "C3"),
+        ("C4",),
+    )
+    solve_kwargs["stage04_config"] = replace(
+        solve_kwargs["stage04_config"],  # type: ignore[arg-type]
+        auto_temperature=False,
+        segment_length=1,
+        min_calls_per_operator=1,
+        reheat_enabled=False,
+        restart_enabled=False,
+        intensification_enabled=False,
+    )
+    result = solve_alns(
+        _candidate_plan_fixture(),
+        seed=2014,
+        max_iterations=2,
+        time_limit_seconds=30.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            100,
+            watchdog_seconds=30.0,
+        ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
+        **solve_kwargs,
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    stage04_rows = [
+        event
+        for event in trace.runtime_semantic_events
+        if event["semantic_stream"] == "stage04"
+        and str(event.get("type", "")).startswith("stage04_segment_")
+    ]
+    assert len(stage04_rows) == 38
+    assert all(event["runtime_native_subject_id"] >= 0 for event in stage04_rows)
+    assert all(
+        event["runtime_native_status_code"]
+        == int(event["type"] == "stage04_segment_update")
+        for event in stage04_rows
+    )
+
+
 def test_full_native_v2_fixed_work_boundary_records_deadline_causal_stream() -> None:
     """A fixed-work boundary is the axis where the deadline stream is mandatory."""
 
@@ -8985,6 +9937,408 @@ def test_full_native_v2_fixed_work_boundary_records_deadline_causal_stream() -> 
         )
 
 
+def test_full_native_fixed_work_boundary_keeps_one_native_terminal_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native budget boundary must not be synthesized again by Python."""
+
+    import evrptw.alns as alns_module
+
+    captured: dict[str, FullNativeALNSResult] = {}
+    original = alns_module.execute_full_native_alns
+
+    def capture(*args: object, **kwargs: object) -> FullNativeALNSResult:
+        native = original(*args, **kwargs)  # type: ignore[arg-type]
+        captured["result"] = native
+        return native
+
+    monkeypatch.setattr(alns_module, "execute_full_native_alns", capture)
+    result = solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=120.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            1,
+            watchdog_seconds=120.0,
+        ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
+        **_full_native_solve_kwargs(),
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    events = trace.runtime_semantic_events
+    journal = captured["result"].canonical_event_journal
+    assert len(events) == len(journal.event_ids)
+    assert [event["runtime_causal_event_id"] for event in events] == [
+        int(event_id) for event_id in journal.event_ids
+    ]
+    assert [event["semantic_stream"] for event in events].count("deadline") == 1
+    assert [event["semantic_stream"] for event in events].count("termination") == 1
+    assert events[-1]["semantic_stream"] == "termination"
+
+
+def test_full_native_bootstrap_mid_round_budget_is_atomic() -> None:
+    """A budget hit inside bootstrap must discard the whole semantic round."""
+
+    common = {
+        "seed": 2014,
+        "max_iterations": 1,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            2,
+            watchdog_seconds=120.0,
+        ),
+        "measurement_config": MeasurementConfig(
+            record_runtime_semantic_events=True,
+        ),
+        **_full_native_solve_kwargs(),
+    }
+    python_result = solve_alns(
+        _fixture_instance(),
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=CandidateControlConfig(worker_count=1),
+    )
+    native_result = solve_alns(
+        _fixture_instance(),
+        **common,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.exact_started_calls == python_result.exact_started_calls == 2
+    assert native_result.effective_iterations == python_result.effective_iterations == 0
+    assert native_result.objective == python_result.objective
+    assert native_result.customer_sequences == python_result.customer_sequences
+    trace = native_result.measurement_trace
+    assert trace is not None
+    assert not any(
+        event["semantic_stream"] in {"operator", "candidate_state"}
+        and event.get("iteration") == 0
+        for event in trace.runtime_semantic_events
+    )
+
+
+def test_full_native_bootstrap_reheat_has_native_source_row() -> None:
+    """A bootstrap reheat must close the native-row to rich-event projection."""
+
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C1", "C2", "C3"),
+        ("C4",),
+    )
+    solve_kwargs["stage04_config"] = replace(
+        solve_kwargs["stage04_config"],  # type: ignore[arg-type]
+        auto_temperature=False,
+        reheat_stagnation_threshold=1,
+        restart_stagnation_threshold=20,
+    )
+    result = solve_alns(
+        _candidate_plan_fixture(),
+        seed=2014,
+        max_iterations=2,
+        time_limit_seconds=30.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            100,
+            watchdog_seconds=30.0,
+        ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
+        **solve_kwargs,
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    reheats = [
+        event
+        for event in trace.runtime_semantic_events
+        if event.get("type") == "stage04_reheat"
+    ]
+    assert reheats
+    assert all(event["runtime_native_subject_id"] == 100 for event in reheats)
+
+
+def test_full_native_restart_and_intensification_end_have_native_source_rows() -> None:
+    """Restart and intensification completion must close their native rows."""
+
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (("C1", "C2", "C3", "C4"),)
+    solve_kwargs["stage04_config"] = replace(
+        solve_kwargs["stage04_config"],  # type: ignore[arg-type]
+        auto_temperature=False,
+        reheat_enabled=False,
+        reheat_stagnation_threshold=1,
+        restart_enabled=True,
+        restart_stagnation_threshold=2,
+        max_restarts=1,
+        intensification_enabled=True,
+        intensification_iterations=1,
+    )
+    result = solve_alns(
+        _candidate_plan_fixture(),
+        seed=2014,
+        max_iterations=4,
+        time_limit_seconds=30.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            500,
+            watchdog_seconds=30.0,
+        ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
+        **solve_kwargs,
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    controls = [
+        event
+        for event in trace.runtime_semantic_events
+        if event.get("type")
+        in {"stage04_restart", "stage04_intensification_end"}
+    ]
+    assert [event["type"] for event in controls] == [
+        "stage04_restart",
+        "stage04_intensification_end",
+    ]
+    assert [event["runtime_native_subject_id"] for event in controls] == [101, 102]
+
+
+def test_full_native_runtime_projection_length_mismatch_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing native row must report a canonical mismatch, never IndexError."""
+
+    import evrptw.alns as alns_module
+
+    original = alns_module.execute_full_native_alns
+
+    def truncate(*args: object, **kwargs: object) -> FullNativeALNSResult:
+        native = original(*args, **kwargs)  # type: ignore[arg-type]
+        journal = native.canonical_event_journal
+        row_fields = (
+            "event_ids",
+            "stream_codes",
+            "event_codes",
+            "lane_ids",
+            "operator_ids",
+            "iterations",
+            "transaction_ids",
+            "subject_ids",
+            "status_codes",
+            "flags",
+        )
+        return replace(
+            native,
+            canonical_event_journal=replace(
+                journal,
+                **{
+                    field: np.asarray(getattr(journal, field), dtype=np.int64)[:-1]
+                    for field in row_fields
+                },
+            ),
+        )
+
+    monkeypatch.setattr(alns_module, "execute_full_native_alns", truncate)
+    with pytest.raises(RuntimeError, match="canonical event journal"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=30.0,
+            termination_mode="fixed_work",
+            exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+                100,
+                watchdog_seconds=30.0,
+            ),
+            measurement_config=MeasurementConfig(
+                record_runtime_semantic_events=True
+            ),
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
+
+
+def test_full_native_rejects_same_context_exact_result_reordering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Producer-hashed route-result order must bind the rich exact payload."""
+
+    original = Stage03Trace.record_route_evaluation
+    reordered = False
+
+    def reorder_same_context(
+        trace: Stage03Trace,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal reordered
+        original(trace, *args, **kwargs)  # type: ignore[arg-type]
+        exact_rows = [
+            index
+            for index, event in enumerate(trace._runtime_semantic_events)
+            if event.get("semantic_stream") == "exact_result"
+            and event.get("lane") == "initialization"
+        ]
+        if not reordered and len(exact_rows) == 2:
+            first, second = exact_rows
+            trace._runtime_semantic_events[first], trace._runtime_semantic_events[second] = (
+                trace._runtime_semantic_events[second],
+                trace._runtime_semantic_events[first],
+            )
+            reordered = True
+
+    monkeypatch.setattr(Stage03Trace, "record_route_evaluation", reorder_same_context)
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C1", "C2", "C3"),
+        ("C4",),
+    )
+    solve_kwargs["stage04_config"] = replace(
+        solve_kwargs["stage04_config"],  # type: ignore[arg-type]
+        auto_temperature=False,
+        reheat_stagnation_threshold=1,
+        restart_stagnation_threshold=20,
+    )
+    with pytest.raises(RuntimeError, match="rich payload order"):
+        solve_alns(
+            _candidate_plan_fixture(),
+            seed=2014,
+            max_iterations=2,
+            time_limit_seconds=30.0,
+            termination_mode="fixed_work",
+            exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+                100,
+                watchdog_seconds=30.0,
+            ),
+            measurement_config=MeasurementConfig(
+                record_runtime_semantic_events=True
+            ),
+            **solve_kwargs,
+            native_execution_config=_native_config("full_native_alns"),
+        )
+    assert reordered
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("evaluation_id", 999),
+        ("exact_started", False),
+        ("exact_completed", False),
+        ("status", "interrupted_deadline"),
+        ("deadline_boundary", "tampered"),
+    ),
+)
+def test_full_native_rejects_unbound_rich_exact_result_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    """Every rich exact semantic field is derived from producer-hashed work."""
+
+    original = Stage03Trace.record_route_evaluation
+    tampered = False
+
+    def tamper_rich_exact_result(
+        trace: Stage03Trace,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal tampered
+        evaluation_id = original(trace, *args, **kwargs)  # type: ignore[arg-type]
+        if not tampered:
+            for event in trace._runtime_semantic_events:
+                if event.get("semantic_stream") == "exact_result":
+                    event[field] = value
+                    tampered = True
+                    break
+        return evaluation_id
+
+    monkeypatch.setattr(
+        Stage03Trace, "record_route_evaluation", tamper_rich_exact_result
+    )
+    with pytest.raises(RuntimeError, match="rich payload order"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=30.0,
+            measurement_config=MeasurementConfig(
+                record_runtime_semantic_events=True
+            ),
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
+    assert tampered
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "lane_ids",
+        "operator_ids",
+        "iterations",
+        "transaction_ids",
+        "subject_ids",
+        "status_codes",
+        "flags",
+    ),
+)
+def test_full_native_runtime_projection_rejects_source_metadata_misbinding(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """A validly decoded row cannot be attached to a different rich event."""
+
+    import evrptw.alns as alns_module
+
+    original = alns_module.execute_full_native_alns
+
+    def corrupt(*args: object, **kwargs: object) -> FullNativeALNSResult:
+        native = original(*args, **kwargs)  # type: ignore[arg-type]
+        journal = native.canonical_event_journal
+        matching_rows = np.flatnonzero(journal.event_codes == 7)
+        row = int(matching_rows[-1] if field == "transaction_ids" else matching_rows[0])
+        values = np.asarray(getattr(journal, field), dtype=np.int64).copy()
+        if field == "transaction_ids":
+            values[row] = 0
+        elif field == "status_codes":
+            values[row] = 1
+        elif field == "flags":
+            values[row] = 3
+        else:
+            values[row] += 1
+        return replace(
+            native,
+            canonical_event_journal=replace(journal, **{field: values}),
+        )
+
+    monkeypatch.setattr(alns_module, "execute_full_native_alns", corrupt)
+    with pytest.raises(RuntimeError, match="canonical event journal"):
+        solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=30.0,
+            termination_mode="fixed_work",
+            exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+                100,
+                watchdog_seconds=30.0,
+            ),
+            measurement_config=MeasurementConfig(
+                record_runtime_semantic_events=True
+            ),
+            **_full_native_solve_kwargs(),
+            native_execution_config=_native_config("full_native_alns"),
+        )
+
+
 def test_full_native_v2_raw_causal_payload_has_ordered_stream_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9013,7 +10367,7 @@ def test_full_native_v2_raw_causal_payload_has_ordered_stream_counts(
 
     payload = captured["payload"]
     assert isinstance(payload, tuple)
-    assert len(payload) == 13
+    assert len(payload) == 14
     causal = payload[11]
     assert isinstance(causal, tuple)
     assert len(causal) == 12
@@ -9069,7 +10423,7 @@ def test_full_native_v2_raw_causal_payload_marks_fixed_work_boundary(
     )
 
     payload = captured["payload"]
-    assert isinstance(payload, tuple) and len(payload) == 13
+    assert isinstance(payload, tuple) and len(payload) == 14
     causal = payload[11]
     assert isinstance(causal, tuple) and len(causal) == 12
     stream_counts = causal[10]
@@ -9106,6 +10460,93 @@ def _rehash_native_causal_payload(payload: list[object]) -> tuple[object, ...]:
         _append_typed_array(evidence, column)
     payload[11] = hashlib.sha256(evidence).hexdigest()
     return tuple(payload)
+
+
+def _valid_native_canonical_payload() -> tuple[object, ...]:
+    columns = [
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([2, 9], dtype=np.int64),
+        np.asarray([12, 19], dtype=np.int64),
+        np.asarray([1, -1], dtype=np.int64),
+        np.asarray([2, -1], dtype=np.int64),
+        np.asarray([-1, 0], dtype=np.int64),
+        np.asarray([-1, -1], dtype=np.int64),
+        np.asarray([0, -1], dtype=np.int64),
+        np.asarray([0, 0], dtype=np.int64),
+        np.asarray([0, 0], dtype=np.int64),
+    ]
+    stream_counts = np.zeros(11, dtype=np.int64)
+    stream_counts[2] = 1
+    stream_counts[9] = 1
+    evidence = bytearray(b"stage05.2-native-canonical-event-journal-v2")
+    for column in (*columns, stream_counts):
+        _append_typed_array(evidence, column)
+    return (*columns, stream_counts, hashlib.sha256(evidence).hexdigest())
+
+
+def _rehash_native_canonical_payload(payload: list[object]) -> tuple[object, ...]:
+    evidence = bytearray(b"stage05.2-native-canonical-event-journal-v2")
+    for column in payload[:11]:
+        assert isinstance(column, np.ndarray)
+        _append_typed_array(evidence, column)
+    payload[11] = hashlib.sha256(evidence).hexdigest()
+    return tuple(payload)
+
+
+@pytest.mark.parametrize(
+    "column,index,value",
+    (
+        (1, 0, 0),  # stage04 event cannot claim candidate_state stream
+        (2, 0, 20),  # native_failure cannot claim stage04 stream
+        (3, 1, 7),  # termination must have boundary lane identity
+        (4, 1, 7),  # termination must have boundary operator identity
+        (6, 1, 0),  # termination cannot belong to a transaction
+        (7, 0, 1),  # Stage 4 config subject is fixed
+        (8, 0, 1),  # Stage 4 config status is fixed
+        (8, 1, 1),  # non-iteration termination requires a deadline row
+        (9, 0, 1),  # Stage 4 config flags are fixed
+        (9, 1, 1),  # termination flags are exactly zero
+    ),
+)
+def test_native_canonical_payload_rejects_rehashed_semantic_corruption(
+    column: int,
+    index: int,
+    value: int,
+) -> None:
+    payload = list(_valid_native_canonical_payload())
+    values = np.asarray(payload[column], dtype=np.int64).copy()
+    values[index] = value
+    payload[column] = values
+    if column == 1:
+        counts = np.bincount(values, minlength=11).astype(np.int64, copy=False)
+        payload[10] = counts
+    with pytest.raises(RuntimeError):
+        _decode_full_native_canonical_event_journal(
+            _rehash_native_canonical_payload(payload)
+        )
+
+
+def test_native_canonical_payload_binds_deadline_to_terminal_iteration() -> None:
+    columns = [
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([8, 9], dtype=np.int64),
+        np.asarray([18, 19], dtype=np.int64),
+        np.asarray([-1, -1], dtype=np.int64),
+        np.asarray([-1, -1], dtype=np.int64),
+        np.asarray([7, 8], dtype=np.int64),
+        np.asarray([-1, -1], dtype=np.int64),
+        np.asarray([-1, -1], dtype=np.int64),
+        np.asarray([1, 1], dtype=np.int64),
+        np.asarray([1, 0], dtype=np.int64),
+    ]
+    stream_counts = np.zeros(11, dtype=np.int64)
+    stream_counts[8] = 1
+    stream_counts[9] = 1
+    payload: list[object] = [*columns, stream_counts, ""]
+    with pytest.raises(RuntimeError, match="deadline and termination"):
+        _decode_full_native_canonical_event_journal(
+            _rehash_native_canonical_payload(payload)
+        )
 
 
 @pytest.mark.parametrize("corruption", ("missing", "duplicate", "out_of_order"))
@@ -9245,7 +10686,7 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
         primary[2] = alternate[2]
         control = np.asarray(args[13], dtype=np.int64)
         initial_state_receipt = _decode_native_initial_state_receipt(
-            primary[12],
+            primary[13],
             expected_seed=int(control[0]),
             expected_node_kind=np.ascontiguousarray(
                 np.asarray(args[0], dtype=np.int64)
@@ -9263,6 +10704,7 @@ def test_full_native_v2_replay_rejects_current_state_as_global_best(
             exact_journal_sha256=primary[9][1],
             control_journal_sha256=primary[10][2],
             causal_journal_sha256=primary[11][11],
+            canonical_event_journal_sha256=primary[12][11],
             initial_state_receipt=initial_state_receipt,
         )
         return tuple(primary)
@@ -9776,6 +11218,115 @@ def test_host_scheduler_exit_fails_fast_without_local_fallback(tmp_path: Path) -
                 scheduler_socket_path=str(endpoint),
             ),
         )
+
+
+def test_full_native_production_ack_loss_rolls_back_without_fallback(
+    tmp_path: Path,
+) -> None:
+    from evrptw import _core as native_core
+
+    endpoint = tmp_path / "production-ack-loss.sock"
+    config = replace(
+        _native_config("host_scheduler"),
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+        scheduler_socket_path=str(endpoint),
+    )
+    with NativeHostScheduler(endpoint) as scheduler:
+        native_core._test_candidate_session_production_ack_loss_once_v2()
+        with pytest.raises(RuntimeError, match="acknowledgement loss without fallback"):
+            solve_alns(
+                _fixture_instance(),
+                seed=2014,
+                max_iterations=1,
+                time_limit_seconds=2.0,
+                **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+                native_execution_config=config,
+            )
+        assert scheduler.is_running
+        healthy = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=config,
+        )
+        assert healthy.native_execution_statistics["fallback_count"] == 0
+
+
+def test_full_native_commit_release_loss_preserves_commit_point(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "production-commit-release-loss.sock"
+    config = replace(
+        _native_config("host_scheduler"),
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+        scheduler_socket_path=str(endpoint),
+    )
+    with NativeHostScheduler(
+        endpoint,
+        enable_fault_injection=True,
+        production_fault="candidate_commit_release_loss",
+    ) as scheduler:
+        release_lost = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=config,
+        )
+        assert release_lost.native_execution_statistics["fallback_count"] == 0
+        assert scheduler.is_running
+        healthy = solve_alns(
+            _fixture_instance(),
+            seed=2014,
+            max_iterations=1,
+            time_limit_seconds=2.0,
+            **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+            native_execution_config=config,
+        )
+        assert healthy.native_execution_statistics["fallback_count"] == 0
+        assert release_lost.objective == healthy.objective
+        assert release_lost.routes == healthy.routes
+
+
+def test_full_native_commit_preapply_crash_fails_without_local_commit(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "production-commit-preapply-crash.sock"
+    config = replace(
+        _native_config("host_scheduler"),
+        candidate_control_config=CandidateControlConfig(
+            worker_count=1,
+            max_exact_calls_per_round=100,
+            proposal_top_k=100,
+        ),
+        scheduler_socket_path=str(endpoint),
+    )
+    with NativeHostScheduler(
+        endpoint,
+        enable_fault_injection=True,
+        production_fault="candidate_commit_before_apply_crash",
+    ) as scheduler:
+        with pytest.raises(RuntimeError):
+            solve_alns(
+                _fixture_instance(),
+                seed=2014,
+                max_iterations=1,
+                time_limit_seconds=2.0,
+                **_full_native_solve_kwargs(),  # type: ignore[arg-type]
+                native_execution_config=config,
+            )
+        assert not scheduler.is_running
 
 
 def _stage052_shared_memory_names() -> set[str]:
