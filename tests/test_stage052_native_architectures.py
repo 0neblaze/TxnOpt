@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 import subprocess
+import tracemalloc
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _canonical_semantic_events,
     _common_prefix,
     _describe_first_divergence,
+    _load_axis_record,
     _raw_axis_inventory,
     _replay_initial_state_receipt,
     _replay_record,
@@ -63,6 +65,66 @@ from tools.native_build_attestation import (
     committed_wheel_project_entries,
     committed_wheel_project_entry_sha256,
 )
+
+
+def test_axis_loader_releases_large_replay_only_fields_between_records(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for index in range(6):
+        path = tmp_path / f"large-axis-{index}.json"
+        data = json.dumps(
+            {
+                "canonical_semantic_events": "x" * (12 * 1024 * 1024),
+                "canonical_semantic_streams": "y" * (12 * 1024 * 1024),
+                "status": "completed",
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        path.write_bytes(data)
+        path.with_suffix(".json.sha256").write_text(
+            hashlib.sha256(data).hexdigest() + "\n",
+            encoding="ascii",
+        )
+        paths.append(path)
+    del data
+
+    tracemalloc.start()
+    records = tuple(_load_axis_record(path) for path in paths)
+    current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert all(record.payload == {"status": "completed"} for record in records)
+    assert current_bytes < 4 * 1024 * 1024
+    assert peak_bytes < 400 * 1024 * 1024
+
+
+def test_signed_axis_hash_and_parse_share_one_byte_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "axis.json"
+    data = json.dumps({"status": "completed"}, sort_keys=True).encode("utf-8")
+    path.write_bytes(data)
+    path.with_suffix(".json.sha256").write_text(
+        hashlib.sha256(data).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    original_read_bytes = Path.read_bytes
+    reads = 0
+
+    def counted_read_bytes(selected: Path) -> bytes:
+        nonlocal reads
+        if selected == path:
+            reads += 1
+        return original_read_bytes(selected)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+
+    record = _load_axis_record(path)
+
+    assert record.payload == {"status": "completed"}
+    assert reads == 1
 
 
 def test_native_campaign_gate_accepts_complete_architecture_capabilities() -> None:
@@ -687,6 +749,11 @@ def _complete_causal_streams(
                 "runtime_event_id": event_id,
                 "semantic_event_id": event_id,
                 "stream_ordinal": 0,
+                **(
+                    {"status": "iteration_limit"}
+                    if stream_name == "termination"
+                    else {}
+                ),
             }
         )
     return streams
@@ -1315,30 +1382,47 @@ def test_canonical_candidate_event_has_stable_candidate_identity() -> None:
     )
     assert "timestamp_seconds" not in canonical
 
+    trajectory_event = {
+        "lane": "constraint_lane",
+        "track": "constraint_lane",
+        "iteration": 7,
+        "operator": "shaw_related",
+        "status": "prefilter_rejected",
+        "candidate_route_sequences": [["C1", "C2"]],
+        "candidate_objective_key": [],
+    }
+    trajectory_identity = {
+        "lane": "constraint_lane",
+        "iteration": 7,
+        "operator": "shaw_related",
+        "status": "prefilter_rejected",
+        "candidate_route_sequences": [["C1", "C2"]],
+        "candidate_objective_key": [],
+        "ordinal": 0,
+    }
+    trajectory_event["candidate_id"] = hashlib.sha256(
+        json.dumps(
+            trajectory_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     with pytest.raises(ValueError, match="candidate_id"):
-        _semantic_trajectory(
-            {"semantic_trajectory": [{**canonical, "candidate_id": "0" * 64}]}
-        )
-    assert _semantic_trajectory({"semantic_trajectory": [canonical]}) == [
-        canonical
-    ]
-    with pytest.raises(ValueError, match="candidate_route_keys"):
-        _canonical_trace_event({"event_type": "candidate_state"})
-    with pytest.raises(ValueError, match="candidate_route_keys"):
         _semantic_trajectory(
             {
                 "semantic_trajectory": [
-                    {
-                        "event_type": "candidate_state",
-                        "candidate_route_keys": "not-an-array",
-                        "candidate_id": "0" * 64,
-                    }
+                    {**trajectory_event, "candidate_id": "0" * 64}
                 ]
             }
         )
-    with pytest.raises(ValueError, match="only candidate_state"):
+    assert _semantic_trajectory(
+        {"semantic_trajectory": [trajectory_event]}
+    ) == [trajectory_event]
+    with pytest.raises(ValueError, match="candidate_route_keys"):
+        _canonical_trace_event({"event_type": "candidate_state"})
+    with pytest.raises(ValueError, match="lane projection"):
         _semantic_trajectory(
-            {"semantic_trajectory": [{"event_type": "cache_event"}]}
+            {"semantic_trajectory": [{"lane": "constraint_lane"}]}
         )
 
 
@@ -1655,11 +1739,12 @@ def test_v6_axis_replay_rejects_bad_candidate_id_on_wall_clock_axis(
     payload["axis"] = "wall_clock_30"
     payload["semantic_trajectory"] = [
         {
-            "event_type": "candidate_state",
             "lane": "legacy",
             "iteration": 0,
             "operator": "route_elimination",
-            "candidate_route_keys": [],
+            "status": "prefilter_rejected",
+            "candidate_route_sequences": [],
+            "candidate_objective_key": [],
             "candidate_id": "0" * 64,
         }
     ]

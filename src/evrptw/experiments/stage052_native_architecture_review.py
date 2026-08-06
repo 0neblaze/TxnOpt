@@ -14,6 +14,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import orjson
+
 from evrptw.artifacts import ArtifactReader
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES
 from evrptw.experiments.stage052_native_architectures import (
@@ -102,7 +104,7 @@ def _number(payload: Mapping[str, object], key: str) -> float:
 
 def _mapping(payload: Mapping[str, object], key: str) -> Mapping[str, object]:
     value = payload.get(key)
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ValueError(f"{key} must be an object")
     return value
 
@@ -121,10 +123,38 @@ def _verify_signed_json(path: Path) -> Mapping[str, object]:
     observed = hashlib.sha256(data).hexdigest()
     if expected != observed:
         raise RuntimeError(f"SHA-256 mismatch: {path}")
-    payload = json.loads(data)
+    payload = orjson.loads(data)
     if not isinstance(payload, dict):
         raise RuntimeError(f"signed JSON root is not an object: {path}")
     return payload
+
+
+_LARGE_REPLAY_ONLY_FIELDS = frozenset(
+    {"canonical_semantic_events", "canonical_semantic_streams"}
+)
+
+
+def _axis_review_projection(payload: Mapping[str, object]) -> dict[str, object]:
+    """Retain report fields while releasing duplicated full semantic journals."""
+
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _LARGE_REPLAY_ONLY_FIELDS
+    }
+
+
+def _load_axis_record(
+    path: Path,
+    *,
+    verified_payload: Mapping[str, object] | None = None,
+) -> ReviewRecord:
+    payload = (
+        verified_payload
+        if verified_payload is not None
+        else _verify_signed_json(path)
+    )
+    return ReviewRecord(path, _axis_review_projection(payload))
 
 
 def _review_build_attestation(manifest: Mapping[str, object]) -> tuple[str, str]:
@@ -371,11 +401,11 @@ def load_records(
         elif identity != common_identity:
             raise RuntimeError("comparison modes do not share one commit/wheel/native identity")
         paths = sorted((run_dir / "axes").rglob("*.json"))
-        mode_records = tuple(
-            ReviewRecord(path, _verify_signed_json(path)) for path in paths
-        )
+        mode_records_list: list[ReviewRecord] = []
         expected_run_label = labels[mode.value]
-        for record in mode_records:
+        for path in paths:
+            full_payload = _verify_signed_json(path)
+            record = ReviewRecord(path, full_payload)
             payload_scheduler_identity = (
                 _string(record.payload, "scheduler_sha256")
                 if manifest_schema == SCHEMA_VERSION
@@ -396,11 +426,15 @@ def load_records(
                 )
             if _string(record.payload, "run_label") != expected_run_label:
                 raise RuntimeError(f"axis run label mismatch: {record.path}")
+            if record.mode is not mode:
+                raise RuntimeError(f"axis mode identity mismatch for {mode.value}")
+            mode_records_list.append(
+                _load_axis_record(path, verified_payload=full_payload)
+            )
+        mode_records = tuple(mode_records_list)
         keys = {record.key for record in mode_records}
         if keys != _expected_keys(scope) or len(mode_records) != len(keys):
             raise RuntimeError(f"axis identity set is incomplete or duplicated for {mode.value}")
-        if any(record.mode is not mode for record in mode_records):
-            raise RuntimeError(f"axis mode identity mismatch for {mode.value}")
         records.extend(mode_records)
     if len(records) != expected_axis_count(scope):
         raise RuntimeError("comparison record count does not match the fixed protocol")
@@ -974,28 +1008,37 @@ def _semantic_trajectory(payload: Mapping[str, object]) -> list[object]:
     if value is not None:
         if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
             raise ValueError("semantic_trajectory must be a list of event objects")
-        for row in value:
-            if row.get("event_type") != "candidate_state":
-                raise ValueError(
-                    "semantic_trajectory may contain only candidate_state events"
-                )
-            route_keys = row.get("candidate_route_keys")
-            if not isinstance(route_keys, list) or not all(
-                isinstance(key, str) for key in route_keys
-            ):
-                raise ValueError(
-                    "candidate_state requires candidate_route_keys as a string array"
-                )
-            full_route_keys = row.get("candidate_full_route_keys", [])
-            if not isinstance(full_route_keys, list) or not all(
-                isinstance(key, str) for key in full_route_keys
-            ):
-                raise ValueError(
-                    "candidate_full_route_keys must be a string array when present"
-                )
+        quality_operators = {
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+        }
+        for ordinal, row in enumerate(value):
+            operator = str(row.get("operator", ""))
+            track = str(row.get("track", ""))
+            lane = (
+                "constraint_lane"
+                if track == "constraint_lane"
+                else "quality_shadow"
+                if operator in quality_operators
+                else "legacy"
+            )
+            if row.get("lane") != lane:
+                raise ValueError("semantic candidate lane projection is inconsistent")
             identity = {
-                "candidate_route_keys": route_keys,
-                "candidate_full_route_keys": full_route_keys,
+                "lane": lane,
+                "iteration": row.get("iteration"),
+                "operator": operator,
+                "status": row.get("status"),
+                "candidate_route_sequences": row.get(
+                    "candidate_route_sequences", ()
+                ),
+                "candidate_objective_key": row.get(
+                    "candidate_objective_key", ()
+                ),
+                "ordinal": ordinal,
             }
             expected_candidate_id = hashlib.sha256(
                 json.dumps(
@@ -1120,11 +1163,21 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
                 + ", ".join(missing)
             )
         termination = streams["termination"]
-        declared_termination = payload.get("termination_reason")
+        allowed_termination = {
+            "candidate_control_exhausted",
+            "exact_call_budget_exhausted",
+            "initialization_failed",
+            "iteration_limit",
+            "wall_clock_deadline",
+            "watchdog_exhausted",
+        }
+        declared_termination = (
+            termination[0].get("status") if len(termination) == 1 else None
+        )
         if (
             len(termination) != 1
             or termination[0].get("event_type") != "termination"
-            or termination[0].get("status") != declared_termination
+            or declared_termination not in allowed_termination
             or events[-1].get("semantic_stream") != "termination"
         ):
             raise ValueError(
@@ -1132,6 +1185,22 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
             )
         if declared_termination != "iteration_limit" and not streams["deadline"]:
             raise ValueError("canonical semantic deadline boundary is missing")
+        if "axis" in payload:
+            expected_terminal_fields = {
+                "iterations": payload.get("iterations"),
+                "effective_iterations": payload.get("effective_iterations"),
+                "exact_started_calls": payload.get("exact_started_calls"),
+                "exact_completed_calls": payload.get("exact_completed_calls"),
+                "exact_interrupted_calls": payload.get("exact_interrupted_calls"),
+                "objective_key": payload.get("objective"),
+            }
+            if any(
+                termination[0].get(field) != expected
+                for field, expected in expected_terminal_fields.items()
+            ):
+                raise ValueError(
+                    "canonical semantic termination counters do not reconcile"
+                )
     declared_started = payload.get("exact_started_calls")
     declared_completed = payload.get("exact_completed_calls")
     if (
@@ -1175,6 +1244,13 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
     if payload.get("schema_version") == SCHEMA_VERSION:
         return _canonical_semantic_events(payload)
     return _semantic_trajectory(payload)
+
+
+def _comparison_semantic_events_from_artifact(
+    record: ReviewRecord,
+) -> Sequence[object]:
+    full_payload = _verify_signed_json(record.path)
+    return _comparison_semantic_events(full_payload)
 
 
 def _paired(values: Iterable[float]) -> dict[str, float | int | None]:
@@ -1306,7 +1382,11 @@ def _mode_metrics(records: Iterable[ReviewRecord]) -> dict[str, object]:
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _verify_sidecar(path: Path) -> str:
@@ -1722,7 +1802,13 @@ def review_records(
     scope: str,
     benchmark_dir: Path,
 ) -> dict[str, object]:
-    replay = {record.path: _replay_record(record, benchmark_dir) for record in records}
+    replay = {
+        record.path: _replay_record(
+            ReviewRecord(record.path, _verify_signed_json(record.path)),
+            benchmark_dir,
+        )
+        for record in records
+    }
     by_mode = {mode: tuple(record for record in records if record.mode is mode) for mode in MODES}
     by_identity: dict[tuple[int, str, str, int], dict[ArchitectureMode, ReviewRecord]] = (
         defaultdict(dict)
@@ -1771,8 +1857,12 @@ def review_records(
                 continue
             baseline_trajectory = _semantic_trajectory(baseline.payload)
             candidate_trajectory = _semantic_trajectory(candidate.payload)
-            baseline_semantic_events = _comparison_semantic_events(baseline.payload)
-            candidate_semantic_events = _comparison_semantic_events(candidate.payload)
+            baseline_semantic_events = _comparison_semantic_events_from_artifact(
+                baseline
+            )
+            candidate_semantic_events = _comparison_semantic_events_from_artifact(
+                candidate
+            )
             baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
             candidate_measurement = _mapping(candidate.payload, "measurement_evidence")
             exact_order_equal = (
