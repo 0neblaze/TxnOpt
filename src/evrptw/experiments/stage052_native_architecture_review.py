@@ -1255,6 +1255,64 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
             raise ValueError("canonical semantic stream set is missing")
         projection: list[dict[str, object]] = []
 
+        def screening_projection() -> list[dict[str, object]]:
+            stream = raw_streams.get("screening")
+            if not isinstance(stream, list) or not all(
+                isinstance(event, dict) for event in stream
+            ):
+                raise ValueError("canonical semantic stream screening is invalid")
+            semantic_fields = (
+                "event_type",
+                "lane",
+                "iteration",
+                "operator",
+                "candidate_id",
+                "plan_id",
+                "route_key",
+                "status",
+                "decision",
+                "reason",
+                "first_failed_check",
+                "screening_passed",
+                "exact_call_blocked",
+                "negative_cache_hit",
+                "cache_hit",
+            )
+            normalized_events: list[dict[str, object]] = []
+            for event in stream:
+                normalized = {
+                    field: event[field]
+                    for field in semantic_fields
+                    if field in event
+                }
+                raw_checks = event.get("checks")
+                if raw_checks is not None:
+                    if not isinstance(raw_checks, list) or not all(
+                        isinstance(check, dict) for check in raw_checks
+                    ):
+                        raise ValueError("screening checks are invalid")
+                    normalized["checks"] = [
+                        {
+                            field: check[field]
+                            for field in ("check", "status")
+                            if field in check
+                        }
+                        for check in raw_checks
+                    ]
+                if not normalized:
+                    raise ValueError("screening event lacks shared semantic fields")
+                normalized_events.append(normalized)
+            return sorted(
+                normalized_events,
+                key=lambda event: json.dumps(
+                    event,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+            )
+
         def append(stream_name: str, event: Mapping[str, object]) -> None:
             normalized = {
                 key: value
@@ -1327,6 +1385,8 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
             if not isinstance(event, dict):
                 raise ValueError("semantic trajectory contains a non-object event")
             append("operator", event)
+        for event in screening_projection():
+            append("screening", event)
         for stream_name in (
             "candidate_state",
             "stage04",
@@ -1946,6 +2006,7 @@ def review_records(
                         "candidate_work_hash_equal": False,
                         "route_result_hash_equal": False,
                         "trajectory_equal": False,
+                        "screening_semantics_equal": False,
                         "canonical_semantic_events_equal": False,
                         "operator_statistics_equal": False,
                         "stage04_state_equal": False,
@@ -1965,6 +2026,18 @@ def review_records(
             candidate_semantic_events = _comparison_semantic_events_from_artifact(
                 candidate
             )
+            baseline_screening_events = [
+                event
+                for event in baseline_semantic_events
+                if isinstance(event, dict)
+                and event.get("semantic_stream") == "screening"
+            ]
+            candidate_screening_events = [
+                event
+                for event in candidate_semantic_events
+                if isinstance(event, dict)
+                and event.get("semantic_stream") == "screening"
+            ]
             baseline_measurement = _mapping(baseline.payload, "measurement_evidence")
             candidate_measurement = _mapping(candidate.payload, "measurement_evidence")
             exact_order_equal = (
@@ -2028,6 +2101,9 @@ def review_records(
                     "candidate_work_hash_equal": candidate_work_hash_equal,
                     "route_result_hash_equal": route_result_hash_equal,
                     "trajectory_equal": baseline_trajectory == candidate_trajectory,
+                    "screening_semantics_equal": (
+                        baseline_screening_events == candidate_screening_events
+                    ),
                     "canonical_semantic_events_equal": (
                         baseline_semantic_events == candidate_semantic_events
                     ),
@@ -2075,6 +2151,7 @@ def review_records(
                         "candidate_work_hash_equal",
                         "route_result_hash_equal",
                         "trajectory_equal",
+                        "screening_semantics_equal",
                         "canonical_semantic_events_equal",
                         "operator_statistics_equal",
                         "stage04_state_equal",

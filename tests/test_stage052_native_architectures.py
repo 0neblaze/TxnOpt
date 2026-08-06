@@ -1571,7 +1571,7 @@ def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> Non
     }
 
 
-def test_comparison_projection_ignores_only_implementation_batch_telemetry() -> None:
+def test_comparison_projection_preserves_normalized_screening_semantics() -> None:
     stream_names = (
         "candidate_state",
         "operator",
@@ -1612,21 +1612,41 @@ def test_comparison_projection_ignores_only_implementation_batch_telemetry() -> 
         }
     ]
 
-    def payload(screening_rows: int) -> dict[str, object]:
+    def payload(
+        *,
+        batch_row: int,
+        status: str = "pass",
+        reason: str = "",
+    ) -> dict[str, object]:
         streams: dict[str, list[dict[str, object]]] = {
             name: [] for name in stream_names
         }
-        event_id = 0
-        for row in range(screening_rows):
-            event_id += 1
-            streams["screening"].append(
-                {
-                    "semantic_event_id": event_id,
-                    "stream_ordinal": row,
-                    "status": "pass",
-                    "batch_row": row,
-                }
-            )
+        event_id = 1
+        streams["screening"].append(
+            {
+                "semantic_event_id": event_id,
+                "stream_ordinal": 0,
+                "event_type": "screening_decision",
+                "lane": "quality_shadow",
+                "iteration": 3,
+                "operator": "route_segment_destroy",
+                "route_key": "route:2:C1",
+                "status": status,
+                "reason": reason,
+                "first_failed_check": "" if status == "pass" else "route_structure",
+                "negative_cache_hit": False,
+                "exact_call_blocked": status != "pass",
+                "checks": [
+                    {
+                        "check": "route_structure",
+                        "status": status,
+                        "value": status == "pass",
+                    }
+                ],
+                "batch_row": batch_row,
+                "queue_wait_seconds": float(batch_row),
+            }
+        )
         event_id += 1
         streams["candidate_state"].append(
             {
@@ -1648,13 +1668,21 @@ def test_comparison_projection_ignores_only_implementation_batch_telemetry() -> 
             ),
         }
 
-    baseline = payload(1)
-    candidate = payload(2)
+    baseline = payload(batch_row=0)
+    candidate = payload(batch_row=99)
     assert baseline["canonical_semantic_events"] != candidate[
         "canonical_semantic_events"
     ]
     assert _comparison_semantic_events(baseline) == _comparison_semantic_events(
         candidate
+    )
+    changed_decision = payload(
+        batch_row=99,
+        status="rejected",
+        reason="route_structure_prefilter",
+    )
+    assert _comparison_semantic_events(baseline) != _comparison_semantic_events(
+        changed_decision
     )
 
 
