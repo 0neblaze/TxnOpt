@@ -7151,6 +7151,59 @@ def test_full_native_v2_matches_real_c101c5_warm_start(
 
 
 @pytest.mark.external_data
+def test_full_native_v2_matches_real_c101c5_at_fixed_work_budget_boundary() -> None:
+    """A successful repair stays semantic even when its transaction is unselected."""
+
+    instance_path = Path("data/schneider/c101C5.txt")
+    if not instance_path.exists():
+        pytest.skip("Schneider benchmark data are not linked")
+    instance = replace(parse_schneider(instance_path), distance_backend="native")
+    initial = (("C12", "C100"), ("C64", "C30", "C85"))
+    control = CandidateControlConfig(worker_count=4)
+    common = {
+        "seed": 2014,
+        "max_iterations": 1000,
+        "time_limit_seconds": 120.0,
+        "termination_mode": "fixed_work",
+        "exact_deadline_config": ExactDeadlineConfig.fixed_exact_calls(
+            100,
+            watchdog_seconds=120.0,
+        ),
+        **_full_native_solve_kwargs(),
+        "initial_customer_sequences": initial,
+    }
+    python_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        candidate_control_config=control,
+    )
+    native_result = solve_alns(
+        instance,
+        **common,  # type: ignore[arg-type]
+        native_execution_config=replace(
+            _native_config("full_native_alns"),
+            candidate_control_config=control,
+        ),
+    )
+
+    python_trajectory = _semantic_candidate_trajectory(python_result)
+    native_trajectory = _semantic_candidate_trajectory(native_result)
+    assert len(native_trajectory) == len(python_trajectory) == 119
+    assert native_trajectory == python_trajectory, _describe_first_divergence(
+        python_trajectory,
+        native_trajectory,
+    )
+    assert native_result.customer_sequences == python_result.customer_sequences
+    assert native_result.objective == python_result.objective
+    assert native_result.exact_started_calls == python_result.exact_started_calls
+    assert native_result.exact_completed_calls == python_result.exact_completed_calls
+    assert native_result.effective_iterations == python_result.effective_iterations
+    assert native_result.termination_reason == python_result.termination_reason
+    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
+    assert native_result.stage04_statistics == python_result.stage04_statistics
+
+
+@pytest.mark.external_data
 def test_full_native_v2_releases_gil_during_whole_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2007,9 +2007,15 @@ def decode_native_three_lane_semantic_stream(
         by_name = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
         for item in events:
             operator_index = by_name[str(item["operator"])]
+            feasible_repair = bool(
+                item.get(
+                    "_operator_feasible_repair",
+                    bool(item.get("candidate_objective_key")),
+                )
+            )
             activity[operator_index, 0] = max(
                 int(activity[operator_index, 0]),
-                int(bool(item["candidate_feasible"])),
+                int(feasible_repair),
             )
             activity[operator_index, 1] += int(bool(item["prefilter_passed"]))
             activity[operator_index, 2] += cast(int, item["exact_route_evaluations"])
@@ -4702,7 +4708,8 @@ def decode_native_three_lane_search_semantic_stream(
             removed_customers=constraint_removed,
             candidate_route_sequences=(
                 constraint_routes
-                if constraint_prepared
+                if not repair_failed
+                and (constraint_prepared or not constraint_exact_feasible)
                 else ()
             ),
             candidate_vehicle_delta=(
@@ -4820,7 +4827,15 @@ def decode_native_three_lane_search_semantic_stream(
     for item in all_events:
         index = by_name[str(item["operator"])]
         activity[index, 0] = max(
-            int(activity[index, 0]), int(bool(item["candidate_feasible"]))
+            int(activity[index, 0]),
+            int(
+                bool(
+                    item.get(
+                        "_operator_feasible_repair",
+                        bool(item.get("candidate_objective_key")),
+                    )
+                )
+            ),
         )
         activity[index, 1] += _semantic_event_aggregate(item, "prefilter_passed")
         activity[index, 2] += cast(int, item["exact_route_evaluations"])
@@ -7573,6 +7588,7 @@ def _decode_native_three_lane_fourth_general(
                             "route_segment_destroy",
                             "failed",
                             "route_segment_no_change",
+                            _operator_feasible_repair=False,
                             route_indices=(source_index,),
                             removed_customers=actual_removed,
                             candidate_vehicle_delta=0,
@@ -7649,6 +7665,7 @@ def _decode_native_three_lane_fourth_general(
                 "route_segment_destroy",
                 "candidate_proposed",
                 "route_segment_repaired",
+                _operator_feasible_repair=True,
                 route_indices=(int(selected_attempt[0]),),
                 affected_route_indices=quality_affected,
                 removed_customers=selected_removed,
@@ -8226,9 +8243,22 @@ def _decode_native_three_lane_fourth_general(
         group = (cast(int, item["iteration"]), operator)
         feasible_repair_groups[group] = feasible_repair_groups.get(
             group, False
-        ) or bool(item.get("_operator_feasible_repair", item["candidate_feasible"]))
+        ) or bool(
+            item.get(
+                "_operator_feasible_repair",
+                bool(item.get("candidate_objective_key")),
+            )
+        )
         activity[index, 0] = max(
-            int(activity[index, 0]), int(bool(item["candidate_feasible"]))
+            int(activity[index, 0]),
+            int(
+                bool(
+                    item.get(
+                        "_operator_feasible_repair",
+                        bool(item.get("candidate_objective_key")),
+                    )
+                )
+            ),
         )
         activity[index, 1] += _semantic_event_aggregate(item, "prefilter_passed")
         activity[index, 2] += cast(int, item["exact_route_evaluations"])
@@ -8808,6 +8838,7 @@ def _decode_native_three_lane_fourth_iteration(
             "route_segment_destroy",
             "failed",
             "route_segment_no_change",
+            _operator_feasible_repair=False,
             route_indices=(int(attempt[0]),),
             removed_customers=quality_removed[index],
             candidate_vehicle_delta=0,
@@ -8844,6 +8875,7 @@ def _decode_native_three_lane_fourth_iteration(
                 "route_segment_destroy",
                 "candidate_proposed",
                 "route_segment_repaired",
+                _operator_feasible_repair=quality_selected,
                 route_indices=(int(selected_attempt[0]),),
                 affected_route_indices=quality_affected,
                 removed_customers=quality_removed[-1],
@@ -9078,7 +9110,12 @@ def _decode_native_three_lane_fourth_iteration(
         group = (cast(int, item["iteration"]), operator)
         feasible_repair_groups[group] = feasible_repair_groups.get(
             group, False
-        ) or bool(item.get("_operator_feasible_repair", item["candidate_feasible"]))
+        ) or bool(
+            item.get(
+                "_operator_feasible_repair",
+                bool(item.get("candidate_objective_key")),
+            )
+        )
         activity[index, 0] = max(
             int(activity[index, 0]), int(bool(item["candidate_feasible"]))
         )
@@ -9580,7 +9617,15 @@ def _decode_native_three_lane_fifth_general(
         grouped.setdefault((cast(int, item["iteration"]), operator), []).append(item)
     for (_, operator), items in grouped.items():
         index = by_name[operator]
-        feasible_repair = any(bool(item["candidate_feasible"]) for item in items)
+        feasible_repair = any(
+            bool(
+                item.get(
+                    "_operator_feasible_repair",
+                    bool(item.get("candidate_objective_key")),
+                )
+            )
+            for item in items
+        )
         if operator == "vehicle_reduction_refinement":
             feasible_repair = any(
                 bool(item["prefilter_passed"]) and item["status"] != "time_limit"
@@ -10005,40 +10050,61 @@ def _decode_native_three_lane_fifth_iteration(
             name="fifth quality outcome",
         ),
     )
+    selected_quality = int(outcome[0])
+    quality_selected = selected_quality >= 0
     if (
-        int(outcome[0]) < 0
-        or int(outcome[0]) >= candidate_count
-        or int(statuses[int(outcome[0])]) != 5
+        selected_quality < -1
+        or selected_quality >= candidate_count
         or any(int(value) not in (0, 1) for value in outcome[1:])
+        or (
+            quality_selected
+            and int(statuses[selected_quality]) != 5
+        )
+        or (
+            not quality_selected
+            and (
+                np.any(outcome[1:] != 0)
+                or np.any(statuses == 5)
+            )
+        )
     ):
         raise RuntimeError("native three-lane fifth quality selection is invalid")
-    selected_plan = candidate_plans[int(outcome[0])]
-    selected_objective = replay(selected_plan)
-    selected_key = selected_objective.key
-    selected_reported = SolutionObjective(
-        int(objective_integers[int(outcome[0]), 0]),
-        float(objective_floats[int(outcome[0]), 0]),
-        float(objective_floats[int(outcome[0]), 1]),
-        int(objective_integers[int(outcome[0]), 1]),
-    )
-    if selected_reported.key != selected_key:
-        raise RuntimeError("native three-lane fifth selected objective is invalid")
-    quality_accepted = bool(outcome[1])
-    quality_best = quality_accepted and selected_key < prior_best_objective.key
-    quality_vehicle_reduction = (
-        quality_accepted
-        and selected_objective.vehicle_count < prior_quality_objective.vehicle_count
-    )
-    if (
-        bool(outcome[2]) != quality_best
-        or bool(outcome[3]) != quality_vehicle_reduction
-        or (
-            selected_objective.vehicle_count > prior_quality_objective.vehicle_count
-            and quality_accepted
+    selected_plan: tuple[CustomerSequence, ...] | None = None
+    selected_objective: SolutionObjective | None = None
+    selected_key: tuple[int, float, float, int] | tuple[()] = ()
+    quality_accepted = False
+    quality_best = False
+    quality_vehicle_reduction = False
+    if quality_selected:
+        selected_plan = candidate_plans[selected_quality]
+        selected_objective = replay(selected_plan)
+        selected_key = selected_objective.key
+        selected_reported = SolutionObjective(
+            int(objective_integers[selected_quality, 0]),
+            float(objective_floats[selected_quality, 0]),
+            float(objective_floats[selected_quality, 1]),
+            int(objective_integers[selected_quality, 1]),
         )
-        or (selected_key <= prior_quality_objective.key and not quality_accepted)
-    ):
-        raise RuntimeError("native three-lane fifth quality acceptance mismatch")
+        if selected_reported.key != selected_key:
+            raise RuntimeError("native three-lane fifth selected objective is invalid")
+        quality_accepted = bool(outcome[1])
+        quality_best = quality_accepted and selected_key < prior_best_objective.key
+        quality_vehicle_reduction = (
+            quality_accepted
+            and selected_objective.vehicle_count
+            < prior_quality_objective.vehicle_count
+        )
+        if (
+            bool(outcome[2]) != quality_best
+            or bool(outcome[3]) != quality_vehicle_reduction
+            or (
+                selected_objective.vehicle_count
+                > prior_quality_objective.vehicle_count
+                and quality_accepted
+            )
+            or (selected_key <= prior_quality_objective.key and not quality_accepted)
+        ):
+            raise RuntimeError("native three-lane fifth quality acceptance mismatch")
     if payload[3] is not None:
         raise RuntimeError("native three-lane fifth ran an unscheduled constraint lane")
 
@@ -10049,12 +10115,16 @@ def _decode_native_three_lane_fifth_iteration(
         unpack_state(payload[9], "final best"),
     )
     expected_legacy = legacy_routes if legacy_accepted else prior_legacy
-    expected_quality = selected_plan if quality_accepted else prior_quality
+    expected_quality = (
+        selected_plan
+        if quality_accepted and selected_plan is not None
+        else prior_quality
+    )
     expected_best = (
         legacy_routes
         if legacy_best
         else selected_plan
-        if quality_best
+        if quality_best and selected_plan is not None
         else prior_best
     )
     if final_states != (
@@ -10068,7 +10138,7 @@ def _decode_native_three_lane_fifth_iteration(
         legacy_objective
         if legacy_best
         else selected_objective
-        if quality_best
+        if quality_best and selected_objective is not None
         else prior_best_objective
     )
     if replay(final_states[3]).key != expected_best_objective.key:
@@ -10108,25 +10178,32 @@ def _decode_native_three_lane_fifth_iteration(
                 candidate_objective_key=selected_key,
             )
         )
-    selected_changes, selected_depth = candidate_changes[int(outcome[0])]
+    quality_selection_events: tuple[dict[str, object], ...] = ()
+    if quality_selected:
+        if selected_plan is None or selected_objective is None:
+            raise RuntimeError("native three-lane fifth selected quality is missing")
+        selected_changes, selected_depth = candidate_changes[selected_quality]
+        quality_selection_events = (
+            event(
+                "ejection_chain",
+                "candidate_proposed",
+                "ejection_chain_completed",
+                affected_route_indices=selected_changes,
+                candidate_route_sequences=selected_plan,
+                candidate_vehicle_delta=0,
+                candidate_feasible=True,
+                prefilter_passed=True,
+                chain_depth=selected_depth,
+                accepted=quality_accepted,
+                vehicle_reduction=quality_vehicle_reduction,
+                distance_improvement=selected_objective.total_distance
+                < prior_quality_objective.total_distance - 1e-9,
+                candidate_objective_key=selected_key,
+            ),
+        )
     followup_events = (
         *candidate_events,
-        event(
-            "ejection_chain",
-            "candidate_proposed",
-            "ejection_chain_completed",
-            affected_route_indices=selected_changes,
-            candidate_route_sequences=selected_plan,
-            candidate_vehicle_delta=0,
-            candidate_feasible=True,
-            prefilter_passed=True,
-            chain_depth=selected_depth,
-            accepted=quality_accepted,
-            vehicle_reduction=quality_vehicle_reduction,
-            distance_improvement=selected_objective.total_distance
-            < prior_quality_objective.total_distance - 1e-9,
-            candidate_objective_key=selected_key,
-        ),
+        *quality_selection_events,
         *(
             (
                 event(
@@ -10374,9 +10451,12 @@ def _decode_native_three_lane_sixth_iteration(
         and int(metadata[2]) > 0
         and int(metadata[3]) == 0
         and int(metadata[4]) == 0
-        and int(metadata[5]) >= 0
+        and int(metadata[5]) >= -1
         and int(metadata[6]) >= 0
-        and int(metadata[7]) == -2
+        and (
+            (int(metadata[5]) >= 0 and int(metadata[7]) == -2)
+            or (int(metadata[5]) == -1 and int(metadata[7]) == 0)
+        )
     )
     if not valid_standard and not valid_vehicle_repair:
         raise RuntimeError("native three-lane sixth legacy decision is invalid")
@@ -10403,6 +10483,7 @@ def _decode_native_three_lane_sixth_iteration(
     if (
         selected_index >= len(statuses)
         or (candidate_feasible and int(statuses[selected_index]) != 5)
+        or (not candidate_feasible and np.any(statuses == 5))
         or np.any(exact_rows < 0)
     ):
         raise RuntimeError("native three-lane sixth transaction is invalid")
@@ -10538,11 +10619,26 @@ def _decode_native_three_lane_sixth_iteration(
     operator_name = "vehicle_count_aware_repair" if operator_id == 1 else "standard"
     destroy_names = ("random", "worst", "related")
     repair_names = ("greedy", "regret2", "energy")
+    # The public neighborhood event describes the repair proposal, not the
+    # later Candidate Control transaction.  Python emits candidate_proposed as
+    # soon as vehicle-count-aware repair constructs a complete solution, even
+    # when the round budget subsequently prevents that proposal from being
+    # selected.  Keep the transaction status in the native journal instead of
+    # rewriting the earlier operator decision.
+    repair_succeeded = operator_id == 1 and int(metadata[3]) == 0
     item: dict[str, object] = {
         "operator": operator_name,
-        "status": "candidate_proposed" if operator_id == 1 else "proposal",
+        "status": (
+            "candidate_proposed"
+            if repair_succeeded
+            else "failed"
+            if operator_id == 1
+            else "proposal"
+        ),
         "reason": (
             "existing_route_repair"
+            if repair_succeeded
+            else "existing_route_repair_failed"
             if operator_id == 1
             else f"{destroy_names[int(metadata[2])]}+{repair_names[int(metadata[3])]}"
         ),
@@ -10554,7 +10650,7 @@ def _decode_native_three_lane_sixth_iteration(
         "candidate_vehicle_delta": (
             len(repaired_routes) - len(prior_states[0]) if operator_id == 1 else None
         ),
-        "candidate_feasible": candidate_feasible if operator_id == 1 else False,
+        "candidate_feasible": repair_succeeded if operator_id == 1 else False,
         "prefilter_passed": bool(len(exact_rows)) if operator_id == 1 else False,
         "new_routes_created": int(metadata[4]) if operator_id == 1 else 0,
         "exact_route_evaluations": len(exact_rows) if operator_id == 1 else 0,
@@ -10572,6 +10668,12 @@ def _decode_native_three_lane_sixth_iteration(
         "ranking_score": 0.0,
         "iteration": iteration,
         "_operator_feasible_repair": candidate_feasible,
+        # Causal operator-outcome status records whether Candidate Control
+        # prepared a selectable candidate, which is narrower than the public
+        # repair proposal's candidate_feasible field at a budget boundary.
+        "_operator_native_candidate_feasible": (
+            candidate_feasible if operator_id == 1 else False
+        ),
         "_operator_destroy_name": (
             destroy_names[int(metadata[1])] if operator_id == 1 else ""
         ),
@@ -10666,9 +10768,22 @@ def _decode_native_three_lane_sixth_iteration(
         constraint_status_values = constraint_statuses.tolist()
         constraint_exact_infeasible = constraint_status_values == [4]
         constraint_no_change = constraint_status_values == [5]
+        constraint_budget_exhausted = constraint_status_values == [3]
         if (
-            not (constraint_exact_infeasible or constraint_no_change)
+            not (
+                constraint_exact_infeasible
+                or constraint_no_change
+                or constraint_budget_exhausted
+            )
             or np.any(constraint_exact_rows < 0)
+            or (
+                constraint_budget_exhausted
+                and (
+                    len(constraint_exact_rows) != 0
+                    or constraint_candidate_prepared
+                    or np.any(outcome[3:] != 0)
+                )
+            )
             or (
                 constraint_no_change
                 and not constraint_candidate_prepared
@@ -10682,7 +10797,7 @@ def _decode_native_three_lane_sixth_iteration(
         expected_budget_state[1] += len(constraint_exact_rows)
         constraint_objective: SolutionObjective | None = None
         reported_constraint: SolutionObjective | None = None
-        if not constraint_exact_infeasible:
+        if not constraint_exact_infeasible and not constraint_budget_exhausted:
             constraint_integers = cast(
                 npt.NDArray[np.int64], constraint_transaction[2]
             )
@@ -10850,13 +10965,20 @@ def _decode_native_three_lane_sixth_iteration(
                     (
                         "constraint_repair_infeasible"
                         if constraint_exact_infeasible
+                        or constraint_budget_exhausted
                         else "constraint_removal_no_change"
                     ),
                     affected_route_indices=(
-                        constraint_affected if constraint_exact_infeasible else ()
+                        constraint_affected
+                        if constraint_exact_infeasible
+                        or constraint_budget_exhausted
+                        else ()
                     ),
                     candidate_route_sequences=(
-                        constraint_routes if constraint_exact_infeasible else ()
+                        constraint_routes
+                        if constraint_exact_infeasible
+                        or constraint_budget_exhausted
+                        else ()
                     ),
                     exact_route_evaluations=(
                         len(constraint_exact_rows)
@@ -11257,13 +11379,15 @@ def _decode_native_three_lane_seventh_general(
     )
     constraint_operator_id = int(outcome[0])
     tier_index = int(selection[0])
+    constraint_no_change = statuses.tolist() == [5]
+    constraint_budget_exhausted = statuses.tolist() == [3]
     if (
         constraint_operator_id not in range(4)
         or tier_index not in range(3)
         or np.any(outcome[2:] != 0)
-        or statuses.tolist() != [5]
+        or not (constraint_no_change or constraint_budget_exhausted)
         or len(exact_rows) != 0
-        or repaired_routes != prior_states[2]
+        or (constraint_no_change and repaired_routes != prior_states[2])
         or not route_indices
     ):
         raise RuntimeError(
@@ -11316,8 +11440,26 @@ def _decode_native_three_lane_seventh_general(
         event(
             constraint_operator,
             "failed",
-            "constraint_removal_no_change",
+            (
+                "constraint_repair_infeasible"
+                if constraint_budget_exhausted
+                else "constraint_removal_no_change"
+            ),
             removed_customers=removed,
+            affected_route_indices=(
+                tuple(
+                    index
+                    for index, (before, after) in enumerate(
+                        zip(prior_states[2], repaired_routes, strict=False)
+                    )
+                    if before != after
+                )
+                if constraint_budget_exhausted
+                else ()
+            ),
+            candidate_route_sequences=(
+                repaired_routes if constraint_budget_exhausted else ()
+            ),
             prefilter_passed=True,
             track="constraint_lane",
             constraint_category=constraint_operator,
@@ -11439,7 +11581,15 @@ def _decode_native_three_lane_seventh_general(
         grouped.setdefault((cast(int, item["iteration"]), operator), []).append(item)
     for (_, operator), items in grouped.items():
         index = by_name[operator]
-        feasible_repair = any(bool(item["candidate_feasible"]) for item in items)
+        feasible_repair = any(
+            bool(
+                item.get(
+                    "_operator_feasible_repair",
+                    bool(item.get("candidate_objective_key")),
+                )
+            )
+            for item in items
+        )
         if operator == "vehicle_reduction_refinement":
             feasible_repair = any(
                 bool(item["prefilter_passed"]) and item["status"] != "time_limit"
@@ -14142,10 +14292,17 @@ def _decode_full_native_control_journal(
             ]
         )
         accepted = bool(screening_codes[row, 0])
+        negative_cache_hit = bool(screening_flags[row, 1])
         events.append(
             {
                 "event_type": "screening_decision",
-                "status": "pass" if accepted else "rejected",
+                "status": (
+                    "pass"
+                    if accepted
+                    else "negative_cache_hit"
+                    if negative_cache_hit
+                    else "rejected"
+                ),
                 "lane": lane,
                 "iteration": int(screening_contexts[row, 2]),
                 "operator": operator,
@@ -14171,7 +14328,7 @@ def _decode_full_native_control_journal(
                 "structural_energy_lower_bound": float(
                     screening_metrics[row, 5]
                 ),
-                "negative_cache_hit": bool(screening_flags[row, 1]),
+                "negative_cache_hit": negative_cache_hit,
                 "exact_call_blocked": not accepted,
                 "physical_evaluated": bool(screening_flags[row, 0]),
                 "physical_owner": bool(screening_flags[row, 2]),

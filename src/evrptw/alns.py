@@ -5310,7 +5310,12 @@ def _full_native_operator_statistics(
             if bool(event["candidate_feasible"])
         )
         feasible_repair = any(
-            bool(event.get("_operator_feasible_repair", event["candidate_feasible"]))
+            bool(
+                event.get(
+                    "_operator_feasible_repair",
+                    bool(event.get("candidate_objective_key")),
+                )
+            )
             for event in events
         )
         if operator == "vehicle_reduction_refinement":
@@ -5824,6 +5829,7 @@ def _solve_full_native_alns(
     config: Stage052NativeExecutionConfig,
     exact_deadline_config: ExactDeadlineConfig | None,
     initial_customer_sequences: tuple[tuple[str, ...], ...] | None,
+    initial_solution_provenance: Mapping[str, object] | None,
     stage04_config: Stage04Config | None,
     measurement_config: MeasurementConfig | None,
 ) -> ALNSResult:
@@ -6736,6 +6742,7 @@ def _solve_full_native_alns(
                     "event_type": "candidate_initial_solution",
                     "status": "submitted",
                     "customer_sequences": initial_sequences,
+                    **dict(initial_solution_provenance or {}),
                 },
             )
         )
@@ -6798,6 +6805,7 @@ def _solve_full_native_alns(
                     "status": "verified",
                     "customer_sequences": initial_sequences,
                     "objective_key": list(initial_runtime_objective.key),
+                    **dict(initial_solution_provenance or {}),
                 },
             )
         )
@@ -6835,7 +6843,7 @@ def _solve_full_native_alns(
         events_by_iteration_lane: dict[
             tuple[int, str], list[dict[str, object]]
         ] = {}
-        for semantic_event in semantic_events:
+        for semantic_index, semantic_event in enumerate(semantic_events):
             operator = str(semantic_event["operator"])
             lane = (
                 "constraint_lane"
@@ -6844,9 +6852,18 @@ def _solve_full_native_alns(
                 if operator in quality_operators
                 else "legacy"
             )
+            projected_operator_event = dict(semantic_event)
+            raw_operator_event = operator_semantic_events[semantic_index]
+            for private_field in (
+                "_operator_native_candidate_feasible",
+                "_operator_feasible_repair",
+            ):
+                private_value = raw_operator_event.get(private_field)
+                if private_value is not None:
+                    projected_operator_event[private_field] = private_value
             events_by_iteration_lane.setdefault(
                 (int(cast(int, semantic_event["iteration"])), lane), []
-            ).append(dict(semantic_event))
+            ).append(projected_operator_event)
 
         def append_lane_outcome(iteration: int, lane: str) -> None:
             lane_events = events_by_iteration_lane.get((iteration, lane), [])
@@ -6855,7 +6872,17 @@ def _solve_full_native_alns(
             for screening_context in tuple(screening_by_context):
                 if screening_context[:2] == (lane, iteration):
                     append_screening_context(screening_context)
-            runtime_projection.extend(("operator", event) for event in lane_events)
+            # Aggregate pool/prefilter rows are implementation telemetry.  The
+            # Python and native runtimes may group them differently, so they
+            # are audited in the telemetry stream rather than projected into
+            # the cross-runtime canonical decision journal.  The lane still
+            # owns one canonical candidate-state row even when every operator
+            # row in that lane is aggregate telemetry.
+            runtime_projection.extend(
+                ("operator", event)
+                for event in lane_events
+                if not str(event.get("status", "")).endswith("_aggregate")
+            )
             accepted = any(bool(event.get("accepted")) for event in lane_events)
             candidate_event = next(
                 (
@@ -6869,7 +6896,16 @@ def _solve_full_native_alns(
                 tuple[tuple[str, ...], ...],
                 candidate_event.get("candidate_route_sequences", ()),
             )
-            feasible = bool(candidate_event.get("candidate_feasible"))
+            # Candidate-state feasibility belongs to the transaction, while a
+            # public vehicle-repair event can truthfully report that repair
+            # succeeded before Candidate Control declines it at a budget
+            # boundary.
+            feasible = bool(
+                candidate_event.get(
+                    "_operator_native_candidate_feasible",
+                    candidate_event.get("candidate_feasible"),
+                )
+            )
             candidate_full_route_keys: list[str] = []
             if feasible:
                 for sequence in raw_sequences:
@@ -7225,10 +7261,40 @@ def _solve_full_native_alns(
                 ),
                 None,
             )
+            divergence_index = (
+                first_divergence[0]
+                if first_divergence is not None
+                else min(expected_row_count, len(native_event_ids))
+            )
+            context_start = max(0, divergence_index - 2)
+            context_end = min(expected_row_count, divergence_index + 3)
+            runtime_context = [
+                (index, runtime_projection[index])
+                for index in range(context_start, context_end)
+            ]
+            mismatch_native_context = [
+                (
+                    index,
+                    native_stream_codes[index],
+                    native_event_codes[index],
+                    native_lane_ids[index],
+                    native_operator_ids[index],
+                    native_iterations[index],
+                    native_subject_ids[index],
+                    native_status_codes[index],
+                    native_flags[index],
+                )
+                for index in range(
+                    context_start,
+                    min(len(native_event_ids), divergence_index + 3),
+                )
+            ]
             raise RuntimeError(
                 "full native canonical event journal length mismatch: "
                 f"runtime={expected_row_count}, native_fields={native_row_lengths}, "
                 f"first_divergence={first_divergence!r}, "
+                f"runtime_context={runtime_context!r}, "
+                f"native_context={mismatch_native_context!r}, "
                 f"runtime_stream_counts="
                 f"{np.bincount(expected_stream_codes, minlength=11).tolist()}, "
                 f"native_stream_counts="
@@ -7324,7 +7390,12 @@ def _solve_full_native_alns(
                     subject = ordinal_counters.get(ordinal_key, 0)
                     ordinal_counters[ordinal_key] = subject + 1
                 status_code = int(
-                    bool(projected_event.get("candidate_feasible"))
+                    bool(
+                        projected_event.get(
+                            "_operator_native_candidate_feasible",
+                            projected_event.get("candidate_feasible"),
+                        )
+                    )
                     or (
                         operator_name in constraint_subject
                         and status_text == "candidate_proposed"
@@ -7928,6 +7999,7 @@ def solve_alns(
             config=native_execution_config,
             exact_deadline_config=exact_deadline_config,
             initial_customer_sequences=initial_customer_sequences,
+            initial_solution_provenance=initial_solution_provenance,
             stage04_config=stage04_config,
             measurement_config=measurement_config,
         )

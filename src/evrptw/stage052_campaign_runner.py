@@ -163,7 +163,7 @@ _CAMPAIGN_SUCCESSOR_ALLOWED_PATHS = frozenset(
 )
 _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/evrptw_core.cpp": (
-        "336dad1e7bb55104a61ce5845d04dcc458b7ed1189166d49319010ee98c4677e"
+        "9f77e2d243ee721cd77c0bb5513a52532255056e7e35fe1bfc52c61faf300888"
     ),
     "cpp/native_host_scheduler.cpp": (
         "9842bc69c1747c271a25453fbb0abc3f24bb324310b616a99e907f881175b468"
@@ -171,7 +171,7 @@ _CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES = {
     "cpp/native_kernel_client.hpp": (
         "0e95505bf7f2faa904ee089e0f392410794f26ba1135406a52b339fca6a7014c"
     ),
-    "src/evrptw/alns.py": "71d404c219d8a802b3e2b646b20e54fec4706a0edd868795f8467f03d8a7051e",
+    "src/evrptw/alns.py": "c62297484928e9fddcad62f4803340ce968f2d20b352a48f00cc016394d8c81c",
     "src/evrptw/cache_incremental.py": (
         "babe9c2f6315c73a81fbb4c7cbb6d673035cc62c903aa19ee3d430c94e09bdaa"
     ),

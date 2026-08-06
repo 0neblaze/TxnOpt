@@ -1242,7 +1242,109 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
 
 def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[object]:
     if payload.get("schema_version") == SCHEMA_VERSION:
-        return _canonical_semantic_events(payload)
+        # First validate the complete, implementation-owned causal journal.
+        # Cross-architecture equality must then use only the shared logical
+        # projection: native batching legitimately changes the number and
+        # global interleaving of screening, cache, transaction and exact-work
+        # telemetry rows.  Those streams remain mandatory and are reconciled
+        # independently by _canonical_semantic_events plus the dedicated
+        # transaction/cache/deadline gates below.
+        _canonical_semantic_events(payload)
+        raw_streams = payload.get("canonical_semantic_streams")
+        if not isinstance(raw_streams, dict):
+            raise ValueError("canonical semantic stream set is missing")
+        projection: list[dict[str, object]] = []
+
+        def append(stream_name: str, event: Mapping[str, object]) -> None:
+            normalized = {
+                key: value
+                for key, value in event.items()
+                if key
+                not in {
+                    "runtime_event_id",
+                    "semantic_event_id",
+                    "stream_ordinal",
+                    "semantic_sequence",
+                }
+            }
+            if stream_name == "candidate_state":
+                # Candidate-state is the shared lane decision.  Attempted or
+                # fully charged route-key retention and explanatory wording
+                # are implementation telemetry; routes/objectives and exact
+                # order are verified by dedicated gates.
+                normalized = {
+                    key: normalized.get(key)
+                    for key in (
+                        "event_type",
+                        "lane",
+                        "iteration",
+                        "operator",
+                        "candidate_objective_key",
+                        "candidate_feasible",
+                        "accepted",
+                        "status",
+                    )
+                }
+                normalized["candidate_feasible"] = bool(
+                    normalized.get("candidate_objective_key")
+                )
+                normalized["candidate_id"] = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "lane": normalized.get("lane"),
+                            "iteration": normalized.get("iteration"),
+                            "operator": normalized.get("operator"),
+                            "candidate_objective_key": normalized.get(
+                                "candidate_objective_key", []
+                            ),
+                            "candidate_feasible": normalized.get(
+                                "candidate_feasible"
+                            ),
+                            "accepted": normalized.get("accepted"),
+                            "status": normalized.get("status"),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+            elif stream_name == "deadline":
+                normalized["event_type"] = "termination_boundary"
+            projection.append(
+                {
+                    **normalized,
+                    "semantic_stream": stream_name,
+                    "projection_ordinal": len(projection),
+                }
+            )
+
+        # Candidate decisions come from the canonical operator projection,
+        # which removes implementation-only aggregate pruning telemetry and
+        # supplies stable lane/candidate identities for first-divergence
+        # diagnostics.
+        for event in _semantic_trajectory(payload):
+            if not isinstance(event, dict):
+                raise ValueError("semantic trajectory contains a non-object event")
+            append("operator", event)
+        for stream_name in (
+            "candidate_state",
+            "stage04",
+            "exact_result",
+            "deadline",
+            "termination",
+            "native_failure",
+        ):
+            stream = raw_streams.get(stream_name)
+            if not isinstance(stream, list) or not all(
+                isinstance(event, dict) for event in stream
+            ):
+                raise ValueError(
+                    f"canonical semantic stream {stream_name} is invalid"
+                )
+            for event in stream:
+                append(stream_name, event)
+        return projection
     return _semantic_trajectory(payload)
 
 

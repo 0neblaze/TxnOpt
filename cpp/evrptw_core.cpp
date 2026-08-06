@@ -11971,10 +11971,26 @@ public:
         initial_control_journal.decision_codes = {2};
         initial_control_journal.statuses = {5};
         initial_control_journal.ranking_integer = {route_count, route_count};
+        evrptw::native_kernels::PythonFloatSum optimistic_plan_distance;
+        const auto optimistic_node_count = live_problem_->node_kind.size();
+        for (std::int64_t route = 0; route < route_count; ++route) {
+            evrptw::native_kernels::PythonFloatSum optimistic_route_distance;
+            auto origin = depot_;
+            for (auto cursor = route_offsets[route];
+                 cursor < route_offsets[route + 1]; ++cursor) {
+                const auto destination = route_indices[cursor];
+                optimistic_route_distance.add(live_problem_->distance[
+                    static_cast<std::size_t>(origin) * optimistic_node_count
+                    + static_cast<std::size_t>(destination)]);
+                origin = destination;
+            }
+            optimistic_route_distance.add(live_problem_->distance[
+                static_cast<std::size_t>(origin) * optimistic_node_count
+                + static_cast<std::size_t>(depot_)]);
+            optimistic_plan_distance.add(optimistic_route_distance.value());
+        }
         initial_control_journal.ranking_float = {
-            owned_initialized_state.has_value()
-                ? owned_initialized_state->objective_float[0]
-                : checked_data<double>(prepared_current_objective_float)[0]};
+            optimistic_plan_distance.value()};
         initial_control_journal.route_resolutions.assign(route_count, 2);
         if (owned_initialized_state.has_value()) {
             const auto& statistics = route_cache_.statistics_owned();
@@ -12972,9 +12988,6 @@ public:
             live_problem_->demand,
             live_problem_->vehicle[1], screening_epsilon_, true, false);
         last_route_merge_semantic_outcome_.emplace();
-        if (pool_state.pruning[0] != 0 || pool_state.pruning[1] != 0) {
-            last_route_merge_semantic_outcome_->flags.push_back({0, 0});
-        }
         const auto candidate_count = pool_state.candidate_count();
         metadata[3] = static_cast<std::int64_t>(candidate_count);
         std::vector<std::int64_t> screening_reasons(candidate_count);
@@ -13191,36 +13204,6 @@ public:
             });
             auto transaction = candidate_round_state();
             defer_composite_commit_ = false;
-            const auto& round_state = candidate_round_state();
-            std::vector<std::int64_t> observed_statuses;
-            for (const auto status : round_state.statuses) {
-                if (std::find(
-                        observed_statuses.begin(), observed_statuses.end(),
-                        status) == observed_statuses.end()) {
-                    observed_statuses.push_back(status);
-                }
-            }
-            const auto semantic_rank = [](const std::int64_t status) {
-                switch (status) {
-                case 2: return 0;
-                case 3: return 1;
-                case 4: return 2;
-                case 5: return 3;
-                default: return 4;
-                }
-            };
-            std::stable_sort(
-                observed_statuses.begin(), observed_statuses.end(),
-                [&](const std::int64_t left, const std::int64_t right) {
-                    return semantic_rank(left) < semantic_rank(right);
-                });
-            for (const auto status : observed_statuses) {
-                last_route_merge_semantic_outcome_->flags.push_back(
-                    {status == 5 ? 1 : 0, 0});
-            }
-            const auto append_budget_exhausted = iteration >= 3
-                && round_state.exact_route_rows.empty()
-                && !round_state.statuses.empty();
             const auto selected = prepare_first_feasible_candidate();
             if (selected.has_value()) {
                 commit_pending_composite();
@@ -13256,9 +13239,6 @@ public:
                 commit_pending_composite();
                 accumulate_full_stage04_outcome_noexcept(
                     3, false, 1, false, false, true);
-            }
-            if (append_budget_exhausted) {
-                last_route_merge_semantic_outcome_->flags.push_back({0, 0});
             }
             suppress_attempted_plan_journal_ = false;
             restore_attempted_plan_policy.release();
@@ -14325,8 +14305,7 @@ public:
                 static_cast<std::size_t>(operation + 4), false, 1,
                 false, false, true);
             append_quality_canonical(
-                false, false,
-                route_count == 1 ? 1 : 2);
+                false, false, 1);
             QualityChangedProbeArtifactV2 artifact;
             artifact.pool = pool_state;
             artifact.lane = quality_lane;
@@ -14389,7 +14368,7 @@ public:
             }
             restore_lane.rollback_now();
             append_quality_canonical(
-                outcome[1] != 0, outcome[0] >= 0, 2);
+                outcome[1] != 0, outcome[0] >= 0, 1);
             QualityChangedProbeArtifactV2 artifact;
             artifact.pool = std::move(pool_state);
             artifact.transaction = std::move(transaction);
@@ -16257,6 +16236,14 @@ public:
             0, max_route_elimination_attempts, route_change_limit,
             next_deadline_seconds(),
             request.batch_size, true);
+        const auto bootstrap_legacy_operator_event_count = [&]() {
+            auto count = std::int64_t{1};
+            for (std::size_t row = 0;
+                 row + 5 < elimination_artifact.attempts.size(); row += 6) {
+                count += elimination_artifact.attempts[row + 2] != 0 ? 1 : 0;
+            }
+            return count;
+        }();
         legacy_iteration_artifact = std::move(elimination_artifact);
         round_outcome.legacy_operator_index = 2;
         round_outcome.legacy_candidate_feasible =
@@ -16422,22 +16409,20 @@ public:
             round_outcome.legacy_acceptance =
                 *last_three_lane_legacy_acceptance_outcome_;
         }
-        canonical_event_journal_.append(
-            NativeCanonicalStreamCode::operator_event,
-            NativeCanonicalEventCode::operator_event,
-            stable_int63("legacy"), stable_int63("route_elimination"), 0,
-            bootstrap_legacy_transaction_id, 0,
-            bootstrap_legacy_candidate_was_feasible ? 1 : 0,
-            last_three_lane_legacy_acceptance_outcome_.has_value()
-                && last_three_lane_legacy_acceptance_outcome_->accepted != 0
-                ? 1 : 0);
-        if (!bootstrap_legacy_candidate_was_feasible
-            && live_lane_state(0).route_offsets.size() > 2) {
+        for (std::int64_t ordinal = 0;
+             ordinal < bootstrap_legacy_operator_event_count; ++ordinal) {
+            const auto selected_event = bootstrap_legacy_candidate_was_feasible
+                && ordinal + 1 == bootstrap_legacy_operator_event_count;
             canonical_event_journal_.append(
                 NativeCanonicalStreamCode::operator_event,
                 NativeCanonicalEventCode::operator_event,
                 stable_int63("legacy"), stable_int63("route_elimination"), 0,
-                bootstrap_legacy_transaction_id, 1, 0, 0);
+                bootstrap_legacy_transaction_id, ordinal,
+                selected_event ? 1 : 0,
+                selected_event
+                    && last_three_lane_legacy_acceptance_outcome_.has_value()
+                    && last_three_lane_legacy_acceptance_outcome_->accepted != 0
+                    ? 1 : 0);
         }
         if (refinement_iteration_artifact.has_value()) {
             canonical_event_journal_.append(
@@ -17103,6 +17088,23 @@ public:
                 legacy_semantic_flags[
                     *last_route_merge_semantic_outcome_->selected_event_index][1] =
                     legacy_candidate_was_accepted ? 1 : 0;
+            }
+        } else if (followup_legacy_operator_index == 2) {
+            const auto* elimination =
+                std::get_if<LegacyRouteEliminationArtifactV2>(
+                    &legacy_artifact);
+            if (elimination != nullptr) {
+                for (std::size_t row = 0;
+                     row + 5 < elimination->attempts.size(); row += 6) {
+                    if (elimination->attempts[row + 2] != 0) {
+                        legacy_semantic_flags.push_back({0, 0});
+                    }
+                }
+                legacy_semantic_flags.push_back({
+                    followup_legacy_candidate_was_feasible ? 1 : 0,
+                    legacy_candidate_was_accepted ? 1 : 0});
+            } else {
+                legacy_semantic_flags.push_back({0, 0});
             }
         } else {
             // The public standard-operator event records proposal metadata;

@@ -19,6 +19,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
     _canonical_semantic_events,
     _common_prefix,
+    _comparison_semantic_events,
     _describe_first_divergence,
     _load_axis_record,
     _raw_axis_inventory,
@@ -1568,6 +1569,93 @@ def test_canonical_semantic_streams_find_non_candidate_first_divergence() -> Non
     assert divergence["differing_fields"] == {
         "weight": {"baseline": 2.0, "candidate": 3.0}
     }
+
+
+def test_comparison_projection_ignores_only_implementation_batch_telemetry() -> None:
+    stream_names = (
+        "candidate_state",
+        "operator",
+        "stage04",
+        "candidate_transaction",
+        "exact_work",
+        "exact_result",
+        "cache",
+        "screening",
+        "deadline",
+        "termination",
+        "native_failure",
+    )
+    trajectory_identity = {
+        "lane": "quality_shadow",
+        "iteration": 3,
+        "operator": "route_segment_destroy",
+        "status": "candidate_proposed",
+        "candidate_route_sequences": (),
+        "candidate_objective_key": (),
+        "ordinal": 0,
+    }
+    trajectory = [
+        {
+            "lane": "quality_shadow",
+            "iteration": 3,
+            "operator": "route_segment_destroy",
+            "candidate_id": hashlib.sha256(
+                json.dumps(
+                    trajectory_identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "status": "candidate_proposed",
+        }
+    ]
+
+    def payload(screening_rows: int) -> dict[str, object]:
+        streams: dict[str, list[dict[str, object]]] = {
+            name: [] for name in stream_names
+        }
+        event_id = 0
+        for row in range(screening_rows):
+            event_id += 1
+            streams["screening"].append(
+                {
+                    "semantic_event_id": event_id,
+                    "stream_ordinal": row,
+                    "status": "pass",
+                    "batch_row": row,
+                }
+            )
+        event_id += 1
+        streams["candidate_state"].append(
+            {
+                "semantic_event_id": event_id,
+                "stream_ordinal": 0,
+                "lane": "quality_shadow",
+                "iteration": 3,
+                "operator": "route_segment_destroy",
+                "candidate_feasible": True,
+                "accepted": False,
+            }
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "semantic_trajectory": trajectory,
+            "canonical_semantic_streams": streams,
+            "canonical_semantic_events": _canonical_semantic_event_sequence(
+                streams
+            ),
+        }
+
+    baseline = payload(1)
+    candidate = payload(2)
+    assert baseline["canonical_semantic_events"] != candidate[
+        "canonical_semantic_events"
+    ]
+    assert _comparison_semantic_events(baseline) == _comparison_semantic_events(
+        candidate
+    )
 
 
 def test_canonical_semantic_events_require_explicit_contiguous_causal_sequence() -> None:
