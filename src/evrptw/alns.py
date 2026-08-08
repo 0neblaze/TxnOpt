@@ -168,9 +168,7 @@ def _negative_screening_evidence_token(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    token = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
-        (1 << 63) - 1
-    )
+    token = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
     return token or 1
 
 
@@ -415,9 +413,7 @@ class _Evaluator:
         lane: str = "legacy",
         screening_config: CheapScreeningConfig | None = None,
         negative_screening_cache: (
-            dict[str, ScreeningResult]
-            | BoundedScreeningResultCache[ScreeningResult]
-            | None
+            dict[str, ScreeningResult] | BoundedScreeningResultCache[ScreeningResult] | None
         ) = None,
         negative_screening_sequences: (
             dict[tuple[str, ...], str] | BoundedNegativeSequenceCache | None
@@ -578,18 +574,14 @@ class _Evaluator:
                 self.negative_screening_sequences,
                 BoundedNegativeSequenceCache,
             ):
-                negative_sequence_batch = (
-                    self.negative_screening_sequences.begin_store_many_atomic(
-                        pending_negative
-                    )
+                negative_sequence_batch = self.negative_screening_sequences.begin_store_many_atomic(
+                    pending_negative
                 )
             else:
                 for sequence, reason in pending_negative.items():
                     existing = self.negative_screening_sequences.get(sequence)
                     if existing is not None and existing != reason:
-                        raise RuntimeError(
-                            "candidate negative cache reason changed during commit"
-                        )
+                        raise RuntimeError("candidate negative cache reason changed during commit")
                     if existing is None:
                         negative_insertions.append(sequence)
                         self.negative_screening_sequences[sequence] = reason
@@ -598,10 +590,7 @@ class _Evaluator:
                     raise RuntimeError(
                         "candidate transaction negative-cache commit lacks native runtime"
                     )
-                if (
-                    negative_sequence_batch is not None
-                    and negative_sequence_batch.rollover
-                ):
+                if negative_sequence_batch is not None and negative_sequence_batch.rollover:
                     native_negative_commit = (
                         self.candidate_transaction_runtime.replace_negative_cache_entries(
                             self.negative_screening_sequences,
@@ -685,9 +674,7 @@ class _Evaluator:
                     self.negative_screening_sequences,
                     BoundedNegativeSequenceCache,
                 )
-                self.negative_screening_sequences.commit_store_batch(
-                    negative_sequence_batch
-                )
+                self.negative_screening_sequences.commit_store_batch(negative_sequence_batch)
         except BaseException:
             if native_negative_commit is not None and native_negative_commit.active:
                 assert self.candidate_transaction_runtime is not None
@@ -704,9 +691,7 @@ class _Evaluator:
                     self.negative_screening_sequences,
                     BoundedNegativeSequenceCache,
                 )
-                self.negative_screening_sequences.rollback_store_batch(
-                    negative_sequence_batch
-                )
+                self.negative_screening_sequences.rollback_store_batch(negative_sequence_batch)
             elif negative_insertions:
                 assert isinstance(self.negative_screening_sequences, dict)
                 for sequence in negative_insertions:
@@ -852,15 +837,8 @@ class _Evaluator:
         )
         cache_flags = tuple(
             sequence in self.pending_candidate_cache
-            or (
-                self.route_cache is not None
-                and self.route_cache.contains(sequence)
-            )
-            or (
-                self.route_cache is None
-                and self.local_cache_enabled
-                and sequence in self.cache
-            )
+            or (self.route_cache is not None and self.route_cache.contains(sequence))
+            or (self.route_cache is None and self.local_cache_enabled and sequence in self.cache)
             for sequence in clean
         )
         controller_remaining = exact_budget
@@ -903,44 +881,29 @@ class _Evaluator:
         charged_resource_receipt: NativeCandidateResourceReceipt | None = None
         native_charge_event_emitted = False
         native_charge_within_budget = True
-        native_charge_context = (
-            f"{self.lane}:{self.operator}:native_candidate_round"
-        )
+        native_charge_context = f"{self.lane}:{self.operator}:native_candidate_round"
 
         def rollback_protocol_state() -> None:
             self.pending_candidate_cache.clear()
             self.pending_candidate_cache.update(pending_snapshot)
             self.pending_negative_screening_sequences.clear()
-            self.pending_negative_screening_sequences.update(
-                pending_negative_snapshot
-            )
+            self.pending_negative_screening_sequences.update(pending_negative_snapshot)
             if self.route_cache is not None and route_cache_snapshot is not None:
                 self.route_cache.restore_state(route_cache_snapshot)
             transaction_runtime.rollback_protocol_state(transaction_snapshot)
-            transaction_runtime.restore_negative_cache_state(
-                native_negative_cache_snapshot
-            )
+            transaction_runtime.restore_negative_cache_state(native_negative_cache_snapshot)
             if bounded_negative_cache_snapshot is not None:
                 assert isinstance(
                     self.negative_screening_sequences,
                     BoundedNegativeSequenceCache,
                 )
-                self.negative_screening_sequences.restore_state(
-                    bounded_negative_cache_snapshot
-                )
+                self.negative_screening_sequences.restore_state(bounded_negative_cache_snapshot)
             if dictionary_negative_cache_snapshot is not None:
                 assert isinstance(self.negative_screening_sequences, dict)
                 self.negative_screening_sequences.clear()
-                self.negative_screening_sequences.update(
-                    dictionary_negative_cache_snapshot
-                )
-            if (
-                self.measurement_trace is not None
-                and semantic_journal_snapshot is not None
-            ):
-                self.measurement_trace.rollback_runtime_semantic_journal(
-                    semantic_journal_snapshot
-                )
+                self.negative_screening_sequences.update(dictionary_negative_cache_snapshot)
+            if self.measurement_trace is not None and semantic_journal_snapshot is not None:
+                self.measurement_trace.rollback_runtime_semantic_journal(semantic_journal_snapshot)
             control_runtime.rollback_protocol_state(
                 control_snapshot,
                 preserve_round_usage=native_resource_charged,
@@ -1027,9 +990,7 @@ class _Evaluator:
             self.screening_passes += native_result.audit.screening_passes
             self.screening_rejections += native_result.audit.screening_rejections
             self.screening_cache_hits += native_result.audit.screening_cache_hits
-            self.screening_exact_call_blocked += (
-                native_result.audit.screening_exact_call_blocked
-            )
+            self.screening_exact_call_blocked += native_result.audit.screening_exact_call_blocked
             for reason, count in native_result.audit.screening_reason_counts.items():
                 self.screening_reason_counts[reason] = (
                     self.screening_reason_counts.get(reason, 0) + count
@@ -1038,8 +999,7 @@ class _Evaluator:
             rankable = [
                 (index, sequence, float(screening.metrics[index, 3]))
                 for index, sequence in enumerate(clean)
-                if screening.accepted(index)
-                and screening.native_status(index) != "duplicate"
+                if screening.accepted(index) and screening.native_status(index) != "duplicate"
             ]
             selected, selection_events = control_runtime.project_route_candidates(
                 rankable,
@@ -1048,9 +1008,7 @@ class _Evaluator:
                 operator=self.operator,
             )
             journal_selected = tuple(
-                int(row[0])
-                for row in native_result.cache_journal
-                if int(row[1]) in {1, 2, 3}
+                int(row[0]) for row in native_result.cache_journal if int(row[1]) in {1, 2, 3}
             )
             if selected != journal_selected:
                 raise RuntimeError(
@@ -1077,9 +1035,7 @@ class _Evaluator:
                     raise RuntimeError("native candidate-round budget replay diverged")
             elif native_result.exact_candidate_ids:
                 raise RuntimeError("native candidate round started unrequested exact work")
-            exact_sequences = tuple(
-                clean[index] for index in native_result.exact_candidate_ids
-            )
+            exact_sequences = tuple(clean[index] for index in native_result.exact_candidate_ids)
             if exact_started != len(exact_sequences):
                 raise RuntimeError("native exact started-call receipt diverged")
             control_runtime.record_native_work_event(
@@ -1104,9 +1060,7 @@ class _Evaluator:
                             "lane": self.lane,
                             "iteration": self.iteration,
                             "operator": self.operator,
-                            "customer_sequences": [
-                                list(sequence) for sequence in exact_sequences
-                            ],
+                            "customer_sequences": [list(sequence) for sequence in exact_sequences],
                             "route_change_status": route_change_status,
                             "requested_calls": len(exact_sequences),
                             "started_calls": exact_started,
@@ -1187,9 +1141,7 @@ class _Evaluator:
                 elif resolution == "not_selected":
                     resolved[index] = _candidate_control_skip_result("not_selected")
                 elif resolution == "round_budget_exhausted":
-                    resolved[index] = _candidate_control_skip_result(
-                        "round_budget_exhausted"
-                    )
+                    resolved[index] = _candidate_control_skip_result("round_budget_exhausted")
                 elif resolution == "duplicate":
                     source = native_result.resolution_sources[index]
                     if source < 0 or source >= index or resolved[source] is None:
@@ -1209,9 +1161,7 @@ class _Evaluator:
                         self.negative_screening_sequences.snapshot_state()
                     )
                 else:
-                    dictionary_negative_cache_snapshot = dict(
-                        self.negative_screening_sequences
-                    )
+                    dictionary_negative_cache_snapshot = dict(self.negative_screening_sequences)
             self._commit_pending_candidate_cache()
             transaction_runtime.record_worker_protocol(
                 native_result.audit,
@@ -1267,9 +1217,7 @@ class _Evaluator:
                 self.backend_metrics.completed_calls += receipt.completed_calls
                 self.backend_metrics.interrupted_calls += receipt.interrupted_calls
                 self.backend_metrics.native_invocations += 1
-                self.backend_metrics.launch_occupancies.append(
-                    receipt.started_calls
-                )
+                self.backend_metrics.launch_occupancies.append(receipt.started_calls)
                 self.calls += receipt.completed_calls
             rollback_protocol_state()
             if (
@@ -1280,9 +1228,7 @@ class _Evaluator:
                 self.measurement_trace.record_runtime_semantic_event(
                     "native_failure",
                     {
-                        "event_type": (
-                            "native_candidate_round_failed_after_resource_start"
-                        ),
+                        "event_type": ("native_candidate_round_failed_after_resource_start"),
                         "lane": self.lane,
                         "iteration": self.iteration,
                         "operator": self.operator,
@@ -1337,9 +1283,7 @@ class _Evaluator:
                     self.measurement_trace.record_runtime_semantic_event(
                         "native_failure",
                         {
-                            "event_type": (
-                                "native_candidate_round_deadline_after_resource_start"
-                            ),
+                            "event_type": ("native_candidate_round_deadline_after_resource_start"),
                             "lane": self.lane,
                             "iteration": self.iteration,
                             "operator": self.operator,
@@ -1347,9 +1291,7 @@ class _Evaluator:
                             "receipt_phase": charged_resource_receipt.phase,
                             "started_calls": charged_resource_receipt.started_calls,
                             "completed_calls": charged_resource_receipt.completed_calls,
-                            "interrupted_calls": (
-                                charged_resource_receipt.interrupted_calls
-                            ),
+                            "interrupted_calls": (charged_resource_receipt.interrupted_calls),
                             "fail_closed": charged_resource_receipt.fail_closed,
                         },
                     )
@@ -1403,9 +1345,7 @@ class _Evaluator:
             if self.screening_config is not None
             else native_runtime.context.reachability_epsilon
         )
-        for index, (base_sequence, candidate) in enumerate(
-            zip(base_sequences, clean, strict=True)
-        ):
+        for index, (base_sequence, candidate) in enumerate(zip(base_sequences, clean, strict=True)):
             base_snapshot = self.propagation_snapshots.get(base_sequence)
             if base_snapshot is None:
                 base_snapshot = build_route_propagation_snapshot(
@@ -1527,9 +1467,7 @@ class _Evaluator:
             4: "backward_time_window_prefilter",
             5: "time_window_slack_prefilter",
         }
-        for base_sequence, candidate, receipt in zip(
-            base_sequences, clean, receipts, strict=True
-        ):
+        for base_sequence, candidate, receipt in zip(base_sequences, clean, receipts, strict=True):
             if receipt.status_code == 2 or receipt.reason_code not in reasons:
                 raise RuntimeError("native candidate round omitted incremental propagation")
             status = "fallback" if receipt.status_code == 1 else "incremental"
@@ -1714,9 +1652,7 @@ class _Evaluator:
                     )
                     screening_cache_hits = screening.counters["negative_cache_hits"]
                     screening_exact_call_blocked = len(screening.sequences) - screening_passes
-                    screening_rejections = (
-                        screening_exact_call_blocked - screening_cache_hits
-                    )
+                    screening_rejections = screening_exact_call_blocked - screening_cache_hits
                     screening_reason_counts: dict[str, int] = {}
                     for index in range(len(screening.sequences)):
                         reason = screening.reason(index)
@@ -2120,11 +2056,9 @@ class _Evaluator:
                     self.negative_screening_cache,
                     BoundedScreeningResultCache,
                 ):
-                    negative_evidence_token = _negative_screening_evidence_token(
+                    negative_evidence_token = _negative_screening_evidence_token(key, result)
+                    negative_evidence_signature = _negative_screening_evidence_signature(
                         key, result
-                    )
-                    negative_evidence_signature = (
-                        _negative_screening_evidence_signature(key, result)
                     )
                 else:
                     negative_evidence_token = id(result)
@@ -2376,10 +2310,7 @@ class _Evaluator:
             self._discard_pending_candidate_cache("exact_call_budget_exhausted")
             self._record_exact_budget_boundary()
             raise _TimeLimitReached(sequence)
-        if (
-            self.measurement_trace is not None
-            and self.measurement_trace.runtime_semantic_enabled
-        ):
+        if self.measurement_trace is not None and self.measurement_trace.runtime_semantic_enabled:
             self.measurement_trace.record_runtime_semantic_event(
                 "exact_work",
                 {
@@ -2887,10 +2818,7 @@ class _Evaluator:
         active_sequences = (
             sequences[: reservation.granted] if reservation is not None else sequences
         )
-        if (
-            self.measurement_trace is not None
-            and self.measurement_trace.runtime_semantic_enabled
-        ):
+        if self.measurement_trace is not None and self.measurement_trace.runtime_semantic_enabled:
             self.measurement_trace.record_runtime_semantic_event(
                 "exact_work",
                 {
@@ -3213,9 +3141,7 @@ class _NeighborhoodEventStream(list[dict[str, object]]):
     ) -> None:
         super().__init__()
         self._sink = sink
-        self._trace = (
-            trace if trace is not None and trace.runtime_semantic_enabled else None
-        )
+        self._trace = trace if trace is not None and trace.runtime_semantic_enabled else None
         self.emitted_count = 0
 
     def append(self, event: dict[str, object]) -> None:
@@ -3244,9 +3170,7 @@ class _RuntimeSemanticEventList(list[dict[str, object]]):
         semantic_stream: str,
     ) -> None:
         super().__init__()
-        self._trace = (
-            trace if trace is not None and trace.runtime_semantic_enabled else None
-        )
+        self._trace = trace if trace is not None and trace.runtime_semantic_enabled else None
         self._semantic_stream = semantic_stream
 
     def append(self, event: dict[str, object]) -> None:
@@ -3336,14 +3260,10 @@ def _solve_alns(
         raise ValueError("constraint lane time budget must be smaller than the time limit")
     legacy_deadline = started + legacy_lane_budget
     negative_screening_cache: (
-        dict[str, ScreeningResult]
-        | BoundedScreeningResultCache[ScreeningResult]
-        | None
+        dict[str, ScreeningResult] | BoundedScreeningResultCache[ScreeningResult] | None
     ) = (
         (
-            BoundedScreeningResultCache(
-                capacity=STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES
-            )
+            BoundedScreeningResultCache(capacity=STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES)
             if candidate_transaction_config is not None
             else {}
         )
@@ -3353,9 +3273,7 @@ def _solve_alns(
     negative_screening_sequences: (
         dict[tuple[str, ...], str] | BoundedNegativeSequenceCache | None
     ) = (
-        BoundedNegativeSequenceCache(
-            capacity=STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES
-        )
+        BoundedNegativeSequenceCache(capacity=STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES)
         if candidate_transaction_config is not None
         else None
     )
@@ -3469,10 +3387,7 @@ def _solve_alns(
             if initial_customer_sequences is None:
                 initial_sequences = _construct_initial_solution(instance, evaluator)
             else:
-                if (
-                    candidate_control_runtime is None
-                    and warm_start_validation_config is None
-                ):
+                if candidate_control_runtime is None and warm_start_validation_config is None:
                     raise RuntimeError("inherited initialization requires candidate control")
                 initialization_event = {
                     "event_type": "candidate_initial_solution",
@@ -3567,8 +3482,7 @@ def _solve_alns(
         neighborhood_stats["vehicle_reduction_refinement"] = refinement_stats
     semantic_trace = (
         measurement_trace
-        if measurement_trace is not None
-        and measurement_trace.runtime_semantic_enabled
+        if measurement_trace is not None and measurement_trace.runtime_semantic_enabled
         else None
     )
     neighborhood_events = _NeighborhoodEventStream(
@@ -3589,9 +3503,7 @@ def _solve_alns(
     # ── Stage 4 adaptive weights and search control ──────────────
     stage04_enabled = stage04_config is not None and stage04_config.enabled
     stage04_events: list[dict[str, object]] = (
-        _RuntimeSemanticEventList(semantic_trace, "stage04")
-        if semantic_trace is not None
-        else []
+        _RuntimeSemanticEventList(semantic_trace, "stage04") if semantic_trace is not None else []
     )
     temperature_history: list[tuple[int, float]] = []
     reheat_count = 0
@@ -5186,9 +5098,7 @@ def _solve_alns(
             else ()
         ),
         route_result_events=(
-            candidate_control_runtime.route_results
-            if candidate_control_runtime is not None
-            else ()
+            candidate_control_runtime.route_results if candidate_control_runtime is not None else ()
         ),
         stage04_statistics=(
             {
@@ -5249,6 +5159,8 @@ def _solve_alns(
             else None
         ),
     )
+
+
 def _full_native_operator_statistics(
     instance: Instance,
     *,
@@ -5265,8 +5177,7 @@ def _full_native_operator_statistics(
     names = (*_neighborhood_names(operator_profile), "vehicle_reduction_refinement")
     statistics = {name: OperatorStatistics().to_dict() for name in names}
     initial_exact = tuple(
-        solve_exact_charging(instance, sequence)
-        for sequence in initial_customer_sequences
+        solve_exact_charging(instance, sequence) for sequence in initial_customer_sequences
     )
     if any(not result.feasible for result in initial_exact):
         raise RuntimeError("full native operator replay found an infeasible warm start")
@@ -5320,13 +5231,10 @@ def _full_native_operator_statistics(
         )
         if operator == "vehicle_reduction_refinement":
             feasible_repair = any(
-                bool(event["candidate_feasible"])
-                or str(event["reason"]) == "refinement_not_better"
+                bool(event["candidate_feasible"]) or str(event["reason"]) == "refinement_not_better"
                 for event in events
             )
-        values["feasible_repairs"] = cast(int, values["feasible_repairs"]) + int(
-            feasible_repair
-        )
+        values["feasible_repairs"] = cast(int, values["feasible_repairs"]) + int(feasible_repair)
         values["prefilter_passed"] = cast(int, values["prefilter_passed"]) + sum(
             cast(int, event.get("aggregate_count", 1))
             for event in events
@@ -5345,16 +5253,16 @@ def _full_native_operator_statistics(
         values["new_routes_created"] = cast(int, values["new_routes_created"]) + sum(
             cast(int, event["new_routes_created"]) for event in events
         )
-        values["exact_route_evaluations"] = cast(
-            int, values["exact_route_evaluations"]
-        ) + sum(cast(int, event["exact_route_evaluations"]) for event in events)
+        values["exact_route_evaluations"] = cast(int, values["exact_route_evaluations"]) + sum(
+            cast(int, event["exact_route_evaluations"]) for event in events
+        )
         if operator != "vehicle_reduction_refinement":
-            values["vehicle_reductions"] = cast(
-                int, values["vehicle_reductions"]
-            ) + sum(bool(event.get("vehicle_reduction", False)) for event in events)
-        values["distance_improvements"] = cast(
-            int, values["distance_improvements"]
-        ) + sum(bool(event.get("distance_improvement", False)) for event in events)
+            values["vehicle_reductions"] = cast(int, values["vehicle_reductions"]) + sum(
+                bool(event.get("vehicle_reduction", False)) for event in events
+            )
+        values["distance_improvements"] = cast(int, values["distance_improvements"]) + sum(
+            bool(event.get("distance_improvement", False)) for event in events
+        )
         failures = cast(dict[str, int], values["failure_reasons"])
         for event in events:
             reason = str(event["reason"])
@@ -5388,8 +5296,7 @@ def _full_native_operator_statistics(
             raise RuntimeError("full native operator replay found duplicate acceptance")
         if not accepted_events:
             if operator == "vehicle_reduction_refinement" and any(
-                bool(event.get("_operator_budget_discarded", False))
-                for event in events
+                bool(event.get("_operator_budget_discarded", False)) for event in events
             ):
                 # The exact-call boundary discards the enclosing iteration
                 # atomically.  Python preserves refinement work metrics but
@@ -5398,28 +5305,27 @@ def _full_native_operator_statistics(
             values["rejected"] = cast(int, values["rejected"]) + 1
             if any(
                 str(event["reason"])
-                    in {
-                        "constraint_removal_no_change",
-                        "constraint_removal_no_existing_route_insertion",
-                        "constraint_repair_infeasible",
-                        "no_removable_customer",
-                    }
+                in {
+                    "constraint_removal_no_change",
+                    "constraint_removal_no_existing_route_insertion",
+                    "constraint_repair_infeasible",
+                    "no_removable_customer",
+                }
                 for event in events
+            ) or (
+                operator in _CONSTRAINT_REMOVAL_ORDER
+                and any(bool(event["candidate_feasible"]) for event in events)
             ):
                 # Python records both the proposal-level no-change cause and
-                # the operator-outcome rejection.  The canonical native event
-                # stream retains the former; reconstruct the latter here
-                # without inventing an extra neighborhood event.
-                failures["candidate_rejected"] = (
-                    failures.get("candidate_rejected", 0) + 1
-                )
+                # every constraint operator-outcome rejection.  The canonical
+                # native event stream retains the proposal evidence; rebuild
+                # the outcome counter without inventing an extra public event.
+                failures["candidate_rejected"] = failures.get("candidate_rejected", 0) + 1
             if operator != "vehicle_reduction_refinement":
-                values["segment_reward_sum"] = cast(
-                    float, values["segment_reward_sum"]
-                ) + stage04_config.reward_rejected
-                segment_records.append(
-                    (iteration, operator, stage04_config.reward_rejected)
+                values["segment_reward_sum"] = (
+                    cast(float, values["segment_reward_sum"]) + stage04_config.reward_rejected
                 )
+                segment_records.append((iteration, operator, stage04_config.reward_rejected))
             continue
         event = accepted_events[0]
         objective_key = cast(tuple[int, float, float, int], event["candidate_objective_key"])
@@ -5498,9 +5404,7 @@ def _full_native_operator_statistics(
             vehicle_reduction=vehicle_reduction,
         )
         if operator != "vehicle_reduction_refinement":
-            values["segment_reward_sum"] = cast(
-                float, values["segment_reward_sum"]
-            ) + reward
+            values["segment_reward_sum"] = cast(float, values["segment_reward_sum"]) + reward
             segment_records.append((iteration, operator, reward))
         current_by_lane[lane] = candidate_objective
     if not stage04_config.fixed_weights:
@@ -5534,44 +5438,31 @@ def _full_native_operator_statistics(
                 for name in ("greedy", "regret2", "energy")
             },
         }
-        for record_index, (iteration, operator, reward) in enumerate(
-            segment_records
-        ):
+        for record_index, (iteration, operator, reward) in enumerate(segment_records):
             if operator != "vehicle_reduction_refinement":
                 role_names = [f"neighborhood:{operator}"]
                 if operator == "standard":
                     standard_events = grouped[(iteration, operator)]
-                    destroy_name, repair_name = str(
-                        standard_events[-1]["reason"]
-                    ).split("+", maxsplit=1)
-                    role_names.extend(
-                        (f"destroy:{destroy_name}", f"repair:{repair_name}")
+                    destroy_name, repair_name = str(standard_events[-1]["reason"]).split(
+                        "+", maxsplit=1
                     )
+                    role_names.extend((f"destroy:{destroy_name}", f"repair:{repair_name}"))
                 elif operator == "vehicle_count_aware_repair":
                     vehicle_events = grouped[(iteration, operator)]
-                    destroy_name = str(
-                        vehicle_events[-1]["_operator_destroy_name"]
-                    )
-                    role_names.extend(
-                        (f"destroy:{destroy_name}",)
-                    )
+                    destroy_name = str(vehicle_events[-1]["_operator_destroy_name"])
+                    role_names.extend((f"destroy:{destroy_name}",))
                 for role_name in role_names:
                     values = adaptive_state[role_name]
-                    values["segment_calls"] = cast(
-                        int, values["segment_calls"]
-                    ) + 1
-                    values["segment_reward_sum"] = cast(
-                        float, values["segment_reward_sum"]
-                    ) + reward
+                    values["segment_calls"] = cast(int, values["segment_calls"]) + 1
+                    values["segment_reward_sum"] = (
+                        cast(float, values["segment_reward_sum"]) + reward
+                    )
             next_iteration = (
                 segment_records[record_index + 1][0]
                 if record_index + 1 < len(segment_records)
                 else None
             )
-            if (
-                (iteration + 1) % stage04_config.segment_length != 0
-                or next_iteration == iteration
-            ):
+            if (iteration + 1) % stage04_config.segment_length != 0 or next_iteration == iteration:
                 continue
             for role_name, values in adaptive_state.items():
                 segment_calls = cast(int, values["segment_calls"])
@@ -5583,9 +5474,9 @@ def _full_native_operator_statistics(
                         segment_calls,
                     )
                     values["weight"] = new_weight
-                    cast(
-                        list[tuple[int, float]], values["weight_history"]
-                    ).append((iteration, new_weight))
+                    cast(list[tuple[int, float]], values["weight_history"]).append(
+                        (iteration, new_weight)
+                    )
                     if stage04_segment_events is not None:
                         stage04_segment_events.append(
                             {
@@ -5596,9 +5487,7 @@ def _full_native_operator_statistics(
                                 "old_weight": old_weight,
                                 "new_weight": new_weight,
                                 "segment_calls": segment_calls,
-                                "segment_reward_sum": values[
-                                    "segment_reward_sum"
-                                ],
+                                "segment_reward_sum": values["segment_reward_sum"],
                             }
                         )
                 elif stage04_segment_events is not None:
@@ -5609,9 +5498,7 @@ def _full_native_operator_statistics(
                             "role": role_name.partition(":")[0],
                             "iteration": iteration,
                             "segment_calls": segment_calls,
-                            "segment_reward_sum": values[
-                                "segment_reward_sum"
-                            ],
+                            "segment_reward_sum": values["segment_reward_sum"],
                             "minimum_calls": stage04_config.min_calls_per_operator,
                         }
                     )
@@ -5688,21 +5575,15 @@ def _full_native_operator_statistics(
                     f"{name}: native={activity[:7].tolist()}, "
                     f"replayed={replayed_activity.tolist()}"
                 )
-            if int(native_operator_calls[index]) != cast(
-                int, values["segment_calls"]
-            ):
-                raise RuntimeError(
-                    f"full native segment calls disagree with replay for {name}"
-                )
+            if int(native_operator_calls[index]) != cast(int, values["segment_calls"]):
+                raise RuntimeError(f"full native segment calls disagree with replay for {name}")
             if not math.isclose(
                 float(native_operator_rewards[index]),
                 cast(float, values["segment_reward_sum"]),
                 rel_tol=0.0,
                 abs_tol=1e-12,
             ):
-                raise RuntimeError(
-                    f"full native segment rewards disagree with replay for {name}"
-                )
+                raise RuntimeError(f"full native segment rewards disagree with replay for {name}")
             if name == "vehicle_reduction_refinement" and int(activity[7]) != 0:
                 failure_reason = {
                     1: "time_limit_reached_during_refinement",
@@ -5711,18 +5592,12 @@ def _full_native_operator_statistics(
                     4: "evaluation_budget_exhausted",
                 }.get(int(activity[7]))
                 if failure_reason is None:
-                    raise RuntimeError(
-                        "full native refinement failure code is invalid"
-                    )
+                    raise RuntimeError("full native refinement failure code is invalid")
                 expected_failure = {failure_reason: 1}
-                if (
-                    int(activity[7]) == 1
-                    and values["failure_reasons"]
-                    in (
-                        {"no_existing_route_insertion": 1},
-                        {"evaluation_budget_exhausted": 1},
-                        {"refinement_not_better": 1},
-                    )
+                if int(activity[7]) == 1 and values["failure_reasons"] in (
+                    {"no_existing_route_insertion": 1},
+                    {"evaluation_budget_exhausted": 1},
+                    {"refinement_not_better": 1},
                 ):
                     # The frozen Python path reports the proposal's concrete
                     # repair reason in NeighborhoodEvent, but classifies the
@@ -5730,9 +5605,7 @@ def _full_native_operator_statistics(
                     # OperatorStatistics.  Keep that observable legacy split.
                     values["failure_reasons"] = expected_failure
                 if values["failure_reasons"] != expected_failure:
-                    raise RuntimeError(
-                        "full native refinement failure disagrees with replay"
-                    )
+                    raise RuntimeError("full native refinement failure disagrees with replay")
     return statistics
 
 
@@ -5742,6 +5615,7 @@ def _full_native_maximum_stagnation(
     semantic_events: tuple[dict[str, object], ...],
     stage04_events: tuple[dict[str, object], ...],
     completed_iterations: int,
+    native_maximum_stagnation: int,
 ) -> int:
     initial = SolutionObjective.zero()
     for sequence in initial_customer_sequences:
@@ -5762,22 +5636,45 @@ def _full_native_maximum_stagnation(
         for event in stage04_events
         if event.get("type") == "stage04_restart"
     }
+    legacy_main_operators = {
+        "standard",
+        "vehicle_count_aware_repair",
+        "route_elimination",
+        "route_merge",
+        "vehicle_reduction_refinement",
+    }
     for iteration in range(completed_iterations):
         improved = False
         for event in semantic_events:
-            if int(cast(int, event["iteration"])) != iteration or not bool(
-                event["accepted"]
-            ):
+            if int(cast(int, event["iteration"])) != iteration or not bool(event["accepted"]):
                 continue
             candidate_key = cast(tuple[int, float, float, int], event["candidate_objective_key"])
-            if candidate_key and candidate_key < best_key:
+            explicit_global_best = event.get("_operator_is_global_best")
+            is_global_best = (
+                bool(explicit_global_best)
+                if explicit_global_best is not None
+                else (
+                    str(event["operator"]) in legacy_main_operators
+                    and bool(candidate_key)
+                    and candidate_key < best_key
+                )
+            )
+            if is_global_best:
+                if not candidate_key:
+                    raise RuntimeError(
+                        "full native global-best event has no candidate objective"
+                    )
                 best_key = candidate_key
                 improved = True
         stagnation = 0 if improved else stagnation + 1
         maximum = max(maximum, stagnation)
         if iteration in restart_iterations:
             stagnation = 0
-    return maximum
+    if native_maximum_stagnation < maximum:
+        raise RuntimeError(
+            "full native maximum stagnation is below the independently replayed lower bound"
+        )
+    return native_maximum_stagnation
 
 
 def _full_native_acceptance_rate(
@@ -5788,8 +5685,7 @@ def _full_native_acceptance_rate(
 
     first_iteration = max(0, completed_iterations - 50)
     accepted_by_iteration = {
-        iteration: False
-        for iteration in range(first_iteration, completed_iterations)
+        iteration: False for iteration in range(first_iteration, completed_iterations)
     }
     main_operators = {
         "standard",
@@ -5916,9 +5812,7 @@ def _solve_full_native_alns(
             measurement_trace.events.append(event)
             if event.get("event_type") != "candidate_route_result":
                 continue
-            customer_sequences = cast(
-                list[list[str]], event["customer_sequences"]
-            )
+            customer_sequences = cast(list[list[str]], event["customer_sequences"])
             sequence = tuple(customer_sequences[0])
             measurement_trace.record_route_evaluation(
                 sequence,
@@ -5963,18 +5857,12 @@ def _solve_full_native_alns(
                 reason=str(event["reason"]),
                 checks=checks,
                 demand=float(cast(float, event["demand"])),
-                min_time_window_slack=float(
-                    cast(float, event["min_time_window_slack"])
-                ),
-                distance_lower_bound=float(
-                    cast(float, event["distance_lower_bound"])
-                ),
+                min_time_window_slack=float(cast(float, event["min_time_window_slack"])),
+                distance_lower_bound=float(cast(float, event["distance_lower_bound"])),
                 distance_increment_lower_bound=cast(
                     float | None, event["distance_increment_lower_bound"]
                 ),
-                single_segment_reachable=bool(
-                    event["single_segment_reachable"]
-                ),
+                single_segment_reachable=bool(event["single_segment_reachable"]),
                 structural_energy_lower_bound=float(
                     cast(float, event["structural_energy_lower_bound"])
                 ),
@@ -6007,18 +5895,10 @@ def _solve_full_native_alns(
         raise RuntimeError("full native ALNS objective replay disagrees with validator")
     validation_replay_seconds = time.perf_counter() - validation_started
     runtime_seconds = time.perf_counter() - started
-    protocol_boundary_seconds = max(
-        0.0,
-        protocol_seconds
-        - native_result.timings["total_seconds"]
-    )
+    protocol_boundary_seconds = max(0.0, protocol_seconds - native_result.timings["total_seconds"])
     queue_wait_seconds = native_result.timings["queue_wait_seconds"]
     serialization_ipc_seconds = (
-        max(
-            0.0,
-            host_dispatch_seconds
-            - native_result.timings["total_seconds"]
-        )
+        max(0.0, host_dispatch_seconds - native_result.timings["total_seconds"])
         if config.mode == "host_scheduler"
         else 0.0
     )
@@ -6026,15 +5906,11 @@ def _solve_full_native_alns(
     if fallback_count != 0 or native_runtime.fallback_count != 0:
         raise RuntimeError("full native ALNS used a forbidden fallback")
     native_statistics = config.to_dict()
-    causal_stream_counts = [
-        int(value) for value in native_result.causal_journal.stream_counts
-    ]
+    causal_stream_counts = [int(value) for value in native_result.causal_journal.stream_counts]
     candidate_control_semantics_complete = all(
         causal_stream_counts[index] > 0 for index in (1, 3, 4)
     )
-    stage04_semantics_complete = all(
-        causal_stream_counts[index] > 0 for index in (0, 5)
-    )
+    stage04_semantics_complete = all(causal_stream_counts[index] > 0 for index in (0, 5))
     instrumentation_complete = (
         candidate_control_semantics_complete
         and stage04_semantics_complete
@@ -6059,12 +5935,8 @@ def _solve_full_native_alns(
             "work_pool_active_tasks_at_return": int(
                 native_result.timings["work_pool_active_tasks_at_return"]
             ),
-            "queue_depth_on_submit": int(
-                native_result.timings["queue_depth_on_submit"]
-            ),
-            "work_pool_thread_count": int(
-                native_result.timings["work_pool_thread_count"]
-            ),
+            "queue_depth_on_submit": int(native_result.timings["queue_depth_on_submit"]),
+            "work_pool_thread_count": int(native_result.timings["work_pool_thread_count"]),
             "client_dispatch_thread_count": int(
                 native_result.timings["client_dispatch_thread_count"]
             ),
@@ -6089,12 +5961,8 @@ def _solve_full_native_alns(
             "initial_state_receipt": {
                 "schema_version": "stage05.2-native-initial-state-receipt-v3",
                 "host_owned": native_result.initial_state_receipt.host_owned,
-                "operation_count": (
-                    native_result.initial_state_receipt.operation_count
-                ),
-                "request_sha256": (
-                    native_result.initial_state_receipt.request_sha256
-                ),
+                "operation_count": (native_result.initial_state_receipt.operation_count),
+                "request_sha256": (native_result.initial_state_receipt.request_sha256),
                 "state_sha256": native_result.initial_state_receipt.state_sha256,
                 "initial_four_lane_state_sha256": (
                     native_result.initial_state_receipt.initial_four_lane_state_sha256
@@ -6102,9 +5970,7 @@ def _solve_full_native_alns(
                 "initial_four_lane_projection": dict(
                     native_result.initial_state_receipt.initial_four_lane_projection
                 ),
-                "transaction_sha256": (
-                    native_result.initial_state_receipt.transaction_sha256
-                ),
+                "transaction_sha256": (native_result.initial_state_receipt.transaction_sha256),
             },
             "candidate_transaction_occupancies": list(
                 native_result.backend_metrics.launch_occupancies
@@ -6116,17 +5982,13 @@ def _solve_full_native_alns(
             "candidate_screening_occupancies": list(
                 cast(
                     list[int],
-                    native_result.screening_statistics[
-                        "candidate_screening_occupancies"
-                    ],
+                    native_result.screening_statistics["candidate_screening_occupancies"],
                 )
             ),
             "maximum_candidate_screening_occupancy": int(
                 cast(
                     int,
-                    native_result.screening_statistics[
-                        "candidate_screening_maximum_occupancy"
-                    ],
+                    native_result.screening_statistics["candidate_screening_maximum_occupancy"],
                 )
             ),
             "transaction_sha256": native_result.transaction_sha256,
@@ -6134,14 +5996,10 @@ def _solve_full_native_alns(
             "control_journal_sha256": native_result.control_journal_sha256,
             "counters": dict(native_result.counters),
             "timings": dict(native_result.timings),
-            "candidate_control_semantics_complete": (
-                candidate_control_semantics_complete
-            ),
+            "candidate_control_semantics_complete": (candidate_control_semantics_complete),
             "stage04_semantics_complete": stage04_semantics_complete,
             "instrumentation_complete": instrumentation_complete,
-            "causal_journal_sha256": (
-                native_result.causal_journal.transaction_sha256
-            ),
+            "causal_journal_sha256": (native_result.causal_journal.transaction_sha256),
             "causal_stream_counts": causal_stream_counts,
             "shared_native_work_pool": config.mode == "host_scheduler",
         }
@@ -6149,48 +6007,39 @@ def _solve_full_native_alns(
     operator_semantic_events = tuple(
         dict(event) for event in native_result.semantic_stream.neighborhood_events
     )
-    completed_candidate_rounds = int(
-        np.count_nonzero(native_result.canonical_event_journal.event_codes == 17)
+    completed_mask = native_result.canonical_event_journal.event_codes == 17
+    completed_candidate_iterations = frozenset(
+        int(iteration)
+        for iteration in native_result.canonical_event_journal.iterations[completed_mask]
     )
+    completed_candidate_rounds = len(completed_candidate_iterations)
+    if completed_candidate_rounds != int(np.count_nonzero(completed_mask)):
+        raise RuntimeError("full native canonical journal duplicated a completed candidate round")
     if completed_candidate_rounds > native_result.counters["iterations"]:
-        raise RuntimeError(
-            "full native canonical journal completed too many candidate rounds"
-        )
+        raise RuntimeError("full native canonical journal completed too many candidate rounds")
     semantic_events = tuple(
         {
-            **{
-                key: value
-                for key, value in event.items()
-                if not str(key).startswith("_operator_")
-            },
+            **{key: value for key, value in event.items() if not str(key).startswith("_operator_")},
             "accepted": False,
             "vehicle_reduction": False,
             "distance_improvement": False,
         }
         if event["operator"] == "standard" and event["status"] == "proposal"
-        else {
-            key: value
-            for key, value in event.items()
-            if not str(key).startswith("_operator_")
-        }
+        else {key: value for key, value in event.items() if not str(key).startswith("_operator_")}
         for event in operator_semantic_events
+    )
+    operator_replay_semantic_events = (
+        tuple(dict(event) for event in native_result.semantic_stream.operator_replay_events)
+        if isinstance(native_result.semantic_stream, NativeThreeLaneSemanticStream)
+        and native_result.semantic_stream.operator_replay_events
+        else operator_semantic_events
     )
     stage04_segment_events: list[dict[str, object]] = []
     operator_statistics = _full_native_operator_statistics(
         instance,
         operator_profile=OperatorProfile(operator_profile),
         initial_customer_sequences=initial_customer_sequences,
-        semantic_events=(
-            tuple(
-                dict(event)
-                for event in native_result.semantic_stream.operator_replay_events
-            )
-            if isinstance(
-                native_result.semantic_stream, NativeThreeLaneSemanticStream
-            )
-            and native_result.semantic_stream.operator_replay_events
-            else operator_semantic_events
-        ),
+        semantic_events=operator_replay_semantic_events,
         stage04_config=stage04_config,
         native_operator_totals=(
             native_result.semantic_stream.operator_totals
@@ -6223,20 +6072,13 @@ def _solve_full_native_alns(
         3: "candidate_control_exhausted",
     }[native_terminal_reason]
     controlled_exact_started = (
-        native_result.counters["exact_started_calls"]
-        if exact_deadline_config is not None
-        else 0
+        native_result.counters["exact_started_calls"] if exact_deadline_config is not None else 0
     )
     controlled_exact_completed = (
-        native_result.counters["exact_completed_calls"]
-        if exact_deadline_config is not None
-        else 0
+        native_result.counters["exact_completed_calls"] if exact_deadline_config is not None else 0
     )
     native_stage04_events = (
-        tuple(
-            dict(event)
-            for event in native_result.semantic_stream.stage04_events
-        )
+        tuple(dict(event) for event in native_result.semantic_stream.stage04_events)
         if isinstance(native_result.semantic_stream, NativeThreeLaneSemanticStream)
         else ()
     )
@@ -6282,9 +6124,8 @@ def _solve_full_native_alns(
         if work["iteration"] is None:
             continue
         iteration = int(cast(int, work["iteration"]))
-        exact_usage_by_iteration[iteration] = (
-            exact_usage_by_iteration.get(iteration, 0)
-            + len(cast(list[list[str]], work["sequences"]))
+        exact_usage_by_iteration[iteration] = exact_usage_by_iteration.get(iteration, 0) + len(
+            cast(list[list[str]], work["sequences"])
         )
     completed_rounds = native_result.counters["iterations"]
     round_budget = config.candidate_control_config.max_exact_calls_per_round
@@ -6307,14 +6148,10 @@ def _solve_full_native_alns(
         "budget_events": len(exact_work_batches) + budget_skips,
         "budget_skips": budget_skips,
         "parallel_batches": (
-            len(exact_work_batches)
-            if config.candidate_control_config.worker_count > 1
-            else 0
+            len(exact_work_batches) if config.candidate_control_config.worker_count > 1 else 0
         ),
         "completed_rounds": completed_rounds,
-        "maximum_exact_calls_per_round": max(
-            exact_usage_by_iteration.values(), default=0
-        ),
+        "maximum_exact_calls_per_round": max(exact_usage_by_iteration.values(), default=0),
         "total_round_remainder": sum(
             round_budget - exact_usage_by_iteration.get(iteration, 0)
             for iteration in range(completed_rounds)
@@ -6322,12 +6159,9 @@ def _solve_full_native_alns(
     }
     route_cache_statistics = dict(native_result.route_cache_statistics)
     safe_node_indices = tuple(
-        int(index)
-        for index in np.flatnonzero(native_runtime.context.node_kind != 1)
+        int(index) for index in np.flatnonzero(native_runtime.context.node_kind != 1)
     )
-    safe_node_names = tuple(
-        native_runtime.context.node_names[index] for index in safe_node_indices
-    )
+    safe_node_names = tuple(native_runtime.context.node_names[index] for index in safe_node_indices)
 
     def reachability_mask(origin: int) -> int:
         return sum(
@@ -6354,9 +6188,7 @@ def _solve_full_native_alns(
         "queries": int(
             cast(
                 int,
-                native_result.screening_statistics.get(
-                    "station_reachability_queries", 0
-                ),
+                native_result.screening_statistics.get("station_reachability_queries", 0),
             )
         ),
     }
@@ -6397,21 +6229,15 @@ def _solve_full_native_alns(
         for sequence in initial_customer_sequences:
             exact = solve_exact_charging(instance, sequence)
             if not exact.feasible:
-                raise RuntimeError(
-                    "full native semantic projection initial replay is infeasible"
-                )
+                raise RuntimeError("full native semantic projection initial replay is infeasible")
             initial_runtime_objective += SolutionObjective.from_route(
                 instance,
                 exact.route,
                 total_distance=exact.distance,
                 total_charging_time=exact.charging_time,
             )
-        exact_journal_by_context: dict[
-            tuple[str, int | None, str], list[dict[str, object]]
-        ] = {}
-        exact_evaluation_ids_by_context: dict[
-            tuple[str, int | None, str], list[int]
-        ] = {}
+        exact_journal_by_context: dict[tuple[str, int | None, str], list[dict[str, object]]] = {}
+        exact_evaluation_ids_by_context: dict[tuple[str, int | None, str], list[int]] = {}
         next_exact_evaluation_id = 0
         for raw_event in native_result.exact_journal_events:
             context = (
@@ -6425,9 +6251,7 @@ def _solve_full_native_alns(
                 exact_evaluation_ids_by_context.setdefault(context, []).append(
                     next_exact_evaluation_id
                 )
-        exact_results_by_context: dict[
-            tuple[str, int | None, str], list[dict[str, object]]
-        ] = {}
+        exact_results_by_context: dict[tuple[str, int | None, str], list[dict[str, object]]] = {}
         for raw_event in exact_result_events:
             context = (
                 str(raw_event["lane"]),
@@ -6435,28 +6259,16 @@ def _solve_full_native_alns(
                 str(raw_event["operator"]),
             )
             exact_results_by_context.setdefault(context, []).append(dict(raw_event))
-        screening_by_context: dict[
-            tuple[str, int | None, str], list[dict[str, object]]
-        ] = {}
+        screening_by_context: dict[tuple[str, int | None, str], list[dict[str, object]]] = {}
         for raw_event in native_result.control_journal_events:
             if raw_event.get("event_type") != "screening_decision":
                 continue
             event = dict(raw_event)
-            screening_sequence = cast(
-                list[str], event.pop("customer_sequence")
-            )
-            screening_transaction_id = int(
-                cast(int, event.pop("transaction_id"))
-            )
-            screening_canonical_event_id = int(
-                cast(int, event.pop("canonical_event_id"))
-            )
+            screening_sequence = cast(list[str], event.pop("customer_sequence"))
+            screening_transaction_id = int(cast(int, event.pop("transaction_id")))
+            screening_canonical_event_id = int(cast(int, event.pop("canonical_event_id")))
             screening_raw_iteration = cast(int | None, event.get("iteration"))
-            screening_iteration = (
-                None
-                if screening_raw_iteration == -1
-                else screening_raw_iteration
-            )
+            screening_iteration = None if screening_raw_iteration == -1 else screening_raw_iteration
             if (
                 screening_iteration is not None
                 and screening_iteration >= native_result.counters["iterations"]
@@ -6465,9 +6277,7 @@ def _solve_full_native_alns(
                 # native accounting.  It has no committed rich semantic row.
                 continue
             event["iteration"] = screening_iteration
-            event["route_key"] = measurement_trace.register_route(
-                screening_sequence
-            )
+            event["route_key"] = measurement_trace.register_route(screening_sequence)
             event["_native_expected_flags"] = (
                 int(bool(event.get("physical_evaluated")))
                 | (int(bool(event.get("negative_cache_hit"))) << 1)
@@ -6530,18 +6340,14 @@ def _solve_full_native_alns(
             context = (lane, iteration, operator)
             pending_screening = screening_by_context.get(context, [])
             transaction_id = int(cast(int, work["_native_transaction_id"]))
-            first_result_event_id = int(
-                cast(int, work["_native_first_canonical_result_event_id"])
-            )
+            first_result_event_id = int(cast(int, work["_native_first_canonical_result_event_id"]))
             consumed_screening = 0
             while (
                 consumed_screening < len(pending_screening)
                 and int(
                     cast(
                         int,
-                        pending_screening[consumed_screening].get(
-                            "_native_canonical_event_id", -1
-                        ),
+                        pending_screening[consumed_screening].get("_native_canonical_event_id", -1),
                     )
                 )
                 < first_result_event_id
@@ -6554,11 +6360,8 @@ def _solve_full_native_alns(
                 matching_index = next(
                     (
                         index
-                        for index in range(
-                            matched_screening, len(transaction_screening)
-                        )
-                        if transaction_screening[index].get("route_key")
-                        == route_key
+                        for index in range(matched_screening, len(transaction_screening))
+                        if transaction_screening[index].get("route_key") == route_key
                         and transaction_screening[index].get("status") == "pass"
                     ),
                     None,
@@ -6630,8 +6433,10 @@ def _solve_full_native_alns(
                     and producer_result_count == requested
                 ):
                     break
-            if producer_result_count != requested or not producer_events or (
-                producer_events[-1].get("event_type") != "parallel_batch"
+            if (
+                producer_result_count != requested
+                or not producer_events
+                or (producer_events[-1].get("event_type") != "parallel_batch")
             ):
                 raise RuntimeError(
                     "full native exact producer journal lost its work boundary: "
@@ -6653,9 +6458,7 @@ def _solve_full_native_alns(
                 exact_results_by_context[context] = pending_rich_results
             else:
                 exact_results_by_context.pop(context, None)
-            pending_evaluation_ids = exact_evaluation_ids_by_context.get(
-                context, []
-            )
+            pending_evaluation_ids = exact_evaluation_ids_by_context.get(context, [])
             evaluation_ids = pending_evaluation_ids[:requested]
             del pending_evaluation_ids[:requested]
             if pending_evaluation_ids:
@@ -6663,9 +6466,7 @@ def _solve_full_native_alns(
             else:
                 exact_evaluation_ids_by_context.pop(context, None)
             producer_bindings = []
-            for event, evaluation_id in zip(
-                producer_results, evaluation_ids, strict=True
-            ):
+            for event, evaluation_id in zip(producer_results, evaluation_ids, strict=True):
                 feasible = bool(event.get("feasible"))
                 producer_bindings.append(
                     {
@@ -6682,11 +6483,7 @@ def _solve_full_native_alns(
                         "feasible": feasible,
                         "failure_reason": str(event.get("failure_reason", "")),
                         "deadline_boundary": "",
-                        "status": (
-                            "completed_feasible"
-                            if feasible
-                            else "completed_infeasible"
-                        ),
+                        "status": ("completed_feasible" if feasible else "completed_infeasible"),
                     }
                 )
             rich_bindings = [
@@ -6714,22 +6511,12 @@ def _solve_full_native_alns(
                     "full native exact-result rich payload order does not match "
                     "the producer-hashed journal"
                 )
-            runtime_projection.extend(
-                ("candidate_transaction", event)
-                for event in producer_events
-            )
-            runtime_projection.extend(
-                ("exact_result", event)
-                for event in rich_results
-            )
+            runtime_projection.extend(("candidate_transaction", event) for event in producer_events)
+            runtime_projection.extend(("exact_result", event) for event in rich_results)
             return requested
 
         initial_work = next(
-            (
-                work
-                for work in native_result.candidate_work
-                if work["lane"] == "initialization"
-            ),
+            (work for work in native_result.candidate_work if work["lane"] == "initialization"),
             None,
         )
         if initial_work is None:
@@ -6831,18 +6618,14 @@ def _solve_full_native_alns(
             "route_segment_destroy",
             "ejection_chain",
         }
-        work_by_iteration_lane: dict[
-            tuple[int, str], list[Mapping[str, object]]
-        ] = {}
+        work_by_iteration_lane: dict[tuple[int, str], list[Mapping[str, object]]] = {}
         for work in native_result.candidate_work:
             if work is initial_work or work["iteration"] is None:
                 continue
             work_by_iteration_lane.setdefault(
                 (int(cast(int, work["iteration"])), str(work["lane"])), []
             ).append(work)
-        events_by_iteration_lane: dict[
-            tuple[int, str], list[dict[str, object]]
-        ] = {}
+        events_by_iteration_lane: dict[tuple[int, str], list[dict[str, object]]] = {}
         for semantic_index, semantic_event in enumerate(semantic_events):
             operator = str(semantic_event["operator"])
             lane = (
@@ -6856,6 +6639,9 @@ def _solve_full_native_alns(
             raw_operator_event = operator_semantic_events[semantic_index]
             for private_field in (
                 "_operator_native_candidate_feasible",
+                "_operator_native_candidate_route_sequences",
+                "_operator_native_candidate_objective_key",
+                "_operator_native_accepted",
                 "_operator_feasible_repair",
             ):
                 private_value = raw_operator_event.get(private_field)
@@ -6883,18 +6669,27 @@ def _solve_full_native_alns(
                 for event in lane_events
                 if not str(event.get("status", "")).endswith("_aggregate")
             )
-            accepted = any(bool(event.get("accepted")) for event in lane_events)
+            accepted = any(
+                bool(event.get("_operator_native_accepted", event.get("accepted")))
+                for event in lane_events
+            )
             candidate_event = next(
                 (
                     event
                     for event in reversed(lane_events)
-                    if event.get("candidate_route_sequences")
+                    if event.get(
+                        "_operator_native_candidate_route_sequences",
+                        event.get("candidate_route_sequences"),
+                    )
                 ),
                 lane_events[-1],
             )
             raw_sequences = cast(
                 tuple[tuple[str, ...], ...],
-                candidate_event.get("candidate_route_sequences", ()),
+                candidate_event.get(
+                    "_operator_native_candidate_route_sequences",
+                    candidate_event.get("candidate_route_sequences", ()),
+                ),
             )
             # Candidate-state feasibility belongs to the transaction, while a
             # public vehicle-repair event can truthfully report that repair
@@ -6912,11 +6707,14 @@ def _solve_full_native_alns(
                     exact = solve_exact_charging(instance, sequence)
                     if not exact.feasible:
                         raise RuntimeError(
-                            "full native semantic candidate replay is infeasible"
+                            "full native semantic candidate replay is infeasible: "
+                            f"lane={lane}, iteration={iteration}, "
+                            f"operator={candidate_event.get('operator')}, "
+                            f"status={candidate_event.get('status')}, "
+                            f"reason={candidate_event.get('reason')}, "
+                            f"sequence={sequence!r}"
                         )
-                    candidate_full_route_keys.append(
-                        measurement_trace.register_route(exact.route)
-                    )
+                    candidate_full_route_keys.append(measurement_trace.register_route(exact.route))
             status = "accepted" if accepted else "rejected"
             reason = (
                 "quality shadow probe"
@@ -6936,14 +6734,14 @@ def _solve_full_native_alns(
                         "iteration": iteration,
                         "operator": candidate_event.get("operator"),
                         "candidate_route_keys": [
-                            measurement_trace.register_route(sequence)
-                            for sequence in raw_sequences
+                            measurement_trace.register_route(sequence) for sequence in raw_sequences
                         ]
                         if feasible
                         else [],
                         "candidate_full_route_keys": candidate_full_route_keys,
                         "candidate_objective_key": candidate_event.get(
-                            "candidate_objective_key", ()
+                            "_operator_native_candidate_objective_key",
+                            candidate_event.get("candidate_objective_key", ()),
                         )
                         if feasible
                         else (),
@@ -6956,7 +6754,7 @@ def _solve_full_native_alns(
             )
 
         for iteration in range(native_result.counters["iterations"]):
-            iteration_completed = iteration < completed_candidate_rounds
+            iteration_completed = iteration in completed_candidate_iterations
             round_budget = config.candidate_control_config.max_exact_calls_per_round
             runtime_projection.append(
                 (
@@ -6977,9 +6775,7 @@ def _solve_full_native_alns(
                         work,
                         remaining=max(
                             0,
-                            round_budget
-                            - used
-                            - len(cast(list[list[str]], work["sequences"])),
+                            round_budget - used - len(cast(list[list[str]], work["sequences"])),
                         ),
                     )
                 for screening_context in tuple(screening_by_context):
@@ -7037,9 +6833,7 @@ def _solve_full_native_alns(
                         "operator": "termination",
                         "started_calls": controlled_exact_started,
                         "completed_calls": controlled_exact_completed,
-                        "interrupted_calls": native_result.counters[
-                            "interrupted_calls"
-                        ],
+                        "interrupted_calls": native_result.counters["interrupted_calls"],
                     },
                 )
             )
@@ -7053,9 +6847,7 @@ def _solve_full_native_alns(
                     "effective_iterations": completed_candidate_rounds,
                     "exact_started_calls": controlled_exact_started,
                     "exact_completed_calls": controlled_exact_completed,
-                    "exact_interrupted_calls": native_result.counters[
-                        "interrupted_calls"
-                    ],
+                    "exact_interrupted_calls": native_result.counters["interrupted_calls"],
                     "objective_key": list(objective.key),
                 },
             )
@@ -7092,9 +6884,7 @@ def _solve_full_native_alns(
                         "candidate_route_result": 7,
                         "parallel_batch": 8,
                         "candidate_plan_attempted": 10,
-                        "candidate_control_round": (
-                            13 if status == "started" else 17
-                        ),
+                        "candidate_control_round": (13 if status == "started" else 17),
                     }[event_type]
             elif semantic_stream == "screening":
                 event_code = 3
@@ -7116,17 +6906,13 @@ def _solve_full_native_alns(
             elif semantic_stream == "termination":
                 event_code = 19
             else:
-                raise RuntimeError(
-                    "full native runtime projection has an unknown semantic stream"
-                )
+                raise RuntimeError("full native runtime projection has an unknown semantic stream")
             expected_event_codes.append(event_code)
         native_stream_codes = [
-            int(value)
-            for value in native_result.canonical_event_journal.stream_codes
+            int(value) for value in native_result.canonical_event_journal.stream_codes
         ]
         native_event_codes = [
-            int(value)
-            for value in native_result.canonical_event_journal.event_codes
+            int(value) for value in native_result.canonical_event_journal.event_codes
         ]
         expected_lane_ids: list[int] = []
         expected_operator_ids: list[int] = []
@@ -7146,13 +6932,9 @@ def _solve_full_native_alns(
                     lane_value = "initialization"
                     operator_value = "initial_solution"
                 elif event_type == "candidate_control_budget":
-                    context_parts = str(projected_event.get("context", "")).split(
-                        ":", 2
-                    )
+                    context_parts = str(projected_event.get("context", "")).split(":", 2)
                     if len(context_parts) < 2:
-                        raise RuntimeError(
-                            "full native budget event lost its semantic context"
-                        )
+                        raise RuntimeError("full native budget event lost its semantic context")
                     lane_value, operator_value = context_parts[:2]
                 elif semantic_stream == "stage04":
                     lane_value, operator_value = "all", "stage04"
@@ -7161,9 +6943,7 @@ def _solve_full_native_alns(
                 elif semantic_stream == "operator":
                     operator_value = projected_event.get("operator")
                     if not isinstance(operator_value, str):
-                        raise RuntimeError(
-                            "full native operator event lost its operator"
-                        )
+                        raise RuntimeError("full native operator event lost its operator")
                     lane_value = (
                         "constraint_lane"
                         if projected_event.get("track") == "constraint_lane"
@@ -7178,51 +6958,33 @@ def _solve_full_native_alns(
                         if operator_value in quality_operators
                         else "legacy"
                     )
-                if not isinstance(lane_value, str) or not isinstance(
-                    operator_value, str
-                ):
-                    raise RuntimeError(
-                        "full native runtime event lost its lane/operator context"
-                    )
+                if not isinstance(lane_value, str) or not isinstance(operator_value, str):
+                    raise RuntimeError("full native runtime event lost its lane/operator context")
                 expected_lane_ids.append(native_semantic_context_id(lane_value))
-                expected_operator_ids.append(
-                    native_semantic_context_id(operator_value)
-                )
+                expected_operator_ids.append(native_semantic_context_id(operator_value))
             projected_iteration_value = projected_event.get("iteration")
             if semantic_stream == "termination":
                 projected_iteration_value = projected_event.get("iterations")
             expected_iterations.append(
-                -1
-                if projected_iteration_value is None
-                else cast(int, projected_iteration_value)
+                -1 if projected_iteration_value is None else cast(int, projected_iteration_value)
             )
-        native_lane_ids = [
-            int(value)
-            for value in native_result.canonical_event_journal.lane_ids
-        ]
+        native_lane_ids = [int(value) for value in native_result.canonical_event_journal.lane_ids]
         native_operator_ids = [
-            int(value)
-            for value in native_result.canonical_event_journal.operator_ids
+            int(value) for value in native_result.canonical_event_journal.operator_ids
         ]
         native_iterations = [
-            int(value)
-            for value in native_result.canonical_event_journal.iterations
+            int(value) for value in native_result.canonical_event_journal.iterations
         ]
         native_transaction_ids = [
-            int(value)
-            for value in native_result.canonical_event_journal.transaction_ids
+            int(value) for value in native_result.canonical_event_journal.transaction_ids
         ]
         native_subject_ids = [
-            int(value)
-            for value in native_result.canonical_event_journal.subject_ids
+            int(value) for value in native_result.canonical_event_journal.subject_ids
         ]
         native_status_codes = [
-            int(value)
-            for value in native_result.canonical_event_journal.status_codes
+            int(value) for value in native_result.canonical_event_journal.status_codes
         ]
-        native_flags = [
-            int(value) for value in native_result.canonical_event_journal.flags
-        ]
+        native_flags = [int(value) for value in native_result.canonical_event_journal.flags]
         native_row_lengths = {
             "event_ids": len(native_event_ids),
             "stream_codes": len(native_stream_codes),
@@ -7237,8 +6999,7 @@ def _solve_full_native_alns(
         }
         expected_row_count = len(runtime_projection)
         if expected_row_count == 0 or any(
-            length != expected_row_count
-            for length in native_row_lengths.values()
+            length != expected_row_count for length in native_row_lengths.values()
         ):
             comparable_rows = zip(
                 expected_stream_codes,
@@ -7269,8 +7030,7 @@ def _solve_full_native_alns(
             context_start = max(0, divergence_index - 2)
             context_end = min(expected_row_count, divergence_index + 3)
             runtime_context = [
-                (index, runtime_projection[index])
-                for index in range(context_start, context_end)
+                (index, runtime_projection[index]) for index in range(context_start, context_end)
             ]
             mismatch_native_context = [
                 (
@@ -7295,14 +7055,14 @@ def _solve_full_native_alns(
                 f"first_divergence={first_divergence!r}, "
                 f"runtime_context={runtime_context!r}, "
                 f"native_context={mismatch_native_context!r}, "
+                f"semantic_termination="
+                f"{native_result.semantic_stream.termination.tolist()}, "
                 f"runtime_stream_counts="
                 f"{np.bincount(expected_stream_codes, minlength=11).tolist()}, "
                 f"native_stream_counts="
                 f"{native_result.canonical_event_journal.stream_counts.tolist()}"
             )
-        full_operator_index = {
-            name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)
-        }
+        full_operator_index = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
         quality_subject = {"relocate": 0, "swap": 1, "two_opt_star": 2}
         constraint_subject = {
             "station_pressure": 0,
@@ -7399,8 +7159,7 @@ def _solve_full_native_alns(
                     or (
                         operator_name in constraint_subject
                         and status_text == "candidate_proposed"
-                        and str(projected_event.get("reason"))
-                        == "constraint_ranked_removal"
+                        and str(projected_event.get("reason")) == "constraint_ranked_removal"
                     )
                 )
                 flags = int(bool(projected_event.get("accepted")))
@@ -7419,9 +7178,7 @@ def _solve_full_native_alns(
                 stage_type = str(projected_event.get("type", ""))
                 if stage_type.startswith("stage04_segment_"):
                     role = str(projected_event["operator"])
-                    subject = full_operator_index[
-                        role.removeprefix("neighborhood:")
-                    ]
+                    subject = full_operator_index[role.removeprefix("neighborhood:")]
                     status_code = int(stage_type == "stage04_segment_update")
                 else:
                     subject = {
@@ -7456,16 +7213,12 @@ def _solve_full_native_alns(
                 expected_lane_ids[index],
                 expected_operator_ids[index],
                 -1
-                if expected_lane_ids[index]
-                == native_semantic_context_id("initialization")
+                if expected_lane_ids[index] == native_semantic_context_id("initialization")
                 else expected_iterations[index],
             )
-            previous_context = transaction_contexts.setdefault(
-                transaction_id, transaction_context
-            )
+            previous_context = transaction_contexts.setdefault(transaction_id, transaction_context)
             transaction_context_valid = (
-                transaction_context_valid
-                and previous_context == transaction_context
+                transaction_context_valid and previous_context == transaction_context
             )
         first_context_mismatch = next(
             (
@@ -7583,39 +7336,23 @@ def _solve_full_native_alns(
             else runtime_projection[first_context_mismatch][1].get("operator")
         )
         native_subject = (
-            None
-            if first_subject_mismatch is None
-            else native_subject_ids[first_subject_mismatch]
+            None if first_subject_mismatch is None else native_subject_ids[first_subject_mismatch]
         )
         expected_subject = (
-            None
-            if first_subject_mismatch is None
-            else expected_subject_ids[first_subject_mismatch]
+            None if first_subject_mismatch is None else expected_subject_ids[first_subject_mismatch]
         )
         expected_subject_event = (
-            None
-            if first_subject_mismatch is None
-            else runtime_projection[first_subject_mismatch]
+            None if first_subject_mismatch is None else runtime_projection[first_subject_mismatch]
         )
         native_status = (
-            None
-            if first_status_mismatch is None
-            else native_status_codes[first_status_mismatch]
+            None if first_status_mismatch is None else native_status_codes[first_status_mismatch]
         )
         expected_status = (
-            None
-            if first_status_mismatch is None
-            else expected_status_codes[first_status_mismatch]
+            None if first_status_mismatch is None else expected_status_codes[first_status_mismatch]
         )
-        native_flag = (
-            None
-            if first_flags_mismatch is None
-            else native_flags[first_flags_mismatch]
-        )
+        native_flag = None if first_flags_mismatch is None else native_flags[first_flags_mismatch]
         expected_flag = (
-            None
-            if first_flags_mismatch is None
-            else expected_flags[first_flags_mismatch]
+            None if first_flags_mismatch is None else expected_flags[first_flags_mismatch]
         )
         native_event_window = list(
             zip(
@@ -7695,9 +7432,7 @@ def _solve_full_native_alns(
                     "runtime_native_status_code": int(
                         native_result.canonical_event_journal.status_codes[index]
                     ),
-                    "runtime_native_flags": int(
-                        native_result.canonical_event_journal.flags[index]
-                    ),
+                    "runtime_native_flags": int(native_result.canonical_event_journal.flags[index]),
                 },
             )
             for index, (semantic_stream, event) in enumerate(runtime_projection)
@@ -7721,9 +7456,7 @@ def _solve_full_native_alns(
         objective=objective,
         vehicle_count=objective.vehicle_count,
         total_energy=sum(result.total_energy for result in native_result.exact_results),
-        total_charged_energy=sum(
-            result.charged_energy for result in native_result.exact_results
-        ),
+        total_charged_energy=sum(result.charged_energy for result in native_result.exact_results),
         total_charging_time=objective.total_charging_time,
         iterations=native_result.counters["iterations"],
         accepted_moves=native_result.counters["accepted_moves"],
@@ -7737,9 +7470,7 @@ def _solve_full_native_alns(
         charging_labels_generated=sum(
             result.labels_generated for result in native_result.exact_results
         ),
-        charging_labels_pruned=sum(
-            result.labels_pruned for result in native_result.exact_results
-        ),
+        charging_labels_pruned=sum(result.labels_pruned for result in native_result.exact_results),
         destroy_statistics={},
         repair_statistics={},
         operator_profile=OperatorProfile(operator_profile).value,
@@ -7780,33 +7511,21 @@ def _solve_full_native_alns(
         candidate_work_hash=native_result.candidate_work_hash,
         route_result_hash=native_result.route_result_hash,
         candidate_work_events=tuple(
-            {
-                key: value
-                for key, value in event.items()
-                if not key.startswith("_native_")
-            }
+            {key: value for key, value in event.items() if not key.startswith("_native_")}
             for event in native_result.candidate_work
         ),
-        route_result_events=tuple(
-            dict(event) for event in native_result.route_results
-        ),
+        route_result_events=tuple(dict(event) for event in native_result.route_results),
         stage04_statistics=(
             {
                 "enabled": True,
                 "reheat_count": (
-                    int(native_stage04_control[1])
-                    if native_stage04_control is not None
-                    else 0
+                    int(native_stage04_control[1]) if native_stage04_control is not None else 0
                 ),
                 "restart_count": (
-                    int(native_stage04_control[3])
-                    if native_stage04_control is not None
-                    else 0
+                    int(native_stage04_control[3]) if native_stage04_control is not None else 0
                 ),
                 "intensification_active": (
-                    bool(native_stage04_control[4])
-                    if native_stage04_control is not None
-                    else False
+                    bool(native_stage04_control[4]) if native_stage04_control is not None else False
                 ),
                 "acceptance_rate": _full_native_acceptance_rate(
                     operator_semantic_events,
@@ -7820,10 +7539,11 @@ def _solve_full_native_alns(
                 "maximum_stagnation": _full_native_maximum_stagnation(
                     instance,
                     initial_customer_sequences,
-                    semantic_events,
+                    operator_replay_semantic_events,
                     stage04_event_log,
                     native_result.counters["accepted_moves"]
                     + native_result.counters["rejected_moves"],
+                    native_result.counters["maximum_stagnation"],
                 ),
             }
             if stage04_config is not None and stage04_config.enabled
@@ -7891,9 +7611,7 @@ def solve_alns(
                 "and Candidate Control; do not also pass their legacy arguments"
             )
         native_kernel_config = native_execution_config.native_kernel_config
-        candidate_transaction_config = (
-            native_execution_config.candidate_transaction_config
-        )
+        candidate_transaction_config = native_execution_config.candidate_transaction_config
         candidate_control_config = native_execution_config.candidate_control_config
 
     if max_iterations is None and (
@@ -7979,10 +7697,10 @@ def solve_alns(
         and exact_deadline_config.watchdog_seconds is not None
     ):
         time_limit_seconds = exact_deadline_config.watchdog_seconds
-    if (
-        native_execution_config is not None
-        and native_execution_config.mode in {"full_native_alns", "host_scheduler"}
-    ):
+    if native_execution_config is not None and native_execution_config.mode in {
+        "full_native_alns",
+        "host_scheduler",
+    }:
         return _solve_full_native_alns(
             instance,
             seed=seed,
@@ -8144,9 +7862,7 @@ def _attach_native_execution_statistics(
         "native_candidate_transaction_fallbacks",
         0,
     )
-    if isinstance(transaction_fallbacks, bool) or not isinstance(
-        transaction_fallbacks, int
-    ):
+    if isinstance(transaction_fallbacks, bool) or not isinstance(transaction_fallbacks, int):
         raise RuntimeError("native candidate-transaction fallback count is invalid")
     statistics = config.to_dict()
     statistics["fallback_count"] = transaction_fallbacks
@@ -8154,17 +7870,13 @@ def _attach_native_execution_statistics(
         "native_candidate_transactions",
         0,
     )
-    statistics["worker_protocol_invocations"] = (
-        result.candidate_transaction_statistics.get(
-            "native_worker_protocol_invocations",
-            0,
-        )
+    statistics["worker_protocol_invocations"] = result.candidate_transaction_statistics.get(
+        "native_worker_protocol_invocations",
+        0,
     )
-    statistics["worker_protocol_total_seconds"] = (
-        result.candidate_transaction_statistics.get(
-            "native_worker_protocol_total_seconds",
-            0.0,
-        )
+    statistics["worker_protocol_total_seconds"] = result.candidate_transaction_statistics.get(
+        "native_worker_protocol_total_seconds",
+        0.0,
     )
     statistics["queue_wait_seconds"] = result.candidate_transaction_statistics.get(
         "native_worker_protocol_queue_wait_seconds",
@@ -9293,18 +9005,14 @@ def _aggregate_screening_statistics(
     }
     for evaluator in evaluators:
         statistics = cast(Any, evaluator.screening_statistics())
-        raw_negative_result_cache = statistics.get(
-            "negative_screening_result_cache"
-        )
+        raw_negative_result_cache = statistics.get("negative_screening_result_cache")
         if raw_negative_result_cache is not None:
             observed = dict(cast(Mapping[str, object], raw_negative_result_cache))
             if (
                 negative_result_cache_statistics is not None
                 and negative_result_cache_statistics != observed
             ):
-                raise RuntimeError(
-                    "ALNS lanes observed inconsistent bounded negative-cache state"
-                )
+                raise RuntimeError("ALNS lanes observed inconsistent bounded negative-cache state")
             negative_result_cache_statistics = observed
         for field_name in totals:
             totals[field_name] += int(statistics[field_name])
@@ -9321,9 +9029,7 @@ def _aggregate_screening_statistics(
         **native_statistics,
     }
     if negative_result_cache_statistics is not None:
-        output["negative_screening_result_cache"] = (
-            negative_result_cache_statistics
-        )
+        output["negative_screening_result_cache"] = negative_result_cache_statistics
     return output
 
 

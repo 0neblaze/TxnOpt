@@ -280,6 +280,21 @@ def _screen_failure_explanation(
     }.get(check_id, "")
 
 
+def screening_check_explanation(
+    check_id: int,
+    status: str,
+    *,
+    event_count: int,
+) -> str:
+    """Return the canonical explanation shared by scalar and native screening."""
+
+    if status == "fail":
+        return _screen_failure_explanation(check_id, event_count=event_count)
+    if status not in {"pass", "recorded"} or check_id not in _SCREEN_PASS_EXPLANATIONS:
+        raise ValueError("screening check status or identity is invalid")
+    return _SCREEN_PASS_EXPLANATIONS[check_id]
+
+
 def _screen_numeric_result(
     instance: Instance,
     sequence: CustomerSequence,
@@ -404,10 +419,10 @@ def _screen_numeric_result(
         status = _SCREEN_CHECK_STATUS[status_id]
         raw_value = float(metrics[7 + position])
         value: float | bool = bool(raw_value) if check_id in {1, 7} else raw_value
-        explanation = (
-            _screen_failure_explanation(check_id, event_count=event_count)
-            if status == "fail"
-            else _SCREEN_PASS_EXPLANATIONS[check_id]
+        explanation = screening_check_explanation(
+            check_id,
+            status,
+            event_count=event_count,
         )
         checks.append(
             ScreeningCheckTrace(

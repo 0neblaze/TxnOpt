@@ -28,7 +28,8 @@ from evrptw.experiments.stage052_native_architectures import (
     expected_axis_count,
     run_labels_for_scope,
 )
-from evrptw.models import NodeType
+from evrptw.models import Instance, NodeType
+from evrptw.neighborhoods import screen_route_candidate
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
@@ -469,6 +470,10 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
             }
     instance_name = _string(payload, "instance")
     instance = parse_schneider(benchmark_dir / f"{instance_name}.txt")
+    if comparison_schema == SCHEMA_VERSION:
+        screening_error = _replay_physical_screening(payload, instance)
+        if screening_error is not None:
+            return {"valid": False, "reason": screening_error}
     raw_routes = _sequence(payload, "routes")
     routes: list[list[str]] = []
     for raw_route in raw_routes:
@@ -1086,6 +1091,32 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
         if not isinstance(stream, list) or not all(isinstance(row, dict) for row in stream):
             raise ValueError(f"canonical semantic stream {stream_name} is invalid")
         streams[stream_name] = [dict(row) for row in stream]
+    screening_semantic_fields = {
+        "event_type",
+        "lane",
+        "iteration",
+        "operator",
+        "candidate_id",
+        "plan_id",
+        "route_key",
+        "status",
+        "decision",
+        "reason",
+        "first_failed_check",
+        "screening_passed",
+        "exact_call_blocked",
+        "negative_cache_hit",
+        "cache_hit",
+    }
+    for event in streams["screening"]:
+        if not screening_semantic_fields.intersection(event):
+            raise ValueError("screening event lacks auditable semantic fields")
+        raw_checks = event.get("checks")
+        if raw_checks is not None and (
+            not isinstance(raw_checks, list)
+            or not all(isinstance(check, dict) for check in raw_checks)
+        ):
+            raise ValueError("screening checks are invalid")
     raw_events = payload.get("canonical_semantic_events")
     if not isinstance(raw_events, list) or not all(
         isinstance(row, dict) for row in raw_events
@@ -1240,6 +1271,169 @@ def _canonical_semantic_events(payload: Mapping[str, object]) -> list[dict[str, 
     ]
 
 
+def _route_sequence_from_canonical_key(route_key: str) -> tuple[str, ...]:
+    prefix = "route:"
+    if not route_key.startswith(prefix):
+        raise ValueError("physical screening route key is invalid")
+    encoded = route_key[len(prefix) :]
+    if not encoded:
+        return ()
+    sequence: list[str] = []
+    for token in encoded.split("|"):
+        length_text, separator, customer = token.partition(":")
+        if (
+            not separator
+            or not length_text.isdigit()
+            or int(length_text) != len(customer)
+        ):
+            raise ValueError("physical screening route key is invalid")
+        sequence.append(customer)
+    return tuple(sequence)
+
+
+def _replay_physical_screening(
+    payload: Mapping[str, object],
+    instance: Instance,
+) -> str | None:
+    """Independently recompute every safe physical screening decision."""
+
+    raw_streams = payload.get("canonical_semantic_streams")
+    if not isinstance(raw_streams, dict):
+        return "physical screening stream set is missing"
+    raw_screening = raw_streams.get("screening")
+    if not isinstance(raw_screening, list):
+        return "physical screening stream is missing"
+    if not raw_screening:
+        return "physical screening stream is empty"
+    raw_statistics = payload.get("screening_statistics")
+    if not isinstance(raw_statistics, dict):
+        return "physical screening statistics are missing"
+    screening_calls = raw_statistics.get("screening_calls")
+    if (
+        isinstance(screening_calls, bool)
+        or not isinstance(screening_calls, int)
+        or screening_calls != len(raw_screening)
+    ):
+        return "physical screening stream count mismatch"
+    for ordinal, raw_event in enumerate(raw_screening):
+        if not isinstance(raw_event, dict):
+            return f"physical screening row {ordinal} is invalid"
+        try:
+            route_key = _string(raw_event, "route_key")
+            sequence = _route_sequence_from_canonical_key(route_key)
+            replayed = screen_route_candidate(instance, sequence, full=True)
+        except (KeyError, TypeError, ValueError) as error:
+            return f"physical screening row {ordinal} cannot be replayed: {error}"
+        status = raw_event.get("status")
+        negative_cache_hit = raw_event.get("negative_cache_hit")
+        exact_call_blocked = raw_event.get("exact_call_blocked")
+        if not isinstance(negative_cache_hit, bool) or not isinstance(
+            exact_call_blocked, bool
+        ):
+            return f"physical screening row {ordinal} flags are invalid"
+        expected_status = (
+            "negative_cache_hit"
+            if negative_cache_hit
+            else "pass"
+            if replayed.accepted
+            else "rejected"
+        )
+        if (
+            status != expected_status
+            or exact_call_blocked is replayed.accepted
+            or raw_event.get("reason") != replayed.reason
+            or raw_event.get("first_failed_check") != replayed.first_failed_check
+        ):
+            return f"physical screening row {ordinal} decision replay mismatch"
+        raw_checks = raw_event.get("checks")
+        if not isinstance(raw_checks, list) or not all(
+            isinstance(check, dict) for check in raw_checks
+        ):
+            return f"physical screening row {ordinal} checks are invalid"
+        expected_checks: tuple[dict[str, object], ...]
+        if negative_cache_hit:
+            expected_checks = (
+                {
+                    "check": "negative_sequence_cache",
+                    "status": "hit",
+                    "value": True,
+                    "reason": "",
+                },
+            )
+        else:
+            expected_checks = tuple(
+                {
+                    "check": check.check,
+                    "status": check.status,
+                    "value": check.value,
+                    "reason": check.reason,
+                }
+                for check in replayed.checks
+            )
+        if len(raw_checks) != len(expected_checks):
+            return f"physical screening row {ordinal} check replay mismatch"
+        for observed_check, expected_check in zip(
+            raw_checks, expected_checks, strict=True
+        ):
+            if (
+                observed_check.get("check") != expected_check["check"]
+                or observed_check.get("status") != expected_check["status"]
+                or observed_check.get("reason", "") != expected_check["reason"]
+            ):
+                return f"physical screening row {ordinal} check replay mismatch"
+            observed_value = observed_check.get("value")
+            expected_value = expected_check["value"]
+            if isinstance(expected_value, bool) or expected_value is None:
+                if observed_value is not expected_value:
+                    return f"physical screening row {ordinal} check replay mismatch"
+            elif (
+                isinstance(expected_value, bool)
+                or not isinstance(expected_value, int | float)
+                or isinstance(observed_value, bool)
+                or not isinstance(observed_value, int | float)
+                or not math.isfinite(float(observed_value))
+                or not math.isclose(
+                    float(observed_value),
+                    float(expected_value),
+                    rel_tol=1e-9,
+                    abs_tol=1e-7,
+                )
+            ):
+                return f"physical screening row {ordinal} check replay mismatch"
+        expected_metrics = {
+            "demand": replayed.demand,
+            "min_time_window_slack": replayed.min_time_window_slack,
+            "distance_lower_bound": replayed.distance_lower_bound,
+            "structural_energy_lower_bound": replayed.structural_energy_lower_bound,
+        }
+        for field, expected in expected_metrics.items():
+            observed = raw_event.get(field)
+            if (
+                isinstance(observed, bool)
+                or not isinstance(observed, int | float)
+                or not math.isfinite(float(observed))
+                or not math.isclose(
+                    float(observed), float(expected), rel_tol=1e-9, abs_tol=1e-7
+                )
+            ):
+                return (
+                    f"physical screening row {ordinal} metric replay mismatch: "
+                    f"{field}"
+                )
+        if raw_event.get("single_segment_reachable") is not (
+            replayed.single_segment_reachable
+        ):
+            return f"physical screening row {ordinal} reachability replay mismatch"
+        distance_increment = raw_event.get("distance_increment_lower_bound")
+        if distance_increment is not None and (
+            isinstance(distance_increment, bool)
+            or not isinstance(distance_increment, int | float)
+            or not math.isfinite(float(distance_increment))
+        ):
+            return f"physical screening row {ordinal} increment bound is invalid"
+    return None
+
+
 def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[object]:
     if payload.get("schema_version") == SCHEMA_VERSION:
         # First validate the complete, implementation-owned causal journal.
@@ -1256,62 +1450,34 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
         projection: list[dict[str, object]] = []
 
         def screening_projection() -> list[dict[str, object]]:
-            stream = raw_streams.get("screening")
-            if not isinstance(stream, list) or not all(
-                isinstance(event, dict) for event in stream
-            ):
-                raise ValueError("canonical semantic stream screening is invalid")
-            semantic_fields = (
-                "event_type",
-                "lane",
-                "iteration",
-                "operator",
-                "candidate_id",
-                "plan_id",
-                "route_key",
-                "status",
-                "decision",
-                "reason",
-                "first_failed_check",
-                "screening_passed",
-                "exact_call_blocked",
-                "negative_cache_hit",
-                "cache_hit",
-            )
-            normalized_events: list[dict[str, object]] = []
-            for event in stream:
-                normalized = {
-                    field: event[field]
-                    for field in semantic_fields
-                    if field in event
+            # The complete physical screening stream was validated above.
+            # Cross-mode equality uses the candidate-level logical decision:
+            # native batching may screen a larger physical proposal pool, and
+            # negative-cache hits may occur at different physical call sites,
+            # without changing which canonical candidate is proposed, skipped,
+            # accepted, or rejected.  The trajectory binds that decision to
+            # stable candidate, lane, iteration, operator, route, and reason
+            # fields while the raw stream remains independently auditable.
+            return [
+                {
+                    "event_type": "logical_screening_decision",
+                    **{
+                        field: event[field]
+                        for field in (
+                            "candidate_id",
+                            "lane",
+                            "iteration",
+                            "operator",
+                            "status",
+                            "reason",
+                            "candidate_route_sequences",
+                        )
+                        if field in event
+                    },
                 }
-                raw_checks = event.get("checks")
-                if raw_checks is not None:
-                    if not isinstance(raw_checks, list) or not all(
-                        isinstance(check, dict) for check in raw_checks
-                    ):
-                        raise ValueError("screening checks are invalid")
-                    normalized["checks"] = [
-                        {
-                            field: check[field]
-                            for field in ("check", "status")
-                            if field in check
-                        }
-                        for check in raw_checks
-                    ]
-                if not normalized:
-                    raise ValueError("screening event lacks shared semantic fields")
-                normalized_events.append(normalized)
-            return sorted(
-                normalized_events,
-                key=lambda event: json.dumps(
-                    event,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                ),
-            )
+                for event in _semantic_trajectory(payload)
+                if isinstance(event, dict)
+            ]
 
         def append(stream_name: str, event: Mapping[str, object]) -> None:
             normalized = {

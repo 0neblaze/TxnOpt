@@ -796,6 +796,7 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
                             if check_name in boolean_checks
                             else check_value
                         ),
+                        "reason": raw_check.get("reason", ""),
                     }
                 )
             canonical["checks"] = normalized_checks

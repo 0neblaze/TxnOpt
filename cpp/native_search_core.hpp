@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "formal_objective.hpp"
 #include "native_sha256.hpp"
 #include "native_candidate_plan_runtime.hpp"
 #include "native_kernel_protocol.hpp"
@@ -494,6 +495,8 @@ struct CandidateRoundRequestV2 final {
     double deadline_remaining = 0.0;
     std::int64_t batch_size = 0;
     std::vector<std::int64_t> expected_customers;
+    std::vector<std::int64_t> ranking_route_offsets;
+    std::vector<std::int64_t> ranking_route_indices;
 
     void validate() const {
         if (plan_offsets.size() < 2 || route_offsets.size() < 2
@@ -504,6 +507,17 @@ struct CandidateRoundRequestV2 final {
                 != static_cast<std::int64_t>(route_indices.size())) {
             throw std::invalid_argument(
                 "full native plan transaction boundary is invalid");
+        }
+        if (ranking_route_offsets.empty()
+                != ranking_route_indices.empty()
+            || (!ranking_route_offsets.empty()
+                && (ranking_route_offsets.size() < 2
+                    || ranking_route_offsets.front() != 0
+                    || ranking_route_offsets.back()
+                        != static_cast<std::int64_t>(
+                            ranking_route_indices.size())))) {
+            throw std::invalid_argument(
+                "full native ranking baseline boundary is invalid");
         }
         for (std::size_t plan = 0; plan + 1 < plan_offsets.size(); ++plan) {
             if (plan_offsets[plan] < 0
@@ -517,6 +531,15 @@ struct CandidateRoundRequestV2 final {
                 || route_offsets[route] > route_offsets[route + 1]) {
                 throw std::invalid_argument(
                     "full native route offsets must be monotonic");
+            }
+        }
+        for (std::size_t route = 0;
+             route + 1 < ranking_route_offsets.size(); ++route) {
+            if (ranking_route_offsets[route] < 0
+                || ranking_route_offsets[route]
+                    >= ranking_route_offsets[route + 1]) {
+                throw std::invalid_argument(
+                    "full native ranking route offsets must be monotonic and non-empty");
             }
         }
         if (context[0] < 0 || context[1] < 0 || context[2] < -1) {
@@ -2285,6 +2308,7 @@ public:
         const std::int64_t min_iterations_before_exhaustion,
         const std::int64_t started_before_bootstrap,
         const ThreeLaneTerminationStateV2& bootstrap,
+        const bool bootstrap_iteration_completed,
         const bool bootstrap_exhaustion_eligible)
         : max_iterations_(max_iterations),
           fixed_work_(fixed_work),
@@ -2296,7 +2320,8 @@ public:
               bootstrap_exhaustion_eligible
                   && bootstrap.started == started_before_bootstrap
               ? 1
-              : 0) {
+              : 0),
+          effective_iterations_(bootstrap_iteration_completed ? 1 : 0) {
         if (max_iterations_ <= 0 || exhaustion_rounds_ < 0
             || min_iterations_before_exhaustion_ < 0
             || started_before_bootstrap < 0 || bootstrap.started < 0
@@ -2310,6 +2335,7 @@ public:
     [[nodiscard]] ThreeLaneLoopDecisionV2 observe_followup(
         const std::int64_t iteration,
         ThreeLaneTerminationStateV2 termination,
+        const bool iteration_completed,
         const bool exhaustion_eligible) {
         if (iteration <= 0 || iteration >= max_iterations_
             || iteration != next_iteration_ || termination.reason < 0
@@ -2317,6 +2343,9 @@ public:
             || termination.completed_iterations < 0) {
             throw std::invalid_argument(
                 "native three-lane follow-up state is invalid");
+        }
+        if (iteration_completed) {
+            ++effective_iterations_;
         }
         if (exhaustion_eligible) {
             no_exact_rounds_ = termination.started == previous_started_
@@ -2326,9 +2355,8 @@ public:
         previous_started_ = termination.started;
         ++next_iteration_;
         auto exhaustion_applied = false;
-        if (exhaustion_eligible && fixed_work_
-            && termination.completed_iterations
-                >= min_iterations_before_exhaustion_
+        if (iteration_completed && exhaustion_eligible && fixed_work_
+            && effective_iterations_ >= min_iterations_before_exhaustion_
             && no_exact_rounds_ >= exhaustion_rounds_) {
             termination.reason = 3;
             exhaustion_applied = true;
@@ -2352,6 +2380,7 @@ private:
     std::int64_t min_iterations_before_exhaustion_ = 0;
     std::int64_t previous_started_ = 0;
     std::int64_t no_exact_rounds_ = 0;
+    std::int64_t effective_iterations_ = 0;
     std::int64_t next_iteration_ = 1;
 };
 
@@ -3981,7 +4010,9 @@ struct ConfigV2 final {
         if ((protocol_control[0] != 0 && protocol_control[0] != 1)
             || protocol_control[1] <= 0 || protocol_control[2] <= 0
             || (protocol_control[3] != 1 && protocol_control[3] != 4)
-            || protocol_control[4] < 10 || protocol_control[5] < 0) {
+            || protocol_control[4] < 10 || protocol_control[5] < 0
+            || protocol_control[6] < 0 || protocol_control[7] <= 0
+            || protocol_control[8] <= 0) {
             throw std::invalid_argument(
                 "native search Candidate Control configuration is invalid");
         }
@@ -4621,7 +4652,8 @@ public:
         : exact_cache_(
               request.config.protocol_control[7],
               request.config.protocol_control[8]),
-          negative_cache_(request.config.protocol_control[7]),
+          negative_cache_(std::max<std::int64_t>(
+              1, request.config.protocol_control[6])),
           budget_(
               request.config.search_control[4],
               request.config.protocol_control[2]),
@@ -5085,20 +5117,18 @@ struct ExactRouteStateViewV2 final {
     return state;
 }
 
-using LaneObjectiveKeyV2 =
-    std::tuple<std::int64_t, double, double, std::int64_t>;
+using LaneObjectiveKeyV2 = evrptw::formal_objective::Key;
 
 [[nodiscard]] inline LaneObjectiveKeyV2 lane_objective_key_v2(
-    const LaneStateV2& state) noexcept {
-    return {
+    const LaneStateV2& state) {
+    return evrptw::formal_objective::key(
         state.objective_integer[0], state.objective_float[0],
-        state.objective_float[1], state.objective_integer[1],
-    };
+        state.objective_float[1], state.objective_integer[1]);
 }
 
 [[nodiscard]] inline std::int64_t compare_lane_objective_v2(
     const LaneStateV2& left,
-    const LaneStateV2& right) noexcept {
+    const LaneStateV2& right) {
     const auto left_key = lane_objective_key_v2(left);
     const auto right_key = lane_objective_key_v2(right);
     return left_key < right_key ? -1 : left_key == right_key ? 0 : 1;

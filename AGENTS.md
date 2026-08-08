@@ -80,9 +80,12 @@ this repository or one of its subdirectories.
   `(vehicle_count, total_distance, total_charging_time, charging_count)`.
 - Vehicle count has absolute priority. ALNS must always reject a candidate that
   increases vehicle count, including during simulated annealing.
-- All objective construction and comparison must use `evrptw.objective`; callers
-  must not duplicate tuple construction, station-visit counting, or comparison
-  logic.
+- `evrptw.objective` is the normative objective contract. Python callers must
+  use it directly and must not duplicate tuple construction, station-visit
+  counting, or comparison logic. A GIL-free native search may mirror only the
+  numeric key construction and comparison in `cpp/formal_objective.hpp`; that
+  mirror must remain behind one native module and pass Python/C++ golden-vector
+  differential tests, including decimal canonicalisation boundaries.
 - `experiments/baselines/stage00/` is an immutable frozen baseline. Later-stage
   raw results belong under ignored `results/`, while review summaries belong in
   tracked experiment summary directories.

@@ -58,6 +58,11 @@ enum class ControlMessage : std::uint32_t {
     test_request = 7,
 };
 
+enum class FailureCode : std::uint64_t {
+    unspecified = 0,
+    deadline = 1,
+};
+
 struct ArrayDescriptor final {
     NumericType type{};
     std::uint32_t dimensions = 0;

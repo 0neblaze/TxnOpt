@@ -50,6 +50,7 @@
 #include <pybind11/stl.h>
 #include <descrobject.h>
 
+#include "formal_objective.hpp"
 #include "native_concurrency.hpp"
 #include "native_candidate_plan_runtime.hpp"
 #include "native_candidate_transaction_executor.hpp"
@@ -65,50 +66,6 @@ template <typename T>
 const T* checked_data(const py::array& array);
 
 namespace evrptw::formal_objective {
-
-using Key = std::tuple<std::int64_t, double, double, std::int64_t>;
-
-[[nodiscard]] double canonical_component(double value) {
-    if (!std::isfinite(value) || value < 0.0) {
-        throw std::invalid_argument(
-            "objective component must be finite and non-negative");
-    }
-    // Python round(value, 9) performs correctly-rounded decimal conversion.
-    // Scaling by 1e9 first is not equivalent near binary half-way values.
-    std::array<char, 384> buffer{};
-    const auto formatted = std::to_chars(
-        buffer.data(), buffer.data() + buffer.size(), value,
-        std::chars_format::fixed, 9);
-    if (formatted.ec != std::errc{}) {
-        throw std::runtime_error(
-            "objective component decimal canonicalization failed");
-    }
-    double canonical = 0.0;
-    const auto parsed = std::from_chars(
-        buffer.data(), formatted.ptr, canonical, std::chars_format::fixed);
-    if (parsed.ec != std::errc{} || parsed.ptr != formatted.ptr) {
-        throw std::runtime_error(
-            "canonical objective component could not be decoded");
-    }
-    return canonical;
-}
-
-[[nodiscard]] Key key(
-    std::int64_t vehicle_count,
-    double total_distance,
-    double total_charging_time,
-    std::int64_t charging_count) {
-    if (vehicle_count < 0 || charging_count < 0) {
-        throw std::invalid_argument(
-            "objective integer components must be non-negative");
-    }
-    return {
-        vehicle_count,
-        canonical_component(total_distance),
-        canonical_component(total_charging_time),
-        charging_count,
-    };
-}
 
 template <typename IntegerArray, typename FloatArray>
 [[nodiscard]] Key key_from_arrays(
@@ -908,6 +865,18 @@ py::array_t<std::int64_t> native_objective_acceptance_v1(
         }
     }
     return output;
+}
+
+py::tuple native_objective_key_v2(
+    const std::int64_t vehicle_count,
+    const double total_distance,
+    const double total_charging_time,
+    const std::int64_t charging_count) {
+    const auto [vehicles, distance, charging_time, charges] =
+        evrptw::formal_objective::key(
+            vehicle_count, total_distance, total_charging_time,
+            charging_count);
+    return py::make_tuple(vehicles, distance, charging_time, charges);
 }
 
 py::tuple stage04_segment_update_v1(
@@ -1989,7 +1958,8 @@ decide_candidate_plans_owned_v2(
     py::handle coverage_eligible,
     py::handle screening_passed,
     py::handle attempted_flags,
-    std::int64_t current_route_count) {
+    std::int64_t current_route_count,
+    bool allow_vehicle_increase) {
     auto plans = checked_array<std::int64_t>(plan_offsets, "plan_offsets", 1);
     auto coverage = checked_array<std::int64_t>(
         coverage_eligible, "coverage_eligible", 1);
@@ -2003,6 +1973,7 @@ decide_candidate_plans_owned_v2(
         {checked_data<std::int64_t>(screening), static_cast<std::size_t>(screening.size())},
         {checked_data<std::int64_t>(attempted), static_cast<std::size_t>(attempted.size())},
         current_route_count,
+        allow_vehicle_increase,
     });
     return result;
 }
@@ -2023,11 +1994,12 @@ py::tuple decide_candidate_plans_v2(
     py::handle coverage_eligible,
     py::handle screening_passed,
     py::handle attempted_flags,
-    std::int64_t current_route_count) {
+    std::int64_t current_route_count,
+    bool allow_vehicle_increase) {
     return project_candidate_plan_decision_v2(
         decide_candidate_plans_owned_v2(
             plan_offsets, coverage_eligible, screening_passed,
-            attempted_flags, current_route_count));
+            attempted_flags, current_route_count, allow_vehicle_increase));
 }
 
 std::vector<std::int64_t> order_feasible_candidate_plans_owned_v2(
@@ -6303,6 +6275,11 @@ py::tuple exact_charging_batch_numeric(
             order_offsets, order_indices, deadline_remaining, batch_size));
 }
 
+class NativeExactDeadlineInterruption final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 evrptw::native_kernels::ExactBatchOutput exact_charging_batch_owned(
     const evrptw::native_search::ProblemV2& problem,
     const std::vector<std::int64_t>& order_offsets,
@@ -6355,6 +6332,9 @@ evrptw::native_kernels::ExactBatchOutput exact_charging_batch_owned(
                 order_offsets.data(), order_indices.data(), problem.node_count(),
                 route_count, order_indices.size(), deadline_remaining,
                 batch_size);
+        } catch (const evrptw::native_client::KernelClientDeadline&) {
+            throw NativeExactDeadlineInterruption(
+                "host exact transaction crossed its deadline");
         } catch (const std::exception& error) {
             throw std::runtime_error(
                 std::string("host scheduler IPC failed without fallback: ")
@@ -6408,6 +6388,9 @@ evrptw::native_kernels::ScreenOutput dispatch_screen_route(
                 native_kernel_scheduler_endpoint,
                 kinds, demands, ready, due, service, distances, reachable,
                 vehicle, route, route_size, node_count, options, incremental);
+        } catch (const evrptw::native_client::KernelClientDeadline&) {
+            throw NativeExactDeadlineInterruption(
+                "host screening transaction crossed its deadline");
         } catch (const std::exception& error) {
             throw std::runtime_error(
                 std::string("host scheduler IPC failed without fallback: ")
@@ -6452,6 +6435,9 @@ std::vector<evrptw::native_kernels::ScreenOutput> dispatch_screen_routes(
                 service, distances, reachable, vehicle, route_offsets,
                 route_indices, route_count, route_index_count, node_count,
                 options, incremental);
+        } catch (const evrptw::native_client::KernelClientDeadline&) {
+            throw NativeExactDeadlineInterruption(
+                "host screening-batch transaction crossed its deadline");
         } catch (const std::exception& error) {
             throw std::runtime_error(
                 std::string("host scheduler IPC failed without fallback: ")
@@ -6963,6 +6949,10 @@ evrptw::native_search::RepairResultV2 candidate_control_repair_view_v2(
     std::array<double, 6> incremental{};
     while (!pending.empty()) {
         std::optional<Option> best;
+        std::vector<Option> insertion_options;
+        std::vector<double> reference_distances;
+        std::vector<std::int64_t> insertion_offsets{0};
+        std::vector<std::int64_t> insertion_indices;
         for (const auto customer : pending) {
             for (std::size_t route = 0; route < routes.size(); ++route) {
                 if (route_change_limit > 0 && !changed_routes.contains(route)
@@ -6995,25 +6985,36 @@ evrptw::native_search::RepairResultV2 candidate_control_repair_view_v2(
                     candidate.insert(
                         candidate.begin() + static_cast<std::ptrdiff_t>(position),
                         customer);
-                    const std::array<double, 4> options{
-                        1.0, epsilon, reference_sum.value(), 1.0};
-                    const auto screened = dispatch_screen_route(
-                        kinds, demands, ready, due, service, distances,
-                        reachable_values, vehicle_values, candidate.data(),
-                        candidate.size(), node_count, depot, recharge_nodes,
-                        options.data(), incremental.data());
-                    ++screening_calls;
-                    if (screened.codes[0] == 0) {
-                        ++screening_rejections;
-                        continue;
-                    }
-                    ++screening_passes;
-                    Option option{
-                        screened.metrics[4], customer, route, position,
-                        std::move(candidate)};
-                    if (!best.has_value() || option_less(option, *best)) {
-                        best = std::move(option);
-                    }
+                    insertion_indices.insert(
+                        insertion_indices.end(), candidate.begin(), candidate.end());
+                    insertion_offsets.push_back(static_cast<std::int64_t>(
+                        insertion_indices.size()));
+                    insertion_options.push_back(
+                        {0.0, customer, route, position, std::move(candidate)});
+                    reference_distances.push_back(reference_sum.value());
+                }
+            }
+        }
+        if (!insertion_options.empty()) {
+            const std::array<double, 4> options{1.0, epsilon, 0.0, 0.0};
+            const auto screened = dispatch_screen_routes(
+                kinds, demands, ready, due, service, distances,
+                reachable_values, vehicle_values, insertion_offsets.data(),
+                insertion_indices.data(), insertion_options.size(),
+                insertion_indices.size(), node_count, depot, recharge_nodes,
+                options.data(), incremental.data());
+            screening_calls += static_cast<std::int64_t>(screened.size());
+            for (std::size_t index = 0; index < screened.size(); ++index) {
+                if (screened[index].codes[0] == 0) {
+                    ++screening_rejections;
+                    continue;
+                }
+                ++screening_passes;
+                insertion_options[index].score =
+                    screened[index].metrics[3] - reference_distances[index];
+                if (!best.has_value()
+                    || option_less(insertion_options[index], *best)) {
+                    best = std::move(insertion_options[index]);
                 }
             }
         }
@@ -9520,11 +9521,6 @@ py::tuple full_native_initialize_v2(
         deadline_remaining, true);
 }
 
-class NativeExactDeadlineInterruption final : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
 // Stage 5.2's full-native causal journal is deliberately a separate ABI
 // product from the historical semantic and storage journals.  The stream and
 // event codes are integer-only so a consumer never has to reconstruct order
@@ -10920,6 +10916,10 @@ private:
                 routes.route_count());
             owner_.screening_occupancies_.push_back(
                 static_cast<std::int64_t>(routes.route_count()));
+            if (routes.route_count() == 0) {
+                owner_.cache_execution_coverage_flags_[0] = 1;
+                return output;
+            }
 #ifdef __linux__
             const auto scheduler_endpoint = native_kernel_scheduler_endpoint;
             const auto scheduler_required = native_kernel_scheduler_required;
@@ -10940,23 +10940,34 @@ private:
             } else
 #endif
             {
+                const auto task_count = std::max<std::size_t>(
+                    1, std::min<std::size_t>(
+                        routes.route_count(),
+                        static_cast<std::size_t>(owner_.worker_count_)));
+                const auto routes_per_task =
+                    (routes.route_count() + task_count - 1) / task_count;
                 owner_.work_pool_->parallel_for(
-                    routes.route_count(), [&](const std::size_t route) {
+                    task_count, [&](const std::size_t task) {
 #ifdef __linux__
                         NativeSchedulerThreadContext scheduler_context(
                             scheduler_endpoint, scheduler_required,
                             telemetry_collector);
 #endif
-                        const auto sequence = routes.route(route);
-                        output[route] = dispatch_screen_route(
-                            problem.node_kind.data(), problem.demand.data(),
-                            problem.ready_time.data(), problem.due_date.data(),
-                            problem.service_time.data(), problem.distance.data(),
-                            problem.reachable.data(), problem.vehicle.data(),
-                            sequence.data(), sequence.size(),
-                            problem.node_count(), owner_.depot_,
-                            owner_.recharge_nodes_, options.data(),
-                            no_incremental.data());
+                        const auto first = task * routes_per_task;
+                        const auto last = std::min(
+                            routes.route_count(), first + routes_per_task);
+                        for (auto route = first; route < last; ++route) {
+                            const auto sequence = routes.route(route);
+                            output[route] = dispatch_screen_route(
+                                problem.node_kind.data(), problem.demand.data(),
+                                problem.ready_time.data(), problem.due_date.data(),
+                                problem.service_time.data(), problem.distance.data(),
+                                problem.reachable.data(), problem.vehicle.data(),
+                                sequence.data(), sequence.size(),
+                                problem.node_count(), owner_.depot_,
+                                owner_.recharge_nodes_, options.data(),
+                                no_incremental.data());
+                        }
                     });
             }
             owner_.cache_execution_coverage_flags_[0] = 1;
@@ -10979,10 +10990,132 @@ private:
                     routes.offsets.begin(), routes.offsets.end());
                 const std::vector<std::int64_t> route_indices(
                     routes.indices.begin(), routes.indices.end());
-                output = exact_charging_batch_owned(
-                    problem, route_offsets, route_indices, owner_.depot_,
-                    owner_.exact_recharge_stations_, deadline_remaining,
-                    batch_size);
+#ifdef __linux__
+                const auto remote_scheduler =
+                    !native_kernel_scheduler_endpoint.empty();
+#else
+                constexpr auto remote_scheduler = false;
+#endif
+                if (remote_scheduler || routes.route_count() <= 1
+                    || owner_.worker_count_ <= 1) {
+                    output = exact_charging_batch_owned(
+                        problem, route_offsets, route_indices, owner_.depot_,
+                        owner_.exact_recharge_stations_, deadline_remaining,
+                        batch_size);
+                } else {
+                    const auto route_count = routes.route_count();
+                    const auto chunk_count = std::min<std::size_t>(
+                        static_cast<std::size_t>(owner_.worker_count_),
+                        route_count);
+                    const auto chunk_size =
+                        (route_count + chunk_count - 1) / chunk_count;
+                    const auto actual_chunk_count =
+                        (route_count + chunk_size - 1) / chunk_size;
+                    std::vector<evrptw::native_kernels::ExactBatchOutput>
+                        chunk_outputs(actual_chunk_count);
+                    std::vector<std::size_t> chunk_first(actual_chunk_count);
+                    std::vector<std::size_t> completion_rank(
+                        actual_chunk_count);
+                    std::atomic<std::size_t> completion_serial{0};
+                    owner_.work_pool_->parallel_for(
+                        actual_chunk_count, [&](const std::size_t chunk) {
+                            const auto first = chunk * chunk_size;
+                            const auto last = std::min(
+                                route_count, first + chunk_size);
+                            chunk_first[chunk] = first;
+                            std::vector<std::int64_t> chunk_offsets{0};
+                            std::vector<std::int64_t> chunk_indices;
+                            for (auto route = first; route < last; ++route) {
+                                const auto sequence = routes.route(route);
+                                chunk_indices.insert(
+                                    chunk_indices.end(), sequence.begin(),
+                                    sequence.end());
+                                chunk_offsets.push_back(
+                                    static_cast<std::int64_t>(
+                                        chunk_indices.size()));
+                            }
+                            const auto remaining = deadline_remaining
+                                - std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - started)
+                                      .count();
+                            chunk_outputs[chunk] = exact_charging_batch_owned(
+                                problem, chunk_offsets, chunk_indices,
+                                owner_.depot_, owner_.exact_recharge_stations_,
+                                remaining, batch_size);
+                            completion_rank[chunk] =
+                                completion_serial.fetch_add(
+                                    1, std::memory_order_relaxed);
+                        });
+
+                    output.path_offsets.push_back(0);
+                    output.statuses.reserve(route_count);
+                    output.reasons.reserve(route_count);
+                    output.metrics.reserve(route_count * 4);
+                    output.label_counters.reserve(route_count * 3);
+                    output.batch_counters.assign(10, 0);
+                    output.batch_counters[0] =
+                        static_cast<std::int64_t>(route_count);
+                    output.batch_counters[1] =
+                        static_cast<std::int64_t>(route_count);
+                    output.batch_counters[4] = 1;
+                    output.batch_counters[8] = 1;
+                    output.batch_counters[9] = batch_size;
+                    for (std::size_t chunk = 0;
+                         chunk < actual_chunk_count; ++chunk) {
+                        const auto& child = chunk_outputs[chunk];
+                        const auto path_base = output.path_offsets.back();
+                        for (std::size_t row = 1;
+                             row < child.path_offsets.size(); ++row) {
+                            output.path_offsets.push_back(
+                                path_base + child.path_offsets[row]);
+                        }
+                        output.path_indices.insert(
+                            output.path_indices.end(), child.path_indices.begin(),
+                            child.path_indices.end());
+                        output.statuses.insert(
+                            output.statuses.end(), child.statuses.begin(),
+                            child.statuses.end());
+                        output.reasons.insert(
+                            output.reasons.end(), child.reasons.begin(),
+                            child.reasons.end());
+                        output.metrics.insert(
+                            output.metrics.end(), child.metrics.begin(),
+                            child.metrics.end());
+                        output.label_counters.insert(
+                            output.label_counters.end(),
+                            child.label_counters.begin(),
+                            child.label_counters.end());
+                        output.batch_counters[2] += child.batch_counters[2];
+                        output.batch_counters[3] += child.batch_counters[3];
+                        output.batch_counters[5] += child.batch_counters[5];
+                        output.batch_counters[6] += child.batch_counters[6];
+                        output.batch_counters[7] += child.batch_counters[7];
+                    }
+                    std::vector<std::size_t> chunks_by_completion(
+                        actual_chunk_count);
+                    std::iota(
+                        chunks_by_completion.begin(),
+                        chunks_by_completion.end(), std::size_t{0});
+                    std::stable_sort(
+                        chunks_by_completion.begin(),
+                        chunks_by_completion.end(),
+                        [&](const auto left, const auto right) {
+                            return completion_rank[left]
+                                < completion_rank[right];
+                        });
+                    for (const auto chunk : chunks_by_completion) {
+                        for (const auto ordinal :
+                             chunk_outputs[chunk].completion_order) {
+                            output.completion_order.push_back(
+                                static_cast<std::int64_t>(chunk_first[chunk])
+                                + ordinal);
+                        }
+                    }
+                    evrptw::native_kernels::validate_exact_batch_output(
+                        output, problem.node_kind.data(), route_offsets.data(),
+                        route_indices.data(), problem.node_count(), route_count,
+                        route_indices.size(), owner_.depot_, batch_size);
+                }
             }
             owner_.cache_execution_coverage_flags_[2] = 1;
             owner_.record_exact_backend_metrics(
@@ -11003,8 +11136,10 @@ private:
             const evrptw::native_search::CandidateTransactionTraceV2& trace)
             : trace_(trace) {
             for (const auto& plan : trace_.plans) {
-                if (plan.budget_reservation[0] > 0) {
-                    exact_outputs_.push_back(&plan.exact);
+                for (std::size_t batch = 0;
+                     batch < plan.exact_batch_sizes.size(); ++batch) {
+                    exact_outputs_.push_back(evrptw::native_search::
+                        slice_candidate_exact_batch_v2(plan, batch));
                 }
             }
         }
@@ -11034,19 +11169,34 @@ private:
         }
 
         evrptw::native_kernels::ExactBatchOutput exact(
-            const evrptw::native_search::ProblemV2&,
+            const evrptw::native_search::ProblemV2& problem,
             const evrptw::native_search::RouteBatchViewV2 routes,
             const double,
-            const std::int64_t) override {
+            const std::int64_t batch_size) override {
             if (exact_ordinal_ >= exact_outputs_.size()) {
                 throw std::runtime_error(
                     "native candidate remote exact replay has extra work");
             }
-            const auto& output = *exact_outputs_[exact_ordinal_++];
+            const auto& output = exact_outputs_[exact_ordinal_++];
             if (output.statuses.size() != routes.route_count()) {
                 throw std::runtime_error(
-                    "native candidate remote exact replay shape mismatch");
+                    "native candidate remote exact replay batch boundary mismatch");
             }
+            std::int64_t depot = -1;
+            for (std::size_t node = 0; node < problem.node_kind.size(); ++node) {
+                if (problem.node_kind[node]
+                    == evrptw::native_kernels::depot_kind) {
+                    if (depot >= 0) {
+                        throw std::runtime_error(
+                            "native candidate remote exact replay has multiple depots");
+                    }
+                    depot = static_cast<std::int64_t>(node);
+                }
+            }
+            evrptw::native_kernels::validate_exact_batch_output(
+                output, problem.node_kind.data(), routes.offsets.data(),
+                routes.indices.data(), problem.node_kind.size(),
+                routes.route_count(), routes.indices.size(), depot, batch_size);
             return output;
         }
 
@@ -11059,8 +11209,7 @@ private:
 
     private:
         const evrptw::native_search::CandidateTransactionTraceV2& trace_;
-        std::vector<const evrptw::native_kernels::ExactBatchOutput*>
-            exact_outputs_;
+        std::vector<evrptw::native_kernels::ExactBatchOutput> exact_outputs_;
         std::size_t exact_ordinal_ = 0;
         bool screen_consumed_ = false;
     };
@@ -11130,31 +11279,45 @@ private:
             const auto plan = static_cast<std::size_t>(plan_trace.plan_id);
             const auto first_route = static_cast<std::size_t>(
                 result.plan_offsets.at(plan));
-            std::vector<std::int64_t> missing_offsets{0};
-            std::vector<std::int64_t> missing_indices;
-            for (const auto local_row : plan_trace.missing_local_rows) {
-                if (local_row < 0) {
-                    throw std::logic_error(
-                        "full native shared missing-route row is negative");
+            std::size_t missing_cursor = 0;
+            for (std::size_t batch = 0;
+                 batch < plan_trace.exact_batch_sizes.size(); ++batch) {
+                std::vector<std::int64_t> missing_offsets{0};
+                std::vector<std::int64_t> missing_indices;
+                const auto batch_size = static_cast<std::size_t>(
+                    plan_trace.exact_batch_sizes[batch]);
+                for (std::size_t row = 0; row < batch_size; ++row) {
+                    const auto local_row = plan_trace.missing_local_rows.at(
+                        missing_cursor++);
+                    if (local_row < 0) {
+                        throw std::logic_error(
+                            "full native shared missing-route row is negative");
+                    }
+                    const auto route = first_route
+                        + static_cast<std::size_t>(local_row);
+                    const auto first = static_cast<std::size_t>(
+                        result.route_offsets.at(route));
+                    const auto last = static_cast<std::size_t>(
+                        result.route_offsets.at(route + 1));
+                    missing_indices.insert(
+                        missing_indices.end(),
+                        result.route_indices.begin()
+                            + static_cast<std::ptrdiff_t>(first),
+                        result.route_indices.begin()
+                            + static_cast<std::ptrdiff_t>(last));
+                    missing_offsets.push_back(
+                        static_cast<std::int64_t>(missing_indices.size()));
                 }
-                const auto route = first_route
-                    + static_cast<std::size_t>(local_row);
-                const auto first = static_cast<std::size_t>(
-                    result.route_offsets.at(route));
-                const auto last = static_cast<std::size_t>(
-                    result.route_offsets.at(route + 1));
-                missing_indices.insert(
-                    missing_indices.end(),
-                    result.route_indices.begin()
-                        + static_cast<std::ptrdiff_t>(first),
-                    result.route_indices.begin()
-                        + static_cast<std::ptrdiff_t>(last));
-                missing_offsets.push_back(
-                    static_cast<std::int64_t>(missing_indices.size()));
+                const auto exact = evrptw::native_search::
+                    slice_candidate_exact_batch_v2(plan_trace, batch);
+                record_exact_journal_batch(
+                    context, missing_offsets, missing_indices, exact,
+                    transaction_id);
             }
-            record_exact_journal_batch(
-                context, missing_offsets, missing_indices, plan_trace.exact,
-                transaction_id);
+            if (missing_cursor != plan_trace.missing_local_rows.size()) {
+                throw std::logic_error(
+                    "full native shared exact batches lost missing routes");
+            }
             cache_execution_coverage_flags_[3] = 1;
             append_causal_cache_events(
                 context, transaction_id, plan_trace.cache_hit_flags, true);
@@ -12183,7 +12346,9 @@ public:
             *live_problem_, route_cache_.core_, negative_cache_.core_,
             budget_.core_, attempted_plans_.core_, active_lane.route_offsets,
             active_lane.route_indices, kernels, proposal_top_k_,
-            screening_epsilon_);
+            screening_epsilon_,
+            std::span<const std::optional<evrptw::native_search::LaneStateV2>>(
+                live_lane_states_.data(), 3));
         evrptw::native_search::CandidateTransactionExecutionV2 execution;
         {
             py::gil_scoped_release release;
@@ -12259,36 +12424,64 @@ public:
         causal_context_ = context;
         causal_context_transaction_id_ = transaction_id;
         const auto& active_lane = live_lane_state(2);
+        const auto& ranking_offsets = candidate_ranking_baseline_offsets_.has_value()
+            ? *candidate_ranking_baseline_offsets_
+            : active_lane.route_offsets;
+        const auto& ranking_indices = candidate_ranking_baseline_indices_.has_value()
+            ? *candidate_ranking_baseline_indices_
+            : active_lane.route_indices;
+        if (candidate_ranking_baseline_offsets_.has_value()
+            != candidate_ranking_baseline_indices_.has_value()) {
+            throw std::logic_error(
+                "full native candidate ranking baseline is incomplete");
+        }
+        request.ranking_route_offsets.assign(
+            ranking_offsets.begin(), ranking_offsets.end());
+        request.ranking_route_indices.assign(
+            ranking_indices.begin(), ranking_indices.end());
+        request.validate();
         bool protocol_active = false;
         bool negative_active = false;
         bool attempted_active = false;
         bool remote_protocol_active = false;
         try {
-            const evrptw::native_search::CandidateTransactionOptionsV2
+                const evrptw::native_search::CandidateTransactionOptionsV2
                 local_options{
                     suppress_attempted_plan_journal_, suppress_round_budget_,
                     suppress_plan_screening_negative_cache_,
                     allow_partial_customer_coverage_, true,
+                    allow_vehicle_increase_,
                 };
             evrptw::native_search::CandidateTransactionExecutionV2 execution;
 #ifdef __linux__
             if (!native_candidate_session_token.empty()) {
                 auto remote_options = local_options;
                 evrptw::native_search::CandidateTransactionExecutionV2 remote;
-                remote = execute_native_work([&]() {
-                    return evrptw::native_client::
-                        execute_candidate_session_transaction_with_trace_v2(
-                            native_kernel_scheduler_endpoint,
-                            native_candidate_session_token, request,
-                            remote_options);
-                });
+                try {
+                    remote = execute_native_work([&]() {
+                        return evrptw::native_client::
+                            execute_candidate_session_transaction_with_trace_v2(
+                                native_kernel_scheduler_endpoint,
+                                native_candidate_session_token, request,
+                                remote_options);
+                    });
+                } catch (const evrptw::native_client::KernelClientDeadline&) {
+                    throw evrptw::native_search::CandidateTransactionDeadlineV2(
+                        evrptw::native_search::
+                            CandidateTransactionDeadlinePhaseV2::remote_worker,
+                        "host candidate transaction crossed its deadline");
+                }
                 remote_protocol_active = true;
                 screening_occupancies_.push_back(
                     static_cast<std::int64_t>(
                         remote.trace.physical_screen_rows.size()));
                 for (const auto& plan : remote.trace.plans) {
-                    if (plan.budget_reservation[0] > 0) {
-                        record_exact_backend_metrics(plan.exact, 0.0);
+                    for (std::size_t batch = 0;
+                         batch < plan.exact_batch_sizes.size(); ++batch) {
+                        record_exact_backend_metrics(
+                            evrptw::native_search::
+                                slice_candidate_exact_batch_v2(plan, batch),
+                            0.0);
                         cache_execution_coverage_flags_[2] = 1;
                     }
                 }
@@ -12297,35 +12490,114 @@ public:
                 evrptw::native_search::CandidateTransactionExecutorV2 executor(
                     *live_problem_, route_cache_.core_, negative_cache_.core_,
                     budget_.core_, attempted_plans_.core_,
-                    active_lane.route_offsets, active_lane.route_indices,
+                    ranking_offsets, ranking_indices,
                     replay_kernels, proposal_top_k_, screening_epsilon_);
                 execution = execute_native_work([&]() {
                     return executor.execute_with_trace(
                         request, local_options);
                 });
                 replay_kernels.finish();
+                // The scheduler session owns only Candidate Control cache
+                // work, while the search-engine cache also sees exact work
+                // performed by the legacy and refinement lanes.  Therefore a
+                // route can legitimately be resolved from a different
+                // physical cache tier in the two executions.  The local
+                // replay remains the canonical cache journal; compare every
+                // decision and exact-result field while treating only the
+                // physical resolution source as implementation telemetry.
+                auto remote_mirror = remote.result;
+                remote_mirror.route_resolutions =
+                    execution.result.route_resolutions;
+                remote_mirror.cache_statistics =
+                    execution.result.cache_statistics;
+                remote_mirror.cache_hashes = execution.result.cache_hashes;
+                remote_mirror.cache_hash_rows =
+                    execution.result.cache_hash_rows;
+                remote_mirror.negative_statistics =
+                    execution.result.negative_statistics;
+                remote_mirror.transaction_sha256 =
+                    evrptw::native_search::
+                        candidate_plan_transaction_sha256_v2(remote_mirror);
                 const auto remote_wire =
                     evrptw::native_search::encode_candidate_plan_transaction_v2(
-                        remote.result);
+                        remote_mirror);
                 const auto local_wire =
                     evrptw::native_search::encode_candidate_plan_transaction_v2(
                         execution.result);
-                if (remote_wire.integer_offsets != local_wire.integer_offsets
-                    || remote_wire.integer_values != local_wire.integer_values
-                    || remote_wire.double_offsets != local_wire.double_offsets
-                    || remote_wire.double_values.size()
-                        != local_wire.double_values.size()
-                    || (!remote_wire.double_values.empty()
-                        && std::memcmp(
-                            remote_wire.double_values.data(),
-                            local_wire.double_values.data(),
-                            remote_wire.double_values.size() * sizeof(double))
-                            != 0)
-                    || remote_wire.byte_offsets != local_wire.byte_offsets
-                    || remote_wire.byte_values != local_wire.byte_values) {
-                    throw std::runtime_error(
-                        "host candidate transaction mirror mismatch without fallback");
-                }
+                const auto require_mirror_equal = [
+                    &remote_wire](
+                    const auto& remote_values,
+                    const auto& local_values,
+                    const std::string_view field) {
+                    if (remote_values.size() != local_values.size()) {
+                        throw std::runtime_error(
+                            "host candidate transaction mirror mismatch in "
+                            + std::string(field) + " size: remote="
+                            + std::to_string(remote_values.size()) + ", local="
+                            + std::to_string(local_values.size())
+                            + "; fallback is forbidden");
+                    }
+                    for (std::size_t index = 0;
+                         index < remote_values.size(); ++index) {
+                        bool equal = false;
+                        if constexpr (std::is_same_v<
+                                          typename std::remove_cvref_t<
+                                              decltype(remote_values)>::value_type,
+                                          double>) {
+                            equal = std::memcmp(
+                                &remote_values[index], &local_values[index],
+                                sizeof(double)) == 0;
+                        } else {
+                            equal = remote_values[index] == local_values[index];
+                        }
+                        if (!equal) {
+                            std::string segment;
+                            if (field == "integer_values") {
+                                const auto upper = std::upper_bound(
+                                    remote_wire.integer_offsets.begin(),
+                                    remote_wire.integer_offsets.end(),
+                                    static_cast<std::int64_t>(index));
+                                const auto field_index = static_cast<std::size_t>(
+                                    std::distance(
+                                        remote_wire.integer_offsets.begin(),
+                                        upper) - 1);
+                                segment = ", integer_field="
+                                    + std::to_string(field_index)
+                                    + ", field_offset=" + std::to_string(
+                                        index - static_cast<std::size_t>(
+                                            remote_wire.integer_offsets[
+                                                field_index]));
+                            }
+                            throw std::runtime_error(
+                                "host candidate transaction mirror mismatch in "
+                                + std::string(field) + " at index "
+                                + std::to_string(index) + ": remote="
+                                + std::to_string(remote_values[index])
+                                + ", local="
+                                + std::to_string(local_values[index])
+                                + segment
+                                + "; fallback is forbidden");
+                        }
+                    }
+                };
+                require_mirror_equal(
+                    remote_wire.integer_offsets, local_wire.integer_offsets,
+                    "integer_offsets");
+                require_mirror_equal(
+                    remote_wire.integer_values, local_wire.integer_values,
+                    "integer_values");
+                require_mirror_equal(
+                    remote_wire.double_offsets, local_wire.double_offsets,
+                    "double_offsets");
+                require_mirror_equal(
+                    remote_wire.double_values, local_wire.double_values,
+                    "double_values");
+                require_mirror_equal(
+                    remote_wire.byte_offsets, local_wire.byte_offsets,
+                    "byte_offsets");
+                require_mirror_equal(
+                    remote_wire.byte_values, local_wire.byte_values,
+                    "byte_values");
                 execution.trace.screening_seconds =
                     remote.trace.screening_seconds;
             } else
@@ -12335,8 +12607,10 @@ public:
                 evrptw::native_search::CandidateTransactionExecutorV2 executor(
                     *live_problem_, route_cache_.core_, negative_cache_.core_,
                     budget_.core_, attempted_plans_.core_,
-                    active_lane.route_offsets, active_lane.route_indices,
-                    kernels, proposal_top_k_, screening_epsilon_);
+                    ranking_offsets, ranking_indices,
+                    kernels, proposal_top_k_, screening_epsilon_,
+                    std::span<const std::optional<evrptw::native_search::LaneStateV2>>(
+                        live_lane_states_.data(), 3));
                 execution = execute_native_work([&]() {
                     return executor.execute_with_trace(
                         std::move(request), local_options);
@@ -12494,11 +12768,13 @@ public:
                 std::rethrow_exception(remote_rollback_failure);
             }
             const std::string message(error.what());
-            if (message.find("before exact work") != std::string::npos) {
+            if (error.phase() == evrptw::native_search::
+                    CandidateTransactionDeadlinePhaseV2::before_exact) {
                 throw NativeExactDeadlineInterruption(
                     "full native plan transaction reached its deadline before exact work");
             }
-            if (message.find("transaction return") != std::string::npos) {
+            if (error.phase() == evrptw::native_search::
+                    CandidateTransactionDeadlinePhaseV2::transaction_return) {
                 throw NativeExactDeadlineInterruption(
                     "full native plan transaction reached its deadline before return");
             }
@@ -13642,6 +13918,10 @@ public:
         ScopeRollback restore_attempted_plan_policy([this]() noexcept {
             suppress_attempted_plan_journal_ = false;
         });
+        allow_vehicle_increase_ = true;
+        ScopeRollback restore_vehicle_increase_policy([this]() noexcept {
+            allow_vehicle_increase_ = false;
+        });
         defer_composite_commit_ = true;
         try {
             evaluate_plans_state_owned({
@@ -14347,12 +14627,16 @@ public:
                 outcome[0] = *selected_plan;
                 const auto comparison = last_candidate_comparison();
                 if (!budget_.budget_reached()) {
-                    const auto acceptance = apply_last_candidate_state_owned(1.0, 1.0);
+                    const auto acceptance =
+                        apply_last_candidate_state_owned(1.0, 1.0);
                     last_quality_acceptance_outcome_ = acceptance;
                     outcome[1] = acceptance.accepted;
                     outcome[2] = acceptance.improved_global_best;
                     outcome[3] = acceptance.vehicle_reduction;
                 } else {
+                    // Match Python's fixed-work boundary: the completed
+                    // candidate remains observable and its exact work remains
+                    // charged, but it cannot update the quality incumbent.
                     last_candidate_lane_state_.reset();
                     last_candidate_ready_ = false;
                 }
@@ -14623,7 +14907,7 @@ public:
             stable_int63(
                 repair_names[static_cast<std::size_t>(repair_operation)]),
             iteration};
-        if (metadata[5] != 0) {
+        if (metadata[5] != 0 && removed.size() == 1) {
             accumulate_standard_outcome(false, 1, false, false);
             *rng_ = std::move(next_rng);
             return finish_artifact(std::move(repair_state));
@@ -14690,6 +14974,26 @@ public:
                     });
                 return expected;
             };
+            const auto evaluate_with_ranking_baseline = [this](
+                CandidateRoundRequestStateV2 request,
+                const std::vector<std::int64_t>& baseline_offsets,
+                const std::vector<std::int64_t>& baseline_indices) {
+                if (candidate_ranking_baseline_offsets_.has_value()
+                    || candidate_ranking_baseline_indices_.has_value()) {
+                    throw std::logic_error(
+                        "full native candidate ranking baseline is already active");
+                }
+                candidate_ranking_baseline_offsets_ = baseline_offsets;
+                candidate_ranking_baseline_indices_ = baseline_indices;
+                ScopeRollback clear_ranking_baseline([this]() noexcept {
+                    candidate_ranking_baseline_offsets_.reset();
+                    candidate_ranking_baseline_indices_.reset();
+                });
+                evaluate_plans_state_owned(std::move(request));
+                candidate_ranking_baseline_offsets_.reset();
+                candidate_ranking_baseline_indices_.reset();
+                clear_ranking_baseline.release();
+            };
             const auto remaining_deadline = [&]() {
                 const auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - transaction_started).count();
@@ -14699,6 +15003,62 @@ public:
                         "full native standard sequential repair exceeded its deadline");
                 }
                 return remaining;
+            };
+            struct ReferenceDistanceResolution final {
+                std::optional<double> distance;
+                CandidateRoundState transaction;
+            };
+            const auto resolve_reference_distance = [
+                &, this](const std::vector<std::int64_t>& base)
+                -> ReferenceDistanceResolution {
+                if (base.empty()) {
+                    throw std::logic_error(
+                        "full native sequential repair base route is empty");
+                }
+                std::vector<std::int64_t> expected(base.begin(), base.end());
+                std::stable_sort(
+                    expected.begin(), expected.end(),
+                    [this](std::int64_t left, std::int64_t right) {
+                        return owned_lexical_rank(left)
+                            < owned_lexical_rank(right);
+                    });
+                const std::array<std::int64_t, 2> plan_offsets{0, 1};
+                const std::array<std::int64_t, 2> route_offsets{
+                    0, static_cast<std::int64_t>(base.size())};
+                evrptw::native_search::CandidateRoundRequestV2 request{
+                    {plan_offsets.begin(), plan_offsets.end()},
+                    {route_offsets.begin(), route_offsets.end()},
+                    base,
+                    insertion_context,
+                    remaining_deadline(),
+                    batch_size,
+                    std::move(expected),
+                    {route_offsets.begin(), route_offsets.end()},
+                    base,
+                };
+                EngineCandidateTransactionKernelsV2 kernels(*this);
+                evrptw::native_search::AttemptedPlanSetV2
+                    reference_attempted_plans;
+                evrptw::native_search::CandidateTransactionExecutorV2 executor(
+                    *live_problem_, route_cache_.core_, negative_cache_.core_,
+                    budget_.core_, reference_attempted_plans, route_offsets, base,
+                    kernels, proposal_top_k_, screening_epsilon_,
+                    std::span<const std::optional<
+                        evrptw::native_search::LaneStateV2>>(
+                            live_lane_states_.data(), 3));
+                auto execution = execute_native_work([&]() {
+                    return executor.execute_with_trace(
+                        std::move(request), {true, false, false, true, false});
+                });
+                const auto transaction_id = allocate_causal_transaction();
+                append_candidate_transaction_trace_v2(
+                    execution.result, execution.trace, transaction_id);
+                const auto distance = execution.result.feasible_order.empty()
+                    ? std::optional<double>{
+                        std::numeric_limits<double>::infinity()}
+                    : std::optional<double>{
+                        execution.result.objective_float[0]};
+                return {distance, std::move(execution.result)};
             };
             swap_active_with_lane_state_noexcept(0);
             ScopeRollback restore_sequential_lane([this]() noexcept {
@@ -14719,7 +15079,7 @@ public:
                         current_offsets, current_indices, pending[pending_index],
                         live_problem_->demand,
                         live_problem_->vehicle[1], screening_epsilon_,
-                        false);
+                        true);
                     if (pool_state.plan_offsets.size() <= 1) {
                         continue;
                     }
@@ -14732,7 +15092,7 @@ public:
                     });
                     defer_composite_commit_ = true;
                     try {
-            evaluate_plans_state_owned({
+            evaluate_with_ranking_baseline({
                             pool_state.plan_offsets,
                             pool_state.route_offsets,
                             pool_state.route_indices,
@@ -14740,18 +15100,22 @@ public:
                             remaining_deadline(),
                             batch_size,
                             std::move(expected),
-            });
-                        auto transaction = candidate_round_state();
+                        }, current_offsets, current_indices);
                         if (!pending_candidate_round_.has_value()) {
                             throw std::logic_error(
                                 "full native sequential repair lost its staged round");
                         }
-                        const auto& candidate_round = *pending_candidate_round_;
+                        auto candidate_round = candidate_round_state();
                         validate_candidate_round_v2(candidate_round);
+                        exact_rows_seen +=
+                            candidate_round.exact_route_rows.size();
+                        last_transaction = candidate_round;
+                        defer_composite_commit_ = false;
+                        commit_pending_composite();
+                        allow_partial_customer_coverage_ = false;
+                        restore_partial_coverage.release();
                         const auto& feasible_order =
                             candidate_round.feasible_order;
-                        const auto* objectives =
-                            candidate_round.objective_float.data();
                         const auto* exact_metrics =
                             candidate_round.exact.metrics.data();
                         const auto* plan_boundaries =
@@ -14776,7 +15140,29 @@ public:
                                     route_nodes + route_boundaries[route],
                                     route_nodes + route_boundaries[route + 1]);
                             }
-                            auto score = objectives[plan * 2];
+                            if (target < 0
+                                || target > static_cast<std::int64_t>(
+                                    sequential_routes.size())) {
+                                throw std::logic_error(
+                                    "full native sequential repair target is invalid");
+                            }
+                            double reference_distance = 0.0;
+                            if (target < static_cast<std::int64_t>(
+                                    sequential_routes.size())) {
+                                const auto& base = sequential_routes[
+                                    static_cast<std::size_t>(target)];
+                                auto reference =
+                                    resolve_reference_distance(base);
+                                if (!reference.distance.has_value()) {
+                                    last_transaction =
+                                        std::move(reference.transaction);
+                                    continue;
+                                }
+                                reference_distance = *reference.distance;
+                            }
+                            auto score = exact_metrics[
+                                (first_route + target) * 4]
+                                - reference_distance;
                             if (repair_operation == 2) {
                                 score += 0.05 * exact_metrics[
                                     (first_route + target) * 4 + 2];
@@ -14786,12 +15172,6 @@ public:
                                     score, pending[pending_index], target, position,
                                     std::move(candidate_routes)});
                         }
-                        exact_rows_seen += candidate_round.exact_route_rows.size();
-                        last_transaction = std::move(transaction);
-                        defer_composite_commit_ = false;
-                        commit_pending_composite();
-                        allow_partial_customer_coverage_ = false;
-                        restore_partial_coverage.release();
                     } catch (...) {
                         defer_composite_commit_ = false;
                         if (pending_composite_active_) {
@@ -14852,6 +15232,9 @@ public:
                 }
                 auto selected = std::move(
                     options_by_customer[selected_customer].front());
+                const auto [selection_baseline_offsets,
+                            selection_baseline_indices] =
+                    make_routes_vectors(sequential_routes);
                 const auto [selected_offsets, selected_indices] =
                     make_routes_vectors(selected.routes);
                 auto selected_expected = make_expected(selected.routes);
@@ -14865,7 +15248,7 @@ public:
                 });
                 defer_composite_commit_ = true;
                 try {
-            evaluate_plans_state_owned({
+            evaluate_with_ranking_baseline({
                         {0, static_cast<std::int64_t>(
                                 selected_offsets.size() - 1)},
                         selected_offsets,
@@ -14874,7 +15257,7 @@ public:
                         remaining_deadline(),
                         batch_size,
                         std::move(selected_expected),
-            });
+                    }, selection_baseline_offsets, selection_baseline_indices);
                     auto selected_transaction = candidate_round_state();
                     const auto selected_plan = prepare_first_feasible_candidate();
                     if (!selected_plan.has_value()) {
@@ -15216,6 +15599,7 @@ public:
         const auto candidate_limit = std::max<std::int64_t>(
             16, evaluation_budget * 4);
         std::int64_t considered = 0;
+        std::int64_t budget_exhausted_events = 0;
         bool found = false;
         for (std::size_t source = 0;
              source + 1 < quality_lane.route_offsets.size() && !found;
@@ -15229,6 +15613,7 @@ public:
                 for (std::int64_t start = 0;
                      start + length <= source_size && !found; ++start) {
                     if (considered >= candidate_limit) {
+                        ++budget_exhausted_events;
                         break;
                     }
                     ++considered;
@@ -15294,7 +15679,9 @@ public:
                 7, false, 1, false, false, true);
             append_route_segment_canonical(
                 std::max<std::int64_t>(
-                    1, static_cast<std::int64_t>(attempt_rows.size())),
+                    1,
+                    static_cast<std::int64_t>(attempt_rows.size())
+                        + budget_exhausted_events),
                 false, false);
             QualityRouteSegmentArtifactV2 artifact;
             artifact.attempts = std::move(attempts);
@@ -15346,11 +15733,17 @@ public:
                 commit_pending_composite();
                 outcome[0] = *selected;
                 const auto comparison = last_candidate_comparison();
-                const auto acceptance = apply_last_candidate_state_owned(1.0, 1.0);
-                last_quality_acceptance_outcome_ = acceptance;
-                outcome[1] = acceptance.accepted;
-                outcome[2] = acceptance.improved_global_best;
-                outcome[3] = acceptance.vehicle_reduction;
+                if (!budget_.budget_reached()) {
+                    const auto acceptance =
+                        apply_last_candidate_state_owned(1.0, 1.0);
+                    last_quality_acceptance_outcome_ = acceptance;
+                    outcome[1] = acceptance.accepted;
+                    outcome[2] = acceptance.improved_global_best;
+                    outcome[3] = acceptance.vehicle_reduction;
+                } else {
+                    last_candidate_lane_state_.reset();
+                    last_candidate_ready_ = false;
+                }
                 accumulate_full_stage04_outcome_noexcept(
                     7, outcome[1] != 0, comparison,
                     outcome[2] != 0, outcome[3] != 0, true);
@@ -15364,10 +15757,13 @@ public:
             restore_lane.rollback_now();
             append_route_segment_canonical(
                 std::max<std::int64_t>(
-                    1, static_cast<std::int64_t>(attempt_rows.size())),
-                // The repair produced a valid proposal even when Candidate
-                // Control rejects every exact plan in the transaction.
-                true,
+                    1,
+                    static_cast<std::int64_t>(attempt_rows.size())
+                        + budget_exhausted_events),
+                // The public repair event records a safe-screened proposal,
+                // while canonical feasibility records whether Candidate
+                // Control prepared an exact-feasible candidate.
+                outcome[0] >= 0,
                 outcome[1] != 0);
             QualityRouteSegmentArtifactV2 artifact;
             artifact.attempts = std::move(attempts);
@@ -15756,11 +16152,17 @@ public:
                 outcome[0] =
                     static_cast<std::int64_t>(selected_candidate);
                 const auto comparison = last_candidate_comparison();
-                const auto acceptance = apply_last_candidate_state_owned(1.0, 1.0);
-                last_quality_acceptance_outcome_ = acceptance;
-                outcome[1] = acceptance.accepted;
-                outcome[2] = acceptance.improved_global_best;
-                outcome[3] = acceptance.vehicle_reduction;
+                if (!budget_.budget_reached()) {
+                    const auto acceptance =
+                        apply_last_candidate_state_owned(1.0, 1.0);
+                    last_quality_acceptance_outcome_ = acceptance;
+                    outcome[1] = acceptance.accepted;
+                    outcome[2] = acceptance.improved_global_best;
+                    outcome[3] = acceptance.vehicle_reduction;
+                } else {
+                    last_candidate_lane_state_.reset();
+                    last_candidate_ready_ = false;
+                }
                 accumulate_full_stage04_outcome_noexcept(
                     8, outcome[1] != 0, comparison,
                     outcome[2] != 0, outcome[3] != 0, true);
@@ -15998,6 +16400,8 @@ public:
         const auto bootstrap_last_completed_constraint =
             last_completed_constraint_iteration_;
         const auto bootstrap_stagnation = main_stagnation_iterations_;
+        const auto bootstrap_maximum_stagnation =
+            maximum_stagnation_iterations_;
         const auto bootstrap_global_best_improved =
             last_iteration_global_best_improved_;
         const auto bootstrap_quality_outcome = last_quality_acceptance_outcome_;
@@ -16054,6 +16458,7 @@ public:
              bootstrap_intensification_active,
              bootstrap_intensification_remaining, bootstrap_last_finished,
              bootstrap_last_completed_constraint, bootstrap_stagnation,
+             bootstrap_maximum_stagnation,
              bootstrap_global_best_improved, bootstrap_quality_outcome,
              bootstrap_constraint_outcome, bootstrap_legacy_outcome,
              bootstrap_termination, bootstrap_semantic_state,
@@ -16115,6 +16520,8 @@ public:
                 last_completed_constraint_iteration_ =
                     bootstrap_last_completed_constraint;
                 main_stagnation_iterations_ = bootstrap_stagnation;
+                maximum_stagnation_iterations_ =
+                    bootstrap_maximum_stagnation;
                 last_iteration_global_best_improved_ =
                     bootstrap_global_best_improved;
                 last_quality_acceptance_outcome_ = bootstrap_quality_outcome;
@@ -16181,6 +16588,9 @@ public:
             refinement_iteration_artifact;
         std::optional<ConstraintIterationArtifactV2>
             constraint_iteration_artifact;
+        bool bootstrap_refinement_selected = false;
+        std::optional<std::array<std::int64_t, 8>>
+            bootstrap_refinement_totals_before;
         const auto make_termination = [
             this, &round_outcome,
             &stage04_initialization_state, &stage04_boundary_state](
@@ -16201,19 +16611,23 @@ public:
                 request.batch_size);
         }
         if (budget_.budget_reached()) {
+            // Python checks the shared exact-call controller before entering
+            // iteration zero.  Stage 4 temperature calibration is durable,
+            // but no ALNS round, operator call, or stagnation transition has
+            // completed when calibration itself consumes the final call.
             static_cast<void>(make_termination(1, 0));
             if (!last_three_lane_semantic_state_.has_value()) {
                 throw std::logic_error(
-                    "full native bootstrap entry budget exit lost semantic state");
+                    "full native pre-bootstrap fixed-work exit lost semantic state");
             }
             ThreeLaneIterationArtifactV2 iteration_artifact{
                 std::move(legacy_iteration_artifact),
                 std::move(refinement_iteration_artifact),
                 std::move(quality_iteration_artifact),
                 std::move(constraint_iteration_artifact),
-                last_three_lane_legacy_acceptance_outcome_,
-                *last_three_lane_semantic_state_};
+                std::nullopt, *last_three_lane_semantic_state_};
             iteration_artifact.validate(*live_problem_);
+            discard_pending_legacy.release();
             rollback_three_lane_bootstrap.release();
             return iteration_artifact;
         }
@@ -16232,6 +16646,66 @@ public:
             NativeCanonicalEventCode::candidate_round_started,
             stable_int63("all"), stable_int63("candidate_control"), 0,
             -1, 0, 0, 0);
+        const auto make_bootstrap_budget_boundary_result = [&]() {
+            if (pending_composite_active_ || defer_iteration_commit_
+                || defer_global_commit_) {
+                throw std::logic_error(
+                    "full native bootstrap fixed-work boundary crossed an active transaction");
+            }
+            const auto canonical_next =
+                canonical_event_journal_.discard_uncommitted_semantics_since(
+                    canonical_bootstrap_round_snapshot);
+            const auto causal_next =
+                causal_journal_.discard_uncommitted_semantics_since(
+                    causal_bootstrap_round_snapshot);
+            if (legacy_candidate_ready_) {
+                // The main-lane candidate is evaluated before the shared
+                // boundary check in Python.  Its exact work is durable, while
+                // its acceptance and Stage 4 reward are forced to rejection.
+                accumulate_full_stage04_outcome_noexcept(
+                    2, false, 1, false, false, true);
+            }
+            if (bootstrap_refinement_selected) {
+                if (!bootstrap_refinement_totals_before.has_value()) {
+                    throw std::logic_error(
+                        "full native bootstrap boundary lost refinement totals");
+                }
+                auto retained = *bootstrap_refinement_totals_before;
+                ++retained[0];
+                full_operator_totals_[13] = retained;
+            }
+            legacy_candidate_lane_state_.reset();
+            legacy_candidate_ready_ = false;
+            legacy_candidate_operator_ = -1;
+            legacy_candidate_destroy_operator_ = -1;
+            legacy_candidate_repair_operator_ = -1;
+            last_candidate_lane_state_.reset();
+            last_candidate_ready_ = false;
+            last_three_lane_legacy_acceptance_outcome_.reset();
+            round_outcome.legacy_candidate_feasible = 0;
+            round_outcome.legacy_acceptance = {};
+            stage04_boundary_state.reset();
+            next_causal_transaction_id_ = std::max(
+                canonical_next, causal_next);
+            causal_context_ = bootstrap_causal_context;
+            causal_context_transaction_id_ =
+                bootstrap_context_transaction;
+            discard_pending_legacy.release();
+            static_cast<void>(make_termination(1, 1));
+            if (!last_three_lane_semantic_state_.has_value()) {
+                throw std::logic_error(
+                    "full native bootstrap fixed-work exit lost semantic state");
+            }
+            ThreeLaneIterationArtifactV2 iteration_artifact{
+                std::move(legacy_iteration_artifact),
+                std::move(refinement_iteration_artifact),
+                std::move(quality_iteration_artifact),
+                std::move(constraint_iteration_artifact),
+                std::nullopt, *last_three_lane_semantic_state_};
+            iteration_artifact.validate(*live_problem_);
+            rollback_three_lane_bootstrap.release();
+            return iteration_artifact;
+        };
         auto elimination_artifact = legacy_route_elimination_probe_state_owned(
             0, max_route_elimination_attempts, route_change_limit,
             next_deadline_seconds(),
@@ -16248,12 +16722,13 @@ public:
         round_outcome.legacy_operator_index = 2;
         round_outcome.legacy_candidate_feasible =
             legacy_candidate_ready_ ? 1 : 0;
+        if (budget_.budget_reached()) {
+            return make_bootstrap_budget_boundary_result();
+        }
         const auto bootstrap_legacy_transaction_id =
             claim_causal_transaction({
                 stable_int63("legacy"), stable_int63("route_elimination"), 0});
         auto bootstrap_refinement_transaction_id = std::int64_t{-1};
-        bool bootstrap_refinement_selected = false;
-        std::optional<std::array<std::int64_t, 8>> refinement_totals_before;
         const auto reduced_vehicle_threshold = std::max<std::int64_t>(
             1, static_cast<std::int64_t>(
                 std::ceil(static_cast<double>(all_customers_.size()) / 5.0)) - 1);
@@ -16261,9 +16736,8 @@ public:
             && legacy_candidate_lane_state_->route_offsets.size()
                     < live_lane_state(0).route_offsets.size()
             && legacy_candidate_lane_state_->route_offsets.size() - 1
-                <= reduced_vehicle_threshold
-            && !budget_.budget_reached()) {
-            refinement_totals_before = full_operator_totals_[13];
+                <= reduced_vehicle_threshold) {
+            bootstrap_refinement_totals_before = full_operator_totals_[13];
             refinement_iteration_artifact =
                 legacy_vehicle_reduction_refinement_state_owned(
                     0, refinement_budget, next_deadline_seconds(),
@@ -16273,19 +16747,22 @@ public:
                 stable_int63("legacy"),
                 stable_int63("vehicle_reduction_refinement"), 0});
         }
-        if (!budget_.budget_reached()) {
-            quality_iteration_artifact = quality_changed_probe_state_owned(
-                0, 0, next_deadline_seconds(),
-                request.batch_size);
+        if (budget_.budget_reached()) {
+            return make_bootstrap_budget_boundary_result();
         }
-        if (!budget_.budget_reached()) {
-            try {
-                constraint_iteration_artifact = constraint_iteration_state_owned(
-                    0, 0, false, three_lane_threshold_values,
-                    three_lane_fraction_values, next_deadline_seconds(),
-                    request.batch_size,
-                    route_change_limit);
-            } catch (const NativeExactDeadlineInterruption&) {
+        quality_iteration_artifact = quality_changed_probe_state_owned(
+            0, 0, next_deadline_seconds(),
+            request.batch_size);
+        if (budget_.budget_reached()) {
+            return make_bootstrap_budget_boundary_result();
+        }
+        try {
+            constraint_iteration_artifact = constraint_iteration_state_owned(
+                0, 0, false, three_lane_threshold_values,
+                three_lane_fraction_values, next_deadline_seconds(),
+                request.batch_size,
+                -1);
+        } catch (const NativeExactDeadlineInterruption&) {
                 if (legacy_candidate_ready_) {
                     accumulate_full_stage04_outcome_noexcept(
                         2, false, 1, false, false, true);
@@ -16336,65 +16813,10 @@ public:
                     *last_three_lane_semantic_state_};
                 iteration_artifact.validate(*live_problem_);
                 rollback_three_lane_bootstrap.release();
-                return iteration_artifact;
-            }
+            return iteration_artifact;
         }
         if (budget_.budget_reached()) {
-            if (legacy_candidate_ready_) {
-                accumulate_full_stage04_outcome_noexcept(
-                    2, false, 1, false, false, true);
-            }
-            if (bootstrap_refinement_selected
-                && refinement_totals_before.has_value()) {
-                full_operator_totals_[13] = *refinement_totals_before;
-                ++full_operator_totals_[13][0];
-            }
-            legacy_candidate_lane_state_.reset();
-            legacy_candidate_ready_ = false;
-            legacy_candidate_operator_ = -1;
-            legacy_candidate_destroy_operator_ = -1;
-            legacy_candidate_repair_operator_ = -1;
-            discard_pending_legacy.release();
-            for (std::size_t operation = 9; operation <= 12; ++operation) {
-                full_operator_weights_[operation] =
-                    bootstrap_operator_weights_snapshot[operation];
-                full_operator_segment_rewards_[operation] =
-                    bootstrap_operator_rewards_snapshot[operation];
-                full_operator_segment_calls_[operation] =
-                    bootstrap_operator_calls_snapshot[operation];
-                full_operator_totals_[operation] =
-                    bootstrap_operator_totals_snapshot[operation];
-            }
-            constraint_weights_ = bootstrap_constraint_weights;
-            constraint_segment_rewards_ = bootstrap_constraint_rewards;
-            constraint_segment_calls_ = bootstrap_constraint_calls;
-            constraint_totals_ = bootstrap_constraint_totals;
-            const auto canonical_next =
-                canonical_event_journal_.discard_uncommitted_semantics_since(
-                    canonical_bootstrap_round_snapshot);
-            const auto causal_next =
-                causal_journal_.discard_uncommitted_semantics_since(
-                    causal_bootstrap_round_snapshot);
-            next_causal_transaction_id_ = std::max(
-                canonical_next, causal_next);
-            causal_context_ = bootstrap_causal_context;
-            causal_context_transaction_id_ = bootstrap_context_transaction;
-            constraint_iteration_artifact.reset();
-            static_cast<void>(make_termination(1, 1));
-            if (!last_three_lane_semantic_state_.has_value()) {
-                throw std::logic_error(
-                    "full native bootstrap budget exit lost semantic state");
-            }
-            ThreeLaneIterationArtifactV2 iteration_artifact{
-                std::move(legacy_iteration_artifact),
-                std::move(refinement_iteration_artifact),
-                std::move(quality_iteration_artifact),
-                std::move(constraint_iteration_artifact),
-                last_three_lane_legacy_acceptance_outcome_,
-                *last_three_lane_semantic_state_};
-            iteration_artifact.validate(*live_problem_);
-            rollback_three_lane_bootstrap.release();
-            return iteration_artifact;
+            return make_bootstrap_budget_boundary_result();
         }
         const auto bootstrap_legacy_candidate_was_feasible =
             legacy_candidate_ready_;
@@ -16625,6 +17047,7 @@ public:
             stage04_intensification_remaining_;
         const auto round_last_finished = last_finished_stage04_iteration_;
         const auto round_stagnation = main_stagnation_iterations_;
+        const auto round_maximum_stagnation = maximum_stagnation_iterations_;
         const auto round_global_best_improved =
             last_iteration_global_best_improved_;
         const auto round_last_completed_constraint =
@@ -16670,7 +17093,8 @@ public:
              round_constraint_calls, round_constraint_totals,
              round_reheat_count, round_restart_count, round_reheat_floor,
              round_intensification_active, round_intensification_remaining,
-             round_last_finished, round_stagnation, round_global_best_improved,
+             round_last_finished, round_stagnation,
+             round_maximum_stagnation, round_global_best_improved,
              round_last_completed_constraint, round_quality_outcome,
              round_constraint_outcome, round_legacy_outcome,
              round_termination, round_semantic_state,
@@ -16731,6 +17155,7 @@ public:
                     round_intensification_remaining;
                 last_finished_stage04_iteration_ = round_last_finished;
                 main_stagnation_iterations_ = round_stagnation;
+                maximum_stagnation_iterations_ = round_maximum_stagnation;
                 last_iteration_global_best_improved_ =
                     round_global_best_improved;
                 last_completed_constraint_iteration_ =
@@ -16851,11 +17276,139 @@ public:
             rollback_three_lane_round.release();
             return iteration_artifact;
         };
+        const auto make_budget_boundary_result = [&]() {
+            if (pending_composite_active_ || defer_iteration_commit_
+                || defer_global_commit_) {
+                throw std::logic_error(
+                    "full native fixed-work boundary crossed an active transaction");
+            }
+            const auto canonical_next =
+                canonical_event_journal_.discard_uncommitted_semantics_since(
+                    round_canonical_snapshot);
+            const auto causal_next =
+                causal_journal_.discard_uncommitted_semantics_since(
+                    round_causal_snapshot);
+            auto boundary_destroy_operator = std::int64_t{-1};
+            auto boundary_repair_operator = std::int64_t{-1};
+            if (followup_legacy_operator_index == 0) {
+                const auto* standard =
+                    std::get_if<LegacyStandardArtifactV2>(&legacy_artifact);
+                if (standard == nullptr) {
+                    throw std::logic_error(
+                        "full native fixed-work boundary lost its standard artifact");
+                }
+                boundary_destroy_operator = standard->metadata[2];
+                boundary_repair_operator = standard->metadata[3];
+            } else if (followup_legacy_operator_index == 1) {
+                const auto* vehicle =
+                    std::get_if<LegacyVehicleAwareArtifactV2>(&legacy_artifact);
+                if (vehicle == nullptr) {
+                    throw std::logic_error(
+                        "full native fixed-work boundary lost its vehicle artifact");
+                }
+                boundary_destroy_operator = vehicle->metadata[1];
+            }
+
+            // Exact work, cache journals, and the consumed budget are durable at
+            // the fixed-work boundary.  Search decisions from the enclosing
+            // iteration are not: Python stops before acceptance/Stage 4 commit.
+            live_lane_states_ = round_live_lanes;
+            last_candidate_lane_state_ = round_last_candidate_lane;
+            legacy_candidate_lane_state_ = round_legacy_candidate_lane;
+            last_candidate_ready_ = round_last_candidate_ready;
+            legacy_candidate_ready_ = round_legacy_candidate_ready;
+            legacy_candidate_operator_ = round_legacy_candidate_operator;
+            legacy_candidate_destroy_operator_ = round_legacy_destroy_operator;
+            legacy_candidate_repair_operator_ = round_legacy_repair_operator;
+            rng_ = round_rng;
+            constraint_rng_ = round_constraint_rng;
+            full_operator_weights_ = round_full_weights;
+            full_operator_segment_rewards_ = round_full_rewards;
+            full_operator_segment_calls_ = round_full_calls;
+            full_operator_totals_ = round_full_totals;
+            constraint_weights_ = round_constraint_weights;
+            constraint_segment_rewards_ = round_constraint_rewards;
+            constraint_segment_calls_ = round_constraint_calls;
+            constraint_totals_ = round_constraint_totals;
+            stage04_reheat_count_ = round_reheat_count;
+            stage04_restart_count_ = round_restart_count;
+            stage04_reheat_floor_ = round_reheat_floor;
+            stage04_intensification_active_ = round_intensification_active;
+            stage04_intensification_remaining_ =
+                round_intensification_remaining;
+            last_finished_stage04_iteration_ = round_last_finished;
+            main_stagnation_iterations_ = round_stagnation;
+            last_iteration_global_best_improved_ =
+                round_global_best_improved;
+            last_completed_constraint_iteration_ =
+                round_last_completed_constraint;
+            last_quality_acceptance_outcome_ = round_quality_outcome;
+            last_constraint_acceptance_outcome_ = round_constraint_outcome;
+            last_three_lane_legacy_acceptance_outcome_ = round_legacy_outcome;
+            last_constraint_iteration_outcome_ =
+                round_constraint_iteration_outcome;
+            last_dynamic_removal_selection_ = round_dynamic_removal;
+            last_constraint_removal_ = round_constraint_removal;
+            last_constraint_repair_ = round_constraint_repair;
+            next_causal_transaction_id_ = std::max(canonical_next, causal_next);
+            causal_context_ = round_causal_context;
+            causal_context_transaction_id_ = round_context_transaction;
+
+            // The frozen Python path records the selected main operator (and
+            // its destroy/repair roles) as one rejected call at the boundary,
+            // while omitting its public neighborhood event.  Retain exactly
+            // that call partition and Stage 4 rejected reward.
+            const auto retain_rejected_call = [this](const std::size_t operation) {
+                evrptw::native_search::accumulate_stage04_operator_outcome_v2(
+                    full_operator_totals_[operation],
+                    full_operator_segment_rewards_[operation],
+                    full_operator_segment_calls_[operation], stage04_rewards_,
+                    false, 1, false, false, true);
+            };
+            retain_rejected_call(
+                static_cast<std::size_t>(followup_legacy_operator_index));
+            if (followup_legacy_operator_index == 0
+                || followup_legacy_operator_index == 1) {
+                if (boundary_destroy_operator < 0
+                    || boundary_destroy_operator >= 3) {
+                    throw std::logic_error(
+                        "full native fixed-work boundary lost its destroy role");
+                }
+                retain_rejected_call(static_cast<std::size_t>(
+                    14 + boundary_destroy_operator));
+            }
+            if (followup_legacy_operator_index == 0) {
+                if (boundary_repair_operator < 0
+                    || boundary_repair_operator >= 3) {
+                    throw std::logic_error(
+                        "full native fixed-work boundary lost its repair role");
+                }
+                retain_rejected_call(static_cast<std::size_t>(
+                    17 + boundary_repair_operator));
+            }
+
+            round_outcome.legacy_candidate_feasible = 0;
+            round_outcome.legacy_acceptance = {};
+            stage04_boundary_state.reset();
+            discard_pending_legacy.release();
+            static_cast<void>(make_termination(1, iteration + 1));
+            if (!last_three_lane_semantic_state_.has_value()) {
+                throw std::logic_error(
+                    "full native fixed-work exit lost its typed semantic state");
+            }
+            ThreeLaneIterationArtifactV2 iteration_artifact{
+                std::move(legacy_artifact), std::move(refinement_artifact),
+                std::move(quality_artifact), std::move(constraint_artifact),
+                std::nullopt, *last_three_lane_semantic_state_};
+            iteration_artifact.validate(*live_problem_);
+            rollback_three_lane_round.release();
+            return iteration_artifact;
+        };
         try {
         if (iteration == 1) {
             dispatched_legacy_operator_index = 1;
             legacy_artifact = legacy_vehicle_count_aware_probe_state_owned(
-                iteration, removal_fraction, route_change_limit,
+                iteration, removal_fraction, -1,
                 next_deadline_seconds(),
                 request.batch_size, true);
         } else if (iteration == 2) {
@@ -16876,13 +17429,13 @@ public:
             dispatched_legacy_operator_index = selected_main;
             if (selected_main == 0) {
                 auto standard_artifact = legacy_standard_probe_state_owned(
-                    iteration, removal_fraction, route_change_limit,
+                    iteration, removal_fraction, -1,
                     next_deadline_seconds(), request.batch_size);
                 legacy_artifact = std::move(standard_artifact);
             } else if (selected_main == 1) {
                 auto vehicle_aware_artifact =
                     legacy_vehicle_count_aware_probe_state_owned(
-                    iteration, removal_fraction, route_change_limit,
+                    iteration, removal_fraction, -1,
                     next_deadline_seconds(),
                     request.batch_size, true, true);
                 legacy_artifact = std::move(vehicle_aware_artifact);
@@ -16942,6 +17495,9 @@ public:
                 static_cast<std::size_t>(followup_legacy_operator_index)]);
         followup_legacy_transaction_id = claim_causal_transaction({
             stable_int63("legacy"), followup_legacy_operator_id, iteration});
+        if (budget_.budget_reached()) {
+            return make_budget_boundary_result();
+        }
         const auto reduced_vehicle_threshold = std::max<std::int64_t>(
             1, static_cast<std::int64_t>(
                 std::ceil(static_cast<double>(all_customers_.size()) / 5.0)) - 1);
@@ -16949,8 +17505,7 @@ public:
             && legacy_candidate_lane_state_->route_offsets.size()
                     < live_lane_state(0).route_offsets.size()
             && legacy_candidate_lane_state_->route_offsets.size() - 1
-                <= reduced_vehicle_threshold
-            && !budget_.budget_reached()) {
+                <= reduced_vehicle_threshold) {
             refinement_totals_before = full_operator_totals_[13];
             refinement_artifact =
                 legacy_vehicle_reduction_refinement_state_owned(
@@ -16961,88 +17516,44 @@ public:
                 stable_int63("legacy"),
                 stable_int63("vehicle_reduction_refinement"), iteration});
         }
-        if (!budget_.budget_reached()) {
-            if (iteration < 3) {
-                quality_artifact = quality_changed_probe_state_owned(
-                    iteration, iteration, next_deadline_seconds(),
-                    request.batch_size);
-            } else if (iteration == 3) {
-                quality_artifact = quality_route_segment_probe_state_owned(
-                    iteration, route_segment_min_length,
-                    route_segment_max_length, route_segment_budget,
-                    route_change_limit, next_deadline_seconds(),
-                    request.batch_size);
-            } else if (iteration == 4) {
-                quality_artifact = quality_ejection_chain_probe_state_owned(
-                    iteration, ejection_chain_budget,
-                    ejection_chain_max_depth, ejection_chain_beam_width,
-                    next_deadline_seconds(),
-                    request.batch_size);
-            }
+        if (budget_.budget_reached()) {
+            return make_budget_boundary_result();
         }
-        if (!budget_.budget_reached()
-            && (iteration < 4
-                || iteration % three_lane_threshold_values[2] == 0)) {
+        if (iteration < 3) {
+            quality_artifact = quality_changed_probe_state_owned(
+                iteration, iteration, next_deadline_seconds(),
+                request.batch_size);
+        } else if (iteration == 3) {
+            quality_artifact = quality_route_segment_probe_state_owned(
+                iteration, route_segment_min_length,
+                route_segment_max_length, route_segment_budget,
+                -1, next_deadline_seconds(),
+                request.batch_size);
+        } else if (iteration == 4) {
+            quality_artifact = quality_ejection_chain_probe_state_owned(
+                iteration, ejection_chain_budget,
+                ejection_chain_max_depth, ejection_chain_beam_width,
+                next_deadline_seconds(),
+                request.batch_size);
+        }
+        if (budget_.budget_reached()) {
+            return make_budget_boundary_result();
+        }
+        if (iteration < 4
+            || iteration % three_lane_threshold_values[2] == 0) {
             constraint_artifact = constraint_iteration_state_owned(
                 iteration, main_stagnation_iterations_,
                 last_iteration_global_best_improved_,
                 three_lane_threshold_values, three_lane_fraction_values,
                 next_deadline_seconds(),
                 request.batch_size,
-                route_change_limit);
+                -1);
         }
         } catch (const NativeExactDeadlineInterruption&) {
             return make_deadline_result();
         }
         if (budget_.budget_reached()) {
-            canonical_event_journal_.rollback_noexcept(
-                canonical_round_snapshot);
-            // Fixed-work exhaustion discards the enclosing candidate
-            // transaction atomically.  Python still charges the operator and
-            // adaptive-role attempt that produced the incomplete candidate;
-            // preserve those audit counters without committing solver state.
-            if (legacy_candidate_ready_) {
-                accumulate_full_stage04_outcome_noexcept(
-                    static_cast<std::size_t>(legacy_candidate_operator_),
-                    false, 1, false, false, true);
-                if (legacy_candidate_operator_ == 0
-                    || legacy_candidate_operator_ == 1) {
-                    accumulate_full_stage04_outcome_noexcept(
-                        static_cast<std::size_t>(
-                            14 + legacy_candidate_destroy_operator_),
-                        false, 1, false, false, true);
-                    if (legacy_candidate_operator_ == 0) {
-                        accumulate_full_stage04_outcome_noexcept(
-                            static_cast<std::size_t>(
-                                17 + legacy_candidate_repair_operator_),
-                            false, 1, false, false, true);
-                    }
-                }
-            }
-            if (followup_refinement_selected
-                && refinement_totals_before.has_value()) {
-                full_operator_totals_[13] = *refinement_totals_before;
-                ++full_operator_totals_[13][0];
-            }
-            legacy_candidate_lane_state_.reset();
-            legacy_candidate_ready_ = false;
-            legacy_candidate_operator_ = -1;
-            legacy_candidate_destroy_operator_ = -1;
-            legacy_candidate_repair_operator_ = -1;
-            discard_pending_legacy.release();
-            static_cast<void>(make_termination(1, iteration));
-            if (!last_three_lane_semantic_state_.has_value()) {
-                throw std::logic_error(
-                    "full native budget exit lost its typed semantic state");
-            }
-            ThreeLaneIterationArtifactV2 iteration_artifact{
-                std::move(legacy_artifact), std::move(refinement_artifact),
-                std::move(quality_artifact), std::move(constraint_artifact),
-                last_three_lane_legacy_acceptance_outcome_,
-                *last_three_lane_semantic_state_};
-            iteration_artifact.validate(*live_problem_);
-            rollback_three_lane_round.release();
-            return iteration_artifact;
+            return make_budget_boundary_result();
         }
         stage04_reheat_floor_ *= 0.99;
         const auto followup_legacy_candidate_was_feasible =
@@ -17108,11 +17619,11 @@ public:
             }
         } else {
             // The public standard-operator event records proposal metadata;
-            // repair feasibility is carried only by its private projection.
+            // repair feasibility and the accepted candidate state are carried
+            // by the private/canonical projections.  The public proposal keeps
+            // accepted=false for historical neighborhood-event compatibility.
             legacy_semantic_flags.push_back({
-                followup_legacy_operator_index == 0
-                    ? 0
-                    : (followup_legacy_candidate_was_feasible ? 1 : 0),
+                followup_legacy_candidate_was_feasible ? 1 : 0,
                 followup_legacy_operator_index == 0
                     ? 0
                     : last_three_lane_legacy_acceptance_outcome_.has_value()
@@ -17150,13 +17661,9 @@ public:
             ? std::int64_t{13} : followup_legacy_operator_index;
         const auto followup_candidate_feasible = refinement_artifact.has_value()
             ? followup_refinement_selected
-            : (followup_legacy_operator_index == 0
-                   ? false
-                   : followup_legacy_candidate_was_feasible);
+            : followup_legacy_candidate_was_feasible;
         const auto followup_candidate_accepted =
-            (refinement_artifact.has_value()
-                || followup_legacy_operator_index != 0)
-            && last_three_lane_legacy_acceptance_outcome_.has_value()
+            last_three_lane_legacy_acceptance_outcome_.has_value()
             && last_three_lane_legacy_acceptance_outcome_->accepted != 0;
         canonical_event_journal_.append(
             NativeCanonicalStreamCode::candidate_state,
@@ -17339,6 +17846,15 @@ public:
                 "full native search engine already has an active operation");
         }
         return main_stagnation_iterations_;
+    }
+
+    std::int64_t maximum_stagnation_iterations() const {
+        std::unique_lock state_lock(state_mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock()) {
+            throw std::runtime_error(
+                "full native search engine already has an active operation");
+        }
+        return maximum_stagnation_iterations_;
     }
 
     py::tuple constraint_probe(
@@ -18259,6 +18775,8 @@ public:
                 next_intensification_active = false;
             }
         }
+        const auto next_maximum_stagnation = std::max(
+            maximum_stagnation_iterations_, main_stagnation_iterations_);
         boundary.control_status = {
             reheat_triggered ? 1 : 0,
             next_reheat_count,
@@ -18329,6 +18847,7 @@ public:
         stage04_reheat_count_ = next_reheat_count;
         stage04_restart_count_ = next_restart_count;
         main_stagnation_iterations_ = next_stagnation_iterations;
+        maximum_stagnation_iterations_ = next_maximum_stagnation;
         stage04_intensification_active_ = next_intensification_active;
         stage04_intensification_remaining_ = next_intensification_remaining;
         last_finished_stage04_iteration_ = iteration;
@@ -18611,7 +19130,8 @@ public:
             if (iteration_candidate_ready) {
                 comparison = last_candidate_comparison();
             }
-            if (iteration_candidate_ready && !budget_.budget_reached()) {
+            const auto exact_budget_boundary = budget_.budget_reached();
+            if (iteration_candidate_ready && !exact_budget_boundary) {
                 const auto current_distance =
                     live_lane_state(2).objective_float[0];
                 const auto applied = apply_last_candidate_state_owned(
@@ -18622,6 +19142,11 @@ public:
                 outcome.improved_global_best = applied.improved_global_best;
                 outcome.vehicle_reduction = applied.vehicle_reduction;
             } else if (iteration_candidate_ready) {
+                // Python evaluates the complete constraint candidate, but a
+                // fixed-work boundary reached by that evaluation prevents the
+                // candidate from changing the live search state.  Retain the
+                // completed exact work and candidate feasibility while
+                // publishing a rejected acceptance outcome.
                 last_candidate_lane_state_.reset();
                 last_candidate_ready_ = false;
             }
@@ -19347,6 +19872,7 @@ public:
             std::optional<evrptw::native_search::RepairResultV2>
                 last_constraint_repair;
             std::int64_t main_stagnation_iterations;
+            std::int64_t maximum_stagnation_iterations;
             bool last_iteration_global_best_improved;
             NativeCausalJournalV2::Snapshot causal;
         };
@@ -19379,7 +19905,8 @@ public:
             last_dynamic_removal_selection_,
             last_constraint_removal_,
             last_constraint_repair_,
-            main_stagnation_iterations_, last_iteration_global_best_improved_,
+            main_stagnation_iterations_, maximum_stagnation_iterations_,
+            last_iteration_global_best_improved_,
             causal_journal_.snapshot()};
         defer_global_commit_ = true;
         ScopeRollback rollback(
@@ -19470,6 +19997,8 @@ public:
                 last_constraint_repair_ =
                     std::move(snapshot.last_constraint_repair);
                 main_stagnation_iterations_ = snapshot.main_stagnation_iterations;
+                maximum_stagnation_iterations_ =
+                    snapshot.maximum_stagnation_iterations;
                 last_iteration_global_best_improved_ =
                     snapshot.last_iteration_global_best_improved;
             });
@@ -20904,7 +21433,12 @@ private:
     bool suppress_attempted_plan_journal_ = false;
     bool suppress_plan_screening_negative_cache_ = false;
     bool allow_partial_customer_coverage_ = false;
+    bool allow_vehicle_increase_ = false;
     bool suppress_round_budget_ = false;
+    std::optional<std::vector<std::int64_t>>
+        candidate_ranking_baseline_offsets_;
+    std::optional<std::vector<std::int64_t>>
+        candidate_ranking_baseline_indices_;
     bool pending_composite_active_ = false;
     bool pending_round_protocol_ = false;
     bool pending_negative_store_ = false;
@@ -21071,6 +21605,7 @@ private:
     std::int64_t last_finished_stage04_iteration_ = -1;
     std::int64_t last_completed_constraint_iteration_ = -1;
     std::int64_t main_stagnation_iterations_ = 0;
+    std::int64_t maximum_stagnation_iterations_ = 0;
     bool last_iteration_global_best_improved_ = false;
 
     static evrptw::native_search::LaneStateV2 candidate_lane_state(
@@ -21932,6 +22467,12 @@ private:
         const std::unordered_set<std::size_t> physically_evaluated(
             evaluated_rows.begin(), evaluated_rows.end());
         std::unordered_set<std::size_t> physical_owner_recorded;
+        auto physical_semantic_ordinal =
+            canonical_event_journal_.screening_count_for_transaction(
+                transaction_id, true);
+        auto logical_semantic_ordinal =
+            canonical_event_journal_.screening_count_for_transaction(
+                transaction_id, false);
         for (std::size_t semantic = 0; semantic < semantic_rows.size(); ++semantic) {
             const auto unique_row = semantic_rows[semantic];
             const auto& output = outputs[unique_row];
@@ -21957,9 +22498,8 @@ private:
                 | (journal.flags[1] << 1)
                 | (journal.flags[2] << 2)
                 | (journal.flags[3] << 8);
-            const auto semantic_ordinal =
-                canonical_event_journal_.screening_count_for_transaction(
-                    transaction_id, static_cast<bool>(flags & 5));
+            const auto semantic_ordinal = static_cast<bool>(flags & 5)
+                ? physical_semantic_ordinal++ : logical_semantic_ordinal++;
             causal_journal_.append(
                 NativeCausalStreamCode::screening,
                 NativeCausalEventCode::screening_decision,
@@ -22915,7 +23455,9 @@ py::tuple full_native_alns_v2(
     if ((protocol_values[0] != 0 && protocol_values[0] != 1)
         || protocol_values[1] <= 0 || protocol_values[2] <= 0
         || (protocol_values[3] != 1 && protocol_values[3] != 4)
-        || protocol_values[4] < 10 || protocol_values[5] < 0) {
+        || protocol_values[4] < 10 || protocol_values[5] < 0
+        || protocol_values[6] < 0 || protocol_values[7] <= 0
+        || protocol_values[8] <= 0) {
         throw std::invalid_argument(
             "full native v2 Candidate Control values are invalid");
     }
@@ -22947,7 +23489,7 @@ py::tuple full_native_alns_v2(
         protocol_values[2],
         protocol_values[7],
         protocol_values[8],
-        protocol_values[7],
+        std::max<std::int64_t>(1, protocol_values[6]),
         protocol_values[1],
         options[1],
         client_dispatch_threads,
@@ -22959,7 +23501,7 @@ py::tuple full_native_alns_v2(
     }
     engine.configure_node_names_owned(owned_request.problem);
     engine.configure_owned_request(owned_request);
-    engine.suppress_plan_screening_negative_cache(true);
+    engine.suppress_plan_screening_negative_cache(protocol_values[6] == 0);
     static_cast<void>(engine.initialize(
         node_kind,
         demand,
@@ -23019,7 +23561,7 @@ py::tuple full_native_alns_v2(
         ThreeLaneBootstrapRequestStateV2 bootstrap_request{
             operator_integer_values[0],
             operator_integer_values[4],
-            -1,
+            protocol_values[2],
             {operator_integer_values[21], operator_integer_values[22],
              operator_integer_values[23]},
             {operator_float_values[1], operator_float_values[2],
@@ -23030,9 +23572,12 @@ py::tuple full_native_alns_v2(
         };
         auto bootstrap = engine.run_three_lane_bootstrap_state_owned(
             bootstrap_request);
-        const auto bootstrap_exhaustion_eligible =
-            engine.last_three_lane_acceptance_accepted();
         const auto bootstrap_termination = bootstrap.semantic.termination;
+        const auto bootstrap_iteration_completed =
+            bootstrap_termination.completed_iterations > 0;
+        const auto bootstrap_exhaustion_eligible =
+            bootstrap_iteration_completed
+            && bootstrap.semantic.round.legacy_acceptance.accepted != 0;
         semantic_transcript.append(
             bootstrap.semantic,
             owned_request.problem);
@@ -23044,9 +23589,21 @@ py::tuple full_native_alns_v2(
                 base_control_values[1], protocol_values[0] == 1,
                 protocol_values[4], protocol_values[5],
                 pre_bootstrap_started, bootstrap_termination,
+                bootstrap_iteration_completed,
                 bootstrap_exhaustion_eligible);
             for (std::int64_t iteration = loop_control.next_iteration();
                  iteration < base_control_values[1]; ++iteration) {
+                if (protocol_values[0] == 1
+                    && terminal_global_state.has_value()
+                    && terminal_global_state->exact_budget >= 0
+                    && terminal_global_state->started
+                        >= terminal_global_state->exact_budget) {
+                    terminal_override =
+                        engine.three_lane_termination_state_owned(
+                            1, iteration);
+                    terminal_global_state = terminal_override;
+                    break;
+                }
                 const auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - solve_started).count();
                 const auto remaining =
@@ -23073,7 +23630,7 @@ py::tuple full_native_alns_v2(
                         operator_integer_values[10]),
                     operator_integer_values[14],
                     operator_integer_values[15],
-                    -1,
+                    protocol_values[2],
                     bootstrap_request.thresholds,
                     bootstrap_request.fractions,
                     remaining,
@@ -23082,10 +23639,13 @@ py::tuple full_native_alns_v2(
                 auto followup = engine.run_three_lane_followup_state_owned(
                     followup_request);
                 auto followup_termination = followup.semantic.termination;
-                const auto exhaustion_eligible =
-                    engine.last_three_lane_acceptance_accepted();
+                const auto iteration_completed =
+                    followup_termination.completed_iterations == iteration + 1;
+                const auto exhaustion_eligible = iteration_completed
+                    && followup.semantic.round.legacy_acceptance.accepted != 0;
                 const auto decision = loop_control.observe_followup(
-                    iteration, followup_termination, exhaustion_eligible);
+                    iteration, followup_termination, iteration_completed,
+                    exhaustion_eligible);
                 followup_termination = decision.termination;
                 followup.semantic.termination = followup_termination;
                 followup.semantic.validate_assuming_problem_valid(
@@ -23106,6 +23666,12 @@ py::tuple full_native_alns_v2(
         if (iteration_artifacts.empty()) {
             throw std::logic_error(
                 "full native three-lane search produced no iteration artifact");
+        }
+        if (terminal_override.has_value()) {
+            iteration_artifacts.back().semantic.termination =
+                *terminal_override;
+            iteration_artifacts.back().semantic
+                .validate_assuming_problem_valid(owned_request.problem);
         }
         engine.publish_three_lane_iteration_mirrors(
             iteration_artifacts.back());
@@ -23526,7 +24092,7 @@ py::tuple full_native_alns_v2(
     const auto terminal_completed_iterations = three_lane
         ? final_three_lane_termination.completed_iterations
         : terminal_values[2];
-    py::array_t<std::int64_t> counters(8);
+    py::array_t<std::int64_t> counters(9);
     auto* counter_values = checked_data(counters);
     counter_values[0] = terminal_completed_iterations;
     counter_values[1] = three_lane
@@ -23557,6 +24123,8 @@ py::tuple full_native_alns_v2(
     counter_values[6] = three_lane
         ? final_three_lane_termination.interrupted : terminal_values[10];
     counter_values[7] = 0;
+    counter_values[8] = three_lane
+        ? engine.maximum_stagnation_iterations() : 0;
     py::array_t<std::int64_t> trajectory(
         {static_cast<py::ssize_t>(counter_values[0]), py::ssize_t(7)});
     if (counter_values[0] > 0) {
@@ -23962,7 +24530,7 @@ py::tuple candidate_session_execute_host_impl_v2(
     auto flags = owned_search_vector<std::int64_t>(
         protocol_flags, "candidate_session_protocol_flags", 1);
     if (context_values.size() != 3
-        || (flags.size() != 4 && flags.size() != 5)
+        || (flags.size() != 4 && flags.size() != 5 && flags.size() != 6)
         || std::any_of(flags.begin(), flags.end(), [](const auto value) {
             return value != 0 && value != 1;
         })) {
@@ -23982,7 +24550,8 @@ py::tuple candidate_session_execute_host_impl_v2(
                     flags[1] != 0,
                     flags[2] != 0,
                     flags[3] != 0,
-                    flags.size() == 5 && flags[4] != 0,
+                    flags.size() >= 5 && flags[4] != 0,
+                    flags.size() == 6 && flags[5] != 0,
                 },
                 acknowledge_response);
     }
@@ -24152,7 +24721,12 @@ py::tuple full_native_alns_host_v2(
             + error.what());
     }
     native_candidate_session_initial_state = &session.initial_state;
-    native_candidate_session_token = session.token;
+    // The solve engine is the single owner of Candidate Control, cache,
+    // budget, and transaction state.  The host service supplies the shared
+    // native work pool for screening and exact kernels; duplicating the
+    // candidate transaction in a scheduler session creates two independently
+    // evolving LRU journals and therefore non-canonical cache-hit boundaries.
+    native_candidate_session_token.clear();
     const auto clear_session_context = []() noexcept {
         native_candidate_session_initial_state = nullptr;
         native_candidate_session_token.clear();
@@ -24167,14 +24741,24 @@ py::tuple full_native_alns_host_v2(
             stage04_integer, stage04_float, operator_integer, operator_float);
     } catch (...) {
         const auto solve_error = std::current_exception();
+        std::string solve_error_message = "unknown native solve failure";
+        try {
+            std::rethrow_exception(solve_error);
+        } catch (const std::exception& error) {
+            solve_error_message = error.what();
+        } catch (...) {
+        }
         clear_session_context();
         try {
             py::gil_scoped_release release;
             evrptw::native_client::close_candidate_session_v2(
                 socket_path, session.token, 5.0);
-        } catch (...) {
+        } catch (const std::exception& close_error) {
             throw std::runtime_error(
-                "full native host solve failed and its candidate session could not close");
+                "full native host solve failed without fallback: "
+                + solve_error_message
+                + "; its candidate session could not close: "
+                + close_error.what());
         }
         std::rethrow_exception(solve_error);
     }
@@ -24196,6 +24780,19 @@ void test_native_kernel_fault_v2(
     const std::string& fault) {
     py::gil_scoped_release release;
     evrptw::native_client::test_fault(socket_path, fault);
+}
+
+py::dict test_native_kernel_telemetry_v2(bool reset) {
+    if (reset) {
+        evrptw::native_client::reset_telemetry();
+    }
+    const auto snapshot = evrptw::native_client::telemetry_snapshot();
+    py::dict result;
+    result["request_count"] = snapshot.request_count;
+    result["screening_batch_request_count"] =
+        snapshot.screening_batch_request_count;
+    result["initial_state_request_count"] = snapshot.initial_state_request_count;
+    return result;
 }
 
 void test_candidate_session_production_ack_loss_once_v2() {
@@ -24376,6 +24973,13 @@ PYBIND11_MODULE(_core, module) {
         py::arg("temperatures"),
         py::arg("random_draws"));
     module.def(
+        "native_objective_key_v2",
+        &native_objective_key_v2,
+        py::arg("vehicle_count"),
+        py::arg("total_distance"),
+        py::arg("total_charging_time"),
+        py::arg("charging_count"));
+    module.def(
         "stage04_segment_update_v1",
         &stage04_segment_update_v1,
         py::arg("weights"),
@@ -24450,7 +25054,8 @@ PYBIND11_MODULE(_core, module) {
         &decide_candidate_plans_v2,
         py::arg("plan_offsets"), py::arg("coverage_eligible"),
         py::arg("screening_passed"), py::arg("attempted_flags"),
-        py::arg("current_route_count"));
+        py::arg("current_route_count"),
+        py::arg("allow_vehicle_increase") = false);
     module.def(
         "order_feasible_candidate_plans_v2",
         &order_feasible_candidate_plans_v2,
@@ -25261,6 +25866,10 @@ PYBIND11_MODULE(_core, module) {
         &test_native_kernel_fault_v2,
         py::arg("socket_path"),
         py::arg("fault"));
+    module.def(
+        "_test_native_kernel_telemetry_v2",
+        &test_native_kernel_telemetry_v2,
+        py::arg("reset") = false);
 #endif
     module.def(
         "_test_full_native_initial_mirror_fault_v2",

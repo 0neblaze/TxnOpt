@@ -9,9 +9,29 @@
 
 namespace evrptw::native_search {
 
+enum class CandidateTransactionDeadlinePhaseV2 : std::uint8_t {
+    before_transaction,
+    budget_skip,
+    before_exact,
+    exact_work,
+    candidate_commit,
+    transaction_return,
+    remote_worker,
+};
+
 class CandidateTransactionDeadlineV2 final : public std::runtime_error {
 public:
-    using std::runtime_error::runtime_error;
+    CandidateTransactionDeadlineV2(
+        const CandidateTransactionDeadlinePhaseV2 phase,
+        std::string message)
+        : std::runtime_error(std::move(message)), phase_(phase) {}
+
+    [[nodiscard]] CandidateTransactionDeadlinePhaseV2 phase() const noexcept {
+        return phase_;
+    }
+
+private:
+    CandidateTransactionDeadlinePhaseV2 phase_;
 };
 
 class CandidateTransactionKernelsV2 {
@@ -95,17 +115,151 @@ struct CandidateTransactionOptionsV2 final {
     bool suppress_screening_negative_cache = false;
     bool allow_partial_customer_coverage = false;
     bool defer_commit = false;
+    bool allow_vehicle_increase = false;
 };
 
 struct CandidatePlanExecutionTraceV2 final {
     std::int64_t plan_id = -1;
     std::vector<std::int64_t> cache_hit_flags;
     std::vector<std::int64_t> missing_local_rows;
+    std::vector<std::int64_t> exact_batch_sizes;
     std::array<std::int64_t, 3> budget_reservation{};
     native_kernels::ExactBatchOutput exact;
     std::vector<std::int64_t> cache_store_statuses;
     std::vector<std::int64_t> cache_eviction_counts;
 };
+
+inline void validate_candidate_plan_execution_trace_v2(
+    const CandidatePlanExecutionTraceV2& plan) {
+    if (std::any_of(
+            plan.cache_hit_flags.begin(), plan.cache_hit_flags.end(),
+            [](const auto value) { return value != 0 && value != 1; })
+        || std::any_of(
+            plan.exact_batch_sizes.begin(), plan.exact_batch_sizes.end(),
+            [](const auto value) { return value <= 0; })) {
+        throw std::logic_error("native candidate plan trace flags are invalid");
+    }
+    std::int64_t exact_rows = 0;
+    for (const auto batch_size : plan.exact_batch_sizes) {
+        if (exact_rows > std::numeric_limits<std::int64_t>::max() - batch_size) {
+            throw std::overflow_error(
+                "native candidate plan trace exact row count overflows");
+        }
+        exact_rows += batch_size;
+    }
+    const auto exact_row_count = static_cast<std::size_t>(exact_rows);
+    if (plan.budget_reservation[0] != exact_rows
+        || plan.budget_reservation[1] != exact_rows
+        || plan.budget_reservation[2] != exact_rows
+        || plan.missing_local_rows.size() != exact_row_count
+        || plan.exact.statuses.size() != exact_row_count
+        || plan.exact.reasons.size() != exact_row_count
+        || plan.exact.metrics.size() != exact_row_count * 4
+        || plan.exact.label_counters.size() != exact_row_count * 3
+        || plan.exact.batch_counters.size()
+            != plan.exact_batch_sizes.size() * 10
+        || plan.exact.completion_order.size() != exact_row_count
+        || plan.cache_store_statuses.size() != exact_row_count
+        || plan.cache_eviction_counts.size() != exact_row_count) {
+        throw std::logic_error("native candidate plan trace shapes are invalid");
+    }
+    if (exact_row_count == 0) {
+        if (!plan.exact.path_offsets.empty()
+            || !plan.exact.path_indices.empty()) {
+            throw std::logic_error(
+                "native candidate empty exact trace has path data");
+        }
+        return;
+    }
+    if (plan.exact.path_offsets.size() != exact_row_count + 1
+        || plan.exact.path_offsets.front() != 0
+        || !std::is_sorted(
+            plan.exact.path_offsets.begin(), plan.exact.path_offsets.end())
+        || plan.exact.path_offsets.back() < 0
+        || static_cast<std::size_t>(plan.exact.path_offsets.back())
+            != plan.exact.path_indices.size()) {
+        throw std::logic_error(
+            "native candidate plan trace path offsets are invalid");
+    }
+    std::vector<std::int64_t> completion = plan.exact.completion_order;
+    std::sort(completion.begin(), completion.end());
+    for (std::size_t row = 0; row < completion.size(); ++row) {
+        if (completion[row] != static_cast<std::int64_t>(row)) {
+            throw std::logic_error(
+                "native candidate plan trace completion order is invalid");
+        }
+    }
+    for (std::size_t batch = 0;
+         batch < plan.exact_batch_sizes.size(); ++batch) {
+        const auto offset = batch * 10;
+        if (plan.exact.batch_counters[offset + 2]
+                != plan.exact_batch_sizes[batch]
+            || plan.exact.batch_counters[offset + 3] != 0) {
+            throw std::logic_error(
+                "native candidate plan trace batch counters are invalid");
+        }
+    }
+}
+
+inline native_kernels::ExactBatchOutput slice_candidate_exact_batch_v2(
+    const CandidatePlanExecutionTraceV2& plan,
+    const std::size_t batch_index) {
+    validate_candidate_plan_execution_trace_v2(plan);
+    if (batch_index >= plan.exact_batch_sizes.size()) {
+        throw std::out_of_range("native candidate exact batch index is invalid");
+    }
+    const auto first_row = std::accumulate(
+        plan.exact_batch_sizes.begin(),
+        plan.exact_batch_sizes.begin() + static_cast<std::ptrdiff_t>(batch_index),
+        std::int64_t{0});
+    const auto row_count = plan.exact_batch_sizes[batch_index];
+    const auto last_row = first_row + row_count;
+    if (first_row < 0 || row_count <= 0
+        || static_cast<std::size_t>(last_row) > plan.exact.statuses.size()
+        || plan.exact.path_offsets.size() != plan.exact.statuses.size() + 1
+        || plan.exact.reasons.size() != plan.exact.statuses.size()
+        || plan.exact.metrics.size() != plan.exact.statuses.size() * 4
+        || plan.exact.label_counters.size() != plan.exact.statuses.size() * 3
+        || plan.exact.batch_counters.size()
+            != plan.exact_batch_sizes.size() * 10) {
+        throw std::logic_error("native candidate exact batch trace is invalid");
+    }
+    native_kernels::ExactBatchOutput output;
+    output.path_offsets.push_back(0);
+    const auto path_first = plan.exact.path_offsets[static_cast<std::size_t>(first_row)];
+    const auto path_last = plan.exact.path_offsets[static_cast<std::size_t>(last_row)];
+    output.path_indices.assign(
+        plan.exact.path_indices.begin() + path_first,
+        plan.exact.path_indices.begin() + path_last);
+    for (auto row = first_row; row < last_row; ++row) {
+        output.path_offsets.push_back(
+            plan.exact.path_offsets[static_cast<std::size_t>(row + 1)]
+            - path_first);
+    }
+    output.statuses.assign(
+        plan.exact.statuses.begin() + first_row,
+        plan.exact.statuses.begin() + last_row);
+    output.reasons.assign(
+        plan.exact.reasons.begin() + first_row,
+        plan.exact.reasons.begin() + last_row);
+    output.metrics.assign(
+        plan.exact.metrics.begin() + first_row * 4,
+        plan.exact.metrics.begin() + last_row * 4);
+    output.label_counters.assign(
+        plan.exact.label_counters.begin() + first_row * 3,
+        plan.exact.label_counters.begin() + last_row * 3);
+    output.batch_counters.assign(
+        plan.exact.batch_counters.begin()
+            + static_cast<std::ptrdiff_t>(batch_index * 10),
+        plan.exact.batch_counters.begin()
+            + static_cast<std::ptrdiff_t>((batch_index + 1) * 10));
+    for (const auto ordinal : plan.exact.completion_order) {
+        if (ordinal >= first_row && ordinal < last_row) {
+            output.completion_order.push_back(ordinal - first_row);
+        }
+    }
+    return output;
+}
 
 struct CandidateTransactionTraceV2 final {
     std::vector<std::int64_t> canonical_expected;
@@ -219,8 +373,10 @@ inline CandidateTransactionTraceWireV2 encode_candidate_transaction_trace_v2(
     const std::array<double, 1> screening_seconds{trace.screening_seconds};
     add_double(screening_seconds);
     for (const auto& plan : trace.plans) {
+        validate_candidate_plan_execution_trace_v2(plan);
         add_integer(plan.cache_hit_flags);
         add_integer(plan.missing_local_rows);
+        add_integer(plan.exact_batch_sizes);
         add_integer(plan.budget_reservation);
         add_integer(plan.exact.path_offsets);
         add_integer(plan.exact.path_indices);
@@ -267,7 +423,7 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
         return std::vector<double>(values.begin(), values.end());
     };
     const auto plan_ids = integer_field(18);
-    if (wire.integer_offsets.size() != 20 + plan_ids.size() * 12
+    if (wire.integer_offsets.size() != 20 + plan_ids.size() * 13
         || wire.double_offsets.size() != 4 + plan_ids.size()) {
         throw std::runtime_error(
             "native candidate trace wire plan field count is invalid");
@@ -323,12 +479,13 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
     trace.ranking_float = copy_double(0);
     trace.plans.reserve(plan_ids.size());
     for (std::size_t plan = 0; plan < plan_ids.size(); ++plan) {
-        const auto base = 19 + plan * 12;
+        const auto base = 19 + plan * 13;
         CandidatePlanExecutionTraceV2 decoded;
         decoded.plan_id = plan_ids[plan];
         decoded.cache_hit_flags = copy_integer(base);
         decoded.missing_local_rows = copy_integer(base + 1);
-        const auto reservation = integer_field(base + 2);
+        decoded.exact_batch_sizes = copy_integer(base + 2);
+        const auto reservation = integer_field(base + 3);
         if (reservation.size() != decoded.budget_reservation.size()) {
             throw std::runtime_error(
                 "native candidate trace wire budget reservation is invalid");
@@ -336,16 +493,17 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
         std::copy(
             reservation.begin(), reservation.end(),
             decoded.budget_reservation.begin());
-        decoded.exact.path_offsets = copy_integer(base + 3);
-        decoded.exact.path_indices = copy_integer(base + 4);
-        decoded.exact.statuses = copy_integer(base + 5);
-        decoded.exact.reasons = copy_integer(base + 6);
-        decoded.exact.label_counters = copy_integer(base + 7);
-        decoded.exact.batch_counters = copy_integer(base + 8);
-        decoded.exact.completion_order = copy_integer(base + 9);
-        decoded.cache_store_statuses = copy_integer(base + 10);
-        decoded.cache_eviction_counts = copy_integer(base + 11);
+        decoded.exact.path_offsets = copy_integer(base + 4);
+        decoded.exact.path_indices = copy_integer(base + 5);
+        decoded.exact.statuses = copy_integer(base + 6);
+        decoded.exact.reasons = copy_integer(base + 7);
+        decoded.exact.label_counters = copy_integer(base + 8);
+        decoded.exact.batch_counters = copy_integer(base + 9);
+        decoded.exact.completion_order = copy_integer(base + 10);
+        decoded.cache_store_statuses = copy_integer(base + 11);
+        decoded.cache_eviction_counts = copy_integer(base + 12);
         decoded.exact.metrics = copy_double(3 + plan);
+        validate_candidate_plan_execution_trace_v2(decoded);
         trace.plans.push_back(std::move(decoded));
     }
     return trace;
@@ -490,16 +648,27 @@ inline std::vector<std::uint8_t> candidate_transaction_execute_payload_v2(
         native_protocol::NumericType::int64,
         round.expected_customers.data(), round.expected_customers.size(),
         round.expected_customers.size());
-    const std::array<std::int64_t, 5> flags{
+    const std::array<std::int64_t, 6> flags{
         options.suppress_attempted_plan_journal ? 1 : 0,
         options.suppress_round_budget ? 1 : 0,
         options.suppress_screening_negative_cache ? 1 : 0,
         options.allow_partial_customer_coverage ? 1 : 0,
         options.defer_commit ? 1 : 0,
+        options.allow_vehicle_increase ? 1 : 0,
     };
     builder.add(
         native_protocol::NumericType::int64,
         flags.data(), flags.size(), flags.size());
+    builder.add(
+        native_protocol::NumericType::int64,
+        round.ranking_route_offsets.data(),
+        round.ranking_route_offsets.size(),
+        round.ranking_route_offsets.size());
+    builder.add(
+        native_protocol::NumericType::int64,
+        round.ranking_route_indices.data(),
+        round.ranking_route_indices.size(),
+        round.ranking_route_indices.size());
     return builder.finish();
 }
 
@@ -508,7 +677,7 @@ candidate_transaction_execute_from_payload_v2(
     const native_protocol::PayloadView& payload) {
     if (payload.header().operation
             != native_protocol::KernelOperation::candidate_transaction_execute
-        || payload.header().array_count != 9) {
+        || payload.header().array_count != 11) {
         throw std::runtime_error(
             "native candidate transaction execute payload schema is invalid");
     }
@@ -526,7 +695,8 @@ candidate_transaction_execute_from_payload_v2(
     for (const auto index : {
              std::size_t{0}, std::size_t{1}, std::size_t{2},
              std::size_t{3}, std::size_t{4}, std::size_t{6},
-             std::size_t{7}, std::size_t{8}}) {
+             std::size_t{7}, std::size_t{8}, std::size_t{9},
+             std::size_t{10}}) {
         require_vector(index,
             index == 0 ? native_protocol::NumericType::uint8
                        : native_protocol::NumericType::int64);
@@ -536,7 +706,7 @@ candidate_transaction_execute_from_payload_v2(
         || payload.descriptor(4).count != 3
         || payload.descriptor(5).count != 1
         || payload.descriptor(6).count != 1
-        || payload.descriptor(8).count != 5) {
+        || payload.descriptor(8).count != 6) {
         throw std::runtime_error(
             "native candidate transaction execute dimensions are invalid");
     }
@@ -569,8 +739,8 @@ candidate_transaction_execute_from_payload_v2(
     request.round.expected_customers = copy_i64(7);
     const auto* flags = payload.data<std::int64_t>(
         8, native_protocol::NumericType::int64);
-    if (payload.descriptor(8).count != 5
-        || std::any_of(flags, flags + 5, [](const std::int64_t value) {
+    if (payload.descriptor(8).count != 6
+        || std::any_of(flags, flags + 6, [](const std::int64_t value) {
             return value != 0 && value != 1;
         })) {
         throw std::runtime_error(
@@ -582,7 +752,10 @@ candidate_transaction_execute_from_payload_v2(
         flags[2] != 0,
         flags[3] != 0,
         flags[4] != 0,
+        flags[5] != 0,
     };
+    request.round.ranking_route_offsets = copy_i64(9);
+    request.round.ranking_route_indices = copy_i64(10);
     request.round.validate();
     return request;
 }
@@ -615,7 +788,8 @@ public:
         const std::span<const std::int64_t> active_route_indices,
         CandidateTransactionKernelsV2& kernels,
         const std::int64_t proposal_top_k = -1,
-        const double screening_epsilon = -1.0)
+        const double screening_epsilon = -1.0,
+        const std::span<const std::optional<LaneStateV2>> incumbent_lanes = {})
         : problem_(request.problem),
           exact_cache_(exact_cache),
           negative_cache_(negative_cache),
@@ -623,6 +797,7 @@ public:
           attempted_plans_(attempted_plans),
           active_route_offsets_(active_route_offsets),
           active_route_indices_(active_route_indices),
+          incumbent_lanes_(incumbent_lanes),
           kernels_(kernels),
           proposal_top_k_(
               proposal_top_k < 0
@@ -674,7 +849,8 @@ public:
         const std::span<const std::int64_t> active_route_indices,
         CandidateTransactionKernelsV2& kernels,
         const std::int64_t proposal_top_k,
-        const double screening_epsilon)
+        const double screening_epsilon,
+        const std::span<const std::optional<LaneStateV2>> incumbent_lanes = {})
         : problem_(problem),
           exact_cache_(exact_cache),
           negative_cache_(negative_cache),
@@ -682,6 +858,7 @@ public:
           attempted_plans_(attempted_plans),
           active_route_offsets_(active_route_offsets),
           active_route_indices_(active_route_indices),
+          incumbent_lanes_(incumbent_lanes),
           kernels_(kernels),
           proposal_top_k_(proposal_top_k),
           screening_epsilon_(screening_epsilon) {
@@ -706,9 +883,63 @@ private:
     AttemptedPlanSetV2& attempted_plans_;
     std::span<const std::int64_t> active_route_offsets_;
     std::span<const std::int64_t> active_route_indices_;
+    std::span<const std::optional<LaneStateV2>> incumbent_lanes_;
     CandidateTransactionKernelsV2& kernels_;
     std::int64_t proposal_top_k_ = 0;
     double screening_epsilon_ = 0.0;
+
+    [[nodiscard]] std::optional<ExactPayload> incumbent_payload(
+        const std::span<const std::int64_t> sequence) const {
+        const RouteBatchViewV2 active_routes{
+            active_route_offsets_, active_route_indices_};
+        bool unchanged = false;
+        for (std::size_t row = 0; row < active_routes.route_count(); ++row) {
+            const auto active = active_routes.route(row);
+            if (active.size() == sequence.size()
+                && std::equal(
+                    active.begin(), active.end(), sequence.begin())) {
+                unchanged = true;
+                break;
+            }
+        }
+        if (!unchanged) {
+            return std::nullopt;
+        }
+        for (const auto& optional_lane : incumbent_lanes_) {
+            if (!optional_lane.has_value()) {
+                continue;
+            }
+            const auto& lane = *optional_lane;
+            const RouteBatchViewV2 routes{
+                lane.route_offsets, lane.route_indices};
+            for (std::size_t row = 0; row < routes.route_count(); ++row) {
+                const auto incumbent = routes.route(row);
+                if (incumbent.size() != sequence.size()
+                    || !std::equal(
+                        incumbent.begin(), incumbent.end(), sequence.begin())) {
+                    continue;
+                }
+                ExactPayload payload;
+                payload.path.assign(
+                    lane.exact.path_indices.begin()
+                        + lane.exact.path_offsets[row],
+                    lane.exact.path_indices.begin()
+                        + lane.exact.path_offsets[row + 1]);
+                payload.status = lane.exact.statuses[row];
+                payload.reason = lane.exact.reasons[row];
+                std::copy_n(
+                    lane.exact.metrics.begin()
+                        + static_cast<std::ptrdiff_t>(row * 4),
+                    4, payload.metrics.begin());
+                std::copy_n(
+                    lane.exact.label_counters.begin()
+                        + static_cast<std::ptrdiff_t>(row * 3),
+                    3, payload.label_counters.begin());
+                return payload;
+            }
+        }
+        return std::nullopt;
+    }
 
     [[nodiscard]] static double elapsed_seconds(
         const std::chrono::steady_clock::time_point started) {
@@ -719,11 +950,13 @@ private:
     static void require_before_deadline(
         const std::chrono::steady_clock::time_point started,
         const double limit,
-        const std::string_view phase) {
+        const CandidateTransactionDeadlinePhaseV2 phase,
+        const std::string_view phase_name) {
         if (elapsed_seconds(started) >= limit) {
             throw CandidateTransactionDeadlineV2(
+                phase,
                 "native candidate transaction reached deadline during "
-                + std::string(phase));
+                + std::string(phase_name));
         }
     }
 
@@ -873,6 +1106,7 @@ private:
             attempted,
             static_cast<std::int64_t>(
                 active_route_offsets_.size() - 1),
+            options.allow_vehicle_increase,
         });
         const auto ranking = native_candidate_plan::rank({
             round.plan_offsets,
@@ -930,62 +1164,95 @@ private:
                     static_cast<std::int64_t>(local_indices.size()));
             }
             const RouteBatchViewV2 local_routes{local_offsets, local_indices};
-            auto cached = exact_cache_.lookup_exact_many(local_routes);
-            plan_trace.cache_hit_flags = cached.hit_flags;
-            std::vector<std::size_t> missing_rows;
-            std::vector<std::int64_t> missing_offsets{0};
-            std::vector<std::int64_t> missing_indices;
             std::vector<ExactPayload> payloads(last_route - first_route);
+            std::vector<std::size_t> cache_rows;
+            std::vector<std::int64_t> cache_offsets{0};
+            std::vector<std::int64_t> cache_indices;
             for (std::size_t local = 0; local < payloads.size(); ++local) {
-                if (cached.hit_flags[local] == 1) {
+                if (auto precomputed = incumbent_payload(
+                        local_routes.route(local)); precomputed.has_value()) {
+                    payloads[local] = std::move(*precomputed);
+                    route_resolutions[first_route + local] = 3;
+                    continue;
+                }
+                cache_rows.push_back(local);
+                const auto sequence = local_routes.route(local);
+                cache_indices.insert(
+                    cache_indices.end(), sequence.begin(), sequence.end());
+                cache_offsets.push_back(
+                    static_cast<std::int64_t>(cache_indices.size()));
+            }
+            ExactRouteCacheV2::ExactLookupResult cached;
+            if (!cache_rows.empty()) {
+                cached = exact_cache_.lookup_exact_many(
+                    {cache_offsets, cache_indices});
+            }
+            plan_trace.cache_hit_flags = cached.hit_flags;
+            for (std::size_t row = 0; row < cache_rows.size(); ++row) {
+                const auto local = cache_rows[row];
+                if (cached.hit_flags[row] == 1) {
                     auto& payload = payloads[local];
                     payload.path.assign(
-                        cached.path_indices.begin() + cached.path_offsets[local],
+                        cached.path_indices.begin() + cached.path_offsets[row],
                         cached.path_indices.begin()
-                            + cached.path_offsets[local + 1]);
-                    payload.status = cached.statuses[local];
-                    payload.reason = cached.reasons[local];
+                            + cached.path_offsets[row + 1]);
+                    payload.status = cached.statuses[row];
+                    payload.reason = cached.reasons[row];
                     std::copy_n(
                         cached.metrics.begin()
-                            + static_cast<std::ptrdiff_t>(local * 4),
+                            + static_cast<std::ptrdiff_t>(row * 4),
                         4, payload.metrics.begin());
                     std::copy_n(
                         cached.label_counters.begin()
-                            + static_cast<std::ptrdiff_t>(local * 3),
+                            + static_cast<std::ptrdiff_t>(row * 3),
                         3, payload.label_counters.begin());
                     route_resolutions[first_route + local] = 1;
-                    continue;
                 }
-                missing_rows.push_back(local);
-                const auto sequence = local_routes.route(local);
-                missing_indices.insert(
-                    missing_indices.end(), sequence.begin(), sequence.end());
-                missing_offsets.push_back(
-                    static_cast<std::int64_t>(missing_indices.size()));
             }
-            plan_trace.missing_local_rows.reserve(missing_rows.size());
-            std::transform(
-                missing_rows.begin(), missing_rows.end(),
-                std::back_inserter(plan_trace.missing_local_rows),
-                [](const std::size_t row) {
-                    return static_cast<std::int64_t>(row);
-                });
-            const auto requested_exact = static_cast<std::int64_t>(
-                missing_rows.size());
-            const auto exact_remaining = budget_.exact_remaining();
-            if (requested_exact > budget_.round_remaining()
-                || (exact_remaining >= 0
-                    && requested_exact > exact_remaining)) {
-                ++budget_skip_count;
-                statuses[plan] = 3;
-                trace.plans.push_back(std::move(plan_trace));
-                require_before_deadline(started, round.deadline_remaining,
-                    "budget skip");
-                continue;
-            }
-            if (requested_exact > 0) {
-                const auto round_reservation =
-                    budget_.reserve_round(requested_exact, true);
+            struct PendingExactStore final {
+                std::vector<std::int64_t> offsets;
+                std::vector<std::int64_t> indices;
+                native_kernels::ExactBatchOutput exact;
+                std::vector<std::array<std::uint8_t, 32>> hashes;
+                std::vector<std::int64_t> bytes;
+            };
+            std::vector<PendingExactStore> pending_exact_stores;
+            bool plan_budget_skipped = false;
+            const auto execute_missing_group = [
+                &, this](const std::vector<std::size_t>& missing_rows) {
+                const auto requested_exact = static_cast<std::int64_t>(
+                    missing_rows.size());
+                if (requested_exact == 0) {
+                    return;
+                }
+                const auto exact_remaining = budget_.exact_remaining();
+                const auto round_remaining = options.suppress_round_budget
+                    ? requested_exact
+                    : budget_.round_remaining();
+                const auto available_exact = std::min<std::int64_t>(
+                    round_remaining,
+                    exact_remaining < 0 ? requested_exact : exact_remaining);
+                if (requested_exact > available_exact) {
+                    plan_budget_skipped = true;
+                    require_before_deadline(
+                        started, round.deadline_remaining,
+                        CandidateTransactionDeadlinePhaseV2::budget_skip,
+                        "budget skip");
+                    return;
+                }
+                std::vector<std::int64_t> missing_offsets{0};
+                std::vector<std::int64_t> missing_indices;
+                for (const auto local : missing_rows) {
+                    const auto sequence = local_routes.route(local);
+                    missing_indices.insert(
+                        missing_indices.end(), sequence.begin(), sequence.end());
+                    missing_offsets.push_back(
+                        static_cast<std::int64_t>(missing_indices.size()));
+                }
+                const auto round_reservation = options.suppress_round_budget
+                    ? SearchBudgetStateV2::RoundReservation{
+                        requested_exact, requested_exact, round_remaining}
+                    : budget_.reserve_round(requested_exact, true);
                 const auto exact_reservation =
                     budget_.reserve_exact(requested_exact);
                 if (round_reservation.granted != requested_exact
@@ -993,16 +1260,15 @@ private:
                     throw std::logic_error(
                         "native candidate budget changed during reservation");
                 }
-                plan_trace.budget_reservation = {
-                    requested_exact,
-                    round_reservation.granted,
-                    exact_reservation.granted,
-                };
+                plan_trace.budget_reservation[0] += requested_exact;
+                plan_trace.budget_reservation[1] += round_reservation.granted;
+                plan_trace.budget_reservation[2] += exact_reservation.granted;
                 const auto exact_remaining_seconds = round.deadline_remaining
                     - elapsed_seconds(started);
                 if (exact_remaining_seconds <= 0.0) {
                     budget_.restore(plan_budget_before);
                     throw CandidateTransactionDeadlineV2(
+                        CandidateTransactionDeadlinePhaseV2::before_exact,
                         "native candidate deadline expired before exact work");
                 }
                 native_kernels::ExactBatchOutput exact;
@@ -1033,12 +1299,44 @@ private:
                 }
                 const auto completed = exact.batch_counters[2];
                 const auto interrupted = exact.batch_counters[3];
-                plan_trace.exact = exact;
                 if (completed != requested_exact || interrupted != 0
                     || elapsed_seconds(started) >= round.deadline_remaining) {
                     throw CandidateTransactionDeadlineV2(
+                        CandidateTransactionDeadlinePhaseV2::exact_work,
                         "native candidate exact work reached deadline");
                 }
+                const auto aggregate_row_base = plan_trace.exact.statuses.size();
+                if (plan_trace.exact.path_offsets.empty()) {
+                    plan_trace.exact.path_offsets.push_back(0);
+                }
+                const auto path_base = plan_trace.exact.path_offsets.back();
+                for (std::size_t row = 1; row < exact.path_offsets.size(); ++row) {
+                    plan_trace.exact.path_offsets.push_back(
+                        path_base + exact.path_offsets[row]);
+                }
+                plan_trace.exact.path_indices.insert(
+                    plan_trace.exact.path_indices.end(),
+                    exact.path_indices.begin(), exact.path_indices.end());
+                plan_trace.exact.statuses.insert(
+                    plan_trace.exact.statuses.end(),
+                    exact.statuses.begin(), exact.statuses.end());
+                plan_trace.exact.reasons.insert(
+                    plan_trace.exact.reasons.end(),
+                    exact.reasons.begin(), exact.reasons.end());
+                plan_trace.exact.metrics.insert(
+                    plan_trace.exact.metrics.end(),
+                    exact.metrics.begin(), exact.metrics.end());
+                plan_trace.exact.label_counters.insert(
+                    plan_trace.exact.label_counters.end(),
+                    exact.label_counters.begin(), exact.label_counters.end());
+                plan_trace.exact.batch_counters.insert(
+                    plan_trace.exact.batch_counters.end(),
+                    exact.batch_counters.begin(), exact.batch_counters.end());
+                for (const auto ordinal : exact.completion_order) {
+                    plan_trace.exact.completion_order.push_back(
+                        static_cast<std::int64_t>(aggregate_row_base) + ordinal);
+                }
+                plan_trace.exact_batch_sizes.push_back(requested_exact);
                 for (std::size_t exact_row = 0;
                      exact_row < missing_rows.size(); ++exact_row) {
                     const auto local = missing_rows[exact_row];
@@ -1060,6 +1358,8 @@ private:
                     route_resolutions[first_route + local] = 2;
                     exact_route_rows.push_back(
                         static_cast<std::int64_t>(first_route + local));
+                    plan_trace.missing_local_rows.push_back(
+                        static_cast<std::int64_t>(local));
                 }
                 for (const auto exact_ordinal : exact.completion_order) {
                     if (exact_ordinal < 0
@@ -1077,13 +1377,61 @@ private:
                     {missing_offsets, missing_indices}, exact);
                 const auto bytes = exact_entry_bytes_v2(
                     problem_, exact);
-                const auto store =
-                    exact_cache_.begin_store_exact_many_atomic(
-                        {missing_offsets, missing_indices}, exact, hashes, bytes);
-                plan_trace.cache_store_statuses = store.statuses;
-                plan_trace.cache_eviction_counts = store.eviction_counts;
-                exact_cache_.prepare_store_commit();
-                exact_cache_.commit_store_batch_noexcept();
+                pending_exact_stores.push_back({
+                    std::move(missing_offsets), std::move(missing_indices),
+                    std::move(exact), std::move(hashes), std::move(bytes)});
+            };
+            std::vector<std::size_t> pending_missing;
+            for (std::size_t row = 0; row < cache_rows.size(); ++row) {
+                if (cached.hit_flags[row] == 1) {
+                    execute_missing_group(pending_missing);
+                    pending_missing.clear();
+                } else {
+                    pending_missing.push_back(cache_rows[row]);
+                }
+            }
+            execute_missing_group(pending_missing);
+
+            // Python's internal repair/probe paths commit exact prefixes even
+            // when a later miss group exhausts the round budget.  Those paths
+            // suppress the public attempted-plan journal or allow partial
+            // customer coverage.  Public complete-candidate transactions keep
+            // the v2 atomic rollback contract.
+            const auto commit_legacy_exact_prefix =
+                options.suppress_attempted_plan_journal
+                || options.allow_partial_customer_coverage;
+            if (!plan_budget_skipped || commit_legacy_exact_prefix) {
+                for (auto& pending_store : pending_exact_stores) {
+                    const auto store = exact_cache_.begin_store_exact_many_atomic(
+                        {pending_store.offsets, pending_store.indices},
+                        pending_store.exact, pending_store.hashes,
+                        pending_store.bytes);
+                    plan_trace.cache_store_statuses.insert(
+                        plan_trace.cache_store_statuses.end(),
+                        store.statuses.begin(), store.statuses.end());
+                    plan_trace.cache_eviction_counts.insert(
+                        plan_trace.cache_eviction_counts.end(),
+                        store.eviction_counts.begin(),
+                        store.eviction_counts.end());
+                    exact_cache_.prepare_store_commit();
+                    exact_cache_.commit_store_batch_noexcept();
+                }
+            }
+
+            if (plan_budget_skipped) {
+                if (!commit_legacy_exact_prefix) {
+                    plan_trace.cache_store_statuses.assign(
+                        plan_trace.exact.statuses.size(), 0);
+                    plan_trace.cache_eviction_counts.assign(
+                        plan_trace.exact.statuses.size(), 0);
+                }
+                ++budget_skip_count;
+                statuses[plan] = 3;
+                trace.plans.push_back(std::move(plan_trace));
+                require_before_deadline(started, round.deadline_remaining,
+                    CandidateTransactionDeadlinePhaseV2::budget_skip,
+                    "budget skip after exact groups");
+                continue;
             }
 
             bool feasible = true;
@@ -1122,10 +1470,14 @@ private:
             completed_plans.push_back(selected_plan);
             trace.plans.push_back(std::move(plan_trace));
             require_before_deadline(
-                started, round.deadline_remaining, "candidate commit");
+                started, round.deadline_remaining,
+                CandidateTransactionDeadlinePhaseV2::candidate_commit,
+                "candidate commit");
         }
         require_before_deadline(
-            started, round.deadline_remaining, "transaction return");
+            started, round.deadline_remaining,
+            CandidateTransactionDeadlinePhaseV2::transaction_return,
+            "transaction return");
 
         bool attempted_active = false;
         if (!completed_plans.empty()

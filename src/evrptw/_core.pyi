@@ -104,6 +104,7 @@ def decide_candidate_plans_v2(
     screening_passed: npt.NDArray[np.int64],
     attempted_flags: npt.NDArray[np.int64],
     current_route_count: int,
+    allow_vehicle_increase: bool = False,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]: ...
 def order_feasible_candidate_plans_v2(
     plan_offsets: npt.NDArray[np.int64],
@@ -1339,6 +1340,7 @@ def full_native_alns_host_v2(
 ) -> tuple[object, ...]: ...
 
 def _test_native_kernel_fault_v2(socket_path: str, fault: str) -> None: ...
+def _test_native_kernel_telemetry_v2(reset: bool = False) -> dict[str, int]: ...
 def _test_candidate_session_execute_ack_loss_v2(
     socket_path: str,
     token: str,

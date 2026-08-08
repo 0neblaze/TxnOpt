@@ -34,6 +34,11 @@ inline thread_local bool candidate_session_ack_loss_once = false;
 namespace protocol = evrptw::native_protocol;
 namespace kernels = evrptw::native_kernels;
 
+class KernelClientDeadline final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 inline std::atomic<std::uint64_t> request_counter{1};
 inline std::atomic<std::uint64_t> segment_counter{1};
 inline thread_local double transaction_deadline_absolute =
@@ -302,8 +307,11 @@ inline protocol::PayloadView transact(
         throw std::runtime_error("native kernel scheduler returned a partial response");
     }
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
-            "native kernel scheduler response crossed its deadline");
+        throw KernelClientDeadline(
+            "native kernel scheduler response crossed its deadline; operation="
+            + std::to_string(static_cast<std::uint32_t>(
+                protocol::PayloadView(
+                    input_bytes.data(), input_bytes.size()).header().operation)));
     }
     if (response.magic != protocol::kernel_magic
         || response.version != protocol::kernel_protocol_version
@@ -311,6 +319,11 @@ inline protocol::PayloadView transact(
         throw std::runtime_error("native kernel scheduler response identity mismatch");
     }
     if (response.message == protocol::ControlMessage::failure) {
+        if (response.segment_size
+            == static_cast<std::uint64_t>(protocol::FailureCode::deadline)) {
+            throw KernelClientDeadline(protocol::bounded_string(
+                response.error.data(), response.error.size()));
+        }
         throw std::runtime_error(protocol::bounded_string(
             response.error.data(), response.error.size()));
     }
@@ -342,8 +355,12 @@ inline void acknowledge(
     Socket& socket,
     const protocol::ControlFrame& response) {
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
+        throw KernelClientDeadline(
             "native kernel scheduler acknowledgement crossed its deadline");
+    }
+    if (std::exchange(candidate_session_ack_loss_once, false)) {
+        throw std::runtime_error(
+            "injected production candidate acknowledgement loss without fallback");
     }
     socket.refresh_timeout();
     protocol::ControlFrame acknowledgement;
@@ -361,7 +378,7 @@ inline void acknowledge(
         throw std::runtime_error("native kernel scheduler release receipt is invalid");
     }
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
+        throw KernelClientDeadline(
             "native kernel scheduler release crossed its deadline");
     }
 }
@@ -370,7 +387,7 @@ inline bool acknowledge_irreversible_commit(
     Socket& socket,
     const protocol::ControlFrame& response) {
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
+        throw KernelClientDeadline(
             "native kernel scheduler acknowledgement crossed its deadline");
     }
     socket.refresh_timeout();
@@ -433,8 +450,8 @@ inline SearchRequestReceipt search_request_receipt(
         throw std::runtime_error(
             "native search-request receipt hash mismatch");
     }
-    record_telemetry(output, 2);
     acknowledge(socket, response);
+    record_telemetry(output, 2);
     return receipt;
 }
 
@@ -483,8 +500,8 @@ candidate_plan_transaction_wire_roundtrip(
         throw std::runtime_error(
             "native candidate-plan transaction response changed the payload");
     }
-    record_telemetry(output, 6);
     acknowledge(socket, response);
+    record_telemetry(output, 6);
     return received;
 }
 
@@ -504,7 +521,7 @@ execute_candidate_session_transaction_with_trace_v2(
         socket_path,
         std::min(deadline_absolute, transaction_deadline_absolute));
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
+        throw KernelClientDeadline(
             "native candidate session transaction deadline expired before IPC");
     }
     protocol::SharedMapping output_mapping;
@@ -523,7 +540,6 @@ execute_candidate_session_transaction_with_trace_v2(
     }
     auto execution = evrptw::native_search::
         candidate_transaction_execution_from_payload_v2(output);
-    record_telemetry(output, 10);
     if (std::exchange(candidate_session_ack_loss_once, false)) {
         if (!options.defer_commit) {
             throw std::logic_error(
@@ -537,6 +553,7 @@ execute_candidate_session_transaction_with_trace_v2(
             "native candidate session acknowledgement loss without fallback");
     }
     acknowledge(socket, response);
+    record_telemetry(output, 10);
     return execution;
 }
 
@@ -654,7 +671,7 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
         socket_path,
         std::min(request.config.deadline[1], transaction_deadline_absolute));
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
+        throw KernelClientDeadline(
             "native initial-search-state deadline expired before IPC");
     }
     protocol::SharedMapping output_mapping;
@@ -756,8 +773,8 @@ inline evrptw::native_search::InitialStateV2 search_initial_state(
         throw std::runtime_error(
             "native initial-search-state response arrived at or after deadline");
     }
-    record_telemetry(output, 12, false, true);
     acknowledge(socket, response);
+    record_telemetry(output, 12, false, true);
     return state;
 }
 
@@ -774,7 +791,7 @@ inline CandidateSessionHandleV2 open_candidate_session_v2(
         socket_path,
         std::min(request.config.deadline[1], transaction_deadline_absolute));
     if (socket.deadline_expired()) {
-        throw std::runtime_error(
+        throw KernelClientDeadline(
             "native candidate session deadline expired before open");
     }
     protocol::SharedMapping output_mapping;
@@ -801,8 +818,8 @@ inline CandidateSessionHandleV2 open_candidate_session_v2(
     std::string token(
         reinterpret_cast<const char*>(token_bytes),
         static_cast<std::size_t>(token_descriptor.count));
-    record_telemetry(output, 13, false, true);
     acknowledge(socket, response);
+    record_telemetry(output, 13, false, true);
     return {std::move(token), std::move(initial_state)};
 }
 
@@ -818,9 +835,12 @@ inline void close_candidate_session_v2(
     const auto deadline_absolute = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count()
         + deadline_remaining;
-    Socket socket(
-        socket_path,
-        std::min(deadline_absolute, transaction_deadline_absolute));
+    // Closing a session is bounded resource cleanup, not solver work.  The
+    // search deadline may already have expired when a completed/terminated
+    // solve closes its host-side state, so applying that stale deadline here
+    // reduces the release handshake to the 1 ms socket floor and can orphan
+    // an otherwise valid session.  Keep the caller's explicit cleanup bound.
+    Socket socket(socket_path, deadline_absolute);
     protocol::SharedMapping output_mapping;
     protocol::ControlFrame response;
     const auto output = transact(
@@ -836,8 +856,8 @@ inline void close_candidate_session_v2(
         throw std::runtime_error(
             "native candidate session close receipt is invalid");
     }
-    record_telemetry(output, 1);
     acknowledge(socket, response);
+    record_telemetry(output, 1);
 }
 
 inline std::int64_t candidate_session_transaction_status_v2(
@@ -1051,8 +1071,8 @@ inline kernels::ExactBatchOutput exact_charging(
     kernels::validate_exact_batch_output(
         result, node_kinds, order_offsets, order_indices, node_count,
         route_count, order_count, depot, batch_size);
-    record_telemetry(output, 8);
     acknowledge(socket, response);
+    record_telemetry(output, 8);
     return result;
 }
 
@@ -1107,8 +1127,8 @@ inline kernels::ScreenOutput screen_route(
     result.metrics.assign(metrics, metrics + 15);
     result.reachability_queries = output.data<std::int64_t>(
         2, protocol::NumericType::int64)[0];
-    record_telemetry(output, 3);
     acknowledge(socket, response);
+    record_telemetry(output, 3);
     return result;
 }
 
@@ -1178,8 +1198,8 @@ inline std::vector<kernels::ScreenOutput> screen_routes(
             metrics + route * 15, metrics + (route + 1) * 15);
         results[route].reachability_queries = queries[route];
     }
-    record_telemetry(output, 3, true);
     acknowledge(socket, response);
+    record_telemetry(output, 3, true);
     return results;
 }
 

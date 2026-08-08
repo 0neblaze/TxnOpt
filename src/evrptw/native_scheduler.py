@@ -25,8 +25,8 @@ _NUMERIC_THREAD_ENVIRONMENT = {
 
 
 _CONTROL_FRAME = struct.Struct("<QIIQQ128s64s192s")
-_KERNEL_MAGIC = 0x4556525054574B32
-_KERNEL_PROTOCOL_VERSION = 2
+_KERNEL_MAGIC = 0x4556525054574B33
+_KERNEL_PROTOCOL_VERSION = 3
 _SHUTDOWN_MESSAGE = 6
 _RELEASED_MESSAGE = 4
 
@@ -50,9 +50,11 @@ class NativeHostScheduler:
             "pause_before_execute",
             "initial_state_path_offset_oob",
             "exact_path_offset_oob",
+            "deadline_text_screen_failure",
             "candidate_execute_output_failure",
             "candidate_commit_release_loss",
             "candidate_commit_before_apply_crash",
+            "screen_response_before_local_apply_crash",
         }:
             raise ValueError("native scheduler production fault is invalid")
         if self.production_fault is not None and not self.enable_fault_injection:
@@ -116,6 +118,7 @@ class NativeHostScheduler:
         if process is None:
             return
         run_nonce = self._run_nonce
+        shutdown_error: OSError | RuntimeError | None = None
         if process.poll() is None and force:
             process.terminate()
         elif process.poll() is None:
@@ -149,18 +152,46 @@ class NativeHostScheduler:
                         or values[2] != _RELEASED_MESSAGE
                     ):
                         raise RuntimeError("host scheduler shutdown receipt is invalid")
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError) as error:
+                shutdown_error = error
                 process.terminate()
         try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            process.wait(timeout=5.0)
-        self._process = None
-        self.socket_path.unlink(missing_ok=True)
-        if run_nonce is not None:
-            self._cleanup_owned_segments(process.pid, run_nonce)
-        self._run_nonce = None
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired as error:
+                if not force and shutdown_error is None:
+                    shutdown_error = RuntimeError(
+                        "host scheduler did not exit after its shutdown receipt"
+                    )
+                    shutdown_error.__cause__ = error
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired as terminate_error:
+                    if not force and shutdown_error is None:
+                        shutdown_error = RuntimeError(
+                            "host scheduler did not exit after terminate"
+                        )
+                        shutdown_error.__cause__ = terminate_error
+                    process.kill()
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired as kill_error:
+                        if shutdown_error is None:
+                            shutdown_error = RuntimeError(
+                                "host scheduler did not exit after kill"
+                            )
+                            shutdown_error.__cause__ = kill_error
+        finally:
+            self._process = None
+            self.socket_path.unlink(missing_ok=True)
+            if run_nonce is not None:
+                self._cleanup_owned_segments(process.pid, run_nonce)
+            self._run_nonce = None
+        if shutdown_error is not None:
+            raise RuntimeError(
+                "host scheduler graceful shutdown failed without fallback"
+            ) from shutdown_error
 
     @staticmethod
     def _cleanup_owned_segments(process_id: int, run_nonce: str) -> None:

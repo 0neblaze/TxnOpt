@@ -63,6 +63,7 @@ struct PlanDecisionInput final {
     std::span<const std::int64_t> screening_passed;
     std::span<const std::int64_t> attempted_flags;
     std::int64_t current_route_count = 0;
+    bool allow_vehicle_increase = false;
 };
 
 struct PlanDecisionResult final {
@@ -406,7 +407,8 @@ inline void validate_decision_result(
         }
         const auto vehicle_count =
             input.plan_offsets[plan + 1] - input.plan_offsets[plan];
-        if (vehicle_count > input.current_route_count) {
+        if (!input.allow_vehicle_increase
+            && vehicle_count > input.current_route_count) {
             expected_eligible = 0;
         }
         if ((output.eligible[plan] != 0 && output.eligible[plan] != 1)
@@ -566,7 +568,8 @@ inline PlanDecisionResult decide(const PlanDecisionInput& input) {
             }
         }
         const auto vehicle_count = input.plan_offsets[plan + 1] - input.plan_offsets[plan];
-        if (vehicle_count > input.current_route_count) {
+        if (!input.allow_vehicle_increase
+            && vehicle_count > input.current_route_count) {
             output.eligible[plan] = 0;
         }
         output.combined_attempted[plan] =

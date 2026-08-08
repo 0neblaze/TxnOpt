@@ -967,20 +967,37 @@ std::vector<std::uint8_t> execute(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         if (session_remaining <= 0.0) {
             throw evrptw::native_search::CandidateTransactionDeadlineV2(
+                evrptw::native_search::
+                    CandidateTransactionDeadlinePhaseV2::before_transaction,
                 "native candidate session deadline expired before transaction");
         }
         transaction.round.deadline_remaining = std::min(
             transaction.round.deadline_remaining, session_remaining);
         SchedulerCandidateTransactionKernelsV2 kernels(pool);
-        evrptw::native_search::CandidateTransactionExecutorV2 executor(
-            session->request, *session->transaction_state, kernels);
         const auto budget_snapshot =
             session->transaction_state->budget().snapshot();
         if (transaction.options.defer_commit) {
             pending_candidate_transaction = transaction.token;
         }
-        const auto execution = executor.execute_with_trace(
-            std::move(transaction.round), transaction.options);
+        evrptw::native_search::CandidateTransactionExecutionV2 execution;
+        if (!transaction.round.ranking_route_offsets.empty()) {
+            evrptw::native_search::CandidateTransactionExecutorV2 executor(
+                session->request,
+                session->transaction_state->exact_cache(),
+                session->transaction_state->negative_cache(),
+                session->transaction_state->budget(),
+                session->transaction_state->attempted_plans(),
+                transaction.round.ranking_route_offsets,
+                transaction.round.ranking_route_indices,
+                kernels);
+            execution = executor.execute_with_trace(
+                std::move(transaction.round), transaction.options);
+        } else {
+            evrptw::native_search::CandidateTransactionExecutorV2 executor(
+                session->request, *session->transaction_state, kernels);
+            execution = executor.execute_with_trace(
+                std::move(transaction.round), transaction.options);
+        }
         if (transaction.options.defer_commit) {
             session->pending_budget_snapshot = budget_snapshot;
             session->pending_exact_protocol =
@@ -1073,11 +1090,15 @@ void patch_pool_telemetry(
 }
 
 void send_failure(
-    int descriptor, std::uint64_t request_id, std::string_view message) noexcept {
+    int descriptor,
+    std::uint64_t request_id,
+    std::string_view message,
+    protocol::FailureCode code = protocol::FailureCode::unspecified) noexcept {
     try {
         protocol::ControlFrame frame;
         frame.message = protocol::ControlMessage::failure;
         frame.request_id = request_id;
+        frame.segment_size = static_cast<std::uint64_t>(code);
         protocol::copy_bounded(message, frame.error.data(), frame.error.size());
         send_exact(descriptor, &frame, sizeof(frame));
     } catch (...) {
@@ -1157,9 +1178,11 @@ void handle_connection(
         if (!test_request && allow_fault_injection
             && !production_fault.empty()
             && production_fault != "exact_path_offset_oob"
+            && production_fault != "deadline_text_screen_failure"
             && production_fault != "candidate_execute_output_failure"
             && production_fault != "candidate_commit_release_loss"
             && production_fault != "candidate_commit_before_apply_crash"
+            && production_fault != "screen_response_before_local_apply_crash"
             && !production_fault_consumed.exchange(
                 true, std::memory_order_acq_rel)) {
             injected_fault = production_fault;
@@ -1195,6 +1218,14 @@ void handle_connection(
             injected_fault = production_fault;
         }
         if (!test_request && allow_fault_injection
+            && production_fault == "deadline_text_screen_failure"
+            && input_view.header().operation
+                == protocol::KernelOperation::screen_routes
+            && !production_fault_consumed.exchange(
+                true, std::memory_order_acq_rel)) {
+            injected_fault = production_fault;
+        }
+        if (!test_request && allow_fault_injection
             && production_fault == "candidate_execute_output_failure"
             && input_view.header().operation
                 == protocol::KernelOperation::candidate_transaction_execute
@@ -1211,9 +1242,21 @@ void handle_connection(
                 true, std::memory_order_acq_rel)) {
             injected_fault = production_fault;
         }
+        if (!test_request && allow_fault_injection
+            && production_fault == "screen_response_before_local_apply_crash"
+            && input_view.header().operation
+                == protocol::KernelOperation::screen_routes
+            && !production_fault_consumed.exchange(
+                true, std::memory_order_acq_rel)) {
+            injected_fault = production_fault;
+        }
         if (injected_fault == "worker_exception") {
             throw std::runtime_error(
                 "injected native scheduler worker exception");
+        }
+        if (injected_fault == "deadline_text_screen_failure") {
+            throw std::runtime_error(
+                "injected worker failure says deadline expired");
         }
         std::vector<std::uint8_t> output_bytes;
         std::size_t request_peak_active_tasks = 0;
@@ -1307,6 +1350,9 @@ void handle_connection(
         if (injected_fault == "pause_after_response_before_ack") {
             std::this_thread::sleep_for(std::chrono::seconds(30));
         }
+        if (injected_fault == "screen_response_before_local_apply_crash") {
+            ::_exit(86);
+        }
         protocol::ControlFrame acknowledgement;
         if (!read_exact(descriptor, &acknowledgement, sizeof(acknowledgement))) {
             throw std::runtime_error("native scheduler acknowledgement is missing");
@@ -1323,6 +1369,10 @@ void handle_connection(
             throw std::runtime_error("native scheduler acknowledgement mismatch");
         }
         if (injected_fault == "candidate_commit_before_apply_crash") {
+            if (!pending_commit_session.has_value()) {
+                throw std::logic_error(
+                    "candidate commit crash injection lacks a pending commit");
+            }
             ::_exit(86);
         }
         if (pending_commit_session.has_value()) {
@@ -1353,7 +1403,11 @@ void handle_connection(
             candidate_sessions.rollback_open_noexcept(
                 peer_pid, *pending_open_session);
         }
-        send_failure(descriptor, request_id, failure);
+        const auto code = dynamic_cast<const evrptw::native_search::
+            CandidateTransactionDeadlineV2*>(&error) == nullptr
+            ? protocol::FailureCode::unspecified
+            : protocol::FailureCode::deadline;
+        send_failure(descriptor, request_id, failure, code);
     }
     ::close(descriptor);
 }
@@ -1436,11 +1490,15 @@ int main(int argc, char** argv) {
                         != "initial_state_path_offset_oob"
                     && production_fault != "exact_path_offset_oob"
                     && production_fault
+                        != "deadline_text_screen_failure"
+                    && production_fault
                         != "candidate_execute_output_failure"
                     && production_fault
                         != "candidate_commit_release_loss"
                     && production_fault
-                        != "candidate_commit_before_apply_crash"))) {
+                        != "candidate_commit_before_apply_crash"
+                    && production_fault
+                        != "screen_response_before_local_apply_crash"))) {
             throw std::invalid_argument(
                 "native scheduler production fault is invalid");
         }
