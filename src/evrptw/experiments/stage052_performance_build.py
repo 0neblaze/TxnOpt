@@ -241,6 +241,16 @@ def reject_ambient_build_flags(environment: Mapping[str, str]) -> None:
         )
 
 
+def _validated_python_executable(path: Path) -> Path:
+    """Return an absolute executable path without dereferencing a venv symlink."""
+
+    expanded = path.expanduser()
+    absolute = Path(os.path.abspath(expanded if expanded.is_absolute() else Path.cwd() / expanded))
+    if not absolute.is_file() or not os.access(absolute, os.X_OK):
+        raise PerformanceBuildError("Python build interpreter is not executable")
+    return absolute
+
+
 def _safe_extract_wheel(wheel: Path, destination: Path) -> tuple[str, str]:
     try:
         archive = zipfile.ZipFile(wheel)
@@ -611,6 +621,7 @@ def build_performance_wheels(
 ) -> tuple[Path, ...]:
     root = repository.resolve(strict=True)
     output = output_root.resolve()
+    build_python = _validated_python_executable(python_executable)
     if output.exists():
         raise PerformanceBuildError("performance build output namespace already exists")
     try:
@@ -645,7 +656,7 @@ def build_performance_wheels(
             _, profile_manifest = _build_profile(
                 repository=root,
                 output_root=output,
-                python_executable=python_executable.resolve(strict=True),
+                python_executable=build_python,
                 profile=profile,
                 host=detected_host,
                 revision=revision,

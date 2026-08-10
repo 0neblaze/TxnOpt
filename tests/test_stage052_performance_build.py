@@ -14,12 +14,29 @@ from evrptw.experiments.stage052_performance_build import (
     PerformanceBuildError,
     _atomic_signed_json,
     _safe_extract_wheel,
+    _validated_python_executable,
     _verify_wheel_source_inventory,
     main,
     probe_host_native_lto_support,
     reject_ambient_build_flags,
     require_clean_revision,
 )
+
+
+def test_build_interpreter_preserves_virtual_environment_symlink(
+    tmp_path: Path,
+) -> None:
+    base_python = tmp_path / "base-python"
+    base_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    base_python.chmod(0o755)
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+
+    validated = _validated_python_executable(venv_python)
+
+    assert validated == venv_python.absolute()
+    assert validated.is_symlink()
 
 
 def test_performance_build_cli_requires_repository_root(tmp_path: Path) -> None:
@@ -137,4 +154,6 @@ def test_host_native_lto_probe_is_capability_driven(
         compiler_command=("/usr/bin/c++",),
     )
     assert available["supported"] is True
-    assert "-march=native" in available["flags"]
+    flags = available["flags"]
+    assert isinstance(flags, list)
+    assert "-march=native" in flags
