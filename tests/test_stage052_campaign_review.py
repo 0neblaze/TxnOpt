@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import shutil
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -197,11 +198,14 @@ def test_lifecycle_failure_capsule_review_rejects_artifact_drift(
         )
 
 
-def test_resource_calibration_review_replays_terminal_evidence(
+def _resource_calibration_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    label = "stage05.2_resource_calibration_attempt16"
+    *,
+    label: str = "stage05.2_resource_calibration_attempt16",
+    seal_contract: bool = False,
+    binary_artifact: bool = False,
+) -> tuple[Path, Path, ProducerResourceContract]:
     run_dir = tmp_path / label
     control_dir = run_dir / "control"
     control_dir.mkdir(parents=True)
@@ -279,6 +283,7 @@ def test_resource_calibration_review_replays_terminal_evidence(
                 parent_release_path.read_bytes()
             ).hexdigest(),
             "formal_memory_parent_release": parent_release_evidence,
+            "contract": contract.to_dict(),
         },
     )
     reset_path = run_dir / "formal_memory_cgroup_peak_reset.json"
@@ -346,6 +351,10 @@ def test_resource_calibration_review_replays_terminal_evidence(
             + "\n",
             encoding="utf-8",
         )
+    if seal_contract:
+        atomic_write_signed_json(run_dir / "resource_contract", contract.to_dict())
+    if binary_artifact:
+        (run_dir / "opaque.bin").write_bytes(b"\xb5\x00\xff\x81")
     artifacts = []
     for path in sorted(run_dir.rglob("*")):
         if not path.is_file():
@@ -395,6 +404,18 @@ def test_resource_calibration_review_replays_terminal_evidence(
         "load_formal_resource_recalibration_evidence",
         lambda _path, _contract: evidence,
     )
+    return raw_manifest_path, contract_path, contract
+
+
+def test_resource_calibration_review_replays_terminal_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_manifest_path, contract_path, _contract = _resource_calibration_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    run_dir = raw_manifest_path.parent.parent
 
     review_path = run_dir / "review" / "review_manifest.json"
     review = campaign_review_module.review_resource_calibration(
@@ -412,6 +433,91 @@ def test_resource_calibration_review_replays_terminal_evidence(
     assert review["gates"]["parent_memory_release"] == {"passed": True}
     assert review["gates"]["locked_topology"] == {"passed": True}
     assert review_path.is_file()
+
+
+def test_unbound_resource_calibration_replays_full_evidence_and_classifies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_manifest_path, _contract_path, _contract = _resource_calibration_fixture(
+        tmp_path,
+        monkeypatch,
+        binary_artifact=True,
+    )
+    review_path = raw_manifest_path.parent.parent / "review" / "review_manifest.json"
+
+    review = campaign_review_module.review_unbound_resource_calibration(
+        raw_manifest_path=raw_manifest_path,
+        review_manifest_path=review_path,
+    )
+
+    assert review["status"] == "FAILED_KNOWN"
+    assert review["controlled_failure_code"] == "invalid_manifest"
+    assert review["failure_identity"] == {
+        "component": "stage052_calibration",
+        "invariant_or_check": "resource_contract_not_bound_at_seal",
+        "location": raw_manifest_path.relative_to(
+            raw_manifest_path.parent.parent
+        ).as_posix(),
+    }
+    assert review["verified_artifact_count"] == 15
+    assert review["verified_axis_memory_releases"] == 18
+    assert review["verified_batch_memory_releases"] == 18
+    assert review["gates"]["resource_contract_replay"]["passed"] is False
+    assert review["gates"]["embedded_contract_replay"] == {"passed": True}
+
+
+def test_unbound_resource_calibration_rejects_sealed_contract_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_manifest_path, _contract_path, _contract = _resource_calibration_fixture(
+        tmp_path,
+        monkeypatch,
+        seal_contract=True,
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="contains a resource contract"):
+        campaign_review_module.review_unbound_resource_calibration(
+            raw_manifest_path=raw_manifest_path,
+            review_manifest_path=(
+                raw_manifest_path.parent.parent / "review" / "review_manifest.json"
+            ),
+        )
+
+
+def test_unbound_resource_calibration_retention_replay_recomputes_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    label = "stage05.2_resource_calibration_attempt16"
+    raw_manifest_path, _contract_path, _contract = _resource_calibration_fixture(
+        tmp_path,
+        monkeypatch,
+        label=label,
+    )
+    source_path = raw_manifest_path.parent.parent
+    campaign_review_module.review_unbound_resource_calibration(
+        raw_manifest_path=raw_manifest_path,
+        review_manifest_path=source_path / "review" / "review_manifest.json",
+    )
+    archive_path = tmp_path / "archive" / label / "generation-0001"
+    shutil.copytree(source_path, archive_path)
+    replay_path = tmp_path / "retention" / "replay.json"
+
+    result = (
+        campaign_review_module.write_unbound_resource_calibration_retention_replay(
+            archive_path=archive_path,
+            run_label=label,
+            generation=1,
+            output_path=replay_path,
+        )
+    )
+
+    replay = json.loads(result.read_text(encoding="utf-8"))
+    assert replay["status"] == "passed"
+    assert replay["archive_tree_sha256"] == compute_tree_sha256(archive_path)
+    assert replay["raw_review_replay_passed"] is True
 
 
 def _power_load_payload(maximum_runtime_load1: float) -> dict[str, object]:

@@ -30,6 +30,9 @@ from evrptw.stage052_campaign import StorageRoot, StorageRootLocator, VolumeIden
 
 GIB: Final = 1024**3
 POLICY_SCHEMA_VERSION: Final = "experiment-storage-governance-v1"
+LIFECYCLE_ADJUDICATION_SCHEMA_VERSION: Final = (
+    "experiment-lifecycle-root-cause-adjudication-v1"
+)
 _RUN_LABEL: Final = re.compile(
     r"^stage(?P<major>0[0-8])(?:\.(?P<minor>[0-9]+))?_[a-z0-9_]+_"
     r"(?:attempt|rerun)[0-9]{2}$"
@@ -302,8 +305,6 @@ class AdjudicationRecord:
             raise ValueError("adjudication run_label is invalid")
         if _RUN_LABEL.fullmatch(self.canonical_representative_run_label) is None:
             raise ValueError("adjudication canonical representative is invalid")
-        if self.run_label == self.canonical_representative_run_label:
-            raise ValueError("duplicate failure cannot represent itself")
         if re.fullmatch(r"[a-z0-9][a-z0-9._-]*", self.root_cause_id) is None:
             raise ValueError("root_cause_id must be canonical")
         if not self.failure_location or not self.evidence_references:
@@ -425,6 +426,18 @@ class RetentionRequest:
             and not self.root_cause_id
         ):
             raise ValueError("unique failure retention requires root_cause_id")
+        if self.retention_class == RetentionClass.UNIQUE_FAILURE_FULL and (
+            self.adjudication is None
+            or not self.adjudication.is_signed
+            or self.adjudication_path is None
+            or self.adjudication.run_label != self.run_label
+            or self.adjudication.root_cause_id != self.root_cause_id
+            or self.adjudication.canonical_representative_run_label
+            != self.run_label
+        ):
+            raise ValueError(
+                "unique failure retention requires its signed self-adjudication"
+            )
         if (
             self.retention_class
             in {
@@ -602,6 +615,43 @@ def write_adjudication_record(
         evidence_references=draft.evidence_references,
         adjudication_sha256=digest,
     )
+
+
+def write_lifecycle_adjudication_record(
+    path: Path,
+    *,
+    run_label: str,
+    review_manifest_sha256: str,
+    root_cause_id: str,
+    canonical_representative_run_label: str,
+    canonical_representative_record_sha256: str,
+    failure_code: str,
+    failing_component: str,
+    invariant_or_check: str,
+    failure_location: str,
+) -> AdjudicationRecord:
+    """Write the one adjudication consumed by lifecycle and full retention."""
+
+    if not path.is_absolute():
+        raise ValueError("adjudication path must be absolute")
+    payload = {
+        "schema_version": LIFECYCLE_ADJUDICATION_SCHEMA_VERSION,
+        "run_label": run_label,
+        "review_manifest_sha256": review_manifest_sha256,
+        "root_cause_id": root_cause_id,
+        "canonical_representative_run_label": (
+            canonical_representative_run_label
+        ),
+        "canonical_representative_record_sha256": (
+            canonical_representative_record_sha256
+        ),
+        "failure_code": failure_code,
+        "failing_component": failing_component,
+        "invariant_or_check": invariant_or_check,
+        "failure_location": failure_location,
+    }
+    digest = _write_signed_json(path, payload)
+    return load_adjudication_record(path, expected_sha256=digest)
 
 
 def write_migration_dry_run(path: Path, payload: Mapping[str, object]) -> str:
@@ -2132,6 +2182,48 @@ def load_adjudication_record(
     observed = _file_sha256(path)
     if observed != expected_sha256:
         raise StorageGovernanceError("adjudication SHA-256 differs from approved identity")
+    if payload.get("schema_version") == LIFECYCLE_ADJUDICATION_SCHEMA_VERSION:
+        expected_lifecycle_fields = {
+            "schema_version",
+            "run_label",
+            "review_manifest_sha256",
+            "root_cause_id",
+            "canonical_representative_run_label",
+            "canonical_representative_record_sha256",
+            "failure_code",
+            "failing_component",
+            "invariant_or_check",
+            "failure_location",
+        }
+        if set(payload) != expected_lifecycle_fields or any(
+            not isinstance(payload.get(field), str)
+            for field in expected_lifecycle_fields - {"schema_version"}
+        ):
+            raise StorageGovernanceError(
+                "lifecycle adjudication fields do not match its schema"
+            )
+        for field in (
+            "review_manifest_sha256",
+            "canonical_representative_record_sha256",
+        ):
+            if _SHA256.fullmatch(str(payload[field])) is None:
+                raise StorageGovernanceError(
+                    "lifecycle adjudication SHA-256 field is invalid"
+                )
+        return AdjudicationRecord(
+            run_label=str(payload["run_label"]),
+            root_cause_id=str(payload["root_cause_id"]),
+            canonical_representative_run_label=str(
+                payload["canonical_representative_run_label"]
+            ),
+            failure_location=str(payload["failure_location"]),
+            evidence_references=(
+                f"review:{payload['review_manifest_sha256']}",
+                "representative:"
+                f"{payload['canonical_representative_record_sha256']}",
+            ),
+            adjudication_sha256=observed,
+        )
     expected_fields = {
         "schema_version",
         "run_label",
@@ -3598,21 +3690,25 @@ class ExperimentStorageGovernance:
         *,
         lifecycle_retention_class: str,
         storage_permit_sha256: str,
+        review_manifest_sha256: str,
         close_performance: Mapping[str, object],
         content_inventory_path: Path,
     ) -> Path:
         """Bind a verified v2 archive generation to lifecycle-v3 close input."""
 
-        if lifecycle_retention_class not in {
-            "published_full",
-            "current_accepted_full",
-        }:
+        expected_storage_class = {
+            "published_full": RetentionClass.ACCEPTED_FULL,
+            "current_accepted_full": RetentionClass.ACCEPTED_FULL,
+            "unique_failure_full": RetentionClass.UNIQUE_FAILURE_FULL,
+        }.get(lifecycle_retention_class)
+        if expected_storage_class is None:
             raise StorageGovernanceError(
-                "only full accepted retention can use a lifecycle binding receipt"
+                "only full governed retention can use a lifecycle binding receipt"
             )
         if (
-            receipt.retention_class != RetentionClass.ACCEPTED_FULL
+            receipt.retention_class != expected_storage_class
             or _SHA256.fullmatch(storage_permit_sha256) is None
+            or _SHA256.fullmatch(review_manifest_sha256) is None
             or not isinstance(close_performance, Mapping)
         ):
             raise StorageGovernanceError("lifecycle retention binding is invalid")
@@ -3636,6 +3732,7 @@ class ExperimentStorageGovernance:
         if any(
             record.get("archive_root_alias") != "e_archive"
             or record.get("archive_relative_path") != relative_archive
+            or record.get("retention_class") != receipt.retention_class.value
             or record.get("tree_sha256") != receipt.tree_sha256
             or record.get("file_count") != receipt.kept_file_count
             or record.get("byte_count") != receipt.kept_bytes
@@ -3643,6 +3740,30 @@ class ExperimentStorageGovernance:
             for record in matching
         ):
             raise StorageGovernanceError("lifecycle retention generation differs")
+        root_cause_ids = {
+            str(record.get("root_cause_id", "")) for record in matching
+        }
+        adjudication_sha256s = {
+            str(record.get("adjudication_sha256", "")) for record in matching
+        }
+        if len(root_cause_ids) != 1 or len(adjudication_sha256s) != 1:
+            raise StorageGovernanceError(
+                "lifecycle retention failure identity is inconsistent"
+            )
+        root_cause_id = next(iter(root_cause_ids))
+        adjudication_sha256 = next(iter(adjudication_sha256s))
+        if expected_storage_class == RetentionClass.UNIQUE_FAILURE_FULL:
+            if (
+                re.fullmatch(r"[a-z0-9][a-z0-9._-]*", root_cause_id) is None
+                or _SHA256.fullmatch(adjudication_sha256) is None
+            ):
+                raise StorageGovernanceError(
+                    "unique failure retention adjudication is missing"
+                )
+        elif root_cause_id or adjudication_sha256:
+            raise StorageGovernanceError(
+                "accepted retention cannot bind failure adjudication"
+            )
         replay_relatives = {
             str(record.get("replay_receipt_relative_path", ""))
             for record in matching
@@ -3695,6 +3816,9 @@ class ExperimentStorageGovernance:
                 "generation": receipt.generation,
                 "retention_class": lifecycle_retention_class,
                 "storage_permit_sha256": storage_permit_sha256,
+                "review_manifest_sha256": review_manifest_sha256,
+                "root_cause_id": root_cause_id,
+                "adjudication_sha256": adjudication_sha256,
                 "verification_status": "verified",
                 "archive_root_alias": "e_archive",
                 "archive_relative_path": relative_archive,
@@ -3854,6 +3978,8 @@ class ExperimentStorageGovernance:
                 adjudication is None
                 or not adjudication.is_signed
                 or request.adjudication_path is None
+                or adjudication.canonical_representative_run_label
+                == request.run_label
             ):
                 raise StorageGovernanceError(
                     "duplicate failure reduction requires a signed adjudication"
@@ -3871,9 +3997,33 @@ class ExperimentStorageGovernance:
                     "duplicate failure reduction requires explicit retained paths"
                 )
             self._verify_canonical_failure(adjudication)
+        elif request.retention_class == RetentionClass.UNIQUE_FAILURE_FULL:
+            adjudication = request.adjudication
+            if (
+                adjudication is None
+                or not adjudication.is_signed
+                or request.adjudication_path is None
+            ):
+                raise StorageGovernanceError(
+                    "unique failure retention requires a signed adjudication"
+                )
+            observed_adjudication = load_adjudication_record(
+                request.adjudication_path,
+                expected_sha256=adjudication.adjudication_sha256,
+            )
+            if (
+                observed_adjudication != adjudication
+                or adjudication.run_label != request.run_label
+                or adjudication.root_cause_id != request.root_cause_id
+                or adjudication.canonical_representative_run_label
+                != request.run_label
+            ):
+                raise StorageGovernanceError(
+                    "unique failure adjudication differs from the retention request"
+                )
         elif request.adjudication is not None:
             raise StorageGovernanceError(
-                "adjudication is valid only for duplicate failure reduction"
+                "adjudication is valid only for governed failure retention"
             )
 
         archive_root = self.locator.resolve(request.archive_root_alias)
@@ -5018,6 +5168,11 @@ class ExperimentStorageGovernance:
                             else ""
                         )
                     ),
+                    "adjudication_sha256": (
+                        request.adjudication.adjudication_sha256
+                        if request.adjudication is not None
+                        else ""
+                    ),
                     "archive_root_alias": request.archive_root_alias,
                     "archive_relative_path": request.archive_relative_path,
                     "tree_sha256": tree_sha256,
@@ -5051,7 +5206,15 @@ class ExperimentStorageGovernance:
                     addition["generation"],
                 )
                 existing = existing_by_key.get(key)
-                if existing is not None and existing != addition:
+                comparable_existing = dict(existing) if existing is not None else None
+                if (
+                    comparable_existing is not None
+                    and "adjudication_sha256" not in comparable_existing
+                ):
+                    comparable_existing["adjudication_sha256"] = addition[
+                        "adjudication_sha256"
+                    ]
+                if comparable_existing is not None and comparable_existing != addition:
                     raise StorageGovernanceError(
                         f"retention registry generation conflicts at {key}"
                     )

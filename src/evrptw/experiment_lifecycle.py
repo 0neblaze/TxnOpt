@@ -39,6 +39,12 @@ HISTORICAL_GATE_SCHEMA_VERSION: Final = "experiment-lifecycle-historical-gate-v1
 HISTORICAL_COMPACTION_SCHEMA_VERSION: Final = (
     "experiment-historical-compaction-transaction-v1"
 )
+UNBOUND_CALIBRATION_REVIEW_SCHEMA_VERSION: Final = (
+    "experiment-lifecycle-unbound-calibration-review-v1"
+)
+UNBOUND_CALIBRATION_FAILURE_CODE: Final = "invalid_manifest"
+UNBOUND_CALIBRATION_FAILURE_COMPONENT: Final = "stage052_calibration"
+UNBOUND_CALIBRATION_FAILURE_CHECK: Final = "resource_contract_not_bound_at_seal"
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
 _RUN_LABEL: Final = re.compile(
     r"stage0[0-8](?:\.[0-9]+)?_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}"
@@ -87,6 +93,7 @@ class RetentionClassV3(StrEnum):
     PUBLISHED_FULL = "published_full"
     CURRENT_ACCEPTED_FULL = "current_accepted_full"
     SUPERSEDED_ACCEPTED_CAPSULE = "superseded_accepted_capsule"
+    UNIQUE_FAILURE_FULL = "unique_failure_full"
     UNIQUE_FAILURE_CAPSULE = "unique_failure_capsule"
     DUPLICATE_FAILURE_METADATA = "duplicate_failure_metadata"
     SUPERSEDED_METADATA = "superseded_metadata"
@@ -98,6 +105,7 @@ class RetentionClassV3(StrEnum):
         return self in {
             RetentionClassV3.PUBLISHED_FULL,
             RetentionClassV3.CURRENT_ACCEPTED_FULL,
+            RetentionClassV3.UNIQUE_FAILURE_FULL,
             RetentionClassV3.UNKNOWN_FULL,
         }
 
@@ -1201,6 +1209,7 @@ class RunLifecycleRecord:
     failure_check: str = ""
     failure_location: str = ""
     root_cause_id: str = ""
+    adjudication_sha256: str = ""
     canonical_representative: str = ""
     retention_class: RetentionClassV3 | None = None
     retention_receipt_sha256: str = ""
@@ -1223,6 +1232,7 @@ class RunLifecycleRecord:
             self.storage_permit_sha256,
             self.sealed_manifest_sha256,
             self.review_manifest_sha256,
+            self.adjudication_sha256,
             self.retention_receipt_sha256,
             self.content_inventory_sha256,
             self.compaction_plan_sha256,
@@ -1263,6 +1273,7 @@ class RunLifecycleRecord:
             "failure_check": self.failure_check,
             "failure_location": self.failure_location,
             "root_cause_id": self.root_cause_id,
+            "adjudication_sha256": self.adjudication_sha256,
             "canonical_representative": self.canonical_representative,
             "retention_class": (
                 self.retention_class.value if self.retention_class is not None else None
@@ -1309,6 +1320,7 @@ class RunLifecycleRecord:
                 failure_check=str(payload.get("failure_check", "")),
                 failure_location=str(payload.get("failure_location", "")),
                 root_cause_id=str(payload.get("root_cause_id", "")),
+                adjudication_sha256=str(payload.get("adjudication_sha256", "")),
                 canonical_representative=str(
                     payload.get("canonical_representative", "")
                 ),
@@ -3052,7 +3064,24 @@ class ExperimentLifecycleController:
             ReviewerStatus.INVALID,
         } and not all((failure_component, failure_check, failure_location)):
             raise LifecycleError("failed review requires structured failure identity")
-        if reviewer_status != ReviewerStatus.ACCEPTED and not record.failure_code:
+        failure_code = record.failure_code
+        infer_unbound_calibration_failure = (
+            not failure_code
+            and review_payload.get("schema_version")
+            == UNBOUND_CALIBRATION_REVIEW_SCHEMA_VERSION
+            and spec.experiment_id == "stage052_performance"
+            and "_resource_calibration_" in run_label
+            and reviewer_status == ReviewerStatus.FAILED_KNOWN
+            and review_payload.get("controlled_failure_code")
+            == UNBOUND_CALIBRATION_FAILURE_CODE
+            and UNBOUND_CALIBRATION_FAILURE_CODE in spec.allowed_failure_codes
+            and failure_component == UNBOUND_CALIBRATION_FAILURE_COMPONENT
+            and failure_check == UNBOUND_CALIBRATION_FAILURE_CHECK
+            and failure_location == record.sealed_manifest_relative_path
+        )
+        if infer_unbound_calibration_failure:
+            failure_code = UNBOUND_CALIBRATION_FAILURE_CODE
+        if reviewer_status != ReviewerStatus.ACCEPTED and not failure_code:
             raise LifecycleError("non-accepted review requires a controlled failure code")
         raw_manifest_path = persisted_plan.run_dir.joinpath(
             *PurePosixPath(record.sealed_manifest_relative_path).parts
@@ -3080,6 +3109,7 @@ class ExperimentLifecycleController:
             LifecycleState.REVIEWED,
             reviewer_status=reviewer_status,
             review_manifest_sha256=_sha256_file(review_manifest_path),
+            failure_code=failure_code,
             failure_component=failure_component,
             failure_check=failure_check,
             failure_location=failure_location,
@@ -3238,6 +3268,13 @@ class ExperimentLifecycleController:
             )
         if not record.review_manifest_sha256:
             raise LifecycleError("root-cause adjudication has no bound review manifest")
+        from evrptw.storage_governance import load_adjudication_record
+
+        adjudication_sha256 = _sha256_file(adjudication_path)
+        shared_adjudication = load_adjudication_record(
+            adjudication_path,
+            expected_sha256=adjudication_sha256,
+        )
         adjudication = _load_signed_json(adjudication_path)
         required = {
             "run_label": run_label,
@@ -3251,6 +3288,14 @@ class ExperimentLifecycleController:
         }
         if any(adjudication.get(key) != value for key, value in required.items()):
             raise LifecycleError("adjudication does not match the controlled failure identity")
+        if (
+            shared_adjudication.run_label != run_label
+            or shared_adjudication.root_cause_id != root_cause_id
+            or shared_adjudication.canonical_representative_run_label
+            != canonical_representative
+            or shared_adjudication.failure_location != record.failure_location
+        ):
+            raise LifecycleError("shared adjudication identity differs")
         if canonical_representative == run_label:
             representative = record
         else:
@@ -3261,6 +3306,7 @@ class ExperimentLifecycleController:
                 not in {
                     RetentionClassV3.PUBLISHED_FULL,
                     RetentionClassV3.CURRENT_ACCEPTED_FULL,
+                    RetentionClassV3.UNIQUE_FAILURE_FULL,
                     RetentionClassV3.UNIQUE_FAILURE_CAPSULE,
                 }
             ):
@@ -3290,6 +3336,7 @@ class ExperimentLifecycleController:
         updated = replace(
             record,
             root_cause_id=root_cause_id,
+            adjudication_sha256=adjudication_sha256,
             canonical_representative=canonical_representative,
             reviewer_status=(
                 ReviewerStatus.FAILED_KNOWN
@@ -3375,6 +3422,17 @@ class ExperimentLifecycleController:
         elif publication_state == "superseded" and status == ReviewerStatus.ACCEPTED:
             selected = RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE
             reason = "superseded_accepted"
+        elif (
+            status == ReviewerStatus.FAILED_KNOWN
+            and record.failure_code == UNBOUND_CALIBRATION_FAILURE_CODE
+            and record.failure_component == UNBOUND_CALIBRATION_FAILURE_COMPONENT
+            and record.failure_check == UNBOUND_CALIBRATION_FAILURE_CHECK
+            and record.root_cause_id
+            and record.adjudication_sha256
+            and record.canonical_representative == run_label
+        ):
+            selected = RetentionClassV3.UNIQUE_FAILURE_FULL
+            reason = "known_unbound_calibration_full"
         elif (
             status == ReviewerStatus.FAILED_KNOWN
             and record.root_cause_id
@@ -3624,6 +3682,8 @@ class ExperimentLifecycleController:
             != "experiment-lifecycle-retention-binding-v1"
             or receipt.get("run_label") != run_label
             or receipt.get("storage_permit_sha256") != record.storage_permit_sha256
+            or receipt.get("review_manifest_sha256")
+            != record.review_manifest_sha256
         ):
             raise LifecycleError("retention receipt run identity differs")
         if receipt.get("verification_status") not in {"verified", "committed"}:
@@ -3632,6 +3692,19 @@ class ExperimentLifecycleController:
             record.retention_class.value if record.retention_class is not None else None
         ):
             raise LifecycleError("retention receipt class differs")
+        if record.retention_class == RetentionClassV3.UNIQUE_FAILURE_FULL:
+            if (
+                not record.root_cause_id
+                or _SHA256.fullmatch(record.adjudication_sha256) is None
+                or receipt.get("root_cause_id") != record.root_cause_id
+                or receipt.get("adjudication_sha256")
+                != record.adjudication_sha256
+            ):
+                raise LifecycleError(
+                    "unique failure retention adjudication differs"
+                )
+        elif receipt.get("root_cause_id") or receipt.get("adjudication_sha256"):
+            raise LifecycleError("accepted retention cannot bind failure adjudication")
         hashes = (
             str(receipt.get("archive_tree_sha256", "")),
             str(receipt.get("storage_tree_sha256", "")),
@@ -3708,6 +3781,16 @@ class ExperimentLifecycleController:
         ]
         if not matching_records or any(
             item.get("archive_relative_path") != relative_archive.as_posix()
+            or item.get("retention_class")
+            != (
+                "unique_failure_full"
+                if record.retention_class == RetentionClassV3.UNIQUE_FAILURE_FULL
+                else "accepted_full"
+            )
+            or str(item.get("root_cause_id", ""))
+            != receipt.get("root_cause_id")
+            or str(item.get("adjudication_sha256", ""))
+            != receipt.get("adjudication_sha256")
             or item.get("tree_sha256") != receipt.get("storage_tree_sha256")
             or item.get("file_count") != receipt.get("file_count")
             or item.get("byte_count") != receipt.get("byte_count")

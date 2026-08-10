@@ -18,7 +18,6 @@ import evrptw.stage052_campaign_runner as campaign_runner
 from evrptw.artifacts import (
     ArtifactReader,
     ArtifactStorageConfig,
-    atomic_write_signed_json,
 )
 from evrptw.candidate_transaction import NativeCandidateTransactionConfig
 from evrptw.experiments import stage052_performance
@@ -60,7 +59,6 @@ from evrptw.stage052_campaign_runner import (
     create_calibration_successor_attestation,
     probe_volume_identity,
     validate_batch_measurements,
-    verify_calibration_successor_attestation,
     verify_campaign_root_locations,
     verify_campaign_successor_revision,
     verify_rolling_campaign_capacity,
@@ -1238,106 +1236,17 @@ def test_campaign_successor_revision_allows_only_g_governance_paths(
         )
 
 
-def test_calibration_successor_attestation_recomputes_git_and_review_bindings(
+def test_calibration_successor_attestation_rejects_retroactive_attempt23_contract(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    subprocess.run(("git", "init", "-q", str(repository)), check=True)
-    subprocess.run(
-        ("git", "-C", str(repository), "config", "user.email", "test@example.com"),
-        check=True,
-    )
-    subprocess.run(
-        ("git", "-C", str(repository), "config", "user.name", "Test"),
-        check=True,
-    )
-    workflow = repository / "docs" / "stage052_change_log.md"
-    workflow.parent.mkdir()
-    workflow.write_text("predecessor\n", encoding="utf-8")
-    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
-    subprocess.run(
-        ("git", "-C", str(repository), "commit", "-qm", "predecessor"),
-        check=True,
-    )
-    predecessor = subprocess.run(
-        ("git", "-C", str(repository), "rev-parse", "HEAD"),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    monkeypatch.setattr(campaign_runner, "_CALIBRATION_SUCCESSOR_PREDECESSOR", predecessor)
-    monkeypatch.setattr(campaign_runner, "_CALIBRATION_PINNED_RECOVERY_BLOBS", {})
-    monkeypatch.setattr(
-        campaign_runner,
-        "_calibration_scientific_surface_sha256",
-        lambda _repository, _revision: "a" * 64,
-    )
-    workflow.write_text("successor recovery governance\n", encoding="utf-8")
-    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
-    subprocess.run(
-        ("git", "-C", str(repository), "commit", "-qm", "successor"),
-        check=True,
-    )
-    successor = subprocess.run(
-        ("git", "-C", str(repository), "rev-parse", "HEAD"),
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    contract_path, _ = atomic_write_signed_json(tmp_path / "contract.json", {"selected_workers": 6})
-    report_path, _ = atomic_write_signed_json(
-        tmp_path / "report.json",
-        {"run_label": "stage05.2_resource_calibration_attempt23"},
-    )
-    review_path = tmp_path / "review.json"
-    _review_path, review_sidecar = atomic_write_signed_json(
-        review_path,
-        {
-            "schema_version": "stage05.2-resource-calibration-review-v1",
-            "run_label": "stage05.2_resource_calibration_attempt23",
-            "status": "ACCEPTED",
-            "calibration_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
-            "resource_contract_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
-            "gates": {
-                gate: {"passed": True}
-                for gate in campaign_runner._CALIBRATION_REQUIRED_REVIEW_GATES
-            },
-        },
-    )
-    review_sidecar.rename(review_path.with_suffix(".json.sha256"))
-    attestation_path = tmp_path / "successor.json"
-
-    create_calibration_successor_attestation(
-        repository=repository,
-        successor_revision=successor,
-        calibration_report_path=report_path,
-        calibration_review_manifest_path=review_path,
-        resource_contract_path=contract_path,
-        output_path=attestation_path,
-    )
-    verified = verify_calibration_successor_attestation(
-        repository=repository,
-        current_revision=successor,
-        attestation_path=attestation_path,
-        calibration_report_path=report_path,
-        calibration_review_manifest_path=review_path,
-        resource_contract_path=contract_path,
-    )
-
-    assert verified.inheritance_scope == "resource_contract_only"
-    assert verified.formal_batch_geometry_contribution == 0
-    assert set(verified.changed_blob_sha256_by_path) == {"docs/stage052_change_log.md"}
-    report_path.write_bytes(report_path.read_bytes() + b" ")
-    with pytest.raises(RuntimeError, match="not signed"):
-        verify_calibration_successor_attestation(
-            repository=repository,
-            current_revision=successor,
-            attestation_path=attestation_path,
-            calibration_report_path=report_path,
-            calibration_review_manifest_path=review_path,
-            resource_contract_path=contract_path,
+    with pytest.raises(RuntimeError, match="not bound at seal|retroactive"):
+        create_calibration_successor_attestation(
+            repository=tmp_path / "repository",
+            successor_revision="a" * 40,
+            calibration_report_path=tmp_path / "report.json",
+            calibration_review_manifest_path=tmp_path / "review.json",
+            resource_contract_path=tmp_path / "contract.json",
+            output_path=tmp_path / "successor.json",
         )
 
 

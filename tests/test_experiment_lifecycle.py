@@ -54,6 +54,7 @@ from evrptw.stage052_campaign import (
 from evrptw.storage_governance import (
     StorageGovernanceError,
     build_cli_terminal_manifest,
+    write_lifecycle_adjudication_record,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,7 +99,13 @@ def _start(
     tmp_path: Path,
     label: str,
 ) -> ExperimentPlan:
-    plan = _plan(tmp_path, label)
+    spec = controller.catalog.for_run_label(label)
+    plan = replace(
+        _plan(tmp_path, label),
+        prerequisite_sha256_by_contract={
+            contract: HASH for contract in spec.prerequisite_contracts
+        },
+    )
     controller.plan(plan)
     permit_path = controller.capacity_state_root / "permits" / f"{label}.json"
     _write_signed_json(
@@ -114,7 +121,7 @@ def _start(
     if ledger_path.is_file():
         reservations = json.loads(ledger_path.read_text(encoding="utf-8"))["reservations"]
     reservations[label] = {
-        "stage_id": "stage00",
+        "stage_id": spec.stage_id,
         "stage_plan_sha256": plan.plan_sha256,
         "staging_root_alias": "wsl_staging",
         "host_root_alias": "d_host",
@@ -234,6 +241,55 @@ def _review_execution(
             "sealed_manifest_sha256": record.sealed_manifest_sha256,
         },
     )
+
+
+def _seal_unbound_calibration_and_write_review(
+    controller: ExperimentLifecycleController,
+    tmp_path: Path,
+    label: str,
+    *,
+    schema_version: str = "experiment-lifecycle-unbound-calibration-review-v1",
+) -> Path:
+    run_dir = tmp_path / label
+    artifact = run_dir / "calibration_report.json"
+    artifact.write_text("{}\n", encoding="utf-8")
+    raw_manifest = run_dir / "control" / f"{label}_lifecycle_manifest.json"
+    _write_signed_json(
+        raw_manifest,
+        {
+            "schema_version": "experiment-cli-terminal-manifest-v1",
+            "run_label": label,
+            "status": "complete",
+            "evidence_completeness": "complete",
+            "artifacts": [
+                {
+                    "relative_path": artifact.relative_to(run_dir).as_posix(),
+                    "byte_size": artifact.stat().st_size,
+                    "checksum": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }
+            ],
+        },
+    )
+    controller.seal(label, manifest_path=raw_manifest)
+    review = run_dir / "review" / "review_manifest.json"
+    _write_signed_json(
+        review,
+        {
+            "schema_version": schema_version,
+            "run_label": label,
+            "status": "FAILED_KNOWN",
+            "lifecycle_status": "FAILED_KNOWN",
+            "controlled_failure_code": "invalid_manifest",
+            "failure_identity": {
+                "component": "stage052_calibration",
+                "invariant_or_check": "resource_contract_not_bound_at_seal",
+                "location": raw_manifest.relative_to(run_dir).as_posix(),
+            },
+            "files": {},
+        },
+    )
+    _review_execution(controller, label, review)
+    return review
 
 
 def _classification_context(
@@ -356,6 +412,9 @@ def _retention_binding(
     inventory: dict[str, object],
     performance: dict[str, object],
     archive_leaf: str | None = None,
+    retention_class: str = "current_accepted_full",
+    root_cause_id: str = "",
+    adjudication_sha256: str = "",
 ) -> Path:
     generation = 1
     relative_archive = Path("stage00", "runs", label, f"generation-{generation:04d}")
@@ -408,6 +467,13 @@ def _retention_binding(
         {
             "run_label": label,
             "generation": generation,
+            "retention_class": (
+                "unique_failure_full"
+                if retention_class == "unique_failure_full"
+                else "accepted_full"
+            ),
+            "root_cause_id": root_cause_id,
+            "adjudication_sha256": adjudication_sha256,
             "archive_relative_path": relative_archive.as_posix(),
             "tree_sha256": storage_tree_sha256,
             "file_count": len(files),
@@ -428,8 +494,11 @@ def _retention_binding(
             "run_label": label,
             "generation": generation,
             "verification_status": "verified",
-            "retention_class": "current_accepted_full",
+            "retention_class": retention_class,
             "storage_permit_sha256": record.storage_permit_sha256,
+            "review_manifest_sha256": record.review_manifest_sha256,
+            "root_cause_id": root_cause_id,
+            "adjudication_sha256": adjudication_sha256,
             "archive_relative_path": relative_archive.as_posix(),
             "archive_tree_sha256": inventory["source_tree_sha256"],
             "storage_tree_sha256": storage_tree_sha256,
@@ -2123,6 +2192,16 @@ def test_complete_lifecycle_reaches_closed_only_after_retention_and_gate(
         inventory=inventory,
         performance=performance,
     )
+    registry_path = controller.storage_state_root / "retention_registry_v2.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    for item in registry["records"]:
+        item.pop("adjudication_sha256")
+    _write_signed_json(registry_path, registry)
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+    receipt_payload["registry_sha256"] = hashlib.sha256(
+        registry_path.read_bytes()
+    ).hexdigest()
+    _write_signed_json(receipt, receipt_payload)
     assert controller.mark_retained(
         label,
         retention_receipt_path=receipt,
@@ -2375,23 +2454,22 @@ def test_signed_adjudication_unblocks_unknown_failure(tmp_path: Path) -> None:
     )
     record_path = controller._record_path(label)
     adjudication = tmp_path / "unknown-adjudication.json"
-    _write_signed_json(
+    reviewed = next(
+        item for item in controller.records() if item.run_label == label
+    )
+    write_lifecycle_adjudication_record(
         adjudication,
-        {
-            "run_label": label,
-            "review_manifest_sha256": next(
-                item for item in controller.records() if item.run_label == label
-            ).review_manifest_sha256,
-            "root_cause_id": "manifest-integrity-v1",
-            "canonical_representative_run_label": label,
-            "canonical_representative_record_sha256": hashlib.sha256(
-                record_path.read_bytes()
-            ).hexdigest(),
-            "failure_code": "runner_failure",
-            "failing_component": "runner",
-            "invariant_or_check": "manifest_integrity",
-            "failure_location": "control/manifest.json",
-        },
+        run_label=label,
+        review_manifest_sha256=reviewed.review_manifest_sha256,
+        root_cause_id="manifest-integrity-v1",
+        canonical_representative_run_label=label,
+        canonical_representative_record_sha256=hashlib.sha256(
+            record_path.read_bytes()
+        ).hexdigest(),
+        failure_code="runner_failure",
+        failing_component="runner",
+        invariant_or_check="manifest_integrity",
+        failure_location="control/manifest.json",
     )
 
     adjudicated = controller.adjudicate(
@@ -2410,6 +2488,127 @@ def test_signed_adjudication_unblocks_unknown_failure(tmp_path: Path) -> None:
     assert adjudicated.reviewer_status == ReviewerStatus.FAILED_KNOWN
     assert decision.retention_class == RetentionClassV3.UNIQUE_FAILURE_CAPSULE
     assert controller.records()[0].state == LifecycleState.CLASSIFIED
+
+
+def test_unbound_calibration_review_infers_failure_and_keeps_full_tree(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    label = "stage05.2_resource_calibration_attempt23"
+    plan = _start(controller, tmp_path, label)
+    review_path = _seal_unbound_calibration_and_write_review(
+        controller,
+        tmp_path,
+        label,
+    )
+
+    reviewed = controller.review(label, review_manifest_path=review_path)
+    assert reviewed.failure_code == "invalid_manifest"
+    assert reviewed.failure_check == "resource_contract_not_bound_at_seal"
+    root_cause_id = "unbound-producer-resource-contract-v1"
+    adjudication_path = tmp_path / "unbound-adjudication.json"
+    storage_adjudication = write_lifecycle_adjudication_record(
+        adjudication_path,
+        run_label=label,
+        review_manifest_sha256=reviewed.review_manifest_sha256,
+        root_cause_id=root_cause_id,
+        canonical_representative_run_label=label,
+        canonical_representative_record_sha256=hashlib.sha256(
+            controller._record_path(label).read_bytes()
+        ).hexdigest(),
+        failure_code="invalid_manifest",
+        failing_component="stage052_calibration",
+        invariant_or_check="resource_contract_not_bound_at_seal",
+        failure_location=reviewed.failure_location,
+    )
+    adjudicated = controller.adjudicate(
+        label,
+        root_cause_id=root_cause_id,
+        canonical_representative=label,
+        adjudication_path=adjudication_path,
+    )
+    decision = controller.classify(
+        label,
+        classification_context_path=_classification_context(
+            controller,
+            tmp_path,
+            label,
+            publication_state="none",
+        ),
+    )
+
+    assert adjudicated.adjudication_sha256 == hashlib.sha256(
+        adjudication_path.read_bytes()
+    ).hexdigest()
+    assert adjudicated.adjudication_sha256 == (
+        storage_adjudication.adjudication_sha256
+    )
+    assert decision.retention_class == RetentionClassV3.UNIQUE_FAILURE_FULL
+    assert decision.retention_class.preserves_full_tree
+    inventory_path = _content_inventory(plan.run_dir, label)
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    source_bytes = sum(
+        int(item["byte_count"]) for item in inventory["files"]
+    )
+    performance = {
+        "hashed_bytes": source_bytes,
+        "source_bytes": source_bytes,
+        "scan_passes": 1,
+        "delete_traversals": 0,
+        "duplicate_hashed_bytes": 0,
+        "backend_calibrated": True,
+        "implicit_fallback": False,
+        "throughput_mib_per_second": 1.0,
+        "cpu_utilization_percent": 10.0,
+        "peak_memory_bytes": 1024,
+        "io_utilization_percent": 10.0,
+        "close_wall_seconds": 1.0,
+        "backend": "windows_native",
+        "workers": 1,
+    }
+    receipt_path = _retention_binding(
+        controller,
+        label,
+        run_dir=plan.run_dir,
+        inventory=inventory,
+        performance=performance,
+        retention_class="unique_failure_full",
+        root_cause_id=root_cause_id,
+        adjudication_sha256=adjudicated.adjudication_sha256,
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["root_cause_id"] = "wrong-root-cause"
+    _write_signed_json(receipt_path, receipt)
+    with pytest.raises(LifecycleError, match="adjudication differs"):
+        controller.mark_retained(
+            label,
+            retention_receipt_path=receipt_path,
+            content_inventory_path=inventory_path,
+        )
+    receipt["root_cause_id"] = root_cause_id
+    _write_signed_json(receipt_path, receipt)
+    assert controller.mark_retained(
+        label,
+        retention_receipt_path=receipt_path,
+        content_inventory_path=inventory_path,
+    ).state == LifecycleState.RETAINED
+
+
+def test_arbitrary_review_schema_cannot_infer_unbound_calibration_failure(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    label = "stage05.2_resource_calibration_attempt23"
+    _start(controller, tmp_path, label)
+    review_path = _seal_unbound_calibration_and_write_review(
+        controller,
+        tmp_path,
+        label,
+        schema_version="untrusted-review-v1",
+    )
+
+    with pytest.raises(LifecycleError, match="controlled failure code"):
+        controller.review(label, review_manifest_path=review_path)
 
 
 def test_adjudication_rejects_a_running_record(tmp_path: Path) -> None:
@@ -2440,23 +2639,22 @@ def test_unique_failure_requires_exact_signed_root_cause_identity(
         failure_code="runner_failure",
     )
     adjudication = tmp_path / "adjudication.json"
-    _write_signed_json(
+    reviewed = next(
+        item for item in controller.records() if item.run_label == label
+    )
+    write_lifecycle_adjudication_record(
         adjudication,
-        {
-            "run_label": label,
-            "review_manifest_sha256": next(
-                item for item in controller.records() if item.run_label == label
-            ).review_manifest_sha256,
-            "root_cause_id": "manifest-integrity-v1",
-            "canonical_representative_run_label": label,
-            "canonical_representative_record_sha256": (
-                hashlib.sha256(controller._record_path(label).read_bytes()).hexdigest()
-            ),
-            "failure_code": "runner_failure",
-            "failing_component": "runner",
-            "invariant_or_check": "manifest_integrity",
-            "failure_location": "control/manifest.json",
-        },
+        run_label=label,
+        review_manifest_sha256=reviewed.review_manifest_sha256,
+        root_cause_id="manifest-integrity-v1",
+        canonical_representative_run_label=label,
+        canonical_representative_record_sha256=hashlib.sha256(
+            controller._record_path(label).read_bytes()
+        ).hexdigest(),
+        failure_code="runner_failure",
+        failing_component="runner",
+        invariant_or_check="manifest_integrity",
+        failure_location="control/manifest.json",
     )
     controller.adjudicate(
         label,

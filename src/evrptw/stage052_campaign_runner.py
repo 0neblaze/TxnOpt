@@ -828,53 +828,10 @@ def _verified_calibration_successor_inputs(
     calibration_review_manifest_path: Path,
     resource_contract_path: Path,
 ) -> tuple[str, str, str]:
-    for path, sidecar in (
-        (
-            calibration_report_path,
-            calibration_report_path.with_suffix(".sha256"),
-        ),
-        (
-            calibration_review_manifest_path,
-            calibration_review_manifest_path.with_suffix(
-                calibration_review_manifest_path.suffix + ".sha256"
-            ),
-        ),
-        (resource_contract_path, resource_contract_path.with_suffix(".sha256")),
-    ):
-        if not signed_sidecar_matches(path, sidecar):
-            raise RuntimeError(f"calibration successor input is not signed: {path}")
-    try:
-        report = json.loads(calibration_report_path.read_text(encoding="utf-8"))
-        review = json.loads(
-            calibration_review_manifest_path.read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError("calibration successor input JSON is invalid") from error
-    if (
-        not isinstance(report, Mapping)
-        or report.get("run_label") != _CALIBRATION_SUCCESSOR_RUN_LABEL
-        or not isinstance(review, Mapping)
-        or review.get("schema_version")
-        != "stage05.2-resource-calibration-review-v1"
-        or review.get("run_label") != _CALIBRATION_SUCCESSOR_RUN_LABEL
-        or review.get("status") != "ACCEPTED"
-        or review.get("calibration_report_sha256")
-        != _file_sha256(calibration_report_path)
-        or review.get("resource_contract_sha256")
-        != _file_sha256(resource_contract_path)
-        or not isinstance(review.get("gates"), Mapping)
-        or set(cast(Mapping[str, object], review["gates"]))
-        != _CALIBRATION_REQUIRED_REVIEW_GATES
-        or any(
-            not isinstance(gate, Mapping) or gate.get("passed") is not True
-            for gate in cast(Mapping[str, object], review["gates"]).values()
-        )
-    ):
-        raise RuntimeError("calibration successor inputs are not independently accepted")
-    return (
-        _file_sha256(calibration_report_path),
-        _file_sha256(calibration_review_manifest_path),
-        _file_sha256(resource_contract_path),
+    del calibration_report_path, calibration_review_manifest_path, resource_contract_path
+    raise RuntimeError(
+        "Attempt23 calibration contract was not bound at seal; retroactive "
+        "successor attestation is forbidden"
     )
 
 
@@ -887,7 +844,7 @@ def create_calibration_successor_attestation(
     resource_contract_path: Path,
     output_path: Path,
 ) -> Path:
-    """Create the signed Attempt23 resource-contract-only successor proof."""
+    """Reject the retired Attempt23 retroactive-successor path."""
 
     report_sha, review_sha, contract_sha = _verified_calibration_successor_inputs(
         calibration_report_path=calibration_report_path,
@@ -933,7 +890,7 @@ def verify_calibration_successor_attestation(
     calibration_review_manifest_path: Path,
     resource_contract_path: Path,
 ) -> CalibrationSuccessorAttestation:
-    """Recompute Git and evidence bindings before inheriting Attempt23 limits."""
+    """Reject the retired Attempt23 retroactive-successor path."""
 
     if not signed_sidecar_matches(
         attestation_path, attestation_path.with_suffix(".sha256")

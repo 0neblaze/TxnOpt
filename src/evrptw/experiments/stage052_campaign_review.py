@@ -137,10 +137,12 @@ from evrptw.storage_governance import (
     POLICY_SCHEMA_VERSION,
     GovernancePolicy,
     StorageGovernanceError,
+    compute_tree_sha256,
     is_retained_path_from_locator,
     load_storage_migration_attestation,
     resolve_run_from_locator,
     verify_storage_migration_attestation,
+    write_retention_replay_receipt,
 )
 from evrptw.validation import validate_routes
 
@@ -178,7 +180,7 @@ def _verify_review_storage_migration(
         )
     try:
         untrusted = json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise StorageGovernanceError(
             "storage migration attestation is unreadable"
         ) from error
@@ -1228,7 +1230,7 @@ def _strict_float(value: object, field: str) -> float:
 def _json_object(path: Path) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ArtifactIntegrityError(f"cannot read JSON evidence: {path}") from error
     if not isinstance(payload, dict):
         raise ArtifactIntegrityError(f"JSON evidence is not an object: {path}")
@@ -7110,30 +7112,28 @@ def _verify_stage052_batch_memory_release(
     return release_count
 
 
-def review_resource_calibration(
+def _resource_calibration_review_payload(
     *,
     raw_manifest_path: Path,
-    contract_path: Path,
-    review_manifest_path: Path,
-) -> dict[str, object]:
-    """Independently replay one complete Stage 5.2 resource calibration."""
+    contract: ProducerResourceContract,
+    expected_run_label: str | None = None,
+) -> tuple[Path, dict[str, object], set[str]]:
+    """Replay every sealed calibration artifact against one exact contract."""
 
     raw_manifest_path = raw_manifest_path.resolve(strict=True)
     run_dir = raw_manifest_path.parent.parent
+    run_label = expected_run_label or run_dir.name
     if (
         raw_manifest_path.parent.name != "control"
-        or raw_manifest_path.name != f"{run_dir.name}_lifecycle_manifest.json"
+        or raw_manifest_path.name != f"{run_label}_lifecycle_manifest.json"
     ):
         raise ArtifactIntegrityError("calibration lifecycle manifest location is invalid")
-    expected_review_path = run_dir / "review" / "review_manifest.json"
-    if review_manifest_path.resolve() != expected_review_path.resolve():
-        raise ArtifactIntegrityError("calibration review output location is invalid")
     _verify_manifest_sidecar(raw_manifest_path)
     raw = _json_object(raw_manifest_path)
     artifacts = raw.get("artifacts")
     if (
         raw.get("schema_version") != "experiment-cli-terminal-manifest-v1"
-        or raw.get("run_label") != run_dir.name
+        or raw.get("run_label") != run_label
         or raw.get("status") != "complete"
         or raw.get("evidence_completeness") != "complete"
         or not isinstance(artifacts, list)
@@ -7202,9 +7202,6 @@ def review_resource_calibration(
         raise ArtifactIntegrityError("calibration terminal evidence is incomplete")
     for path in required:
         _verify_manifest_sidecar(path)
-    contract_path = contract_path.resolve(strict=True)
-    _verify_manifest_sidecar(contract_path)
-    contract = load_producer_resource_contract(contract_path)
     evidence = load_formal_resource_recalibration_evidence(report_path, contract)
     report = _json_object(report_path)
     measurement = _json_object(measurement_path)
@@ -7214,16 +7211,16 @@ def review_resource_calibration(
     formal = report.get("formal_memory_measurement")
     if (
         report.get("corpus_role") != "read_only_benchmark_differential_only"
-        or report.get("run_label") != run_dir.name
+        or report.get("run_label") != run_label
         or report.get("formal_memory_measurement_sha256") != measurement_sha256
         or not isinstance(formal, Mapping)
         or measurement.get("schema_version")
         != "stage05.2-formal-memory-measurement-v1"
-        or measurement.get("run_label") != run_dir.name
+        or measurement.get("run_label") != run_label
         or measurement.get("status") != "measured_pending_contract_validation"
         or measurement.get("memory_capacity_bytes") != contract.available_memory_bytes
         or measurement.get("measurement") != formal
-        or evidence.report_run_label != run_dir.name
+        or evidence.report_run_label != run_label
     ):
         raise ArtifactIntegrityError("calibration report/measurement binding differs")
     parent_release_sha256 = _sha256(parent_release_path)
@@ -7231,7 +7228,7 @@ def review_resource_calibration(
     if (
         parent_release.get("schema_version")
         != "stage05.2-process-memory-release-v1"
-        or parent_release.get("run_label") != run_dir.name
+        or parent_release.get("run_label") != run_label
         or parent_release.get("component")
         != "formal_memory_calibration_parent"
         or parent_release.get("status") != "verified"
@@ -7252,14 +7249,14 @@ def review_resource_calibration(
     for seed in sorted(expected_seeds):
         relative_trace = (
             "formal-memory-workers6-rg16384-qd1/r205_21/"
-            f"{seed}/{run_dir.name}_trace_r205_21_{seed}.json"
+            f"{seed}/{run_label}_trace_r205_21_{seed}.json"
         )
         if relative_trace not in observed_paths:
             raise ArtifactIntegrityError("calibration memory trace inventory is incomplete")
         trace = _json_object(run_dir / relative_trace)
         axes = trace.get("axes")
         if (
-            trace.get("run_label") != run_dir.name
+            trace.get("run_label") != run_label
             or trace.get("instance") != "r205_21"
             or trace.get("seed") != seed
             or not isinstance(axes, Mapping)
@@ -7283,7 +7280,7 @@ def review_resource_calibration(
     reset_memory_peak = reset.get("memory_peak_bytes_after_reset")
     if (
         reset.get("schema_version") != "stage05.2-cgroup-peak-reset-v1"
-        or reset.get("run_label") != run_dir.name
+        or reset.get("run_label") != run_label
         or reset.get("status") != "verified"
         or reset.get("cgroup_path") != formal_cgroup
         or not is_stage052_dedicated_cgroup_path(formal_cgroup)
@@ -7309,7 +7306,7 @@ def review_resource_calibration(
 
     manifest: dict[str, object] = {
         "schema_version": "stage05.2-resource-calibration-review-v1",
-        "run_label": run_dir.name,
+        "run_label": run_label,
         "status": "ACCEPTED",
         "lifecycle_status": "ACCEPTED",
         "raw_manifest_sha256": _sha256(raw_manifest_path),
@@ -7317,7 +7314,6 @@ def review_resource_calibration(
         "formal_memory_measurement_sha256": measurement_sha256,
         "cgroup_peak_reset_sha256": _sha256(reset_path),
         "parent_memory_release_sha256": parent_release_sha256,
-        "resource_contract_sha256": _sha256(contract_path),
         "resource_evidence": asdict(evidence),
         "verified_artifact_count": len(artifacts),
         "verified_artifact_bytes": total_bytes,
@@ -7342,13 +7338,203 @@ def review_resource_calibration(
         },
         "files": {},
     }
+    return run_dir, manifest, observed_paths
+
+
+def review_resource_calibration(
+    *,
+    raw_manifest_path: Path,
+    contract_path: Path,
+    review_manifest_path: Path,
+) -> dict[str, object]:
+    """Independently replay one complete Stage 5.2 resource calibration."""
+
+    contract_path = contract_path.resolve(strict=True)
+    _verify_manifest_sidecar(contract_path)
+    contract = load_producer_resource_contract(contract_path)
+    run_dir, manifest, _observed_paths = _resource_calibration_review_payload(
+        raw_manifest_path=raw_manifest_path,
+        contract=contract,
+    )
+    expected_review_path = run_dir / "review" / "review_manifest.json"
+    if review_manifest_path.resolve() != expected_review_path.resolve():
+        raise ArtifactIntegrityError("calibration review output location is invalid")
+    manifest["resource_contract_sha256"] = _sha256(contract_path)
     review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
     atomic_write_signed_json(review_manifest_path, manifest)
     return manifest
 
 
+def _unbound_resource_calibration_review_payload(
+    raw_manifest_path: Path,
+    *,
+    expected_run_label: str | None = None,
+) -> tuple[Path, dict[str, object]]:
+    raw_manifest_path = raw_manifest_path.resolve(strict=True)
+    run_dir = raw_manifest_path.parent.parent
+    report_path = run_dir / "calibration_report.json"
+    _verify_manifest_sidecar(report_path)
+    report = _json_object(report_path)
+    raw_contract = report.get("contract")
+    if not isinstance(raw_contract, Mapping):
+        raise ArtifactIntegrityError("calibration embedded resource contract is missing")
+    try:
+        contract = ProducerResourceContract.from_dict(raw_contract)
+    except ValueError as error:
+        raise ArtifactIntegrityError(
+            "calibration embedded resource contract is invalid"
+        ) from error
+    observed_run_dir, manifest, observed_paths = (
+        _resource_calibration_review_payload(
+            raw_manifest_path=raw_manifest_path,
+            contract=contract,
+            expected_run_label=expected_run_label,
+        )
+    )
+    raw_manifest = _json_object(raw_manifest_path)
+    if observed_run_dir != run_dir:
+        raise ArtifactIntegrityError("calibration run identity changed during replay")
+    if (
+        "resource_contract_sha256" in report
+        or "resource_contract_sha256" in raw_manifest
+    ):
+        raise ArtifactIntegrityError(
+            "calibration terminal evidence claims a bound resource contract"
+        )
+    for relative in sorted(observed_paths):
+        path = run_dir / relative
+        if path == report_path:
+            continue
+        try:
+            payload = _json_object(path)
+        except ArtifactIntegrityError:
+            continue
+        if (
+            payload.get("schema_version")
+            == "stage05.2-producer-resource-contract-v1"
+        ):
+            raise ArtifactIntegrityError(
+                "calibration terminal inventory contains a resource contract"
+            )
+    gates = cast(dict[str, object], manifest["gates"])
+    gates["resource_contract_replay"] = {
+        "passed": False,
+        "failure_code": "resource_contract_not_bound_at_seal",
+    }
+    gates["embedded_contract_replay"] = {"passed": True}
+    manifest.update(
+        {
+            "schema_version": "experiment-lifecycle-unbound-calibration-review-v1",
+            "status": "FAILED_KNOWN",
+            "lifecycle_status": "FAILED_KNOWN",
+            "controlled_failure_code": "invalid_manifest",
+            "failure_identity": {
+                "component": "stage052_calibration",
+                "invariant_or_check": "resource_contract_not_bound_at_seal",
+                "location": raw_manifest_path.relative_to(run_dir).as_posix(),
+            },
+            "embedded_resource_contract_sha256": _canonical_sha256(
+                contract.to_dict()
+            ),
+        }
+    )
+    return run_dir, manifest
+
+
+def review_unbound_resource_calibration(
+    *,
+    raw_manifest_path: Path,
+    review_manifest_path: Path,
+) -> dict[str, object]:
+    """Classify a fully replayed calibration whose contract was not sealed."""
+
+    run_dir, manifest = _unbound_resource_calibration_review_payload(
+        raw_manifest_path
+    )
+    expected_review_path = run_dir / "review" / "review_manifest.json"
+    if review_manifest_path.resolve() != expected_review_path.resolve():
+        raise ArtifactIntegrityError("calibration review output location is invalid")
+    review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
+    atomic_write_signed_json(review_manifest_path, manifest)
+    return manifest
+
+
+def write_unbound_resource_calibration_retention_replay(
+    *,
+    archive_path: Path,
+    run_label: str,
+    generation: int,
+    output_path: Path,
+) -> Path:
+    """Replay an archived unbound calibration before full retention closes."""
+
+    archive_path = archive_path.resolve(strict=True)
+    if (
+        not archive_path.is_dir()
+        or re.fullmatch(r"[a-z0-9][a-z0-9._-]*", run_label) is None
+        or isinstance(generation, bool)
+        or generation <= 0
+    ):
+        raise ArtifactIntegrityError("calibration retention replay identity is invalid")
+    output_path = output_path.resolve()
+    if output_path.exists() or output_path.is_relative_to(archive_path):
+        raise ArtifactIntegrityError("calibration retention replay output is unsafe")
+    raw_manifest_path = (
+        archive_path / "control" / f"{run_label}_lifecycle_manifest.json"
+    )
+    run_dir, expected_review = _unbound_resource_calibration_review_payload(
+        raw_manifest_path,
+        expected_run_label=run_label,
+    )
+    if run_dir != archive_path or expected_review.get("run_label") != run_label:
+        raise ArtifactIntegrityError("archived calibration run identity differs")
+    review_path = archive_path / "review" / "review_manifest.json"
+    _verify_manifest_sidecar(review_path)
+    if _json_object(review_path) != expected_review:
+        raise ArtifactIntegrityError("archived calibration review replay differs")
+    tree_sha256 = compute_tree_sha256(archive_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_retention_replay_receipt(
+        output_path,
+        run_label=run_label,
+        generation=generation,
+        archive_path=archive_path,
+        verifier_identity_sha256=_sha256(Path(__file__)),
+        validator_replay_passed=True,
+        objective_replay_passed=True,
+        raw_review_replay_passed=True,
+    )
+    if _json_object(output_path).get("archive_tree_sha256") != tree_sha256:
+        raise ArtifactIntegrityError("calibration retention tree changed during replay")
+    return output_path
+
+
 def main() -> int:
     import argparse
+
+    if "--lifecycle-unbound-calibration-manifest" in sys.argv[1:]:
+        unbound_parser = argparse.ArgumentParser(description=__doc__)
+        unbound_parser.add_argument(
+            "--lifecycle-unbound-calibration-manifest",
+            type=Path,
+            required=True,
+        )
+        unbound_parser.add_argument(
+            "--unbound-calibration-review-manifest",
+            type=Path,
+            required=True,
+        )
+        unbound_arguments = unbound_parser.parse_args()
+        payload = review_unbound_resource_calibration(
+            raw_manifest_path=(
+                unbound_arguments.lifecycle_unbound_calibration_manifest
+            ),
+            review_manifest_path=(
+                unbound_arguments.unbound_calibration_review_manifest
+            ),
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
 
     if "--lifecycle-calibration-manifest" in sys.argv[1:]:
         calibration_parser = argparse.ArgumentParser(description=__doc__)

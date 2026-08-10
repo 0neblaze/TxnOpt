@@ -679,13 +679,14 @@ this repository or one of its subdirectories.
   retains its own valid semantic digest and must fit below the replacement
   contract's selected aggregate and per-worker peaks. Missing or mismatched
   evidence, lower floors, topology changes, or shard reuse fail fast.
-- Calibration Attempt23 may cross the `58c325a` revision boundary only through
-  a signed `resource_contract_only` successor attestation after its sealed
-  independent review reports `ACCEPTED`. Producer and reviewer independently
-  recompute the exact Git changed-path/blob inventory and the report, review,
-  and contract hashes. Solver, objective, native-kernel, shard/artifact schema,
-  or scientific-configuration changes reject inheritance; this exception never
-  authorizes Formal batch reuse across revisions.
+- Calibration Attempt23 cannot cross the `58c325a` revision boundary because
+  its sealed terminal inventory did not bind a standalone signed producer
+  resource contract. Independent review classifies this exact condition as
+  controlled `resource_contract_not_bound_at_seal` / `invalid_manifest`; no
+  later process may synthesize a retroactive success contract or successor
+  attestation. Its canonical unique failure retains the complete source tree
+  through `unique_failure_full` retention so close never deletes or compacts
+  the evidence. A new calibration uses a new immutable attempt label.
 - Every Stage 5.2 calibration CLI invocation must pass the clean ext4 checkout
   explicitly through `--repository-root`. Service working-directory state is
   not a source-identity input and may not be relied on implicitly. A missing

@@ -40,6 +40,7 @@ from evrptw.storage_governance import (
     verify_storage_migration_attestation,
     write_adjudication_record,
     write_cleanup_confirmation_receipt,
+    write_lifecycle_adjudication_record,
     write_migration_dry_run,
     write_retention_replay_receipt,
     write_storage_migration_attestation,
@@ -1153,12 +1154,25 @@ def test_duplicate_failure_retains_auditable_projection_and_trigger_shard(
     ).resolve()
     (representative / "raw").mkdir(parents=True)
     (representative / "raw" / "events.parquet").write_bytes(b"canonical full")
+    representative_adjudication_path = (
+        tmp_path / "adjudications" / f"{representative.name}.json"
+    )
+    representative_adjudication = write_adjudication_record(
+        representative_adjudication_path,
+        run_label=representative.name,
+        root_cause_id="sqlite-transaction-v1",
+        canonical_representative_run_label=representative.name,
+        failure_location="artifact_store.register_many",
+        evidence_references=("docs/stage052_change_log.md#attempt60",),
+    )
     governance.retain_run(
         RetentionRequest(
             run_label=representative.name,
             generation=1,
             retention_class=RetentionClass.UNIQUE_FAILURE_FULL,
             root_cause_id="sqlite-transaction-v1",
+            adjudication=representative_adjudication,
+            adjudication_path=representative_adjudication_path,
             archive_root_alias="e_archive",
             archive_relative_path=(
                 f"stage05.2/generations/{representative.name}/0001"
@@ -1234,8 +1248,10 @@ def test_duplicate_failure_retains_auditable_projection_and_trigger_shard(
     assert len(projection["omitted_files"]) == 1
 
 
+@pytest.mark.parametrize("unique_failure", (False, True))
 def test_lifecycle_binding_preserves_storage_and_inventory_tree_identities(
     tmp_path: Path,
+    unique_failure: bool,
 ) -> None:
     locator = _locator(tmp_path)
     for alias in locator.aliases:
@@ -1254,16 +1270,45 @@ def test_lifecycle_binding_preserves_storage_and_inventory_tree_identities(
             if root.absolute_path == path
         ),
     )
-    run_label = "stage05.2_resource_calibration_attempt98"
+    run_label = (
+        "stage05.2_resource_calibration_attempt97"
+        if unique_failure
+        else "stage05.2_resource_calibration_attempt98"
+    )
     source = tmp_path / "source" / run_label
     source.mkdir(parents=True)
     artifact = source / "manifest.json"
     artifact.write_bytes(b"sealed calibration")
+    adjudication_path: Path | None = None
+    adjudication: AdjudicationRecord | None = None
+    if unique_failure:
+        adjudication_path = (tmp_path / "adjudication.json").resolve()
+        adjudication = write_lifecycle_adjudication_record(
+            adjudication_path,
+            run_label=run_label,
+            review_manifest_sha256="b" * 64,
+            root_cause_id="unbound-producer-resource-contract-v1",
+            canonical_representative_run_label=run_label,
+            canonical_representative_record_sha256="c" * 64,
+            failure_code="invalid_manifest",
+            failing_component="stage052_calibration",
+            invariant_or_check="resource_contract_not_bound_at_seal",
+            failure_location="control/lifecycle_manifest.json",
+        )
     receipt = governance.retain_run(
         RetentionRequest(
             run_label=run_label,
             generation=1,
-            retention_class=RetentionClass.ACCEPTED_FULL,
+            retention_class=(
+                RetentionClass.UNIQUE_FAILURE_FULL
+                if unique_failure
+                else RetentionClass.ACCEPTED_FULL
+            ),
+            root_cause_id=(
+                "unbound-producer-resource-contract-v1" if unique_failure else ""
+            ),
+            adjudication=adjudication,
+            adjudication_path=adjudication_path,
             archive_root_alias="e_archive",
             archive_relative_path=f"runs/{run_label}/generation-0001",
             segments=(RetentionSegment("run", source, "."),),
@@ -1305,10 +1350,25 @@ def test_lifecycle_binding_preserves_storage_and_inventory_tree_identities(
         {"run_label": run_label, "status": "reserved"},
     )
 
+    lifecycle_class = (
+        "unique_failure_full" if unique_failure else "current_accepted_full"
+    )
+    with pytest.raises(StorageGovernanceError, match="binding|governed retention"):
+        governance.write_lifecycle_retention_binding(
+            receipt,
+            lifecycle_retention_class=(
+                "current_accepted_full" if unique_failure else "unique_failure_full"
+            ),
+            storage_permit_sha256=permit_sha256,
+            review_manifest_sha256="b" * 64,
+            close_performance={"backend": "test"},
+            content_inventory_path=inventory_path,
+        )
     binding_path = governance.write_lifecycle_retention_binding(
         receipt,
-        lifecycle_retention_class="current_accepted_full",
+        lifecycle_retention_class=lifecycle_class,
         storage_permit_sha256=permit_sha256,
+        review_manifest_sha256="b" * 64,
         close_performance={"backend": "test"},
         content_inventory_path=inventory_path,
     )
@@ -1316,6 +1376,13 @@ def test_lifecycle_binding_preserves_storage_and_inventory_tree_identities(
 
     assert binding["archive_tree_sha256"] == lifecycle_tree_sha256
     assert binding["storage_tree_sha256"] == receipt.tree_sha256
+    assert binding["review_manifest_sha256"] == "b" * 64
+    assert binding["root_cause_id"] == (
+        "unbound-producer-resource-contract-v1" if unique_failure else ""
+    )
+    assert binding["adjudication_sha256"] == (
+        adjudication.adjudication_sha256 if adjudication is not None else ""
+    )
     assert binding["archive_tree_sha256"] != binding["storage_tree_sha256"]
     assert binding["content_inventory_sha256"] == hashlib.sha256(
         inventory_path.read_bytes()
@@ -1391,6 +1458,14 @@ def test_retention_retry_adopts_only_an_identical_published_generation(
     receipt = governance.retain_run(request)
     assert receipt.archive_path == destination
     assert governance.resolve_run(request.run_label) == destination
+    registry_path = (
+        governance.retention_state_root / "retention_registry_v2.json"
+    )
+    legacy_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    for record in legacy_registry["records"]:
+        record.pop("adjudication_sha256")
+    storage_governance_module._write_signed_json(registry_path, legacy_registry)
+    assert governance.retain_run(request).archive_path == destination
 
     (destination / "manifest.json").write_text("tampered", encoding="utf-8")
     with pytest.raises(StorageGovernanceError, match="already exists but differs"):
