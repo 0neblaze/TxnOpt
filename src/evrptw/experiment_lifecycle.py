@@ -25,7 +25,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Final, cast
@@ -37,6 +37,9 @@ MIGRATION_SCHEMA_VERSION: Final = "experiment-lifecycle-migration-v3"
 HISTORICAL_GATE_SCHEMA_VERSION: Final = "experiment-lifecycle-historical-gate-v1"
 HISTORICAL_COMPACTION_SCHEMA_VERSION: Final = (
     "experiment-historical-compaction-transaction-v1"
+)
+HISTORICAL_COMPLETION_CORRECTION_SCHEMA_VERSION: Final = (
+    "experiment-historical-compaction-completion-correction-v1"
 )
 UNBOUND_CALIBRATION_REVIEW_SCHEMA_VERSION: Final = (
     "experiment-lifecycle-unbound-calibration-review-v1"
@@ -65,6 +68,73 @@ _HISTORICAL_PREPARED_IDENTITY_FIELDS: Final = (
     "delete_file_count",
     "delete_bytes",
     "created_at_utc",
+)
+_LEGACY_HISTORICAL_COMPLETION_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "run_label",
+        "status",
+        "historical_gate_sha256",
+        "content_inventory_sha256",
+        "review_manifest_sha256",
+        "compaction_plan_sha256",
+        "compaction_receipt_sha256",
+        "released_bytes",
+        "deleted_file_count",
+        "final_tree_sha256",
+        "committed_at_utc",
+    }
+)
+_CURRENT_HISTORICAL_COMPLETION_FIELDS: Final = frozenset(
+    {
+        *_LEGACY_HISTORICAL_COMPLETION_FIELDS,
+        "migration_ledger_sha256",
+        "compaction_plan_receipt_sha256",
+        "historical_import_receipt_sha256",
+        "prepared_identity_sha256",
+    }
+)
+_HISTORICAL_GATE_FIELDS: Final = frozenset(
+    {"schema_version", "migration_ledger_sha256", "status", "records"}
+)
+_HISTORICAL_GATE_RECORD_FIELDS: Final = frozenset(
+    {
+        "run_label",
+        "review_status",
+        "retention_class",
+        "review_manifest_relative_path",
+        "review_manifest_sha256",
+        "content_inventory_relative_path",
+        "content_inventory_sha256",
+        "archive_root_alias",
+        "archive_root_resolved_path",
+        "archive_generation_relative_path",
+        "legacy_registry_sha256",
+        "legacy_tree_sha256",
+    }
+)
+_HISTORICAL_COMPLETION_CORRECTION_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "run_label",
+        "status",
+        "reason_code",
+        "close_receipt_sha256",
+        "prepared_receipt_sha256",
+        "expected_completion_receipt_sha256",
+        "observed_completion_receipt_sha256",
+        "compaction_plan_sha256",
+        "compaction_plan_receipt_sha256",
+        "compaction_receipt_sha256",
+        "historical_gate_sha256",
+        "migration_ledger_sha256",
+        "historical_import_receipt_sha256",
+        "prepared_identity_sha256",
+        "content_inventory_sha256",
+        "review_manifest_sha256",
+        "created_at_utc",
+        "correction_identity_sha256",
+    }
 )
 _WRITER_LEASES: list[tuple[int, Path, Path]] = []
 
@@ -240,6 +310,74 @@ def _write_signed_json(path: Path, payload: object) -> str:
         temporary.unlink(missing_ok=True)
         temporary_sidecar.unlink(missing_ok=True)
     return digest
+
+
+def _write_signed_json_no_replace(path: Path, payload: object) -> str:
+    """Publish one signed payload without replacing either target."""
+
+    data = _canonical_json(payload) + b"\n"
+    digest = _sha256_bytes(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if path.exists() or sidecar.exists():
+        raise LifecycleError(f"immutable lifecycle target already exists: {path}")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary_sidecar = sidecar.with_name(
+        f".{sidecar.name}.{uuid.uuid4().hex}.tmp"
+    )
+    linked_payload = False
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with temporary_sidecar.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"{digest}  {path.name}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+        linked_payload = True
+        os.link(temporary_sidecar, sidecar)
+        _sync_parent_directory(path)
+    except FileExistsError as error:
+        if linked_payload:
+            try:
+                if path.is_file() and os.path.samefile(temporary, path):
+                    path.unlink()
+            except OSError:
+                pass
+        raise LifecycleError(
+            f"immutable lifecycle target was published concurrently: {path}"
+        ) from error
+    finally:
+        temporary.unlink(missing_ok=True)
+        temporary_sidecar.unlink(missing_ok=True)
+    return digest
+
+
+def _historical_completion_correction_identity_sha256(
+    payload: Mapping[str, object],
+) -> str:
+    identity_fields = _HISTORICAL_COMPLETION_CORRECTION_FIELDS.difference(
+        {"correction_identity_sha256"}
+    )
+    if set(payload) != identity_fields:
+        raise LifecycleError(
+            "historical completion correction identity fields differ"
+        )
+    return _sha256_bytes(_canonical_json(payload))
+
+
+def _strict_utc_timestamp(value: object, *, context: str) -> datetime:
+    if not isinstance(value, str):
+        raise LifecycleError(f"{context} timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise LifecycleError(f"{context} timestamp is invalid") from error
+    if parsed.utcoffset() != timedelta(0):
+        raise LifecycleError(f"{context} timestamp is not UTC")
+    return parsed
 
 
 def _repair_orphan_lifecycle_sidecar(path: Path) -> None:
@@ -2541,6 +2679,178 @@ class ExperimentLifecycleController:
         _write_signed_json(prepared_path, committed_prepared)
         return completion
 
+    def write_historical_completion_correction(
+        self,
+        run_label: str,
+    ) -> Path:
+        """Append a deterministic binding for a republished legacy completion.
+
+        This does not rewrite the historical close, prepared transaction, or
+        completion receipt.  It is available only when the close and prepared
+        receipts agree on the missing predecessor hash and the currently
+        signed completion independently replays every historical binding.
+        """
+
+        if _RUN_LABEL.fullmatch(run_label) is None:
+            raise LifecycleError("historical completion correction label is invalid")
+        correction_path = (
+            self.state_root
+            / "historical-compaction"
+            / "corrections"
+            / f"{run_label}.json"
+        )
+        correction_sidecar = correction_path.with_suffix(
+            correction_path.suffix + ".sha256"
+        )
+        close_path = self.state_root / "close" / f"{run_label}.json"
+        completion_path = (
+            self.state_root
+            / "historical-compaction"
+            / "receipts"
+            / f"{run_label}.json"
+        )
+        prepared_path = (
+            self.state_root
+            / "historical-compaction"
+            / "prepared"
+            / f"{run_label}.json"
+        )
+        historical_gate_path = (
+            self.state_root / "historical-migration" / "gate.json"
+        )
+        with _exclusive_lock(
+            self.state_root / "historical-compaction" / "transaction.lock"
+        ):
+            record = self._load(run_label)
+            close = _load_signed_json(close_path)
+            prepared = _load_signed_json(prepared_path)
+            completion = _load_signed_json(completion_path)
+            expected_completion_sha256 = close.get(
+                "historical_compaction_receipt_sha256"
+            )
+            observed_completion_sha256 = _sha256_file(completion_path)
+            observed_completion_at = _strict_utc_timestamp(
+                completion.get("committed_at_utc"),
+                context="observed historical completion",
+            )
+            prepared_committed_at = _strict_utc_timestamp(
+                prepared.get("committed_at_utc"),
+                context="historical prepared completion",
+            )
+            correction_exists = (
+                correction_path.exists() or correction_sidecar.exists()
+            )
+            correction_created_at = datetime.now(UTC)
+            if (
+                record.state != LifecycleState.CLOSED
+                or not isinstance(expected_completion_sha256, str)
+                or _SHA256.fullmatch(expected_completion_sha256) is None
+                or prepared.get("completion_receipt_sha256")
+                != expected_completion_sha256
+                or observed_completion_sha256 == expected_completion_sha256
+                or completion.get("run_label") != run_label
+                or set(completion) != _LEGACY_HISTORICAL_COMPLETION_FIELDS
+                or observed_completion_at <= prepared_committed_at
+                or (
+                    not correction_exists
+                    and correction_created_at < observed_completion_at
+                )
+                or not self._close_receipt_valid(
+                    record,
+                    allow_unbound_historical_completion=True,
+                )
+            ):
+                raise LifecycleError(
+                    "historical completion correction prerequisites differ"
+                )
+            plan_path = (
+                self.state_root
+                / "historical-compaction"
+                / "plans"
+                / run_label
+                / f"{record.compaction_plan_sha256}.json"
+            )
+            import_path = (
+                self.state_root
+                / "historical-compaction"
+                / "imports"
+                / f"{run_label}.json"
+            )
+            stable_identity = {
+                "schema_version": (
+                    HISTORICAL_COMPLETION_CORRECTION_SCHEMA_VERSION
+                ),
+                "run_label": run_label,
+                "status": "CORRECTED",
+                "reason_code": "legacy_completion_republished_after_close",
+                "close_receipt_sha256": _sha256_file(close_path),
+                "prepared_receipt_sha256": _sha256_file(prepared_path),
+                "expected_completion_receipt_sha256": (
+                    expected_completion_sha256
+                ),
+                "observed_completion_receipt_sha256": (
+                    observed_completion_sha256
+                ),
+                "compaction_plan_sha256": record.compaction_plan_sha256,
+                "compaction_plan_receipt_sha256": _sha256_file(plan_path),
+                "compaction_receipt_sha256": record.compaction_receipt_sha256,
+                "historical_gate_sha256": _sha256_file(
+                    historical_gate_path
+                ),
+                "migration_ledger_sha256": prepared[
+                    "migration_ledger_sha256"
+                ],
+                "historical_import_receipt_sha256": _sha256_file(import_path),
+                "prepared_identity_sha256": (
+                    _historical_prepared_identity_sha256(prepared)
+                ),
+                "content_inventory_sha256": record.content_inventory_sha256,
+                "review_manifest_sha256": record.review_manifest_sha256,
+            }
+            if correction_exists:
+                _repair_orphan_lifecycle_sidecar(correction_path)
+                existing = _load_signed_json(correction_path)
+                existing_created_at = existing.get("created_at_utc")
+                if not isinstance(existing_created_at, str):
+                    raise LifecycleError(
+                        "historical completion correction timestamp differs"
+                    )
+                existing_identity = {
+                    **stable_identity,
+                    "created_at_utc": existing_created_at,
+                }
+                expected_existing = {
+                    **existing_identity,
+                    "correction_identity_sha256": (
+                        _historical_completion_correction_identity_sha256(
+                            existing_identity
+                        )
+                    ),
+                }
+                if existing != expected_existing:
+                    raise LifecycleError(
+                        "historical completion correction identity differs"
+                    )
+            else:
+                correction_identity = {
+                    **stable_identity,
+                    "created_at_utc": correction_created_at.isoformat(),
+                }
+                payload = {
+                    **correction_identity,
+                    "correction_identity_sha256": (
+                        _historical_completion_correction_identity_sha256(
+                            correction_identity
+                        )
+                    ),
+                }
+                _write_signed_json_no_replace(correction_path, payload)
+            if not self._close_receipt_valid(record):
+                raise LifecycleError(
+                    "historical completion correction did not close the audit"
+                )
+        return correction_path
+
     def _record_path(self, run_label: str) -> Path:
         return self.state_root / "runs" / f"{run_label}.json"
 
@@ -3205,6 +3515,7 @@ class ExperimentLifecycleController:
         record: RunLifecycleRecord,
         *,
         allow_historical_prepared_recovery: bool = False,
+        allow_unbound_historical_completion: bool = False,
     ) -> bool:
         if record.state != LifecycleState.CLOSED:
             return False
@@ -3213,11 +3524,31 @@ class ExperimentLifecycleController:
             receipt = _load_signed_json(path)
         except LifecycleError:
             return False
+        raw_receipt_record = receipt.get("record")
+        if not isinstance(raw_receipt_record, Mapping):
+            return False
+        current_record_fields = set(record.to_dict())
+        receipt_record_fields = set(raw_receipt_record)
+        allowed_record_fields = (
+            receipt_record_fields == current_record_fields
+            or (
+                not record.adjudication_sha256
+                and receipt_record_fields
+                == current_record_fields.difference({"adjudication_sha256"})
+            )
+        )
+        try:
+            receipt_record = RunLifecycleRecord.from_dict(
+                raw_receipt_record
+            )
+        except (LifecycleError, TypeError, ValueError):
+            return False
         valid_receipt = (
-            receipt.get("schema_version") == LIFECYCLE_SCHEMA_VERSION
+            allowed_record_fields
+            and receipt.get("schema_version") == LIFECYCLE_SCHEMA_VERSION
             and receipt.get("status") == "CLOSED"
             and receipt.get("run_label") == record.run_label
-            and receipt.get("record") == record.to_dict()
+            and receipt_record == record
         )
         if not valid_receipt:
             return False
@@ -3273,10 +3604,27 @@ class ExperimentLifecycleController:
                 / "imports"
                 / f"{record.run_label}.json"
             )
+            historical_gate_path = (
+                self.state_root / "historical-migration" / "gate.json"
+            )
+            correction_path = (
+                self.state_root
+                / "historical-compaction"
+                / "corrections"
+                / f"{record.run_label}.json"
+            )
             try:
-                if _sha256_file(completion_path) != historical_compaction_sha256:
-                    return False
+                completion_sha256 = _sha256_file(completion_path)
                 completion = _load_signed_json(completion_path)
+                completion_fields = set(completion)
+                legacy_completion = (
+                    completion_fields
+                    == _LEGACY_HISTORICAL_COMPLETION_FIELDS
+                )
+                current_completion = (
+                    completion_fields
+                    == _CURRENT_HISTORICAL_COMPLETION_FIELDS
+                )
                 prepared = _load_signed_json(prepared_path)
                 plan_payload = _load_signed_json(plan_path)
                 plan = CompactionPlan.from_dict(plan_payload)
@@ -3289,6 +3637,47 @@ class ExperimentLifecycleController:
                 import_receipt_sha256 = _sha256_file(import_path)
                 prepared_identity_sha256 = (
                     _historical_prepared_identity_sha256(prepared)
+                )
+                historical_gate = _load_signed_json(historical_gate_path)
+                historical_gate_sha256 = _sha256_file(historical_gate_path)
+                gate_records = historical_gate.get("records")
+                if not isinstance(gate_records, list) or any(
+                    not isinstance(item, dict) for item in gate_records
+                ):
+                    return False
+                matching_gate_records = [
+                    item
+                    for item in gate_records
+                    if item.get("run_label") == record.run_label
+                ]
+                if len(matching_gate_records) != 1:
+                    return False
+                gate_record = matching_gate_records[0]
+                generation_relative = PurePosixPath(
+                    str(gate_record.get("archive_generation_relative_path", ""))
+                )
+                archive_root = Path(
+                    str(gate_record.get("archive_root_resolved_path", ""))
+                )
+                if (
+                    generation_relative.is_absolute()
+                    or not generation_relative.parts
+                    or ".." in generation_relative.parts
+                    or not archive_root.is_absolute()
+                ):
+                    return False
+                expected_source_root = str(
+                    archive_root.joinpath(*generation_relative.parts)
+                )
+                expected_review_status = (
+                    record.reviewer_status.value
+                    if record.reviewer_status is not None
+                    else ""
+                )
+                expected_retention_class = (
+                    record.retention_class.value
+                    if record.retention_class is not None
+                    else ""
                 )
                 imported_record_payload = imported.get("record")
                 if not isinstance(imported_record_payload, dict):
@@ -3303,28 +3692,105 @@ class ExperimentLifecycleController:
                     updated_at_utc=record.created_at_utc,
                     compaction_receipt_sha256="",
                 )
+                direct_completion_binding = (
+                    completion_sha256 == historical_compaction_sha256
+                )
+                corrected_completion_binding = False
+                if (
+                    not direct_completion_binding
+                    and not allow_unbound_historical_completion
+                    and legacy_completion
+                ):
+                    correction = _load_signed_json(correction_path)
+                    correction_created_at = correction.get("created_at_utc")
+                    parsed_correction_created_at = _strict_utc_timestamp(
+                        correction_created_at,
+                        context="historical completion correction",
+                    )
+                    observed_completion_at = _strict_utc_timestamp(
+                        completion.get("committed_at_utc"),
+                        context="observed historical completion",
+                    )
+                    prepared_committed_at = _strict_utc_timestamp(
+                        prepared.get("committed_at_utc"),
+                        context="historical prepared completion",
+                    )
+                    if (
+                        observed_completion_at <= prepared_committed_at
+                        or parsed_correction_created_at
+                        < observed_completion_at
+                    ):
+                        return False
+                    expected_correction_identity = {
+                        "schema_version": (
+                            HISTORICAL_COMPLETION_CORRECTION_SCHEMA_VERSION
+                        ),
+                        "run_label": record.run_label,
+                        "status": "CORRECTED",
+                        "reason_code": (
+                            "legacy_completion_republished_after_close"
+                        ),
+                        "close_receipt_sha256": _sha256_file(path),
+                        "prepared_receipt_sha256": _sha256_file(prepared_path),
+                        "expected_completion_receipt_sha256": (
+                            historical_compaction_sha256
+                        ),
+                        "observed_completion_receipt_sha256": (
+                            completion_sha256
+                        ),
+                        "compaction_plan_sha256": (
+                            record.compaction_plan_sha256
+                        ),
+                        "compaction_plan_receipt_sha256": (
+                            plan_receipt_sha256
+                        ),
+                        "compaction_receipt_sha256": (
+                            record.compaction_receipt_sha256
+                        ),
+                        "historical_gate_sha256": historical_gate_sha256,
+                        "migration_ledger_sha256": historical_gate.get(
+                            "migration_ledger_sha256"
+                        ),
+                        "historical_import_receipt_sha256": (
+                            import_receipt_sha256
+                        ),
+                        "prepared_identity_sha256": (
+                            prepared_identity_sha256
+                        ),
+                        "content_inventory_sha256": (
+                            record.content_inventory_sha256
+                        ),
+                        "review_manifest_sha256": (
+                            record.review_manifest_sha256
+                        ),
+                        "created_at_utc": correction_created_at,
+                    }
+                    corrected_completion_binding = (
+                        set(correction)
+                        == _HISTORICAL_COMPLETION_CORRECTION_FIELDS
+                        and all(
+                            correction.get(field) == value
+                            for field, value in (
+                                expected_correction_identity.items()
+                            )
+                        )
+                        and correction.get("correction_identity_sha256")
+                        == _historical_completion_correction_identity_sha256(
+                            expected_correction_identity
+                        )
+                    )
             except (KeyError, LifecycleError, OSError, TypeError, ValueError):
                 return False
             return (
-                set(completion)
-                == {
-                    "schema_version",
-                    "run_label",
-                    "status",
-                    "historical_gate_sha256",
-                    "migration_ledger_sha256",
-                    "content_inventory_sha256",
-                    "review_manifest_sha256",
-                    "compaction_plan_sha256",
-                    "compaction_plan_receipt_sha256",
-                    "compaction_receipt_sha256",
-                    "historical_import_receipt_sha256",
-                    "prepared_identity_sha256",
-                    "released_bytes",
-                    "deleted_file_count",
-                    "final_tree_sha256",
-                    "committed_at_utc",
-                }
+                (
+                    direct_completion_binding
+                    or corrected_completion_binding
+                    or (
+                        allow_unbound_historical_completion
+                        and legacy_completion
+                    )
+                )
+                and (legacy_completion or current_completion)
                 and (
                     (
                         prepared.get("state") == "COMMITTED"
@@ -3377,17 +3843,55 @@ class ExperimentLifecycleController:
                 == record.compaction_plan_sha256
                 and completion.get("compaction_receipt_sha256")
                 == record.compaction_receipt_sha256
-                and completion.get("compaction_plan_receipt_sha256")
-                == plan_receipt_sha256
-                and completion.get("historical_import_receipt_sha256")
-                == import_receipt_sha256
-                and completion.get("prepared_identity_sha256")
-                == prepared_identity_sha256
+                and completion.get("historical_gate_sha256")
+                == historical_gate_sha256
+                and (
+                    legacy_completion
+                    or (
+                        completion.get("migration_ledger_sha256")
+                        == historical_gate.get("migration_ledger_sha256")
+                        and completion.get("compaction_plan_receipt_sha256")
+                        == plan_receipt_sha256
+                        and completion.get("historical_import_receipt_sha256")
+                        == import_receipt_sha256
+                        and completion.get("prepared_identity_sha256")
+                        == prepared_identity_sha256
+                    )
+                )
+                and set(historical_gate) == _HISTORICAL_GATE_FIELDS
+                and historical_gate.get("schema_version")
+                == HISTORICAL_GATE_SCHEMA_VERSION
+                and historical_gate.get("status") == "complete"
+                and _SHA256.fullmatch(
+                    str(historical_gate.get("migration_ledger_sha256", ""))
+                )
+                is not None
+                and set(gate_record) == _HISTORICAL_GATE_RECORD_FIELDS
+                and gate_record.get("archive_root_alias") == "e_archive"
+                and gate_record.get("review_status")
+                == expected_review_status
+                and gate_record.get("retention_class")
+                == expected_retention_class
+                and gate_record.get("content_inventory_sha256")
+                == record.content_inventory_sha256
+                and gate_record.get("review_manifest_sha256")
+                == record.review_manifest_sha256
                 and prepared.get("schema_version")
                 == HISTORICAL_COMPACTION_SCHEMA_VERSION
                 and prepared.get("run_label") == record.run_label
                 and prepared.get("compaction_plan_sha256")
                 == record.compaction_plan_sha256
+                and prepared.get("historical_gate_sha256")
+                == historical_gate_sha256
+                and prepared.get("migration_ledger_sha256")
+                == historical_gate.get("migration_ledger_sha256")
+                and prepared.get("legacy_registry_sha256")
+                == gate_record.get("legacy_registry_sha256")
+                and prepared.get("source_tree_sha256")
+                == gate_record.get("legacy_tree_sha256")
+                and prepared.get("retention_class") == record.retention_class
+                and prepared.get("source_root") == expected_source_root
+                and prepared.get("created_at_utc") == record.created_at_utc
                 and (
                     (
                         prepared.get("state") == "COMMITTED"
@@ -3402,8 +3906,6 @@ class ExperimentLifecycleController:
                 and completion.get("historical_gate_sha256")
                 == prepared.get("historical_gate_sha256")
                 == imported.get("historical_gate_sha256")
-                and completion.get("migration_ledger_sha256")
-                == prepared.get("migration_ledger_sha256")
                 and completion.get("content_inventory_sha256")
                 == prepared.get("content_inventory_sha256")
                 == imported.get("content_inventory_sha256")
@@ -3416,6 +3918,15 @@ class ExperimentLifecycleController:
                 and plan.plan_sha256 == record.compaction_plan_sha256
                 and plan.retention_class == record.retention_class
                 and plan_payload == plan.to_dict()
+                and str(plan.source_root) == expected_source_root
+                and plan.source_tree_sha256
+                == gate_record.get("legacy_tree_sha256")
+                and len(plan.keep) == prepared.get("keep_file_count")
+                and sum(item.byte_count for item in plan.keep)
+                == prepared.get("keep_bytes")
+                and len(plan.delete) == prepared.get("delete_file_count")
+                and sum(item.byte_count for item in plan.delete)
+                == prepared.get("delete_bytes")
                 and compaction_receipt.get("schema_version")
                 == COMPACTION_SCHEMA_VERSION
                 and compaction_receipt.get("run_label") == record.run_label

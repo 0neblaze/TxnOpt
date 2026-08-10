@@ -1400,6 +1400,17 @@ The executable workflow and gate table are maintained in
   close receipts and `CLOSED`. Only `superseded_metadata` and
   `superseded_accepted_capsule` are eligible; the v2 registry remains immutable
   historical input and the append-only v3 ledger records every removed file.
+- Historical compaction completion compatibility is exact and append-only. A
+  directly bound legacy completion is accepted only with its original 12-field
+  schema and signed close hash. If a legacy completion was republished after a
+  signed `CLOSED` receipt, the original close, prepared transaction, and
+  completion remain immutable; recovery requires one canonical no-replace
+  signed correction that binds both predecessor hashes, the observed signed
+  completion, gate/migration/registry/tree identities, plan/import/prepared and
+  compaction receipts, content/review hashes, and a stable correction identity.
+  The corrected path is valid only for the exact legacy schema after complete
+  independent replay; current-schema receipts and any conflicting retry fail
+  closed, and the direct original-hash path always takes precedence.
 - Historical command replay validates the signed command's existing absolute
   Python executable, `-m` invocation, allowlisted reviewer module, complete
   option set, and downstream hashes. It must not require the historical

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -2614,6 +2615,29 @@ def test_new_current_close_demotes_previous_current_in_same_transaction(
         RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE.value
     )
     assert first_status["superseded_by"] == second
+    first_close_path = (
+        controller.state_root / "close" / f"{first}.json"
+    )
+    first_close_payload = json.loads(
+        first_close_path.read_text(encoding="utf-8")
+    )
+    legacy_close_payload = dict(first_close_payload)
+    legacy_close_record = dict(legacy_close_payload["record"])
+    legacy_close_record.pop("adjudication_sha256")
+    legacy_close_payload["record"] = legacy_close_record
+    _write_signed_json(first_close_path, legacy_close_payload)
+    assert controller.status_payload(first_record)["superseded_by"] == second
+    tampered_close_payload = dict(legacy_close_payload)
+    tampered_close_record = dict(legacy_close_record)
+    tampered_close_record["unexpected"] = True
+    tampered_close_payload["record"] = tampered_close_record
+    _write_signed_json(first_close_path, tampered_close_payload)
+    with pytest.raises(
+        LifecycleError,
+        match="supersession projection evidence differs",
+    ):
+        controller.status_payload(first_record)
+    _write_signed_json(first_close_path, first_close_payload)
     archived_raw = (
         controller.archive_root
         / "stage00"
@@ -3276,16 +3300,18 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
         "legacy_registry_sha256": legacy_registry_sha256,
         "legacy_tree_sha256": tree_sha256,
     }
+    migration_ledger = tmp_path / "migration.json"
+    _write_signed_json(migration_ledger, {"status": "test"})
     gate = {
         "schema_version": "experiment-lifecycle-historical-gate-v1",
-        "migration_ledger_sha256": "2" * 64,
+        "migration_ledger_sha256": hashlib.sha256(
+            migration_ledger.read_bytes()
+        ).hexdigest(),
         "status": "complete",
         "records": [gate_record],
     }
     gate_path = gate_root / "gate.json"
     _write_signed_json(gate_path, gate)
-    migration_ledger = tmp_path / "migration.json"
-    _write_signed_json(migration_ledger, {"status": "test"})
     monkeypatch.setattr(
         lifecycle_module,
         "load_historical_migration_gate",
@@ -3408,6 +3434,136 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
     _write_signed_json(prepared_path, prepared_payload)
     assert controller.audit()["passed"] is True
     assert lifecycle_module._load_signed_json(prepared_path)["state"] == "COMMITTED"
+
+    completion_path = (
+        controller.state_root
+        / "historical-compaction"
+        / "receipts"
+        / f"{label}.json"
+    )
+    close_path = controller.state_root / "close" / f"{label}.json"
+    completion_payload = json.loads(
+        completion_path.read_text(encoding="utf-8")
+    )
+    close_payload = json.loads(close_path.read_text(encoding="utf-8"))
+
+    def publish_historical_completion(payload: dict[str, object]) -> None:
+        completion_sha256 = _write_signed_json(completion_path, payload)
+        rebound_close = dict(close_payload)
+        rebound_close["historical_compaction_receipt_sha256"] = (
+            completion_sha256
+        )
+        _write_signed_json(close_path, rebound_close)
+        rebound_prepared = dict(prepared_payload)
+        rebound_prepared["completion_receipt_sha256"] = completion_sha256
+        _write_signed_json(prepared_path, rebound_prepared)
+
+    legacy_completion = dict(completion_payload)
+    for field in (
+        "migration_ledger_sha256",
+        "compaction_plan_receipt_sha256",
+        "historical_import_receipt_sha256",
+        "prepared_identity_sha256",
+    ):
+        legacy_completion.pop(field)
+    publish_historical_completion(legacy_completion)
+    assert controller.audit()["passed"] is True
+
+    tampered_legacy = dict(legacy_completion)
+    tampered_legacy["historical_gate_sha256"] = "3" * 64
+    publish_historical_completion(tampered_legacy)
+    assert controller.audit()["passed"] is False
+
+    incomplete_legacy = dict(legacy_completion)
+    incomplete_legacy.pop("final_tree_sha256")
+    publish_historical_completion(incomplete_legacy)
+    assert controller.audit()["passed"] is False
+
+    extended_legacy = dict(legacy_completion)
+    extended_legacy["unexpected"] = True
+    publish_historical_completion(extended_legacy)
+    assert controller.audit()["passed"] is False
+
+    publish_historical_completion(legacy_completion)
+    predecessor_bytes = {
+        path: path.read_bytes()
+        for path in (
+            close_path,
+            close_path.with_suffix(close_path.suffix + ".sha256"),
+            prepared_path,
+            prepared_path.with_suffix(prepared_path.suffix + ".sha256"),
+        )
+    }
+    expected_correction_path = (
+        controller.state_root
+        / "historical-compaction"
+        / "corrections"
+        / f"{label}.json"
+    )
+    future_completion = dict(legacy_completion)
+    future_completion["committed_at_utc"] = (
+        datetime.now(UTC) + timedelta(days=1)
+    ).isoformat()
+    _write_signed_json(completion_path, future_completion)
+    with pytest.raises(LifecycleError, match="prerequisites differ"):
+        controller.write_historical_completion_correction(label)
+    assert not expected_correction_path.exists()
+    assert not expected_correction_path.with_suffix(
+        expected_correction_path.suffix + ".sha256"
+    ).exists()
+
+    republished_legacy = dict(legacy_completion)
+    republished_legacy["committed_at_utc"] = (
+        datetime.fromisoformat(str(prepared_payload["committed_at_utc"]))
+        + timedelta(microseconds=1)
+    ).astimezone(UTC).isoformat()
+    _write_signed_json(completion_path, republished_legacy)
+    observed_completion_bytes = {
+        path: path.read_bytes()
+        for path in (
+            completion_path,
+            completion_path.with_suffix(completion_path.suffix + ".sha256"),
+        )
+    }
+    assert controller.audit()["passed"] is False
+    correction_path = controller.write_historical_completion_correction(
+        label
+    )
+    assert correction_path == expected_correction_path
+    correction_payload = json.loads(
+        correction_path.read_text(encoding="utf-8")
+    )
+    assert controller.audit()["passed"] is True
+    assert (
+        controller.write_historical_completion_correction(label)
+        == correction_path
+    )
+    assert all(path.read_bytes() == data for path, data in predecessor_bytes.items())
+    assert all(
+        path.read_bytes() == data
+        for path, data in observed_completion_bytes.items()
+    )
+    tampered_correction = dict(correction_payload)
+    tampered_correction["migration_ledger_sha256"] = "4" * 64
+    _write_signed_json(correction_path, tampered_correction)
+    assert controller.audit()["passed"] is False
+    tampered_correction_bytes = correction_path.read_bytes()
+    with pytest.raises(LifecycleError, match="correction identity differs"):
+        controller.write_historical_completion_correction(label)
+    assert correction_path.read_bytes() == tampered_correction_bytes
+    _write_signed_json(correction_path, correction_payload)
+    assert controller.audit()["passed"] is True
+
+    publish_historical_completion(completion_payload)
+    assert controller.audit()["passed"] is True
+    republished_current = dict(completion_payload)
+    republished_current["committed_at_utc"] = datetime.now(UTC).isoformat()
+    _write_signed_json(completion_path, republished_current)
+    assert controller.audit()["passed"] is False
+    with pytest.raises(LifecycleError, match="prerequisites differ"):
+        controller.write_historical_completion_correction(label)
+    publish_historical_completion(completion_payload)
+    assert controller.audit()["passed"] is True
     assert (
         controller.apply_historical_compaction(
             label,
