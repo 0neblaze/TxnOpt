@@ -443,6 +443,55 @@ def test_preflight_allows_only_monotonic_remaining_archive_projection(
     )
     reconciliation_payload = json.loads(reconciliation.read_text(encoding="utf-8"))
     assert reconciliation_payload["storage_permit_sha256"] == initial_permit_sha256
+    ledger_path = tmp_path / "state" / "capacity_ledger.json"
+    ledger_before = ledger_path.read_bytes()
+    reconciliation_before = reconciliation.read_bytes()
+    reconciliation_sidecar_before = reconciliation.with_suffix(
+        reconciliation.suffix + ".sha256"
+    ).read_bytes()
+    successor = governance.write_permit_reconciliation_successor(
+        request.run_label,
+        evidence_sha256="9" * 64,
+    )
+    successor_before = successor.read_bytes()
+    successor_payload = json.loads(successor_before)
+    assert successor_payload == {
+        "created_at_utc": successor_payload["created_at_utc"],
+        "outcome": "retained",
+        "predecessor_evidence_sha256": "8" * 64,
+        "predecessor_reconciliation_sha256": hashlib.sha256(
+            reconciliation_before
+        ).hexdigest(),
+        "reason": "retention_completed_after_capacity_release",
+        "run_label": request.run_label,
+        "schema_version": "experiment-capacity-reconciliation-successor-v1",
+        "storage_permit_sha256": initial_permit_sha256,
+        "successor_evidence_sha256": "9" * 64,
+    }
+    assert governance.write_permit_reconciliation_successor(
+        request.run_label,
+        evidence_sha256="9" * 64,
+    ) == successor
+    assert governance.reconcile_permit(
+        request.run_label,
+        outcome="retained",
+        evidence_sha256="8" * 64,
+    ) == reconciliation
+    assert successor.read_bytes() == successor_before
+    assert ledger_path.read_bytes() == ledger_before
+    assert reconciliation.read_bytes() == reconciliation_before
+    assert (
+        reconciliation.with_suffix(reconciliation.suffix + ".sha256").read_bytes()
+        == reconciliation_sidecar_before
+    )
+    with pytest.raises(
+        StorageGovernanceError,
+        match="successor identity differs",
+    ):
+        governance.write_permit_reconciliation_successor(
+            request.run_label,
+            evidence_sha256="a" * 64,
+        )
     with pytest.raises(StorageCapacityError, match="conflicts"):
         governance.preflight_run(
             replace(request, planned_archive_bytes=1 * GIB)

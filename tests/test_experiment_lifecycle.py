@@ -404,6 +404,68 @@ def _storage_reconciliation(
     return path
 
 
+def _storage_reconciliation_successor(
+    controller: ExperimentLifecycleController,
+    label: str,
+    *,
+    predecessor_evidence_sha256: str = "f" * 64,
+) -> Path:
+    record = next(item for item in controller.records() if item.run_label == label)
+    successor_evidence_sha256 = (
+        record.retention_receipt_sha256
+        if record.state == LifecycleState.RETAINED
+        else record.compaction_receipt_sha256
+    )
+    permit_path = controller.capacity_state_root / "permits" / f"{label}.json"
+    permit_sha256 = hashlib.sha256(permit_path.read_bytes()).hexdigest()
+    ledger_path = controller.capacity_state_root / "capacity_ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["reservations"][label].update(
+        status="reconciled",
+        outcome="retained",
+        evidence_sha256=predecessor_evidence_sha256,
+        storage_permit_sha256=permit_sha256,
+    )
+    _write_signed_json(ledger_path, ledger)
+    predecessor_path = (
+        controller.capacity_state_root
+        / "permit_reconciliations"
+        / f"{label}.json"
+    )
+    _write_signed_json(
+        predecessor_path,
+        {
+            "schema_version": "experiment-capacity-reconciliation-v1",
+            "run_label": label,
+            "outcome": "retained",
+            "evidence_sha256": predecessor_evidence_sha256,
+            "storage_permit_sha256": permit_sha256,
+        },
+    )
+    successor_path = (
+        controller.capacity_state_root
+        / "permit_reconciliation_successors"
+        / f"{label}.json"
+    )
+    _write_signed_json(
+        successor_path,
+        {
+            "schema_version": "experiment-capacity-reconciliation-successor-v1",
+            "run_label": label,
+            "outcome": "retained",
+            "reason": "retention_completed_after_capacity_release",
+            "predecessor_reconciliation_sha256": hashlib.sha256(
+                predecessor_path.read_bytes()
+            ).hexdigest(),
+            "predecessor_evidence_sha256": predecessor_evidence_sha256,
+            "successor_evidence_sha256": successor_evidence_sha256,
+            "storage_permit_sha256": permit_sha256,
+            "created_at_utc": "2026-08-10T00:00:00+00:00",
+        },
+    )
+    return successor_path
+
+
 def _retention_binding(
     controller: ExperimentLifecycleController,
     label: str,
@@ -2226,8 +2288,37 @@ def test_complete_lifecycle_reaches_closed_only_after_retention_and_gate(
                 backend="windows_native",
                 workers=1,
             ),
-            storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
+            storage_reconciliation_path=tmp_path / "unused-reconciliation.json",
         )
+    successor_path = _storage_reconciliation_successor(controller, label)
+    predecessor_path = (
+        controller.capacity_state_root
+        / "permit_reconciliations"
+        / f"{label}.json"
+    )
+    predecessor_payload = json.loads(predecessor_path.read_text(encoding="utf-8"))
+    predecessor_path.unlink()
+    predecessor_path.with_suffix(predecessor_path.suffix + ".sha256").unlink()
+    with pytest.raises(LifecycleError, match="cannot read signed lifecycle"):
+        controller.close(
+            label,
+            performance=ClosePerformance.from_dict(performance),
+            storage_reconciliation_path=successor_path,
+        )
+    _write_signed_json(predecessor_path, predecessor_payload)
+    successor_payload = json.loads(successor_path.read_text(encoding="utf-8"))
+    successor_payload["predecessor_reconciliation_sha256"] = "0" * 64
+    _write_signed_json(successor_path, successor_payload)
+    with pytest.raises(LifecycleError, match="successor chain differs"):
+        controller.close(
+            label,
+            performance=ClosePerformance.from_dict(performance),
+            storage_reconciliation_path=successor_path,
+        )
+    successor_payload["predecessor_reconciliation_sha256"] = hashlib.sha256(
+        predecessor_path.read_bytes()
+    ).hexdigest()
+    _write_signed_json(successor_path, successor_payload)
     closed = controller.close(
         label,
         performance=ClosePerformance(
@@ -2246,9 +2337,33 @@ def test_complete_lifecycle_reaches_closed_only_after_retention_and_gate(
             backend="windows_native",
             workers=1,
         ),
-        storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
+        storage_reconciliation_path=successor_path,
     )
     assert closed.state == LifecycleState.CLOSED
+    assert controller.audit()["passed"] is True
+    close_path = controller.state_root / "close" / f"{label}.json"
+    close_payload = json.loads(close_path.read_text(encoding="utf-8"))
+    injected_historical_close = dict(close_payload)
+    injected_historical_close["historical_compaction_receipt_sha256"] = "0" * 64
+    _write_signed_json(close_path, injected_historical_close)
+    assert controller.audit()["passed"] is False
+    _write_signed_json(close_path, close_payload)
+    closed_successor_payload = json.loads(
+        successor_path.read_text(encoding="utf-8")
+    )
+    tampered_successor = dict(closed_successor_payload)
+    tampered_successor["reason"] = "tampered"
+    _write_signed_json(successor_path, tampered_successor)
+    failed_audit = controller.audit()
+    assert failed_audit["passed"] is False
+    assert failed_audit["unfinished"] == [label]
+    _write_signed_json(successor_path, closed_successor_payload)
+    predecessor_path.unlink()
+    predecessor_path.with_suffix(predecessor_path.suffix + ".sha256").unlink()
+    failed_audit = controller.audit()
+    assert failed_audit["passed"] is False
+    assert failed_audit["unfinished"] == [label]
+    _write_signed_json(predecessor_path, predecessor_payload)
     assert controller.audit()["passed"] is True
 
 
@@ -2983,6 +3098,40 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
     assert raw.is_file()
     assert controller._load(label).state == LifecycleState.CLASSIFIED
 
+    original_write_signed_json = lifecycle_module._write_signed_json
+
+    def fail_final_prepared_commit(path: Path, payload: object) -> str:
+        if (
+            path == prepared_path
+            and isinstance(payload, dict)
+            and payload.get("state") == "COMMITTED"
+        ):
+            raise LifecycleError("injected final prepared commit failure")
+        return original_write_signed_json(path, payload)
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_write_signed_json",
+        fail_final_prepared_commit,
+    )
+    with pytest.raises(LifecycleError, match="injected final prepared"):
+        controller.apply_historical_compaction(
+            label,
+            repository=tmp_path,
+            migration_ledger_path=migration_ledger,
+            historical_gate_path=gate_path,
+            plan_path=plan_path,
+            expected_plan_sha256=compaction.plan_sha256,
+            writer_is_active=lambda _path: False,
+        )
+    assert controller._load(label).state == LifecycleState.CLOSED
+    assert lifecycle_module._load_signed_json(prepared_path)["state"] == "PREPARED"
+    assert controller.audit()["passed"] is False
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_write_signed_json",
+        original_write_signed_json,
+    )
     receipt = controller.apply_historical_compaction(
         label,
         repository=tmp_path,
@@ -2998,6 +3147,46 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
     assert not raw.exists()
     assert manifest.is_file()
     assert controller._load(label).state == LifecycleState.CLOSED
+    assert controller.audit()["passed"] is True
+    compaction_receipt_path = (
+        controller.state_root / "compaction" / "receipts" / f"{label}.json"
+    )
+    import_path = (
+        controller.state_root
+        / "historical-compaction"
+        / "imports"
+        / f"{label}.json"
+    )
+    for evidence_path in (plan_path, compaction_receipt_path, import_path):
+        evidence_payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence_path.unlink()
+        evidence_path.with_suffix(evidence_path.suffix + ".sha256").unlink()
+        assert controller.audit()["passed"] is False
+        _write_signed_json(evidence_path, evidence_payload)
+        assert controller.audit()["passed"] is True
+    import_payload = json.loads(import_path.read_text(encoding="utf-8"))
+    tampered_import = dict(import_payload)
+    tampered_import["state"] = "TAMPERED"
+    _write_signed_json(import_path, tampered_import)
+    assert controller.audit()["passed"] is False
+    _write_signed_json(import_path, import_payload)
+    assert controller.audit()["passed"] is True
+    tampered_import = dict(import_payload)
+    tampered_import["historical_gate_sha256"] = "3" * 64
+    _write_signed_json(import_path, tampered_import)
+    assert controller.audit()["passed"] is False
+    _write_signed_json(import_path, import_payload)
+    tampered_import = json.loads(json.dumps(import_payload))
+    tampered_import["record"]["reviewer_status"] = "FAILED_KNOWN"
+    _write_signed_json(import_path, tampered_import)
+    assert controller.audit()["passed"] is False
+    _write_signed_json(import_path, import_payload)
+    prepared_payload = json.loads(prepared_path.read_text(encoding="utf-8"))
+    tampered_prepared = dict(prepared_payload)
+    tampered_prepared["migration_ledger_sha256"] = "4" * 64
+    _write_signed_json(prepared_path, tampered_prepared)
+    assert controller.audit()["passed"] is False
+    _write_signed_json(prepared_path, prepared_payload)
     assert controller.audit()["passed"] is True
     assert lifecycle_module._load_signed_json(prepared_path)["state"] == "COMMITTED"
     assert (

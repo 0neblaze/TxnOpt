@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import shutil
 from collections.abc import Iterator
 from dataclasses import replace
@@ -486,6 +487,30 @@ def test_unbound_resource_calibration_rejects_sealed_contract_artifact(
         )
 
 
+def test_unbound_resource_calibration_live_review_rejects_mtime_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_manifest_path, _contract_path, _contract = _resource_calibration_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    report_path = raw_manifest_path.parent.parent / "calibration_report.json"
+    report_stat = report_path.stat()
+    os.utime(
+        report_path,
+        ns=(report_stat.st_atime_ns, report_stat.st_mtime_ns + 1_000_000),
+    )
+
+    with pytest.raises(ArtifactIntegrityError, match="artifact content differs"):
+        campaign_review_module.review_unbound_resource_calibration(
+            raw_manifest_path=raw_manifest_path,
+            review_manifest_path=(
+                raw_manifest_path.parent.parent / "review" / "review_manifest.json"
+            ),
+        )
+
+
 def test_unbound_resource_calibration_retention_replay_recomputes_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -503,6 +528,12 @@ def test_unbound_resource_calibration_retention_replay_recomputes_tree(
     )
     archive_path = tmp_path / "archive" / label / "generation-0001"
     shutil.copytree(source_path, archive_path)
+    archived_report = archive_path / "calibration_report.json"
+    archived_stat = archived_report.stat()
+    os.utime(
+        archived_report,
+        ns=(archived_stat.st_atime_ns, archived_stat.st_mtime_ns + 1_000_000),
+    )
     replay_path = tmp_path / "retention" / "replay.json"
 
     result = (

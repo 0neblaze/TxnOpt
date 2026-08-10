@@ -3646,14 +3646,35 @@ class ExperimentStorageGovernance:
                     raise StorageGovernanceError(
                         "capacity permit reconciliation identity differs"
                     )
+                stable_receipt: dict[str, object] = {
+                    "schema_version": "experiment-capacity-reconciliation-v1",
+                    "run_label": run_label,
+                    "outcome": outcome,
+                    "evidence_sha256": evidence_sha256,
+                    "storage_permit_sha256": permit_sha256,
+                }
+                receipt_sidecar = receipt_path.with_suffix(
+                    receipt_path.suffix + ".sha256"
+                )
+                if receipt_path.exists() or receipt_sidecar.exists():
+                    existing = _load_signed_json(receipt_path)
+                    if (
+                        set(existing) != {*stable_receipt, "reconciled_at_utc"}
+                        or any(
+                            existing.get(key) != value
+                            for key, value in stable_receipt.items()
+                        )
+                        or not isinstance(existing.get("reconciled_at_utc"), str)
+                        or not existing["reconciled_at_utc"]
+                    ):
+                        raise StorageGovernanceError(
+                            "capacity permit reconciliation receipt differs"
+                        )
+                    return receipt_path
                 _write_signed_json(
                     receipt_path,
                     {
-                        "schema_version": "experiment-capacity-reconciliation-v1",
-                        "run_label": run_label,
-                        "outcome": outcome,
-                        "evidence_sha256": evidence_sha256,
-                        "storage_permit_sha256": permit_sha256,
+                        **stable_receipt,
                         "reconciled_at_utc": datetime.now(UTC).isoformat(),
                     },
                 )
@@ -3683,6 +3704,109 @@ class ExperimentStorageGovernance:
             )
             _write_signed_json(receipt_path, receipt)
         return receipt_path
+
+    def write_permit_reconciliation_successor(
+        self,
+        run_label: str,
+        *,
+        evidence_sha256: str,
+    ) -> Path:
+        """Bind completed retention after an earlier capacity-only release.
+
+        The original capacity ledger and reconciliation stay immutable. This
+        signed successor proves the exact predecessor receipt and the later
+        lifecycle disposition without reopening or rewriting the reservation.
+        """
+
+        if _RUN_LABEL.fullmatch(run_label) is None:
+            raise ValueError("permit run label is invalid")
+        if _SHA256.fullmatch(evidence_sha256) is None:
+            raise ValueError("permit successor evidence SHA-256 is invalid")
+        ledger_path = self.state_root / "capacity_ledger.json"
+        lock_path = self.state_root / "capacity_ledger.lock"
+        permit_path = self.state_root / "permits" / f"{run_label}.json"
+        predecessor_path = (
+            self.state_root / "permit_reconciliations" / f"{run_label}.json"
+        )
+        successor_path = (
+            self.state_root
+            / "permit_reconciliation_successors"
+            / f"{run_label}.json"
+        )
+        with _state_lock(lock_path):
+            if not permit_path.is_file():
+                raise StorageGovernanceError("capacity permit receipt does not exist")
+            permit_sha256 = _file_sha256(permit_path)
+            if not ledger_path.is_file():
+                raise StorageGovernanceError("capacity ledger does not exist")
+            reservations = _reservation_mapping(_load_signed_json(ledger_path))
+            reservation = reservations.get(run_label)
+            if (
+                reservation is None
+                or reservation.get("status") != "reconciled"
+                or reservation.get("outcome") != "retained"
+                or reservation.get("storage_permit_sha256") != permit_sha256
+            ):
+                raise StorageGovernanceError(
+                    "capacity ledger cannot authorize a reconciliation successor"
+                )
+            predecessor = _load_signed_json(predecessor_path)
+            predecessor_evidence = predecessor.get("evidence_sha256")
+            if (
+                predecessor.get("schema_version")
+                != "experiment-capacity-reconciliation-v1"
+                or predecessor.get("run_label") != run_label
+                or predecessor.get("outcome") != "retained"
+                or predecessor_evidence != reservation.get("evidence_sha256")
+                or predecessor.get("storage_permit_sha256") != permit_sha256
+            ):
+                raise StorageGovernanceError(
+                    "capacity reconciliation predecessor differs from the ledger"
+                )
+            if evidence_sha256 == predecessor_evidence:
+                raise StorageGovernanceError(
+                    "capacity reconciliation successor does not advance evidence"
+                )
+            stable_payload: dict[str, object] = {
+                "schema_version": (
+                    "experiment-capacity-reconciliation-successor-v1"
+                ),
+                "run_label": run_label,
+                "outcome": "retained",
+                "reason": "retention_completed_after_capacity_release",
+                "predecessor_reconciliation_sha256": _file_sha256(
+                    predecessor_path
+                ),
+                "predecessor_evidence_sha256": predecessor_evidence,
+                "successor_evidence_sha256": evidence_sha256,
+                "storage_permit_sha256": permit_sha256,
+            }
+            successor_sidecar = successor_path.with_suffix(
+                successor_path.suffix + ".sha256"
+            )
+            if successor_path.exists() or successor_sidecar.exists():
+                existing = _load_signed_json(successor_path)
+                if (
+                    set(existing) != {*stable_payload, "created_at_utc"}
+                    or any(
+                        existing.get(key) != value
+                        for key, value in stable_payload.items()
+                    )
+                    or not isinstance(existing.get("created_at_utc"), str)
+                    or not existing["created_at_utc"]
+                ):
+                    raise StorageGovernanceError(
+                        "capacity reconciliation successor identity differs"
+                    )
+                return successor_path
+            _write_signed_json(
+                successor_path,
+                {
+                    **stable_payload,
+                    "created_at_utc": datetime.now(UTC).isoformat(),
+                },
+            )
+        return successor_path
 
     def write_lifecycle_retention_binding(
         self,

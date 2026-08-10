@@ -7172,7 +7172,7 @@ def _resource_calibration_review_payload(
         stat = path.stat()
         if (
             stat.st_size != byte_size
-            or stat.st_mtime_ns != modified_time_ns
+            or (expected_run_label is None and stat.st_mtime_ns != modified_time_ns)
             or _sha256(path) != checksum
         ):
             raise ArtifactIntegrityError("calibration artifact content differs")

@@ -49,6 +49,24 @@ _SHA256: Final = re.compile(r"[0-9a-f]{64}")
 _RUN_LABEL: Final = re.compile(
     r"stage0[0-8](?:\.[0-9]+)?_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}"
 )
+_HISTORICAL_PREPARED_IDENTITY_FIELDS: Final = (
+    "schema_version",
+    "run_label",
+    "compaction_plan_sha256",
+    "historical_gate_sha256",
+    "migration_ledger_sha256",
+    "content_inventory_sha256",
+    "review_manifest_sha256",
+    "legacy_registry_sha256",
+    "source_tree_sha256",
+    "retention_class",
+    "source_root",
+    "keep_file_count",
+    "keep_bytes",
+    "delete_file_count",
+    "delete_bytes",
+    "created_at_utc",
+)
 _WRITER_LEASES: list[tuple[int, Path, Path]] = []
 
 
@@ -143,6 +161,21 @@ def _canonical_json(payload: object) -> bytes:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _historical_prepared_identity_sha256(
+    payload: Mapping[str, object],
+) -> str:
+    try:
+        identity = {
+            field: payload[field]
+            for field in _HISTORICAL_PREPARED_IDENTITY_FIELDS
+        }
+    except KeyError as error:
+        raise LifecycleError(
+            "historical compaction prepared identity is incomplete"
+        ) from error
+    return _sha256_bytes(_canonical_json(identity))
 
 
 def _sha256_file(path: Path) -> str:
@@ -2330,7 +2363,10 @@ class ExperimentLifecycleController:
         if self._record_path(run_label).is_file():
             existing = self._load(run_label)
             if existing.state == LifecycleState.CLOSED:
-                if not self._close_receipt_valid(existing):
+                if not self._close_receipt_valid(
+                    existing,
+                    allow_historical_prepared_recovery=True,
+                ):
                     raise LifecycleError("historical compaction close receipt is invalid")
                 completion = _load_signed_json(completion_path)
                 if (
@@ -2439,15 +2475,29 @@ class ExperimentLifecycleController:
                     / f"{run_label}.json"
                 ),
             )
+        historical_import_path = (
+            self.state_root
+            / "historical-compaction"
+            / "imports"
+            / f"{run_label}.json"
+        )
         completion = {
             "schema_version": HISTORICAL_COMPACTION_SCHEMA_VERSION,
             "run_label": run_label,
             "status": "COMMITTED",
             "historical_gate_sha256": _sha256_file(historical_gate_path),
+            "migration_ledger_sha256": _sha256_file(migration_ledger_path),
             "content_inventory_sha256": _sha256_file(inventory_path),
             "review_manifest_sha256": _sha256_file(review_path),
             "compaction_plan_sha256": expected_plan_sha256,
+            "compaction_plan_receipt_sha256": _sha256_file(plan_path),
             "compaction_receipt_sha256": receipt.receipt_sha256,
+            "historical_import_receipt_sha256": _sha256_file(
+                historical_import_path
+            ),
+            "prepared_identity_sha256": _historical_prepared_identity_sha256(
+                prepared
+            ),
             "released_bytes": receipt.released_bytes,
             "deleted_file_count": receipt.deleted_file_count,
             "final_tree_sha256": receipt.final_tree_sha256,
@@ -2646,7 +2696,131 @@ class ExperimentLifecycleController:
         payload["superseded_by"] = successor_label
         return payload
 
-    def _close_receipt_valid(self, record: RunLifecycleRecord) -> bool:
+    def _validate_storage_reconciliation(
+        self,
+        record: RunLifecycleRecord,
+        *,
+        disposition_sha256: str,
+        storage_reconciliation_path: Path,
+    ) -> None:
+        """Replay the direct or successor capacity chain for one disposition."""
+
+        if _SHA256.fullmatch(disposition_sha256) is None:
+            raise LifecycleError("lifecycle disposition identity is invalid")
+        direct_reconciliation_path = (
+            self.capacity_state_root
+            / "permit_reconciliations"
+            / f"{record.run_label}.json"
+        ).resolve()
+        successor_reconciliation_path = (
+            self.capacity_state_root
+            / "permit_reconciliation_successors"
+            / f"{record.run_label}.json"
+        ).resolve()
+        resolved_reconciliation_path = storage_reconciliation_path.resolve(strict=True)
+        predecessor_evidence_sha256: object
+        if resolved_reconciliation_path == direct_reconciliation_path:
+            reconciliation = _load_signed_json(storage_reconciliation_path)
+            if (
+                reconciliation.get("schema_version")
+                != "experiment-capacity-reconciliation-v1"
+                or reconciliation.get("run_label") != record.run_label
+                or reconciliation.get("outcome") != "retained"
+                or reconciliation.get("evidence_sha256") != disposition_sha256
+                or reconciliation.get("storage_permit_sha256")
+                != record.storage_permit_sha256
+            ):
+                raise LifecycleError(
+                    "storage permit reconciliation does not bind retention"
+                )
+            predecessor_evidence_sha256 = disposition_sha256
+        elif resolved_reconciliation_path == successor_reconciliation_path:
+            reconciliation = _load_signed_json(storage_reconciliation_path)
+            predecessor = _load_signed_json(direct_reconciliation_path)
+            predecessor_evidence_sha256 = reconciliation.get(
+                "predecessor_evidence_sha256"
+            )
+            expected_successor_fields = {
+                "schema_version",
+                "run_label",
+                "outcome",
+                "reason",
+                "predecessor_reconciliation_sha256",
+                "predecessor_evidence_sha256",
+                "successor_evidence_sha256",
+                "storage_permit_sha256",
+                "created_at_utc",
+            }
+            if (
+                set(reconciliation) != expected_successor_fields
+                or reconciliation.get("schema_version")
+                != "experiment-capacity-reconciliation-successor-v1"
+                or reconciliation.get("run_label") != record.run_label
+                or reconciliation.get("outcome") != "retained"
+                or reconciliation.get("reason")
+                != "retention_completed_after_capacity_release"
+                or reconciliation.get("predecessor_reconciliation_sha256")
+                != _sha256_file(direct_reconciliation_path)
+                or not isinstance(predecessor_evidence_sha256, str)
+                or _SHA256.fullmatch(predecessor_evidence_sha256) is None
+                or predecessor_evidence_sha256 == disposition_sha256
+                or reconciliation.get("successor_evidence_sha256")
+                != disposition_sha256
+                or reconciliation.get("storage_permit_sha256")
+                != record.storage_permit_sha256
+                or not isinstance(reconciliation.get("created_at_utc"), str)
+                or not reconciliation["created_at_utc"]
+                or predecessor.get("schema_version")
+                != "experiment-capacity-reconciliation-v1"
+                or predecessor.get("run_label") != record.run_label
+                or predecessor.get("outcome") != "retained"
+                or predecessor.get("evidence_sha256")
+                != predecessor_evidence_sha256
+                or predecessor.get("storage_permit_sha256")
+                != record.storage_permit_sha256
+            ):
+                raise LifecycleError(
+                    "storage permit reconciliation successor chain differs"
+                )
+        else:
+            raise LifecycleError("storage reconciliation is outside capacity governance")
+        permit_path = (
+            self.capacity_state_root / "permits" / f"{record.run_label}.json"
+        )
+        if (
+            not permit_path.is_file()
+            or _sha256_file(permit_path) != record.storage_permit_sha256
+        ):
+            raise LifecycleError("capacity permit identity differs at close")
+        permit = _load_signed_json(permit_path)
+        ledger_path = self.capacity_state_root / "capacity_ledger.json"
+        ledger = _load_signed_json(ledger_path)
+        reservations = ledger.get("reservations")
+        reservation = (
+            reservations.get(record.run_label)
+            if isinstance(reservations, dict)
+            else None
+        )
+        if (
+            permit.get("run_label") != record.run_label
+            or permit.get("stage_plan_sha256") != record.plan_sha256
+            or not isinstance(reservation, dict)
+            or reservation.get("status") != "reconciled"
+            or reservation.get("stage_plan_sha256") != record.plan_sha256
+            or reservation.get("outcome") != "retained"
+            or reservation.get("evidence_sha256")
+            != predecessor_evidence_sha256
+            or reservation.get("storage_permit_sha256")
+            != record.storage_permit_sha256
+        ):
+            raise LifecycleError("capacity ledger does not reconcile the lifecycle")
+
+    def _close_receipt_valid(
+        self,
+        record: RunLifecycleRecord,
+        *,
+        allow_historical_prepared_recovery: bool = False,
+    ) -> bool:
         if record.state != LifecycleState.CLOSED:
             return False
         path = self.state_root / "close" / f"{record.run_label}.json"
@@ -2654,11 +2828,264 @@ class ExperimentLifecycleController:
             receipt = _load_signed_json(path)
         except LifecycleError:
             return False
-        return (
-            receipt.get("status") == "CLOSED"
+        valid_receipt = (
+            receipt.get("schema_version") == LIFECYCLE_SCHEMA_VERSION
+            and receipt.get("status") == "CLOSED"
             and receipt.get("run_label") == record.run_label
             and receipt.get("record") == record.to_dict()
         )
+        if not valid_receipt:
+            return False
+        historical_compaction_sha256 = receipt.get(
+            "historical_compaction_receipt_sha256"
+        )
+        if historical_compaction_sha256 is not None:
+            if (
+                set(receipt)
+                != {
+                    "schema_version",
+                    "run_label",
+                    "status",
+                    "record",
+                    "historical_compaction_receipt_sha256",
+                }
+                or not isinstance(historical_compaction_sha256, str)
+                or _SHA256.fullmatch(historical_compaction_sha256) is None
+                or not isinstance(record.compaction_plan_sha256, str)
+                or _SHA256.fullmatch(record.compaction_plan_sha256) is None
+                or not isinstance(record.compaction_receipt_sha256, str)
+                or _SHA256.fullmatch(record.compaction_receipt_sha256) is None
+            ):
+                return False
+            completion_path = (
+                self.state_root
+                / "historical-compaction"
+                / "receipts"
+                / f"{record.run_label}.json"
+            )
+            prepared_path = (
+                self.state_root
+                / "historical-compaction"
+                / "prepared"
+                / f"{record.run_label}.json"
+            )
+            plan_path = (
+                self.state_root
+                / "historical-compaction"
+                / "plans"
+                / record.run_label
+                / f"{record.compaction_plan_sha256}.json"
+            )
+            compaction_receipt_path = (
+                self.state_root
+                / "compaction"
+                / "receipts"
+                / f"{record.run_label}.json"
+            )
+            import_path = (
+                self.state_root
+                / "historical-compaction"
+                / "imports"
+                / f"{record.run_label}.json"
+            )
+            try:
+                if _sha256_file(completion_path) != historical_compaction_sha256:
+                    return False
+                completion = _load_signed_json(completion_path)
+                prepared = _load_signed_json(prepared_path)
+                plan_payload = _load_signed_json(plan_path)
+                plan = CompactionPlan.from_dict(plan_payload)
+                plan_receipt_sha256 = _sha256_file(plan_path)
+                compaction_receipt = _load_signed_json(compaction_receipt_path)
+                compaction_receipt_sha256 = _sha256_file(
+                    compaction_receipt_path
+                )
+                imported = _load_signed_json(import_path)
+                import_receipt_sha256 = _sha256_file(import_path)
+                prepared_identity_sha256 = (
+                    _historical_prepared_identity_sha256(prepared)
+                )
+                imported_record_payload = imported.get("record")
+                if not isinstance(imported_record_payload, dict):
+                    return False
+                imported_record = RunLifecycleRecord.from_dict(
+                    imported_record_payload
+                )
+                expected_imported_record = record.to_dict()
+                expected_imported_record.update(
+                    state=LifecycleState.CLASSIFIED.value,
+                    transition_ordinal=0,
+                    updated_at_utc=record.created_at_utc,
+                    compaction_receipt_sha256="",
+                )
+            except (KeyError, LifecycleError, OSError, TypeError, ValueError):
+                return False
+            return (
+                set(completion)
+                == {
+                    "schema_version",
+                    "run_label",
+                    "status",
+                    "historical_gate_sha256",
+                    "migration_ledger_sha256",
+                    "content_inventory_sha256",
+                    "review_manifest_sha256",
+                    "compaction_plan_sha256",
+                    "compaction_plan_receipt_sha256",
+                    "compaction_receipt_sha256",
+                    "historical_import_receipt_sha256",
+                    "prepared_identity_sha256",
+                    "released_bytes",
+                    "deleted_file_count",
+                    "final_tree_sha256",
+                    "committed_at_utc",
+                }
+                and (
+                    (
+                        prepared.get("state") == "COMMITTED"
+                        and set(prepared)
+                        == {
+                            *_HISTORICAL_PREPARED_IDENTITY_FIELDS,
+                            "state",
+                            "completion_receipt_sha256",
+                            "committed_at_utc",
+                        }
+                    )
+                    or (
+                        allow_historical_prepared_recovery
+                        and prepared.get("state") == "PREPARED"
+                        and set(prepared)
+                        == {
+                            *_HISTORICAL_PREPARED_IDENTITY_FIELDS,
+                            "state",
+                        }
+                    )
+                )
+                and set(imported)
+                == {
+                    "schema_version",
+                    "run_label",
+                    "state",
+                    "historical_gate_sha256",
+                    "content_inventory_sha256",
+                    "review_manifest_sha256",
+                    "compaction_plan_sha256",
+                    "record",
+                }
+                and set(compaction_receipt)
+                == {
+                    "schema_version",
+                    "run_label",
+                    "state",
+                    "compaction_plan_sha256",
+                    "released_bytes",
+                    "deleted_file_count",
+                    "final_tree_sha256",
+                    "delete_traversals",
+                    "committed_at_utc",
+                }
+                and completion.get("schema_version")
+                == HISTORICAL_COMPACTION_SCHEMA_VERSION
+                and completion.get("run_label") == record.run_label
+                and completion.get("status") == "COMMITTED"
+                and completion.get("compaction_plan_sha256")
+                == record.compaction_plan_sha256
+                and completion.get("compaction_receipt_sha256")
+                == record.compaction_receipt_sha256
+                and completion.get("compaction_plan_receipt_sha256")
+                == plan_receipt_sha256
+                and completion.get("historical_import_receipt_sha256")
+                == import_receipt_sha256
+                and completion.get("prepared_identity_sha256")
+                == prepared_identity_sha256
+                and prepared.get("schema_version")
+                == HISTORICAL_COMPACTION_SCHEMA_VERSION
+                and prepared.get("run_label") == record.run_label
+                and prepared.get("compaction_plan_sha256")
+                == record.compaction_plan_sha256
+                and (
+                    (
+                        prepared.get("state") == "COMMITTED"
+                        and prepared.get("completion_receipt_sha256")
+                        == historical_compaction_sha256
+                    )
+                    or (
+                        allow_historical_prepared_recovery
+                        and prepared.get("state") == "PREPARED"
+                    )
+                )
+                and completion.get("historical_gate_sha256")
+                == prepared.get("historical_gate_sha256")
+                == imported.get("historical_gate_sha256")
+                and completion.get("migration_ledger_sha256")
+                == prepared.get("migration_ledger_sha256")
+                and completion.get("content_inventory_sha256")
+                == prepared.get("content_inventory_sha256")
+                == imported.get("content_inventory_sha256")
+                == record.content_inventory_sha256
+                and completion.get("review_manifest_sha256")
+                == prepared.get("review_manifest_sha256")
+                == imported.get("review_manifest_sha256")
+                == record.review_manifest_sha256
+                and plan.run_label == record.run_label
+                and plan.plan_sha256 == record.compaction_plan_sha256
+                and plan.retention_class == record.retention_class
+                and plan_payload == plan.to_dict()
+                and compaction_receipt.get("schema_version")
+                == COMPACTION_SCHEMA_VERSION
+                and compaction_receipt.get("run_label") == record.run_label
+                and compaction_receipt.get("state") == "COMMITTED"
+                and compaction_receipt.get("compaction_plan_sha256")
+                == record.compaction_plan_sha256
+                and compaction_receipt_sha256 == record.compaction_receipt_sha256
+                and completion.get("released_bytes")
+                == compaction_receipt.get("released_bytes")
+                and completion.get("deleted_file_count")
+                == compaction_receipt.get("deleted_file_count")
+                and completion.get("final_tree_sha256")
+                == compaction_receipt.get("final_tree_sha256")
+                and imported.get("schema_version")
+                == HISTORICAL_COMPACTION_SCHEMA_VERSION
+                and imported.get("run_label") == record.run_label
+                and imported.get("state") == "CLASSIFIED"
+                and imported.get("compaction_plan_sha256")
+                == record.compaction_plan_sha256
+                and imported_record.to_dict() == expected_imported_record
+            )
+        reconciliation_sha256 = receipt.get("storage_reconciliation_sha256")
+        if (
+            not isinstance(reconciliation_sha256, str)
+            or _SHA256.fullmatch(reconciliation_sha256) is None
+        ):
+            return False
+        candidates = (
+            self.capacity_state_root
+            / "permit_reconciliations"
+            / f"{record.run_label}.json",
+            self.capacity_state_root
+            / "permit_reconciliation_successors"
+            / f"{record.run_label}.json",
+        )
+        matching_paths = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.is_file()
+            and _sha256_file(candidate) == reconciliation_sha256
+        )
+        disposition_sha256 = (
+            record.compaction_receipt_sha256 or record.retention_receipt_sha256
+        )
+        if len(matching_paths) != 1 or not isinstance(disposition_sha256, str):
+            return False
+        try:
+            self._validate_storage_reconciliation(
+                record,
+                disposition_sha256=disposition_sha256,
+                storage_reconciliation_path=matching_paths[0],
+            )
+        except (LifecycleError, OSError):
+            return False
+        return True
 
     def plan(self, plan: ExperimentPlan) -> RunLifecycleRecord:
         spec = self.catalog.for_run_label(plan.run_label)
@@ -4437,49 +4864,13 @@ class ExperimentLifecycleController:
             if record.state == LifecycleState.RETAINED
             else record.compaction_receipt_sha256
         )
-        expected_reconciliation_path = (
-            self.capacity_state_root
-            / "permit_reconciliations"
-            / f"{run_label}.json"
-        ).resolve()
-        if storage_reconciliation_path.resolve(strict=True) != (
-            expected_reconciliation_path
-        ):
-            raise LifecycleError("storage reconciliation is outside capacity governance")
-        reconciliation = _load_signed_json(storage_reconciliation_path)
-        if (
-            reconciliation.get("schema_version")
-            != "experiment-capacity-reconciliation-v1"
-            or reconciliation.get("run_label") != run_label
-            or reconciliation.get("outcome") != "retained"
-            or reconciliation.get("evidence_sha256") != disposition_sha256
-            or reconciliation.get("storage_permit_sha256")
-            != record.storage_permit_sha256
-        ):
-            raise LifecycleError("storage permit reconciliation does not bind retention")
-        permit_path = self.capacity_state_root / "permits" / f"{run_label}.json"
-        if (
-            not permit_path.is_file()
-            or _sha256_file(permit_path) != record.storage_permit_sha256
-        ):
-            raise LifecycleError("capacity permit identity differs at close")
-        permit = _load_signed_json(permit_path)
-        ledger_path = self.capacity_state_root / "capacity_ledger.json"
-        ledger = _load_signed_json(ledger_path)
-        reservations = ledger.get("reservations")
-        reservation = (
-            reservations.get(run_label) if isinstance(reservations, dict) else None
+        if not isinstance(disposition_sha256, str):
+            raise LifecycleError("lifecycle disposition identity is missing")
+        self._validate_storage_reconciliation(
+            record,
+            disposition_sha256=disposition_sha256,
+            storage_reconciliation_path=storage_reconciliation_path,
         )
-        if (
-            permit.get("run_label") != run_label
-            or permit.get("stage_plan_sha256") != record.plan_sha256
-            or not isinstance(reservation, dict)
-            or reservation.get("status") != "reconciled"
-            or reservation.get("stage_plan_sha256") != record.plan_sha256
-            or reservation.get("outcome") != "retained"
-            or reservation.get("evidence_sha256") != disposition_sha256
-        ):
-            raise LifecycleError("capacity ledger does not reconcile the lifecycle")
         if retained_archive_path is not None and retained_archive_snapshot is not None:
             _verify_tree_metadata_snapshot(
                 retained_archive_path,
@@ -4530,14 +4921,24 @@ class ExperimentLifecycleController:
     def audit(self) -> dict[str, object]:
         records = self.records()
         effective_records = [self.status_payload(item) for item in records]
+        close_receipt_validity = {
+            item.run_label: self._close_receipt_valid(item) for item in records
+        }
         blocked = [
             item.run_label
             for item in records
             if item.state == LifecycleState.BLOCKED_RETENTION
         ]
         unfinished = [
-            item.run_label for item in records if not self._close_receipt_valid(item)
+            item.run_label
+            for item in records
+            if not close_receipt_validity[item.run_label]
         ]
+        invalid_closed = any(
+            item.state == LifecycleState.CLOSED
+            and not close_receipt_validity[item.run_label]
+            for item in records
+        )
         return {
             "schema_version": LIFECYCLE_SCHEMA_VERSION,
             "catalog_sha256": self.catalog.catalog_sha256,
@@ -4545,7 +4946,7 @@ class ExperimentLifecycleController:
             "blocked_retention": blocked,
             "unfinished": unfinished,
             "effective_records": effective_records,
-            "passed": not blocked and len(unfinished) <= 1,
+            "passed": not blocked and not invalid_closed and len(unfinished) <= 1,
         }
 
 
