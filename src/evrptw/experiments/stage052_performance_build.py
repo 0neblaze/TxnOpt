@@ -417,6 +417,45 @@ def _compile_commands_receipt(build_directory: Path) -> dict[str, object]:
     }
 
 
+def _verify_profile_compile_commands(
+    profile: str,
+    receipt: Mapping[str, object],
+) -> None:
+    raw_commands = receipt.get("commands")
+    if (
+        not isinstance(raw_commands, list)
+        or not raw_commands
+        or not all(isinstance(command, str) and command for command in raw_commands)
+    ):
+        raise PerformanceBuildError("compile command receipt is invalid")
+    expected_lto = profile.endswith("-lto")
+    expected_host_native = profile == "host-native-lto"
+    for index, command in enumerate(cast(list[str], raw_commands)):
+        tokens = tuple(token.casefold() for token in shlex.split(command))
+        observed_lto = any(token.startswith("-flto") or token == "/gl" for token in tokens)
+        observed_host_native = any(token in {"-march=native", "-mtune=native"} for token in tokens)
+        if observed_lto is not expected_lto:
+            raise PerformanceBuildError(
+                f"{profile} compile command {index} has an invalid LTO surface"
+            )
+        if observed_host_native is not expected_host_native:
+            raise PerformanceBuildError(
+                f"{profile} compile command {index} has an invalid host-native surface"
+            )
+
+
+def _publish_verified_profile_receipt(
+    *,
+    profile: str,
+    receipt_path: Path,
+    receipt: WheelReceipt,
+    compile_commands: Mapping[str, object],
+) -> str:
+    _verify_profile_compile_commands(profile, compile_commands)
+    receipt.verify_files()
+    return _atomic_signed_json(receipt_path, receipt.to_dict())
+
+
 def _build_profile(
     *,
     repository: Path,
@@ -583,9 +622,13 @@ def _build_profile(
         compiler_id=cast(str, native_identity["compiler_id"]),
         source_receipt_path=receipt_path,
     )
-    receipt.verify_files()
-    receipt_sha256 = _atomic_signed_json(receipt_path, receipt.to_dict())
     compile_commands = _compile_commands_receipt(build_directory)
+    receipt_sha256 = _publish_verified_profile_receipt(
+        profile=profile,
+        receipt_path=receipt_path,
+        receipt=receipt,
+        compile_commands=compile_commands,
+    )
     profile_manifest = {
         "build_profile": profile,
         "build_seconds": build_seconds,

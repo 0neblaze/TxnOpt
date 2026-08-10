@@ -7,20 +7,24 @@ import subprocess
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from evrptw.experiments.stage052_performance_build import (
     PerformanceBuildError,
     _atomic_signed_json,
+    _publish_verified_profile_receipt,
     _safe_extract_wheel,
     _validated_python_executable,
+    _verify_profile_compile_commands,
     _verify_wheel_source_inventory,
     main,
     probe_host_native_lto_support,
     reject_ambient_build_flags,
     require_clean_revision,
 )
+from evrptw.experiments.stage052_performance_calibration import WheelReceipt
 
 
 def test_build_interpreter_preserves_virtual_environment_symlink(
@@ -37,6 +41,61 @@ def test_build_interpreter_preserves_virtual_environment_symlink(
 
     assert validated == venv_python.absolute()
     assert validated.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("profile", "flags"),
+    (
+        ("portable-o3", "-O3"),
+        ("portable-lto", "-O3 -flto=auto"),
+        ("host-native-lto", "-O3 -flto=auto -march=native"),
+    ),
+)
+def test_compile_command_profile_surface_is_explicit(
+    profile: str,
+    flags: str,
+) -> None:
+    _verify_profile_compile_commands(
+        profile,
+        {"commands": [f"/usr/bin/g++ {flags} -c source.cpp"]},
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile", "flags"),
+    (
+        ("portable-o3", "-O3 -flto=auto"),
+        ("portable-lto", "-O3"),
+        ("portable-lto", "-O3 -flto=auto -march=native"),
+        ("host-native-lto", "-O3 -flto=auto"),
+    ),
+)
+def test_compile_command_profile_surface_rejects_implicit_or_missing_flags(
+    profile: str,
+    flags: str,
+) -> None:
+    with pytest.raises(PerformanceBuildError, match="compile command"):
+        _verify_profile_compile_commands(
+            profile,
+            {"commands": [f"/usr/bin/g++ {flags} -c source.cpp"]},
+        )
+
+
+def test_invalid_compile_surface_is_rejected_before_receipt_publication(
+    tmp_path: Path,
+) -> None:
+    receipt_path = tmp_path / "wheel_receipt.json"
+
+    with pytest.raises(PerformanceBuildError, match="invalid LTO surface"):
+        _publish_verified_profile_receipt(
+            profile="portable-o3",
+            receipt_path=receipt_path,
+            receipt=cast(WheelReceipt, SimpleNamespace()),
+            compile_commands={"commands": ["/usr/bin/g++ -O3 -flto=auto -c source.cpp"]},
+        )
+
+    assert not receipt_path.exists()
+    assert not receipt_path.with_suffix(".json.sha256").exists()
 
 
 def test_performance_build_cli_requires_repository_root(tmp_path: Path) -> None:

@@ -175,7 +175,14 @@ else()
   set(EVRPTW_BUILD_CPP_SOURCE_KIND "git_blob_snapshot")
 endif()
 
-pybind11_add_module(_core "${EVRPTW_NATIVE_CPP_DIR}/evrptw_core.cpp")
+# Disable pybind11's implicit release-mode LTO/strip extras. The frozen EVRPTW
+# performance profile below is the sole owner of those build choices.
+pybind11_add_module(
+  _core
+  MODULE
+  NO_EXTRAS
+  "${EVRPTW_NATIVE_CPP_DIR}/evrptw_core.cpp"
+)
 target_include_directories(_core PRIVATE "${EVRPTW_NATIVE_CPP_DIR}")
 if(UNIX AND NOT APPLE)
   add_executable(
