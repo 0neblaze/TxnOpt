@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import evrptw.experiment_lifecycle as lifecycle_module
 import evrptw.stage052_retention as legacy_retention
 import evrptw.storage_governance as storage_governance_module
 from evrptw.stage052_campaign import (
@@ -491,6 +492,376 @@ def test_preflight_allows_only_monotonic_remaining_archive_projection(
         governance.write_permit_reconciliation_successor(
             request.run_label,
             evidence_sha256="a" * 64,
+        )
+    partial_failure_record: dict[str, object] = {
+        "schema_version": "experiment-lifecycle-v3",
+        "run_label": request.run_label,
+        "state": "RETAINED",
+        "transition_ordinal": 7,
+    }
+    partial_failure_stable: dict[str, object] = {
+        "schema_version": "experiment-lifecycle-close-failure-v1",
+        "run_label": request.run_label,
+        "failure_check": "storage_reconciliation_validation",
+        "record_sha256": hashlib.sha256(
+            storage_governance_module._lifecycle_record_bytes(
+                partial_failure_record
+            )
+        ).hexdigest(),
+        "record": partial_failure_record,
+        "record_state": "RETAINED",
+        "record_transition_ordinal": 7,
+        "transition_event_sha256": "d" * 64,
+        "storage_reconciliation_kind": "invalid_successor",
+        "storage_reconciliation_sha256": hashlib.sha256(
+            successor_before
+        ).hexdigest(),
+        "disposition_sha256": "a" * 64,
+        "error_type": "LifecycleError",
+        "error_message": (
+            "storage permit reconciliation successor chain differs"
+        ),
+    }
+    partial_failure_identity = hashlib.sha256(
+        storage_governance_module._lifecycle_canonical_json(
+            partial_failure_stable
+        )
+    ).hexdigest()
+    partial_failed_close_receipt = (
+        locator.resolve("e_archive").absolute_path
+        / ".experiment-lifecycle"
+        / "close"
+        / "failures"
+        / request.run_label
+        / f"{partial_failure_identity}.json"
+    )
+    storage_governance_module._write_signed_json(
+        partial_failed_close_receipt,
+        {
+            **partial_failure_stable,
+            "failure_identity_sha256": partial_failure_identity,
+            "created_at_utc": "2026-08-10T00:00:00+00:00",
+        },
+    )
+    correction_path = (
+        tmp_path
+        / "state"
+        / "permit_reconciliation_successor_corrections"
+        / f"{request.run_label}.json"
+    )
+    with pytest.raises(
+        StorageGovernanceError,
+        match="failure record is invalid",
+    ):
+        governance.write_permit_reconciliation_successor_correction(
+            request.run_label,
+            evidence_sha256="a" * 64,
+            failed_close_receipt_path=partial_failed_close_receipt,
+        )
+    assert not correction_path.exists()
+    assert not correction_path.with_suffix(
+        correction_path.suffix + ".sha256"
+    ).exists()
+
+    retention_performance = {
+        "hashed_bytes": 1,
+        "source_bytes": 1,
+        "scan_passes": 1,
+        "delete_traversals": 0,
+        "duplicate_hashed_bytes": 0,
+        "backend_calibrated": True,
+        "implicit_fallback": False,
+        "throughput_mib_per_second": 1.0,
+        "cpu_utilization_percent": 10.0,
+        "peak_memory_bytes": 1_024,
+        "io_utilization_percent": 10.0,
+        "close_wall_seconds": 1.0,
+        "backend": "test",
+        "workers": 1,
+    }
+    retention_path = (
+        locator.resolve("e_archive").absolute_path
+        / ".experiment-lifecycle"
+        / "retention"
+        / "receipts"
+        / f"{request.run_label}.json"
+    )
+    storage_governance_module._write_signed_json(
+        retention_path,
+        {"close_performance": retention_performance},
+    )
+    retention_sha256 = hashlib.sha256(retention_path.read_bytes()).hexdigest()
+    failure_record: dict[str, object] = {
+        "schema_version": "experiment-lifecycle-v3",
+        "run_label": request.run_label,
+        "experiment_id": "stage052_performance",
+        "state": "RETAINED",
+        "plan_sha256": "7" * 64,
+        "catalog_sha256": "2" * 64,
+        "transition_ordinal": 7,
+        "created_at_utc": "2026-08-10T00:00:00+00:00",
+        "updated_at_utc": "2026-08-10T00:00:01+00:00",
+        "storage_permit_sha256": initial_permit_sha256,
+        "sealed_manifest_sha256": "3" * 64,
+        "sealed_manifest_relative_path": "control/manifest.json",
+        "reviewer_status": "FAILED_KNOWN",
+        "review_manifest_sha256": "4" * 64,
+        "failure_code": "invalid_manifest",
+        "failure_component": "stage052_calibration",
+        "failure_check": "resource_contract_not_bound_at_seal",
+        "failure_location": "control/manifest.json",
+        "root_cause_id": "unbound-producer-resource-contract-v1",
+        "adjudication_sha256": "5" * 64,
+        "canonical_representative": request.run_label,
+        "retention_class": "unique_failure_full",
+        "retention_receipt_sha256": retention_sha256,
+        "content_inventory_sha256": "7" * 64,
+        "compaction_plan_sha256": "",
+        "compaction_receipt_sha256": "",
+        "superseded_by": "",
+        "blocked_reason": "",
+    }
+    current_record_path = (
+        locator.resolve("e_archive").absolute_path
+        / ".experiment-lifecycle"
+        / "runs"
+        / f"{request.run_label}.json"
+    )
+    lifecycle_module._write_signed_json(
+        current_record_path,
+        failure_record,
+    )
+    failure_record_sha256 = hashlib.sha256(
+        storage_governance_module._lifecycle_record_bytes(failure_record)
+    ).hexdigest()
+    transition_path = (
+        locator.resolve("e_archive").absolute_path
+        / ".experiment-lifecycle"
+        / "events"
+        / request.run_label
+        / "0007-RETAINED.json"
+    )
+    storage_governance_module._write_signed_json(
+        transition_path,
+        {
+            **failure_record,
+            "record_sha256": failure_record_sha256,
+        },
+    )
+    failure_stable_payload: dict[str, object] = {
+        "schema_version": "experiment-lifecycle-close-failure-v1",
+        "run_label": request.run_label,
+        "failure_check": "storage_reconciliation_validation",
+        "record_sha256": failure_record_sha256,
+        "record": failure_record,
+        "record_state": "RETAINED",
+        "record_transition_ordinal": 7,
+        "transition_event_sha256": hashlib.sha256(
+            transition_path.read_bytes()
+        ).hexdigest(),
+        "storage_reconciliation_kind": "invalid_successor",
+        "storage_reconciliation_sha256": hashlib.sha256(
+            successor_before
+        ).hexdigest(),
+        "disposition_sha256": retention_sha256,
+        "error_type": "LifecycleError",
+        "error_message": (
+            "storage permit reconciliation successor chain differs"
+        ),
+    }
+    failure_identity = hashlib.sha256(
+        storage_governance_module._lifecycle_canonical_json(
+            failure_stable_payload
+        )
+    ).hexdigest()
+    failed_close_receipt = (
+        locator.resolve("e_archive").absolute_path
+        / ".experiment-lifecycle"
+        / "close"
+        / "failures"
+        / request.run_label
+        / f"{failure_identity}.json"
+    )
+    storage_governance_module._write_signed_json(
+        failed_close_receipt,
+        {
+            **failure_stable_payload,
+            "failure_identity_sha256": failure_identity,
+            "created_at_utc": "2026-08-10T00:00:00+00:00",
+        },
+    )
+    wrong_current_record = {
+        **failure_record,
+        "retention_receipt_sha256": "6" * 64,
+    }
+    wrong_current_stable = {
+        **failure_stable_payload,
+        "record_sha256": hashlib.sha256(
+            storage_governance_module._lifecycle_record_bytes(
+                wrong_current_record
+            )
+        ).hexdigest(),
+        "record": wrong_current_record,
+    }
+    wrong_current_identity = hashlib.sha256(
+        storage_governance_module._lifecycle_canonical_json(
+            wrong_current_stable
+        )
+    ).hexdigest()
+    wrong_current_receipt = failed_close_receipt.with_name(
+        f"{wrong_current_identity}.json"
+    )
+    storage_governance_module._write_signed_json(
+        wrong_current_receipt,
+        {
+            **wrong_current_stable,
+            "failure_identity_sha256": wrong_current_identity,
+            "created_at_utc": "2026-08-10T00:00:00+00:00",
+        },
+    )
+    with pytest.raises(
+        StorageGovernanceError,
+        match="cannot be corrected",
+    ):
+        governance.write_permit_reconciliation_successor_correction(
+            request.run_label,
+            evidence_sha256=retention_sha256,
+            failed_close_receipt_path=wrong_current_receipt,
+        )
+    assert not correction_path.exists()
+    assert not correction_path.with_suffix(
+        correction_path.suffix + ".sha256"
+    ).exists()
+    malformed_successor = dict(successor_payload)
+    malformed_successor["unexpected"] = True
+    storage_governance_module._write_signed_json(successor, malformed_successor)
+    with pytest.raises(
+        StorageGovernanceError,
+        match="cannot be corrected",
+    ):
+        governance.write_permit_reconciliation_successor_correction(
+            request.run_label,
+            evidence_sha256=retention_sha256,
+            failed_close_receipt_path=failed_close_receipt,
+        )
+    storage_governance_module._write_signed_json(successor, successor_payload)
+    correction = governance.write_permit_reconciliation_successor_correction(
+        request.run_label,
+        evidence_sha256=retention_sha256,
+        failed_close_receipt_path=failed_close_receipt,
+    )
+    correction_before = correction.read_bytes()
+    correction_payload = json.loads(correction_before)
+    assert correction_payload == {
+        "created_at_utc": correction_payload["created_at_utc"],
+        "invalid_successor_evidence_sha256": "9" * 64,
+        "invalid_successor_reconciliation_sha256": hashlib.sha256(
+            successor_before
+        ).hexdigest(),
+        "failed_close_receipt_identity_sha256": failure_identity,
+        "failed_close_receipt_sha256": hashlib.sha256(
+            failed_close_receipt.read_bytes()
+        ).hexdigest(),
+        "outcome": "retained",
+        "predecessor_evidence_sha256": "8" * 64,
+        "predecessor_reconciliation_sha256": hashlib.sha256(
+            reconciliation_before
+        ).hexdigest(),
+        "reason": "corrected_successor_evidence_after_failed_close",
+        "run_label": request.run_label,
+        "schema_version": (
+            "experiment-capacity-reconciliation-successor-correction-v1"
+        ),
+        "storage_permit_sha256": initial_permit_sha256,
+        "successor_evidence_sha256": retention_sha256,
+    }
+    assert governance.write_permit_reconciliation_successor_correction(
+        request.run_label,
+        evidence_sha256=retention_sha256,
+        failed_close_receipt_path=failed_close_receipt,
+    ) == correction
+    closed_record = {
+        **failure_record,
+        "state": "CLOSED",
+        "transition_ordinal": 8,
+        "updated_at_utc": "2026-08-10T00:00:02+00:00",
+    }
+    lifecycle_module._write_signed_json(current_record_path, closed_record)
+    closed_transition_path = transition_path.with_name("0008-CLOSED.json")
+    lifecycle_module._write_signed_json(
+        closed_transition_path,
+        {
+            **closed_record,
+            "record_sha256": hashlib.sha256(
+                storage_governance_module._lifecycle_record_bytes(
+                    closed_record
+                )
+            ).hexdigest(),
+        },
+    )
+    close_path = (
+        current_record_path.parents[1]
+        / "close"
+        / f"{request.run_label}.json"
+    )
+    close_payload = {
+        "schema_version": "experiment-lifecycle-v3",
+        "run_label": request.run_label,
+        "status": "CLOSED",
+        "record": closed_record,
+        "storage_reconciliation_sha256": hashlib.sha256(
+            correction.read_bytes()
+        ).hexdigest(),
+        "performance": retention_performance,
+    }
+    lifecycle_module._write_signed_json(close_path, close_payload)
+    assert governance.write_permit_reconciliation_successor_correction(
+        request.run_label,
+        evidence_sha256=retention_sha256,
+        failed_close_receipt_path=failed_close_receipt,
+    ) == correction
+    assert correction.read_bytes() == correction_before
+    assert successor.read_bytes() == successor_before
+    assert ledger_path.read_bytes() == ledger_before
+    assert reconciliation.read_bytes() == reconciliation_before
+    lifecycle_module._write_signed_json(
+        close_path,
+        {**close_payload, "performance": {"backend": "test"}},
+    )
+    with pytest.raises(
+        StorageGovernanceError,
+        match="cannot be corrected",
+    ):
+        governance.write_permit_reconciliation_successor_correction(
+            request.run_label,
+            evidence_sha256=retention_sha256,
+            failed_close_receipt_path=failed_close_receipt,
+        )
+    lifecycle_module._write_signed_json(close_path, close_payload)
+    drifted_performance = dict(retention_performance)
+    drifted_performance["throughput_mib_per_second"] = 2.0
+    lifecycle_module._write_signed_json(
+        close_path,
+        {**close_payload, "performance": drifted_performance},
+    )
+    with pytest.raises(
+        StorageGovernanceError,
+        match="cannot be corrected",
+    ):
+        governance.write_permit_reconciliation_successor_correction(
+            request.run_label,
+            evidence_sha256=retention_sha256,
+            failed_close_receipt_path=failed_close_receipt,
+        )
+    lifecycle_module._write_signed_json(close_path, close_payload)
+    with pytest.raises(
+        StorageGovernanceError,
+        match="cannot be corrected",
+    ):
+        governance.write_permit_reconciliation_successor_correction(
+            request.run_label,
+            evidence_sha256="b" * 64,
+            failed_close_receipt_path=failed_close_receipt,
         )
     with pytest.raises(StorageCapacityError, match="conflicts"):
         governance.preflight_run(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -559,6 +560,269 @@ class SweepReceipt:
 
 def _canonical_json(payload: object) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _lifecycle_canonical_json(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _lifecycle_record_bytes(payload: Mapping[str, object]) -> bytes:
+    return _lifecycle_canonical_json(payload) + b"\n"
+
+
+def _validated_retained_lifecycle_record_payload(
+    payload: object,
+    *,
+    run_label: str,
+    expected_state: str = "RETAINED",
+) -> dict[str, object]:
+    """Validate the exact lifecycle record surface consumed after correction."""
+
+    if not isinstance(payload, Mapping):
+        raise StorageGovernanceError(
+            "capacity reconciliation failure record is invalid"
+        )
+    record = dict(payload)
+    expected_fields = {
+        "schema_version",
+        "run_label",
+        "experiment_id",
+        "state",
+        "plan_sha256",
+        "catalog_sha256",
+        "transition_ordinal",
+        "created_at_utc",
+        "updated_at_utc",
+        "storage_permit_sha256",
+        "sealed_manifest_sha256",
+        "sealed_manifest_relative_path",
+        "reviewer_status",
+        "review_manifest_sha256",
+        "failure_code",
+        "failure_component",
+        "failure_check",
+        "failure_location",
+        "root_cause_id",
+        "adjudication_sha256",
+        "canonical_representative",
+        "retention_class",
+        "retention_receipt_sha256",
+        "content_inventory_sha256",
+        "compaction_plan_sha256",
+        "compaction_receipt_sha256",
+        "superseded_by",
+        "blocked_reason",
+    }
+    string_fields = expected_fields.difference(
+        {"transition_ordinal", "reviewer_status", "retention_class"}
+    )
+    required_sha_fields = {
+        "plan_sha256",
+        "catalog_sha256",
+        "storage_permit_sha256",
+        "sealed_manifest_sha256",
+        "review_manifest_sha256",
+        "retention_receipt_sha256",
+        "content_inventory_sha256",
+    }
+    optional_sha_fields = {
+        "adjudication_sha256",
+        "compaction_plan_sha256",
+        "compaction_receipt_sha256",
+    }
+    ordinal = record.get("transition_ordinal")
+    sealed_relative = PurePosixPath(
+        str(record.get("sealed_manifest_relative_path", ""))
+    )
+    if (
+        set(record) != expected_fields
+        or record.get("schema_version") != "experiment-lifecycle-v3"
+        or record.get("run_label") != run_label
+        or expected_state not in {"RETAINED", "CLOSED"}
+        or record.get("state") != expected_state
+        or any(not isinstance(record.get(field), str) for field in string_fields)
+        or not isinstance(ordinal, int)
+        or isinstance(ordinal, bool)
+        or ordinal < 0
+        or not record.get("experiment_id")
+        or not record.get("created_at_utc")
+        or not record.get("updated_at_utc")
+        or any(
+            _SHA256.fullmatch(str(record.get(field, ""))) is None
+            for field in required_sha_fields
+        )
+        or any(
+            value and _SHA256.fullmatch(value) is None
+            for field in optional_sha_fields
+            if isinstance((value := record.get(field)), str)
+        )
+        or record.get("reviewer_status")
+        not in {
+            "ACCEPTED",
+            "FAILED_KNOWN",
+            "FAILED_UNKNOWN",
+            "PARTIAL",
+            "INVALID",
+        }
+        or record.get("retention_class")
+        not in {
+            "published_full",
+            "current_accepted_full",
+            "superseded_accepted_capsule",
+            "unique_failure_full",
+            "unique_failure_capsule",
+            "duplicate_failure_metadata",
+            "superseded_metadata",
+            "rebuildable",
+            "unknown_full",
+        }
+        or not record.get("sealed_manifest_relative_path")
+        or sealed_relative.is_absolute()
+        or ".." in sealed_relative.parts
+        or (
+            record.get("canonical_representative")
+            and _RUN_LABEL.fullmatch(
+                str(record["canonical_representative"])
+            )
+            is None
+        )
+        or (
+            record.get("superseded_by")
+            and _RUN_LABEL.fullmatch(str(record["superseded_by"])) is None
+        )
+    ):
+        raise StorageGovernanceError(
+            "capacity reconciliation failure record is invalid"
+        )
+    return record
+
+
+def validate_storage_permit_payload(
+    payload: object,
+    *,
+    run_label: str,
+    stage_plan_sha256: str,
+) -> dict[str, object]:
+    """Validate the exact signed permit schema shared with lifecycle control."""
+
+    if not isinstance(payload, Mapping):
+        raise StorageGovernanceError("storage permit payload is invalid")
+    permit = dict(payload)
+    expected_fields = {
+        "schema_version",
+        "run_label",
+        "stage_plan_sha256",
+        "status",
+        "observation_sha256",
+        "maintenance_audit_sha256",
+        "maintenance_audit_path",
+    }
+    if (
+        set(permit) != expected_fields
+        or permit.get("schema_version") != POLICY_SCHEMA_VERSION
+        or permit.get("run_label") != run_label
+        or permit.get("stage_plan_sha256") != stage_plan_sha256
+        or permit.get("status") != "reserved"
+        or _SHA256.fullmatch(str(permit.get("observation_sha256", "")))
+        is None
+        or _SHA256.fullmatch(
+            str(permit.get("maintenance_audit_sha256", ""))
+        )
+        is None
+        or not isinstance(permit.get("maintenance_audit_path"), str)
+        or not Path(str(permit["maintenance_audit_path"])).is_absolute()
+    ):
+        raise StorageGovernanceError("storage permit payload is invalid")
+    return permit
+
+
+def validate_close_performance_payload(
+    payload: object,
+    *,
+    enforce_gates: bool = True,
+) -> dict[str, object]:
+    """Validate the exact fail-closed performance receipt schema."""
+
+    if not isinstance(payload, Mapping):
+        raise StorageGovernanceError("close performance payload is invalid")
+    performance = dict(payload)
+    expected_fields = {
+        "hashed_bytes",
+        "source_bytes",
+        "scan_passes",
+        "delete_traversals",
+        "duplicate_hashed_bytes",
+        "backend_calibrated",
+        "implicit_fallback",
+        "throughput_mib_per_second",
+        "cpu_utilization_percent",
+        "peak_memory_bytes",
+        "io_utilization_percent",
+        "close_wall_seconds",
+        "backend",
+        "workers",
+    }
+    integer_fields = {
+        "hashed_bytes",
+        "source_bytes",
+        "scan_passes",
+        "delete_traversals",
+        "duplicate_hashed_bytes",
+        "peak_memory_bytes",
+        "workers",
+    }
+    rate_fields = {
+        "throughput_mib_per_second",
+        "cpu_utilization_percent",
+        "io_utilization_percent",
+        "close_wall_seconds",
+    }
+    if set(performance) != expected_fields or any(
+        not isinstance(performance.get(field), int)
+        or isinstance(performance.get(field), bool)
+        for field in integer_fields
+    ) or any(
+        not isinstance(performance.get(field), (int, float))
+        or isinstance(performance.get(field), bool)
+        for field in rate_fields
+    ):
+        raise StorageGovernanceError("close performance payload is invalid")
+    integers = {
+        field: cast(int, performance[field]) for field in integer_fields
+    }
+    rates = {
+        field: float(cast(int | float, performance[field]))
+        for field in rate_fields
+    }
+    if (
+        not isinstance(performance.get("backend_calibrated"), bool)
+        or not isinstance(performance.get("implicit_fallback"), bool)
+        or not isinstance(performance.get("backend"), str)
+    ):
+        raise StorageGovernanceError("close performance payload is invalid")
+    if enforce_gates and (
+        any(value < 0 for value in integers.values())
+        or any(not math.isfinite(value) for value in rates.values())
+        or integers["hashed_bytes"] > integers["source_bytes"]
+        or integers["scan_passes"] > 1
+        or integers["delete_traversals"] > 1
+        or integers["duplicate_hashed_bytes"] != 0
+        or performance.get("backend_calibrated") is not True
+        or performance.get("implicit_fallback") is not False
+        or rates["throughput_mib_per_second"] <= 0
+        or rates["cpu_utilization_percent"] < 0
+        or rates["io_utilization_percent"] < 0
+        or rates["close_wall_seconds"] <= 0
+        or not performance["backend"]
+        or integers["workers"] <= 0
+    ):
+        raise StorageGovernanceError("close performance payload is invalid")
+    return performance
 
 
 def _write_signed_json(path: Path, payload: object) -> str:
@@ -3807,6 +4071,391 @@ class ExperimentStorageGovernance:
                 },
             )
         return successor_path
+
+    def write_permit_reconciliation_successor_correction(
+        self,
+        run_label: str,
+        *,
+        evidence_sha256: str,
+        failed_close_receipt_path: Path,
+    ) -> Path:
+        """Append a signed correction after an unusable successor was published.
+
+        The predecessor, capacity ledger, and first successor remain byte-immutable.
+        A correction is permitted only when it advances to a different disposition
+        identity and binds the complete earlier chain.
+        """
+
+        if _RUN_LABEL.fullmatch(run_label) is None:
+            raise ValueError("permit run label is invalid")
+        if _SHA256.fullmatch(evidence_sha256) is None:
+            raise ValueError(
+                "permit successor correction evidence SHA-256 is invalid"
+            )
+        ledger_path = self.state_root / "capacity_ledger.json"
+        lock_path = self.state_root / "capacity_ledger.lock"
+        permit_path = self.state_root / "permits" / f"{run_label}.json"
+        predecessor_path = (
+            self.state_root / "permit_reconciliations" / f"{run_label}.json"
+        )
+        successor_path = (
+            self.state_root
+            / "permit_reconciliation_successors"
+            / f"{run_label}.json"
+        )
+        correction_path = (
+            self.state_root
+            / "permit_reconciliation_successor_corrections"
+            / f"{run_label}.json"
+        )
+        with _state_lock(lock_path):
+            if not permit_path.is_file() or not ledger_path.is_file():
+                raise StorageGovernanceError(
+                    "capacity successor correction prerequisites do not exist"
+                )
+            permit_sha256 = _file_sha256(permit_path)
+            permit_payload = _load_signed_json(permit_path)
+            reservations = _reservation_mapping(_load_signed_json(ledger_path))
+            reservation = reservations.get(run_label)
+            predecessor = _load_signed_json(predecessor_path)
+            successor = _load_signed_json(successor_path)
+            predecessor_evidence = predecessor.get("evidence_sha256")
+            invalid_successor_evidence = successor.get(
+                "successor_evidence_sha256"
+            )
+            resolved_failure_path = failed_close_receipt_path.resolve(strict=True)
+            failure = _load_signed_json(resolved_failure_path)
+            failure_record = _validated_retained_lifecycle_record_payload(
+                failure.get("record"),
+                run_label=run_label,
+            )
+            permit = validate_storage_permit_payload(
+                permit_payload,
+                run_label=run_label,
+                stage_plan_sha256=str(failure_record["plan_sha256"]),
+            )
+            failure_identity = failure.get("failure_identity_sha256")
+            failure_transition_ordinal = failure.get(
+                "record_transition_ordinal"
+            )
+            if (
+                not isinstance(failure_transition_ordinal, int)
+                or isinstance(failure_transition_ordinal, bool)
+                or failure_transition_ordinal < 0
+            ):
+                raise StorageGovernanceError(
+                    "capacity reconciliation failure ordinal is invalid"
+                )
+            expected_failure_root = (
+                self.locator.resolve("e_archive").absolute_path.resolve()
+                / ".experiment-lifecycle"
+                / "close"
+                / "failures"
+                / run_label
+            )
+            current_record_path = (
+                expected_failure_root.parents[2]
+                / "runs"
+                / f"{run_label}.json"
+            )
+            current_record_payload = _load_signed_json(current_record_path)
+            correction_sidecar = correction_path.with_suffix(
+                correction_path.suffix + ".sha256"
+            )
+            correction_exists = (
+                correction_path.exists() or correction_sidecar.exists()
+            )
+            current_state = current_record_payload.get("state")
+            current_binding_valid = False
+            if current_state == "RETAINED":
+                current_record = _validated_retained_lifecycle_record_payload(
+                    current_record_payload,
+                    run_label=run_label,
+                )
+                current_binding_valid = (
+                    current_record == failure_record
+                    and failure.get("record_sha256")
+                    == _file_sha256(current_record_path)
+                )
+            elif current_state == "CLOSED" and correction_exists:
+                current_record = _validated_retained_lifecycle_record_payload(
+                    current_record_payload,
+                    run_label=run_label,
+                    expected_state="CLOSED",
+                )
+                current_transition_ordinal = cast(
+                    int, current_record["transition_ordinal"]
+                )
+                identity_fields = set(current_record).difference(
+                    {"state", "transition_ordinal", "updated_at_utc"}
+                )
+                close_path = (
+                    expected_failure_root.parents[2]
+                    / "close"
+                    / f"{run_label}.json"
+                )
+                close_receipt = _load_signed_json(close_path)
+                retention_path = (
+                    expected_failure_root.parents[2]
+                    / "retention"
+                    / "receipts"
+                    / f"{run_label}.json"
+                )
+                retention_receipt = _load_signed_json(retention_path)
+                retention_performance = retention_receipt.get(
+                    "close_performance"
+                )
+                closed_transition_path = (
+                    expected_failure_root.parents[2]
+                    / "events"
+                    / run_label
+                    / (
+                        f"{current_transition_ordinal:04d}-"
+                        "CLOSED.json"
+                    )
+                )
+                closed_transition = _load_signed_json(
+                    closed_transition_path
+                )
+                try:
+                    close_performance = validate_close_performance_payload(
+                        close_receipt.get("performance")
+                    )
+                    expected_close_performance = (
+                        validate_close_performance_payload(
+                            retention_performance
+                        )
+                    )
+                except StorageGovernanceError:
+                    close_performance_valid = False
+                else:
+                    close_performance_valid = (
+                        close_performance == expected_close_performance
+                        and _file_sha256(retention_path)
+                        == failure_record.get("retention_receipt_sha256")
+                    )
+                current_binding_valid = (
+                    current_transition_ordinal
+                    == failure_transition_ordinal + 1
+                    and all(
+                        current_record[field] == failure_record[field]
+                        for field in identity_fields
+                    )
+                    and set(close_receipt)
+                    == {
+                        "schema_version",
+                        "run_label",
+                        "status",
+                        "record",
+                        "storage_reconciliation_sha256",
+                        "performance",
+                    }
+                    and close_receipt.get("schema_version")
+                    == "experiment-lifecycle-v3"
+                    and close_receipt.get("run_label") == run_label
+                    and close_receipt.get("status") == "CLOSED"
+                    and close_receipt.get("record") == current_record
+                    and close_receipt.get(
+                        "storage_reconciliation_sha256"
+                    )
+                    == _file_sha256(correction_path)
+                    and close_performance_valid
+                    and closed_transition
+                    == {
+                        **current_record,
+                        "record_sha256": hashlib.sha256(
+                            _lifecycle_record_bytes(current_record)
+                        ).hexdigest(),
+                    }
+                )
+            expected_failure_fields = {
+                "schema_version",
+                "run_label",
+                "failure_check",
+                "record_sha256",
+                "record",
+                "record_state",
+                "record_transition_ordinal",
+                "transition_event_sha256",
+                "storage_reconciliation_kind",
+                "storage_reconciliation_sha256",
+                "disposition_sha256",
+                "error_type",
+                "error_message",
+                "failure_identity_sha256",
+                "created_at_utc",
+            }
+            failure_stable_payload = {
+                key: value
+                for key, value in failure.items()
+                if key not in {"failure_identity_sha256", "created_at_utc"}
+            }
+            expected_successor_fields = {
+                "schema_version",
+                "run_label",
+                "outcome",
+                "reason",
+                "predecessor_reconciliation_sha256",
+                "predecessor_evidence_sha256",
+                "successor_evidence_sha256",
+                "storage_permit_sha256",
+                "created_at_utc",
+            }
+            expected_predecessor_fields = {
+                "schema_version",
+                "run_label",
+                "outcome",
+                "evidence_sha256",
+                "storage_permit_sha256",
+                "reconciled_at_utc",
+            }
+            if (
+                reservation is None
+                or reservation.get("status") != "reconciled"
+                or reservation.get("outcome") != "retained"
+                or reservation.get("storage_permit_sha256") != permit_sha256
+                or reservation.get("evidence_sha256") != predecessor_evidence
+                or resolved_failure_path.parent != expected_failure_root
+                or not isinstance(failure_identity, str)
+                or _SHA256.fullmatch(failure_identity) is None
+                or resolved_failure_path.name != f"{failure_identity}.json"
+                or set(failure) != expected_failure_fields
+                or failure.get("schema_version")
+                != "experiment-lifecycle-close-failure-v1"
+                or failure.get("run_label") != run_label
+                or failure.get("failure_check")
+                != "storage_reconciliation_validation"
+                or failure.get("record_state") != "RETAINED"
+                or failure.get("record_transition_ordinal")
+                != failure_record.get("transition_ordinal")
+                or failure.get("record_sha256")
+                != hashlib.sha256(
+                    _lifecycle_record_bytes(failure_record)
+                ).hexdigest()
+                or not current_binding_valid
+                or failure_record.get("retention_receipt_sha256")
+                != evidence_sha256
+                or failure_record.get("storage_permit_sha256")
+                != permit_sha256
+                or failure_record.get("plan_sha256")
+                != permit.get("stage_plan_sha256")
+                or failure_record.get("plan_sha256")
+                != reservation.get("stage_plan_sha256")
+                or _SHA256.fullmatch(
+                    str(failure.get("transition_event_sha256", ""))
+                )
+                is None
+                or failure.get("storage_reconciliation_kind")
+                != "invalid_successor"
+                or failure.get("storage_reconciliation_sha256")
+                != _file_sha256(successor_path)
+                or failure.get("disposition_sha256") != evidence_sha256
+                or failure.get("error_type") != "LifecycleError"
+                or failure.get("error_message")
+                != "storage permit reconciliation successor chain differs"
+                or hashlib.sha256(
+                    _lifecycle_canonical_json(failure_stable_payload)
+                ).hexdigest()
+                != failure_identity
+                or not isinstance(failure.get("created_at_utc"), str)
+                or not failure["created_at_utc"]
+                or set(predecessor) != expected_predecessor_fields
+                or predecessor.get("schema_version")
+                != "experiment-capacity-reconciliation-v1"
+                or predecessor.get("run_label") != run_label
+                or predecessor.get("outcome") != "retained"
+                or predecessor.get("storage_permit_sha256") != permit_sha256
+                or not isinstance(predecessor.get("reconciled_at_utc"), str)
+                or not predecessor["reconciled_at_utc"]
+                or set(successor) != expected_successor_fields
+                or successor.get("schema_version")
+                != "experiment-capacity-reconciliation-successor-v1"
+                or successor.get("run_label") != run_label
+                or successor.get("outcome") != "retained"
+                or successor.get("reason")
+                != "retention_completed_after_capacity_release"
+                or successor.get("predecessor_reconciliation_sha256")
+                != _file_sha256(predecessor_path)
+                or successor.get("predecessor_evidence_sha256")
+                != predecessor_evidence
+                or successor.get("storage_permit_sha256") != permit_sha256
+                or not isinstance(invalid_successor_evidence, str)
+                or _SHA256.fullmatch(invalid_successor_evidence) is None
+                or invalid_successor_evidence
+                in (predecessor_evidence, evidence_sha256)
+                or not isinstance(successor.get("created_at_utc"), str)
+                or not successor["created_at_utc"]
+            ):
+                raise StorageGovernanceError(
+                    "capacity reconciliation successor cannot be corrected"
+                )
+            transition_path = (
+                expected_failure_root.parents[2]
+                / "events"
+                / run_label
+                / (
+                    f"{failure_transition_ordinal:04d}-"
+                    "RETAINED.json"
+                )
+            )
+            transition = _load_signed_json(transition_path)
+            if (
+                failure.get("transition_event_sha256")
+                != _file_sha256(transition_path)
+                or transition
+                != {
+                    **dict(failure_record),
+                    "record_sha256": failure.get("record_sha256"),
+                }
+            ):
+                raise StorageGovernanceError(
+                    "capacity reconciliation failure transition differs"
+                )
+            stable_payload: dict[str, object] = {
+                "schema_version": (
+                    "experiment-capacity-reconciliation-successor-correction-v1"
+                ),
+                "run_label": run_label,
+                "outcome": "retained",
+                "reason": "corrected_successor_evidence_after_failed_close",
+                "predecessor_reconciliation_sha256": _file_sha256(
+                    predecessor_path
+                ),
+                "predecessor_evidence_sha256": predecessor_evidence,
+                "invalid_successor_reconciliation_sha256": _file_sha256(
+                    successor_path
+                ),
+                "invalid_successor_evidence_sha256": invalid_successor_evidence,
+                "failed_close_receipt_identity_sha256": failure_identity,
+                "failed_close_receipt_sha256": _file_sha256(
+                    resolved_failure_path
+                ),
+                "successor_evidence_sha256": evidence_sha256,
+                "storage_permit_sha256": permit_sha256,
+            }
+            if correction_path.exists() or correction_sidecar.exists():
+                existing = _load_signed_json(correction_path)
+                if (
+                    set(existing) != {*stable_payload, "created_at_utc"}
+                    or any(
+                        existing.get(key) != value
+                        for key, value in stable_payload.items()
+                    )
+                    or not isinstance(existing.get("created_at_utc"), str)
+                    or not existing["created_at_utc"]
+                ):
+                    raise StorageGovernanceError(
+                        "capacity reconciliation successor correction identity differs"
+                    )
+                return correction_path
+            _write_signed_json(
+                correction_path,
+                {
+                    **stable_payload,
+                    "created_at_utc": datetime.now(UTC).isoformat(),
+                },
+            )
+        return correction_path
 
     def write_lifecycle_retention_binding(
         self,

@@ -15,7 +15,6 @@ import csv
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import platform
 import re
@@ -1059,7 +1058,7 @@ class ExperimentCatalog:
                         retention_policy=str(record["retention_policy"]),
                     )
                 )
-            except (KeyError, TypeError, ValueError) as error:
+            except (KeyError, LifecycleError, TypeError, ValueError) as error:
                 raise LifecycleError("experiment catalog record is incomplete") from error
         return cls(
             tuple(specs),
@@ -1754,77 +1753,85 @@ class ClosePerformance:
     backend: str
     workers: int
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "hashed_bytes": self.hashed_bytes,
+            "source_bytes": self.source_bytes,
+            "scan_passes": self.scan_passes,
+            "delete_traversals": self.delete_traversals,
+            "duplicate_hashed_bytes": self.duplicate_hashed_bytes,
+            "backend_calibrated": self.backend_calibrated,
+            "implicit_fallback": self.implicit_fallback,
+            "throughput_mib_per_second": self.throughput_mib_per_second,
+            "cpu_utilization_percent": self.cpu_utilization_percent,
+            "peak_memory_bytes": self.peak_memory_bytes,
+            "io_utilization_percent": self.io_utilization_percent,
+            "close_wall_seconds": self.close_wall_seconds,
+            "backend": self.backend,
+            "workers": self.workers,
+        }
+
     def verify(self) -> None:
-        failures: list[str] = []
-        counts = (
-            self.hashed_bytes,
-            self.source_bytes,
-            self.scan_passes,
-            self.delete_traversals,
-            self.duplicate_hashed_bytes,
-            self.peak_memory_bytes,
-            self.workers,
+        from evrptw.storage_governance import (
+            StorageGovernanceError,
+            validate_close_performance_payload,
         )
-        if any(isinstance(value, bool) or value < 0 for value in counts):
-            failures.append("close counters contain a negative value")
-        rates = (
-            self.throughput_mib_per_second,
-            self.cpu_utilization_percent,
-            self.io_utilization_percent,
-            self.close_wall_seconds,
-        )
-        if any(not math.isfinite(value) for value in rates):
-            failures.append("close performance contains a non-finite value")
-        if self.hashed_bytes > self.source_bytes:
-            failures.append("same file content was hashed more than once")
-        if self.scan_passes > 1:
-            failures.append("close used more than one inventory traversal")
-        if self.delete_traversals > 1:
-            failures.append("close used more than one deletion traversal")
-        if self.duplicate_hashed_bytes:
-            failures.append("duplicate hash bytes are nonzero")
-        if not self.backend_calibrated:
-            failures.append("I/O backend is not calibrated")
-        if self.implicit_fallback:
-            failures.append("implicit I/O fallback occurred")
-        if self.throughput_mib_per_second <= 0:
-            failures.append("close throughput is not positive")
-        if self.cpu_utilization_percent < 0:
-            failures.append("close CPU utilization is invalid")
-        if self.peak_memory_bytes < 0:
-            failures.append("close peak memory is invalid")
-        if self.io_utilization_percent < 0:
-            failures.append("close I/O utilization is invalid")
-        if self.close_wall_seconds <= 0:
-            failures.append("close wall time is not positive")
-        if not self.backend or self.workers <= 0:
-            failures.append("close backend identity is incomplete")
-        if failures:
-            raise LifecycleError("close performance gate failed: " + "; ".join(failures))
+
+        try:
+            validate_close_performance_payload(self.to_dict())
+        except StorageGovernanceError as error:
+            raise LifecycleError(
+                "close performance gate failed: close performance payload is invalid"
+            ) from error
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> ClosePerformance:
-        booleans = (payload.get("backend_calibrated"), payload.get("implicit_fallback"))
+        from evrptw.storage_governance import (
+            StorageGovernanceError,
+            validate_close_performance_payload,
+        )
+
+        try:
+            normalized = validate_close_performance_payload(
+                payload,
+                enforce_gates=False,
+            )
+        except StorageGovernanceError as error:
+            raise LifecycleError(
+                "close performance evidence is incomplete"
+            ) from error
+        booleans = (
+            normalized.get("backend_calibrated"),
+            normalized.get("implicit_fallback"),
+        )
         if not all(isinstance(value, bool) for value in booleans):
             raise LifecycleError("close performance booleans are invalid")
         try:
             return cls(
-                hashed_bytes=int(str(payload["hashed_bytes"])),
-                source_bytes=int(str(payload["source_bytes"])),
-                scan_passes=int(str(payload["scan_passes"])),
-                delete_traversals=int(str(payload["delete_traversals"])),
-                duplicate_hashed_bytes=int(str(payload["duplicate_hashed_bytes"])),
+                hashed_bytes=int(str(normalized["hashed_bytes"])),
+                source_bytes=int(str(normalized["source_bytes"])),
+                scan_passes=int(str(normalized["scan_passes"])),
+                delete_traversals=int(str(normalized["delete_traversals"])),
+                duplicate_hashed_bytes=int(
+                    str(normalized["duplicate_hashed_bytes"])
+                ),
                 backend_calibrated=cast(bool, booleans[0]),
                 implicit_fallback=cast(bool, booleans[1]),
                 throughput_mib_per_second=float(
-                    str(payload["throughput_mib_per_second"])
+                    str(normalized["throughput_mib_per_second"])
                 ),
-                cpu_utilization_percent=float(str(payload["cpu_utilization_percent"])),
-                peak_memory_bytes=int(str(payload["peak_memory_bytes"])),
-                io_utilization_percent=float(str(payload["io_utilization_percent"])),
-                close_wall_seconds=float(str(payload["close_wall_seconds"])),
-                backend=str(payload["backend"]),
-                workers=int(str(payload["workers"])),
+                cpu_utilization_percent=float(
+                    str(normalized["cpu_utilization_percent"])
+                ),
+                peak_memory_bytes=int(str(normalized["peak_memory_bytes"])),
+                io_utilization_percent=float(
+                    str(normalized["io_utilization_percent"])
+                ),
+                close_wall_seconds=float(
+                    str(normalized["close_wall_seconds"])
+                ),
+                backend=str(normalized["backend"]),
+                workers=int(str(normalized["workers"])),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise LifecycleError("close performance evidence is incomplete") from error
@@ -2717,6 +2724,11 @@ class ExperimentLifecycleController:
             / "permit_reconciliation_successors"
             / f"{record.run_label}.json"
         ).resolve()
+        correction_reconciliation_path = (
+            self.capacity_state_root
+            / "permit_reconciliation_successor_corrections"
+            / f"{record.run_label}.json"
+        ).resolve()
         resolved_reconciliation_path = storage_reconciliation_path.resolve(strict=True)
         predecessor_evidence_sha256: object
         if resolved_reconciliation_path == direct_reconciliation_path:
@@ -2782,6 +2794,231 @@ class ExperimentLifecycleController:
                 raise LifecycleError(
                     "storage permit reconciliation successor chain differs"
                 )
+        elif resolved_reconciliation_path == correction_reconciliation_path:
+            reconciliation = _load_signed_json(storage_reconciliation_path)
+            predecessor = _load_signed_json(direct_reconciliation_path)
+            invalid_successor = _load_signed_json(successor_reconciliation_path)
+            predecessor_evidence_sha256 = reconciliation.get(
+                "predecessor_evidence_sha256"
+            )
+            invalid_successor_evidence_sha256 = reconciliation.get(
+                "invalid_successor_evidence_sha256"
+            )
+            failed_close_identity_sha256 = reconciliation.get(
+                "failed_close_receipt_identity_sha256"
+            )
+            failed_close_receipt_sha256 = reconciliation.get(
+                "failed_close_receipt_sha256"
+            )
+            if (
+                not isinstance(failed_close_identity_sha256, str)
+                or _SHA256.fullmatch(failed_close_identity_sha256) is None
+            ):
+                raise LifecycleError(
+                    "storage permit reconciliation correction failure identity differs"
+                )
+            failed_close_path = (
+                self.state_root
+                / "close"
+                / "failures"
+                / record.run_label
+                / f"{failed_close_identity_sha256}.json"
+            )
+            failed_close = _load_signed_json(failed_close_path)
+            failed_record_payload = failed_close.get("record")
+            if not isinstance(failed_record_payload, Mapping):
+                raise LifecycleError(
+                    "storage permit reconciliation correction failure record differs"
+                )
+            try:
+                failed_record = RunLifecycleRecord.from_dict(
+                    failed_record_payload
+                )
+            except (KeyError, LifecycleError, TypeError, ValueError) as error:
+                raise LifecycleError(
+                    "storage permit reconciliation correction failure record differs"
+                ) from error
+            failed_transition_path = (
+                self.state_root
+                / "events"
+                / record.run_label
+                / (
+                    f"{failed_record.transition_ordinal:04d}-"
+                    f"{failed_record.state.value}.json"
+                )
+            )
+            failed_transition = _load_signed_json(failed_transition_path)
+            record_identity_fields = set(record.to_dict()).difference(
+                {"state", "transition_ordinal", "updated_at_utc"}
+            )
+            failure_record_matches = (
+                record.state == LifecycleState.RETAINED
+                and failed_record == record
+            ) or (
+                record.state == LifecycleState.CLOSED
+                and failed_record.state == LifecycleState.RETAINED
+                and failed_record.transition_ordinal + 1
+                == record.transition_ordinal
+                and all(
+                    failed_record.to_dict()[field]
+                    == record.to_dict()[field]
+                    for field in record_identity_fields
+                )
+            )
+            failed_close_stable_payload = {
+                key: value
+                for key, value in failed_close.items()
+                if key not in {"failure_identity_sha256", "created_at_utc"}
+            }
+            expected_correction_fields = {
+                "schema_version",
+                "run_label",
+                "outcome",
+                "reason",
+                "predecessor_reconciliation_sha256",
+                "predecessor_evidence_sha256",
+                "invalid_successor_reconciliation_sha256",
+                "invalid_successor_evidence_sha256",
+                "failed_close_receipt_identity_sha256",
+                "failed_close_receipt_sha256",
+                "successor_evidence_sha256",
+                "storage_permit_sha256",
+                "created_at_utc",
+            }
+            expected_failed_close_fields = {
+                "schema_version",
+                "run_label",
+                "failure_check",
+                "record_sha256",
+                "record",
+                "record_state",
+                "record_transition_ordinal",
+                "transition_event_sha256",
+                "storage_reconciliation_kind",
+                "storage_reconciliation_sha256",
+                "disposition_sha256",
+                "error_type",
+                "error_message",
+                "failure_identity_sha256",
+                "created_at_utc",
+            }
+            expected_predecessor_fields = {
+                "schema_version",
+                "run_label",
+                "outcome",
+                "evidence_sha256",
+                "storage_permit_sha256",
+                "reconciled_at_utc",
+            }
+            expected_invalid_successor_fields = {
+                "schema_version",
+                "run_label",
+                "outcome",
+                "reason",
+                "predecessor_reconciliation_sha256",
+                "predecessor_evidence_sha256",
+                "successor_evidence_sha256",
+                "storage_permit_sha256",
+                "created_at_utc",
+            }
+            if (
+                set(reconciliation) != expected_correction_fields
+                or reconciliation.get("schema_version")
+                != "experiment-capacity-reconciliation-successor-correction-v1"
+                or reconciliation.get("run_label") != record.run_label
+                or reconciliation.get("outcome") != "retained"
+                or reconciliation.get("reason")
+                != "corrected_successor_evidence_after_failed_close"
+                or reconciliation.get("predecessor_reconciliation_sha256")
+                != _sha256_file(direct_reconciliation_path)
+                or not isinstance(predecessor_evidence_sha256, str)
+                or _SHA256.fullmatch(predecessor_evidence_sha256) is None
+                or reconciliation.get("invalid_successor_reconciliation_sha256")
+                != _sha256_file(successor_reconciliation_path)
+                or not isinstance(invalid_successor_evidence_sha256, str)
+                or _SHA256.fullmatch(invalid_successor_evidence_sha256) is None
+                or invalid_successor_evidence_sha256
+                in (disposition_sha256, predecessor_evidence_sha256)
+                or not isinstance(failed_close_receipt_sha256, str)
+                or _SHA256.fullmatch(failed_close_receipt_sha256) is None
+                or _sha256_file(failed_close_path)
+                != failed_close_receipt_sha256
+                or set(failed_close) != expected_failed_close_fields
+                or failed_close.get("schema_version")
+                != "experiment-lifecycle-close-failure-v1"
+                or failed_close.get("run_label") != record.run_label
+                or failed_close.get("failure_check")
+                != "storage_reconciliation_validation"
+                or failed_close.get("record") != failed_record.to_dict()
+                or failed_close.get("record_sha256")
+                != _sha256_bytes(
+                    _canonical_json(failed_record.to_dict()) + b"\n"
+                )
+                or failed_close.get("record_state")
+                != LifecycleState.RETAINED.value
+                or failed_close.get("record_transition_ordinal")
+                != failed_record.transition_ordinal
+                or failed_close.get("transition_event_sha256")
+                != _sha256_file(failed_transition_path)
+                or failed_transition
+                != {
+                    **failed_record.to_dict(),
+                    "record_sha256": failed_close.get("record_sha256"),
+                }
+                or not failure_record_matches
+                or failed_close.get("storage_reconciliation_kind")
+                != "invalid_successor"
+                or failed_close.get("storage_reconciliation_sha256")
+                != _sha256_file(successor_reconciliation_path)
+                or failed_close.get("disposition_sha256")
+                != disposition_sha256
+                or failed_close.get("error_type") != "LifecycleError"
+                or failed_close.get("error_message")
+                != "storage permit reconciliation successor chain differs"
+                or failed_close.get("failure_identity_sha256")
+                != failed_close_identity_sha256
+                or _sha256_bytes(_canonical_json(failed_close_stable_payload))
+                != failed_close_identity_sha256
+                or not isinstance(failed_close.get("created_at_utc"), str)
+                or not failed_close["created_at_utc"]
+                or reconciliation.get("successor_evidence_sha256")
+                != disposition_sha256
+                or reconciliation.get("storage_permit_sha256")
+                != record.storage_permit_sha256
+                or not isinstance(reconciliation.get("created_at_utc"), str)
+                or not reconciliation["created_at_utc"]
+                or set(predecessor) != expected_predecessor_fields
+                or predecessor.get("schema_version")
+                != "experiment-capacity-reconciliation-v1"
+                or predecessor.get("run_label") != record.run_label
+                or predecessor.get("outcome") != "retained"
+                or predecessor.get("evidence_sha256")
+                != predecessor_evidence_sha256
+                or predecessor.get("storage_permit_sha256")
+                != record.storage_permit_sha256
+                or not isinstance(predecessor.get("reconciled_at_utc"), str)
+                or not predecessor["reconciled_at_utc"]
+                or set(invalid_successor) != expected_invalid_successor_fields
+                or invalid_successor.get("schema_version")
+                != "experiment-capacity-reconciliation-successor-v1"
+                or invalid_successor.get("run_label") != record.run_label
+                or invalid_successor.get("outcome") != "retained"
+                or invalid_successor.get("reason")
+                != "retention_completed_after_capacity_release"
+                or invalid_successor.get("predecessor_reconciliation_sha256")
+                != _sha256_file(direct_reconciliation_path)
+                or invalid_successor.get("predecessor_evidence_sha256")
+                != predecessor_evidence_sha256
+                or invalid_successor.get("successor_evidence_sha256")
+                != invalid_successor_evidence_sha256
+                or invalid_successor.get("storage_permit_sha256")
+                != record.storage_permit_sha256
+                or not isinstance(invalid_successor.get("created_at_utc"), str)
+                or not invalid_successor["created_at_utc"]
+            ):
+                raise LifecycleError(
+                    "storage permit reconciliation correction chain differs"
+                )
         else:
             raise LifecycleError("storage reconciliation is outside capacity governance")
         permit_path = (
@@ -2814,6 +3051,154 @@ class ExperimentLifecycleController:
             != record.storage_permit_sha256
         ):
             raise LifecycleError("capacity ledger does not reconcile the lifecycle")
+
+    def _record_storage_reconciliation_failure(
+        self,
+        record: RunLifecycleRecord,
+        *,
+        disposition_sha256: str,
+        storage_reconciliation_path: Path,
+        error: LifecycleError,
+    ) -> Path:
+        """Persist one immutable failed-close receipt before re-raising."""
+
+        resolved = storage_reconciliation_path.resolve(strict=True)
+        canonical_paths = {
+            (
+                self.capacity_state_root
+                / "permit_reconciliations"
+                / f"{record.run_label}.json"
+            ).resolve(): "direct",
+            (
+                self.capacity_state_root
+                / "permit_reconciliation_successors"
+                / f"{record.run_label}.json"
+            ).resolve(): "invalid_successor",
+            (
+                self.capacity_state_root
+                / "permit_reconciliation_successor_corrections"
+                / f"{record.run_label}.json"
+            ).resolve(): "correction",
+        }
+        kind = canonical_paths.get(resolved)
+        if kind is None:
+            raise LifecycleError(
+                "failed close reconciliation is outside capacity governance"
+            ) from error
+        stable_payload: dict[str, object] = {
+            "schema_version": "experiment-lifecycle-close-failure-v1",
+            "run_label": record.run_label,
+            "failure_check": "storage_reconciliation_validation",
+            "record_sha256": _sha256_file(self._record_path(record.run_label)),
+            "record": record.to_dict(),
+            "record_state": record.state.value,
+            "record_transition_ordinal": record.transition_ordinal,
+            "transition_event_sha256": _sha256_file(
+                self.state_root
+                / "events"
+                / record.run_label
+                / (
+                    f"{record.transition_ordinal:04d}-"
+                    f"{record.state.value}.json"
+                )
+            ),
+            "storage_reconciliation_kind": kind,
+            "storage_reconciliation_sha256": _sha256_file(resolved),
+            "disposition_sha256": disposition_sha256,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+        }
+        failure_identity_sha256 = _sha256_bytes(_canonical_json(stable_payload))
+        path = (
+            self.state_root
+            / "close"
+            / "failures"
+            / record.run_label
+            / f"{failure_identity_sha256}.json"
+        )
+        expected_payload = {
+            **stable_payload,
+            "failure_identity_sha256": failure_identity_sha256,
+        }
+        _repair_orphan_lifecycle_sidecar(path)
+        if path.exists() or path.with_suffix(path.suffix + ".sha256").exists():
+            existing = _load_signed_json(path)
+            if (
+                set(existing) != {*expected_payload, "created_at_utc"}
+                or any(
+                    existing.get(key) != value
+                    for key, value in expected_payload.items()
+                )
+                or not isinstance(existing.get("created_at_utc"), str)
+                or not existing["created_at_utc"]
+            ):
+                raise LifecycleError(
+                    "existing failed-close receipt identity differs"
+                ) from error
+            return path
+        _write_signed_json(
+            path,
+            {
+                **expected_payload,
+                "created_at_utc": datetime.now(UTC).isoformat(),
+            },
+        )
+        return path
+
+    def _close_performance_matches_evidence(
+        self,
+        record: RunLifecycleRecord,
+        performance: ClosePerformance,
+    ) -> bool:
+        try:
+            performance.verify()
+            if record.compaction_plan_sha256:
+                plan_payload = _load_signed_json(
+                    self.state_root
+                    / "compaction"
+                    / "plans"
+                    / record.run_label
+                    / f"{record.compaction_plan_sha256}.json"
+                )
+                compaction_receipt = _load_signed_json(
+                    self.state_root
+                    / "compaction"
+                    / "receipts"
+                    / f"{record.run_label}.json"
+                )
+                expected_source_bytes = sum(
+                    int(str(item["byte_count"]))
+                    for field in ("keep", "delete")
+                    for item in cast(
+                        list[dict[str, object]], plan_payload[field]
+                    )
+                )
+                return (
+                    performance.hashed_bytes
+                    == int(str(plan_payload["hashed_bytes"]))
+                    and performance.source_bytes == expected_source_bytes
+                    and performance.scan_passes
+                    == int(str(plan_payload["scan_passes"]))
+                    and performance.delete_traversals
+                    == int(str(compaction_receipt["delete_traversals"]))
+                    and performance.backend == plan_payload["io_backend"]
+                    and performance.workers
+                    == int(str(plan_payload["io_workers"]))
+                )
+            retained = _load_signed_json(
+                self.state_root
+                / "retention"
+                / "receipts"
+                / f"{record.run_label}.json"
+            )
+            expected_payload = retained.get("close_performance")
+            if not isinstance(expected_payload, Mapping):
+                return False
+            expected = ClosePerformance.from_dict(expected_payload)
+            expected.verify()
+            return performance == expected
+        except (KeyError, LifecycleError, OSError, TypeError, ValueError):
+            return False
 
     def _close_receipt_valid(
         self,
@@ -3052,6 +3437,24 @@ class ExperimentLifecycleController:
                 == record.compaction_plan_sha256
                 and imported_record.to_dict() == expected_imported_record
             )
+        if set(receipt) != {
+            "schema_version",
+            "run_label",
+            "status",
+            "record",
+            "storage_reconciliation_sha256",
+            "performance",
+        }:
+            return False
+        performance_payload = receipt.get("performance")
+        if not isinstance(performance_payload, Mapping):
+            return False
+        try:
+            performance = ClosePerformance.from_dict(performance_payload)
+        except (LifecycleError, TypeError, ValueError):
+            return False
+        if not self._close_performance_matches_evidence(record, performance):
+            return False
         reconciliation_sha256 = receipt.get("storage_reconciliation_sha256")
         if (
             not isinstance(reconciliation_sha256, str)
@@ -3064,6 +3467,9 @@ class ExperimentLifecycleController:
             / f"{record.run_label}.json",
             self.capacity_state_root
             / "permit_reconciliation_successors"
+            / f"{record.run_label}.json",
+            self.capacity_state_root
+            / "permit_reconciliation_successor_corrections"
             / f"{record.run_label}.json",
         )
         matching_paths = tuple(
@@ -3216,12 +3622,21 @@ class ExperimentLifecycleController:
     def permit(self, run_label: str, *, storage_permit_path: Path) -> RunLifecycleRecord:
         record = self._load(run_label)
         permit = _load_signed_json(storage_permit_path)
-        if (
-            permit.get("run_label") != run_label
-            or permit.get("status") != "reserved"
-            or permit.get("stage_plan_sha256") != record.plan_sha256
-        ):
-            raise LifecycleError("storage permit does not bind the lifecycle plan")
+        from evrptw.storage_governance import (
+            StorageGovernanceError,
+            validate_storage_permit_payload,
+        )
+
+        try:
+            validate_storage_permit_payload(
+                permit,
+                run_label=run_label,
+                stage_plan_sha256=record.plan_sha256,
+            )
+        except StorageGovernanceError as error:
+            raise LifecycleError(
+                "storage permit does not bind the lifecycle plan"
+            ) from error
         permit_sha256 = _sha256_file(storage_permit_path)
         if record.state != LifecycleState.PLANNED:
             if record.storage_permit_sha256 != permit_sha256:
@@ -4796,43 +5211,21 @@ class ExperimentLifecycleController:
             raise LifecycleError("unknown retention cannot be CLOSED")
         retained_archive_path: Path | None = None
         retained_archive_snapshot: dict[str, tuple[int, int]] | None = None
-        if record.state == LifecycleState.COMPACTED:
-            if not record.compaction_plan_sha256:
-                raise LifecycleError("compacted run has no bound plan identity")
-            plan_payload = _load_signed_json(
-                self.state_root
-                / "compaction"
-                / "plans"
-                / run_label
-                / f"{record.compaction_plan_sha256}.json"
+        if record.state == LifecycleState.COMPACTED and not record.compaction_plan_sha256:
+            raise LifecycleError("compacted run has no bound plan identity")
+        if not self._close_performance_matches_evidence(record, performance):
+            evidence_kind = (
+                "compaction"
+                if record.state == LifecycleState.COMPACTED
+                else "retention"
             )
-            compaction_receipt = _load_signed_json(
-                self.state_root / "compaction" / "receipts" / f"{run_label}.json"
+            raise LifecycleError(
+                f"close performance differs from {evidence_kind} evidence"
             )
-            expected_source_bytes = sum(
-                int(str(item["byte_count"]))
-                for field in ("keep", "delete")
-                for item in cast(list[dict[str, object]], plan_payload[field])
-            )
-            if (
-                performance.hashed_bytes != int(str(plan_payload["hashed_bytes"]))
-                or performance.source_bytes != expected_source_bytes
-                or performance.scan_passes != int(str(plan_payload["scan_passes"]))
-                or performance.delete_traversals
-                != int(str(compaction_receipt["delete_traversals"]))
-                or performance.backend != plan_payload["io_backend"]
-                or performance.workers != int(str(plan_payload["io_workers"]))
-            ):
-                raise LifecycleError("close performance differs from compaction evidence")
-        else:
+        if record.state != LifecycleState.COMPACTED:
             retained = _load_signed_json(
                 self.state_root / "retention" / "receipts" / f"{run_label}.json"
             )
-            expected_performance = retained.get("close_performance")
-            if not isinstance(expected_performance, dict) or performance != (
-                ClosePerformance.from_dict(expected_performance)
-            ):
-                raise LifecycleError("close performance differs from retention evidence")
             inventory_path = (
                 self.state_root / "retention" / "inventories" / f"{run_label}.json"
             )
@@ -4866,11 +5259,20 @@ class ExperimentLifecycleController:
         )
         if not isinstance(disposition_sha256, str):
             raise LifecycleError("lifecycle disposition identity is missing")
-        self._validate_storage_reconciliation(
-            record,
-            disposition_sha256=disposition_sha256,
-            storage_reconciliation_path=storage_reconciliation_path,
-        )
+        try:
+            self._validate_storage_reconciliation(
+                record,
+                disposition_sha256=disposition_sha256,
+                storage_reconciliation_path=storage_reconciliation_path,
+            )
+        except LifecycleError as error:
+            self._record_storage_reconciliation_failure(
+                record,
+                disposition_sha256=disposition_sha256,
+                storage_reconciliation_path=storage_reconciliation_path,
+                error=error,
+            )
+            raise
         if retained_archive_path is not None and retained_archive_snapshot is not None:
             _verify_tree_metadata_snapshot(
                 retained_archive_path,
@@ -4893,22 +5295,7 @@ class ExperimentLifecycleController:
                 "storage_reconciliation_sha256": _sha256_file(
                     storage_reconciliation_path
                 ),
-                "performance": {
-                    "hashed_bytes": performance.hashed_bytes,
-                    "source_bytes": performance.source_bytes,
-                    "scan_passes": performance.scan_passes,
-                    "delete_traversals": performance.delete_traversals,
-                    "duplicate_hashed_bytes": performance.duplicate_hashed_bytes,
-                    "backend_calibrated": performance.backend_calibrated,
-                    "implicit_fallback": performance.implicit_fallback,
-                    "throughput_mib_per_second": performance.throughput_mib_per_second,
-                    "cpu_utilization_percent": performance.cpu_utilization_percent,
-                    "peak_memory_bytes": performance.peak_memory_bytes,
-                    "io_utilization_percent": performance.io_utilization_percent,
-                    "close_wall_seconds": performance.close_wall_seconds,
-                    "backend": performance.backend,
-                    "workers": performance.workers,
-                },
+                "performance": performance.to_dict(),
             },
         )
         self._write(closed)
