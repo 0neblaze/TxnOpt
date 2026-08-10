@@ -259,6 +259,27 @@ allowed_failure_codes = ["runner_failure", "invalid_source", "partial"]
 retention_policy = "retention-v3"
 
 [[experiments]]
+experiment_id = "stage052_native_architecture_performance_calibration"
+stage_id = "stage05.2"
+component = "native_architecture_performance_calibration"
+label_pattern = "stage05\\.2_native_architecture_performance_calibration_(?:attempt|rerun)[0-9]{2}"
+runner_module = "evrptw.experiments.stage052_performance_calibration"
+reviewer_module = "evrptw.experiments.stage052_performance_calibration_review"
+prerequisite_contracts = []
+prerequisite_paths = {}
+max_batch_bytes = 1073741824
+max_run_bytes = 17179869184
+max_archive_bytes = 17179869184
+max_workspace_bytes = 17179869184
+max_workers = 1024
+max_threads = 2049
+max_processes = 2056
+artifact_schema = "stage05.2-native-architecture-performance-calibration-v1"
+publication_role = "current_stage"
+allowed_failure_codes = ["runner_failure", "invalid_manifest", "resource_limit", "partial"]
+retention_policy = "retention-v3"
+
+[[experiments]]
 experiment_id = "stage052_performance"
 stage_id = "stage05.2"
 component = "performance_benchmark"

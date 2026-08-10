@@ -22,6 +22,11 @@ def validate_scheduler_build_attestation(
     git_tree: str,
     source_manifest_sha256: str,
     tracked_file_count: int,
+    performance_profile: str | None = None,
+    compiler_id: str | None = None,
+    compiler_version: str | None = None,
+    interprocedural_optimization: bool | None = None,
+    host_native: bool | None = None,
 ) -> None:
     if type(payload.get("schema_version")) is not int:
         raise RuntimeError("native scheduler attestation schema type is invalid")
@@ -31,8 +36,11 @@ def validate_scheduler_build_attestation(
         raise RuntimeError("native scheduler dirty-source flag type is invalid")
     if type(payload.get("development_override")) is not bool:
         raise RuntimeError("native scheduler development override type is invalid")
+    schema_version = payload.get("schema_version")
+    if schema_version not in {1, 2}:
+        raise RuntimeError("native scheduler attestation schema is unsupported")
     expected: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "revision": revision,
         "git_tree": git_tree,
         "source_manifest_sha256": source_manifest_sha256,
@@ -41,6 +49,55 @@ def validate_scheduler_build_attestation(
         "development_override": False,
         "cpp_source_kind": "git_blob_snapshot",
     }
+    if schema_version == 2:
+        observed_profile = payload.get("performance_profile")
+        observed_compiler_id = payload.get("compiler_id")
+        observed_compiler_version = payload.get("compiler_version")
+        observed_ipo = payload.get("interprocedural_optimization")
+        observed_host_native = payload.get("host_native")
+        profile_flags = {
+            "portable-o3": (False, False),
+            "portable-lto": (True, False),
+            "host-native-lto": (True, True),
+        }
+        if observed_profile not in profile_flags:
+            raise RuntimeError("native scheduler performance profile is invalid")
+        if not isinstance(observed_compiler_id, str) or not observed_compiler_id:
+            raise RuntimeError("native scheduler compiler identity is invalid")
+        if not isinstance(observed_compiler_version, str) or not observed_compiler_version:
+            raise RuntimeError("native scheduler compiler version is invalid")
+        if type(observed_ipo) is not bool or type(observed_host_native) is not bool:
+            raise RuntimeError("native scheduler build flags are invalid")
+        if (observed_ipo, observed_host_native) != profile_flags[observed_profile]:
+            raise RuntimeError("native scheduler build flags contradict its profile")
+        expected.update(
+            {
+                "performance_profile": (
+                    observed_profile if performance_profile is None else performance_profile
+                ),
+                "compiler_id": (observed_compiler_id if compiler_id is None else compiler_id),
+                "compiler_version": (
+                    observed_compiler_version if compiler_version is None else compiler_version
+                ),
+                "interprocedural_optimization": (
+                    observed_ipo
+                    if interprocedural_optimization is None
+                    else interprocedural_optimization
+                ),
+                "host_native": (observed_host_native if host_native is None else host_native),
+            }
+        )
+    elif any(
+        value is not None
+        for value in (
+            performance_profile,
+            compiler_id,
+            compiler_version,
+            interprocedural_optimization,
+            host_native,
+        )
+    ):
+        raise RuntimeError("legacy scheduler attestation lacks performance identity")
     if dict(payload) != expected:
         raise RuntimeError("native scheduler build attestation does not reconcile")
 
@@ -80,9 +137,7 @@ def committed_source_attestation(root: Path, revision: str) -> dict[str, object]
     """Recompute the clean source manifest from committed Git objects only."""
 
     root = root.resolve()
-    top_level = Path(
-        _git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()
-    ).resolve()
+    top_level = Path(_git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()).resolve()
     if top_level != root:
         raise RuntimeError("native build source is not the exact Git top-level")
     raw_tree = _git(root, "ls-tree", "-r", "-z", revision)
@@ -94,9 +149,7 @@ def committed_source_attestation(root: Path, revision: str) -> dict[str, object]
             metadata, raw_path = item.split(b"\t", 1)
             mode, object_type, head_oid = metadata.decode("ascii").split()
             if object_type != "blob" or mode == "160000":
-                raise RuntimeError(
-                    "native build attestation encountered an unsupported Git entry"
-                )
+                raise RuntimeError("native build attestation encountered an unsupported Git entry")
             relative_path = raw_path.decode("utf-8")
             member = archive_members.get(relative_path)
             if member is None:
@@ -149,9 +202,7 @@ def committed_wheel_project_entries(root: Path, revision: str) -> set[str]:
     return entries
 
 
-def committed_wheel_project_entry_sha256(
-    root: Path, revision: str
-) -> dict[str, str]:
+def committed_wheel_project_entry_sha256(root: Path, revision: str) -> dict[str, str]:
     """Return the committed Git-blob bytes required for every wheel source entry."""
 
     root = root.resolve()
@@ -165,9 +216,7 @@ def committed_wheel_project_entry_sha256(
         "src/evrptw",
         "tools",
     )
-    archive_bytes = _git(
-        root, "archive", "--format=tar", revision, "src/evrptw", "tools"
-    )
+    archive_bytes = _git(root, "archive", "--format=tar", revision, "src/evrptw", "tools")
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
         members = {member.name: member for member in archive.getmembers()}
         entries: dict[str, str] = {}
@@ -262,9 +311,7 @@ def materialize_committed_cpp(root: Path, revision: str, destination: Path) -> N
             output.write_bytes(data)
             output.chmod(0o755 if mode == "100755" else 0o644)
     observed_paths = {
-        path
-        for path in destination.rglob("*")
-        if path.is_file() or path.is_symlink()
+        path for path in destination.rglob("*") if path.is_file() or path.is_symlink()
     }
     if observed_paths != expected_paths:
         raise RuntimeError("native C++ snapshot contains missing or unexpected files")
@@ -282,9 +329,7 @@ def verify_committed_cpp(root: Path, revision: str, destination: Path) -> None:
         if _working_bytes(output, mode) != data:
             raise RuntimeError("native C++ snapshot bytes do not match Git")
     observed_paths = {
-        path
-        for path in destination.rglob("*")
-        if path.is_file() or path.is_symlink()
+        path for path in destination.rglob("*") if path.is_file() or path.is_symlink()
     }
     if observed_paths != expected_paths:
         raise RuntimeError("native C++ snapshot contains missing or unexpected files")
@@ -292,9 +337,7 @@ def verify_committed_cpp(root: Path, revision: str, destination: Path) -> None:
 
 def inspect_source(root: Path, *, development_override: bool) -> dict[str, object]:
     root = root.resolve()
-    top_level = Path(
-        _git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()
-    ).resolve()
+    top_level = Path(_git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()).resolve()
     if top_level != root:
         raise RuntimeError("native build source is not the exact Git top-level")
     object_format = _git(root, "rev-parse", "--show-object-format").decode().strip()
@@ -391,13 +434,9 @@ def main() -> int:
             if arguments.revision is None or arguments.destination is None:
                 raise RuntimeError("native C++ snapshot arguments are incomplete")
             if arguments.command == "materialize-cpp":
-                materialize_committed_cpp(
-                    arguments.root, arguments.revision, arguments.destination
-                )
+                materialize_committed_cpp(arguments.root, arguments.revision, arguments.destination)
             else:
-                verify_committed_cpp(
-                    arguments.root, arguments.revision, arguments.destination
-                )
+                verify_committed_cpp(arguments.root, arguments.revision, arguments.destination)
             print(json.dumps({"verified": True}, sort_keys=True))
             return 0
         payload = inspect_source(

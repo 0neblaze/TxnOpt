@@ -112,9 +112,7 @@ def _start(
     ledger_path = controller.capacity_state_root / "capacity_ledger.json"
     reservations: dict[str, object] = {}
     if ledger_path.is_file():
-        reservations = json.loads(ledger_path.read_text(encoding="utf-8"))[
-            "reservations"
-        ]
+        reservations = json.loads(ledger_path.read_text(encoding="utf-8"))["reservations"]
     reservations[label] = {
         "stage_id": "stage00",
         "stage_plan_sha256": plan.plan_sha256,
@@ -223,9 +221,7 @@ def _review_execution(
             "raw_manifest_sha256_before": record.sealed_manifest_sha256,
             "raw_manifest_sha256_after": record.sealed_manifest_sha256,
             "raw_manifest_unchanged": True,
-            "review_manifest_sha256": hashlib.sha256(
-                review_manifest.read_bytes()
-            ).hexdigest(),
+            "review_manifest_sha256": hashlib.sha256(review_manifest.read_bytes()).hexdigest(),
         },
     )
     _write_signed_json(
@@ -233,12 +229,8 @@ def _review_execution(
         {
             "schema_version": "experiment-review-execution-binding-v1",
             "run_label": label,
-            "review_execution_sha256": hashlib.sha256(
-                execution_path.read_bytes()
-            ).hexdigest(),
-            "review_manifest_sha256": hashlib.sha256(
-                review_manifest.read_bytes()
-            ).hexdigest(),
+            "review_execution_sha256": hashlib.sha256(execution_path.read_bytes()).hexdigest(),
+            "review_manifest_sha256": hashlib.sha256(review_manifest.read_bytes()).hexdigest(),
             "sealed_manifest_sha256": record.sealed_manifest_sha256,
         },
     )
@@ -342,11 +334,7 @@ def _storage_reconciliation(
         storage_permit_sha256=permit_sha256,
     )
     _write_signed_json(ledger_path, ledger)
-    path = (
-        controller.capacity_state_root
-        / "permit_reconciliations"
-        / f"{label}.json"
-    )
+    path = controller.capacity_state_root / "permit_reconciliations" / f"{label}.json"
     _write_signed_json(
         path,
         {
@@ -370,9 +358,7 @@ def _retention_binding(
     archive_leaf: str | None = None,
 ) -> Path:
     generation = 1
-    relative_archive = Path(
-        "stage00", "runs", label, f"generation-{generation:04d}"
-    )
+    relative_archive = Path("stage00", "runs", label, f"generation-{generation:04d}")
     if archive_leaf is not None:
         relative_archive /= archive_leaf
     archive_path = controller.archive_root / relative_archive
@@ -434,11 +420,7 @@ def _retention_binding(
         {"schema_version": "experiment-retention-registry-v2", "records": records},
     )
     record = next(item for item in controller.records() if item.run_label == label)
-    receipt = (
-        controller.storage_state_root
-        / "lifecycle_retention_receipts"
-        / f"{label}.json"
-    )
+    receipt = controller.storage_state_root / "lifecycle_retention_receipts" / f"{label}.json"
     _write_signed_json(
         receipt,
         {
@@ -461,9 +443,7 @@ def _retention_binding(
             "replay_receipt_relative_path": replay_path.relative_to(
                 controller.storage_state_root
             ).as_posix(),
-            "replay_receipt_sha256": hashlib.sha256(
-                replay_path.read_bytes()
-            ).hexdigest(),
+            "replay_receipt_sha256": hashlib.sha256(replay_path.read_bytes()).hexdigest(),
             "close_performance": performance,
         },
     )
@@ -528,17 +508,15 @@ def _close_current_accepted(
     controller.close(
         label,
         performance=ClosePerformance.from_dict(performance),
-        storage_reconciliation_path=_storage_reconciliation(
-            controller, tmp_path, label
-        ),
+        storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
     )
     return raw
 
 
-def test_catalog_has_exactly_thirteen_governed_runner_entries() -> None:
+def test_catalog_has_exactly_fourteen_governed_runner_entries() -> None:
     catalog = _catalog()
 
-    assert len(catalog.specs) == 13
+    assert len(catalog.specs) == 14
     assert catalog.for_run_label("stage05.2_benchmark_rerun03").experiment_id == (
         "stage052_performance"
     )
@@ -563,12 +541,7 @@ def test_v1_v2_migration_ledger_is_read_only_and_v3_is_new_truth() -> None:
 def test_historical_gate_rejects_handwritten_review_and_inventory(
     tmp_path: Path,
 ) -> None:
-    migration_path = (
-        ROOT
-        / "experiments"
-        / "registries"
-        / "experiment_lifecycle_v3_migration.json"
-    )
+    migration_path = ROOT / "experiments" / "registries" / "experiment_lifecycle_v3_migration.json"
     migration = load_lifecycle_migration_ledger(migration_path, repository=ROOT)
     migration_sha256 = hashlib.sha256(migration_path.read_bytes()).hexdigest()
     gate_root = tmp_path / "historical-migration"
@@ -581,15 +554,13 @@ def test_historical_gate_rejects_handwritten_review_and_inventory(
         inventory_sha256 = _write_signed_json(
             inventory_path,
             {
-                    "schema_version": "experiment-content-inventory-v1",
-                    "run_label": label,
-                    "archive_root_alias": "e_archive",
-                    "archive_root_resolved_path": str(archive_root.resolve()),
-                    "archive_generation_relative_path": (
-                        f"stage05.2/runs/{label}/generation-0001"
-                    ),
-                    "legacy_registry_sha256": HASH,
-                    "legacy_tree_sha256": HASH,
+                "schema_version": "experiment-content-inventory-v1",
+                "run_label": label,
+                "archive_root_alias": "e_archive",
+                "archive_root_resolved_path": str(archive_root.resolve()),
+                "archive_generation_relative_path": (f"stage05.2/runs/{label}/generation-0001"),
+                "legacy_registry_sha256": HASH,
+                "legacy_tree_sha256": HASH,
                 "files": [
                     {
                         "relative_path": "control/manifest.json",
@@ -607,17 +578,13 @@ def test_historical_gate_rejects_handwritten_review_and_inventory(
                 "status": "FAILED_KNOWN",
                 "retention_class": "unique_failure_capsule",
                 "migration_ledger_sha256": migration_sha256,
-                    "content_inventory_sha256": inventory_sha256,
-                    "archive_root_alias": "e_archive",
-                    "archive_root_resolved_path": str(archive_root.resolve()),
-                    "archive_generation_relative_path": (
-                        f"stage05.2/runs/{label}/generation-0001"
-                    ),
-                    "legacy_registry_sha256": HASH,
-                    "legacy_tree_sha256": HASH,
-                "reviewer_module_name": (
-                    "evrptw.experiments.lifecycle_historical_review"
-                ),
+                "content_inventory_sha256": inventory_sha256,
+                "archive_root_alias": "e_archive",
+                "archive_root_resolved_path": str(archive_root.resolve()),
+                "archive_generation_relative_path": (f"stage05.2/runs/{label}/generation-0001"),
+                "legacy_registry_sha256": HASH,
+                "legacy_tree_sha256": HASH,
+                "reviewer_module_name": ("evrptw.experiments.lifecycle_historical_review"),
             },
         )
         records.append(
@@ -625,22 +592,16 @@ def test_historical_gate_rejects_handwritten_review_and_inventory(
                 "run_label": label,
                 "review_status": "FAILED_KNOWN",
                 "retention_class": "unique_failure_capsule",
-                "review_manifest_relative_path": review_path.relative_to(
-                    gate_root
-                ).as_posix(),
+                "review_manifest_relative_path": review_path.relative_to(gate_root).as_posix(),
                 "review_manifest_sha256": review_sha256,
-                "content_inventory_relative_path": inventory_path.relative_to(
-                    gate_root
-                ).as_posix(),
-                    "content_inventory_sha256": inventory_sha256,
-                    "archive_root_alias": "e_archive",
-                    "archive_root_resolved_path": str(archive_root.resolve()),
-                    "archive_generation_relative_path": (
-                        f"stage05.2/runs/{label}/generation-0001"
-                    ),
-                    "legacy_registry_sha256": HASH,
-                    "legacy_tree_sha256": HASH,
-                }
+                "content_inventory_relative_path": inventory_path.relative_to(gate_root).as_posix(),
+                "content_inventory_sha256": inventory_sha256,
+                "archive_root_alias": "e_archive",
+                "archive_root_resolved_path": str(archive_root.resolve()),
+                "archive_generation_relative_path": (f"stage05.2/runs/{label}/generation-0001"),
+                "legacy_registry_sha256": HASH,
+                "legacy_tree_sha256": HASH,
+            }
         )
     gate_path = gate_root / "gate.json"
     _write_signed_json(
@@ -665,21 +626,14 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    migration_path = (
-        ROOT
-        / "experiments"
-        / "registries"
-        / "experiment_lifecycle_v3_migration.json"
-    )
+    migration_path = ROOT / "experiments" / "registries" / "experiment_lifecycle_v3_migration.json"
     migration = load_lifecycle_migration_ledger(migration_path, repository=ROOT)
     migration_sha256 = hashlib.sha256(migration_path.read_bytes()).hexdigest()
     output_root = tmp_path / "historical"
     archive_root = tmp_path / "archive"
     archive_root.mkdir()
     volume = VolumeIdentity("test-volume", "ext4")
-    locator = StorageRootLocator(
-        {"e_archive": StorageRoot("e_archive", archive_root, volume)}
-    )
+    locator = StorageRootLocator({"e_archive": StorageRoot("e_archive", archive_root, volume)})
     monkeypatch.setattr(
         StorageRootLocator,
         "from_toml",
@@ -702,9 +656,7 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
     labels = migration["pending_historical_classification"]
     assert isinstance(labels, list) and labels
     reviewer_module = "evrptw.experiments.stage052_historical_semantic_review"
-    reviewer_path = (
-        ROOT / "src/evrptw/experiments/stage052_historical_semantic_review.py"
-    )
+    reviewer_path = ROOT / "src/evrptw/experiments/stage052_historical_semantic_review.py"
     reviewer_sha256 = hashlib.sha256(reviewer_path.read_bytes()).hexdigest()
     historical_reviewer_python = tmp_path / "reviewer-venv" / "bin" / "python"
     historical_reviewer_python.parent.mkdir(parents=True)
@@ -743,9 +695,7 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
                 "exit_code": 0,
                 "reviewer_module_name": reviewer_module,
                 "reviewer_module_sha256": reviewer_sha256,
-                "semantic_review_sha256": hashlib.sha256(
-                    semantic_path.read_bytes()
-                ).hexdigest(),
+                "semantic_review_sha256": hashlib.sha256(semantic_path.read_bytes()).hexdigest(),
                 "semantic_review_relative_path": "semantic_review.json",
                 "migration_ledger_sha256_before": migration_sha256,
                 "migration_ledger_sha256_after": migration_sha256,
@@ -776,14 +726,10 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
         _write_signed_json(
             output_root / "executions" / f"{label}.json",
             {
-                "schema_version": (
-                    "experiment-historical-review-execution-binding-v1"
-                ),
+                "schema_version": ("experiment-historical-review-execution-binding-v1"),
                 "run_label": label,
                 "review_execution_sha256": execution_sha256,
-                "semantic_review_sha256": hashlib.sha256(
-                    semantic_path.read_bytes()
-                ).hexdigest(),
+                "semantic_review_sha256": hashlib.sha256(semantic_path.read_bytes()).hexdigest(),
                 "migration_ledger_sha256": migration_sha256,
                 "content_inventory_sha256": inventory_sha256,
                 "archive_root_alias": "e_archive",
@@ -812,9 +758,7 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
                 "run_label": label,
                 "archive_root_alias": "e_archive",
                 "archive_root_resolved_path": str(archive_root.resolve()),
-                "archive_generation_relative_path": (
-                    f"stage05.2/runs/{label}/generation-0001"
-                ),
+                "archive_generation_relative_path": (f"stage05.2/runs/{label}/generation-0001"),
                 "legacy_registry_sha256": trusted_registry_sha256,
                 "legacy_tree_sha256": HASH,
                 "files": [
@@ -850,11 +794,7 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
     )
 
     relocated_migration_path = (
-        tmp_path
-        / "sealed-source"
-        / "experiments"
-        / "registries"
-        / migration_path.name
+        tmp_path / "sealed-source" / "experiments" / "registries" / migration_path.name
     )
     relocated_migration_path.parent.mkdir(parents=True)
     relocated_migration_path.write_bytes(migration_path.read_bytes())
@@ -862,11 +802,14 @@ def test_historical_semantic_adjudication_closes_gate_only_when_complete(
         migration_path.with_suffix(".json.sha256").read_bytes()
     )
     monkeypatch.setattr(sys, "executable", str(historical_reviewer_python.resolve()))
-    assert load_historical_migration_gate(
-        gate_path,
-        migration_ledger_path=relocated_migration_path,
-        repository=ROOT,
-    )["status"] == "complete"
+    assert (
+        load_historical_migration_gate(
+            gate_path,
+            migration_ledger_path=relocated_migration_path,
+            repository=ROOT,
+        )["status"]
+        == "complete"
+    )
 
 
 def test_stage052_historical_semantic_reviewer_is_label_exact(
@@ -876,9 +819,7 @@ def test_stage052_historical_semantic_reviewer_is_label_exact(
     blocked_label = "stage05.2_hot_path_attempt04"
     keeper = "stage05.2_benchmark_attempt97"
     archive_root = tmp_path / "archive"
-    generation_relative = (
-        "stage05.2/runs/stage05.2_benchmark_attempt97/generation-0001"
-    )
+    generation_relative = "stage05.2/runs/stage05.2_benchmark_attempt97/generation-0001"
     generation = archive_root / generation_relative
     dependency_document = generation / "wsl_active/formal_memory_probe_report.json"
     dependency_document.parent.mkdir(parents=True)
@@ -915,12 +856,8 @@ def test_stage052_historical_semantic_reviewer_is_label_exact(
             "protected_run_labels": [keeper],
             "legacy_sources": [
                 {
-                    "registry_sha256": hashlib.sha256(
-                        registry_path.read_bytes()
-                    ).hexdigest(),
-                    "relative_path": (
-                        ".storage-governance/retention_registry_v2.json"
-                    ),
+                    "registry_sha256": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+                    "relative_path": (".storage-governance/retention_registry_v2.json"),
                     "role": "read_only_primary_legacy",
                     "root_alias": "e_archive",
                     "schema_version": "experiment-retention-registry-v2",
@@ -933,12 +870,8 @@ def test_stage052_historical_semantic_reviewer_is_label_exact(
                     "archive_tree_sha256": HASH,
                     "dependency_documents": [
                         {
-                            "relative_path": (
-                                "wsl_active/formal_memory_probe_report.json"
-                            ),
-                            "sha256": hashlib.sha256(
-                                dependency_document.read_bytes()
-                            ).hexdigest(),
+                            "relative_path": ("wsl_active/formal_memory_probe_report.json"),
+                            "sha256": hashlib.sha256(dependency_document.read_bytes()).hexdigest(),
                         }
                     ],
                 }
@@ -1009,9 +942,7 @@ def test_historical_inventory_uses_governance_tree_identity(
 ) -> None:
     generation = tmp_path / "generation"
     (generation / "segment").mkdir(parents=True)
-    (generation / "segment" / "first.json").write_text(
-        '{"value": 1}\n', encoding="utf-8"
-    )
+    (generation / "segment" / "first.json").write_text('{"value": 1}\n', encoding="utf-8")
     (generation / "second.bin").write_bytes(b"evidence")
 
     inventory, tree_sha256 = _inventory_generation(
@@ -1091,9 +1022,7 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
         "staging_root_identity",
     }
 
-    def gates(
-        *failed: str, details: dict[str, str] | None = None
-    ) -> dict[str, dict[str, object]]:
+    def gates(*failed: str, details: dict[str, str] | None = None) -> dict[str, dict[str, object]]:
         detail_by_name = details or {}
         return {
             name: {
@@ -1221,9 +1150,7 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
         "scope": "performance",
         "status": "NOT_READY",
     }
-    current_review_sha256 = write_json(
-        current_review_root / "review_manifest.json", current_review
-    )
+    current_review_sha256 = write_json(current_review_root / "review_manifest.json", current_review)
     write_json(
         current_review_root / "review_execution.json",
         {
@@ -1233,9 +1160,7 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
             "raw_manifest_sha256_before": current_raw,
             "raw_manifest_unchanged": True,
             "review_manifest_sha256": current_review_sha256,
-            "reviewer_module_name": (
-                "evrptw.experiments.stage052_performance_review"
-            ),
+            "reviewer_module_name": ("evrptw.experiments.stage052_performance_review"),
             "run_label": current_label,
             "schema_version": "stage05.2-review-execution-v1",
             "status": "completed",
@@ -1275,9 +1200,7 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
             "raw_manifest_sha256_before": successor_raw,
             "raw_manifest_unchanged": True,
             "review_manifest_sha256": successor_review_sha256,
-            "reviewer_module_name": (
-                "evrptw.experiments.stage052_performance_review"
-            ),
+            "reviewer_module_name": ("evrptw.experiments.stage052_performance_review"),
             "run_label": successor_label,
             "schema_version": "stage05.2-review-execution-v1",
             "status": "completed",
@@ -1332,12 +1255,8 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
             "protected_run_labels": ["stage05.2_benchmark_attempt97"],
             "legacy_sources": [
                 {
-                    "registry_sha256": hashlib.sha256(
-                        registry_path.read_bytes()
-                    ).hexdigest(),
-                    "relative_path": (
-                        ".storage-governance/retention_registry_v2.json"
-                    ),
+                    "registry_sha256": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+                    "relative_path": (".storage-governance/retention_registry_v2.json"),
                     "role": "read_only_primary_legacy",
                     "root_alias": "e_archive",
                     "schema_version": "experiment-retention-registry-v2",
@@ -1350,9 +1269,7 @@ def test_stage052_hot_path_requires_accepted_lineage_and_successor(
             "archive_root_alias": "e_archive",
             "archive_root_resolved_path": str(archive_root.resolve()),
             "archive_generation_relative_path": current_relative,
-            "legacy_registry_sha256": hashlib.sha256(
-                registry_path.read_bytes()
-            ).hexdigest(),
+            "legacy_registry_sha256": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
             "legacy_tree_sha256": current_tree,
         }
     )
@@ -1421,12 +1338,7 @@ def test_historical_semantic_execution_rejects_archive_root_substitution(
         },
     )
     semantic_path = evidence_dir / "semantic_review.json"
-    migration_path = (
-        ROOT
-        / "experiments"
-        / "registries"
-        / "experiment_lifecycle_v3_migration.json"
-    )
+    migration_path = ROOT / "experiments" / "registries" / "experiment_lifecycle_v3_migration.json"
     command = (
         sys.executable,
         "-m",
@@ -1488,9 +1400,7 @@ def test_physical_historical_review_rejects_mirror_and_fake_registry(
     v1_path = repository / "experiments/registries/stage05.2_retention_registry.csv"
     v1_path.parent.mkdir(parents=True)
     v1_path.write_text("trusted-v1\n", encoding="utf-8")
-    trusted_registry = (
-        canonical_archive / ".storage-governance/retention_registry_v2.json"
-    )
+    trusted_registry = canonical_archive / ".storage-governance/retention_registry_v2.json"
     fake_registry = mirror_archive / ".storage-governance/retention_registry_v2.json"
     registry_payload = {
         "schema_version": "experiment-retention-registry-v2",
@@ -1511,27 +1421,17 @@ def test_physical_historical_review_rejects_mirror_and_fake_registry(
                     "role": "read_only_primary_legacy",
                     "root_alias": "e_archive",
                     "record_count": 1,
-                    "relative_path": (
-                        ".storage-governance/retention_registry_v2.json"
-                    ),
-                    "registry_sha256": hashlib.sha256(
-                        trusted_registry.read_bytes()
-                    ).hexdigest(),
+                    "relative_path": (".storage-governance/retention_registry_v2.json"),
+                    "registry_sha256": hashlib.sha256(trusted_registry.read_bytes()).hexdigest(),
                 },
                 {
                     "schema_version": "stage05.2-retention-v1",
-                    "relative_path": (
-                        "experiments/registries/stage05.2_retention_registry.csv"
-                    ),
-                    "registry_sha256": hashlib.sha256(
-                        v1_path.read_bytes()
-                    ).hexdigest(),
+                    "relative_path": ("experiments/registries/stage05.2_retention_registry.csv"),
+                    "registry_sha256": hashlib.sha256(v1_path.read_bytes()).hexdigest(),
                 },
             ],
             "protected_run_labels": ["stage05.2_benchmark_attempt97"],
-            "pending_historical_classification": [
-                "stage05.2_benchmark_attempt33"
-            ],
+            "pending_historical_classification": ["stage05.2_benchmark_attempt33"],
         },
     )
 
@@ -1643,9 +1543,7 @@ def test_permit_retry_after_start_is_idempotent(tmp_path: Path) -> None:
 
     resumed = controller.permit(
         label,
-        storage_permit_path=controller.capacity_state_root
-        / "permits"
-        / f"{label}.json",
+        storage_permit_path=controller.capacity_state_root / "permits" / f"{label}.json",
     )
 
     assert resumed.state == LifecycleState.RUNNING
@@ -1714,9 +1612,7 @@ def test_seal_accepts_the_existing_artifact_sidecar_convention(tmp_path: Path) -
     )
 
     assert manifest.with_suffix(".sha256").is_file()
-    assert controller.seal(label, manifest_path=manifest).state == (
-        LifecycleState.SEALED
-    )
+    assert controller.seal(label, manifest_path=manifest).state == (LifecycleState.SEALED)
 
 
 def test_terminal_manifest_reuses_signed_child_artifact_identities(
@@ -1764,9 +1660,7 @@ def test_terminal_manifest_reuses_signed_child_artifact_identities(
     }
     omitted = child / "raw" / "omitted.bin"
     omitted.write_bytes(b"omitted")
-    with pytest.raises(
-        StorageGovernanceError, match="terminal manifest file set differs"
-    ):
+    with pytest.raises(StorageGovernanceError, match="terminal manifest file set differs"):
         build_cli_terminal_manifest(output_dir=output, run_label=label)
     omitted.unlink()
     raw.write_bytes(b"PARQUET")
@@ -1814,10 +1708,7 @@ def test_terminal_manifest_replays_direct_v2_shard_manifests(tmp_path: Path) -> 
         "calibration_report.json",
         "calibration_report.sha256",
         f"formal-memory-workers6-rg16384-qd1/r205_21/2014/{raw.name}",
-        (
-            "formal-memory-workers6-rg16384-qd1/r205_21/2014/"
-            f"{shard_manifest.name}"
-        ),
+        (f"formal-memory-workers6-rg16384-qd1/r205_21/2014/{shard_manifest.name}"),
         (
             "formal-memory-workers6-rg16384-qd1/r205_21/2014/"
             f"{shard_manifest.with_suffix('.sha256').name}"
@@ -1871,9 +1762,7 @@ def test_failed_cli_attempt_capsules_a_broken_child_manifest(
         run_label=label,
     )
 
-    manifest = (
-        output / "control" / f"{label}_failure_lifecycle_manifest.json"
-    )
+    manifest = output / "control" / f"{label}_failure_lifecycle_manifest.json"
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["artifact_trust"] == "untrusted_failure_capsule"
     assert "child/control/broken_manifest.json" in {
@@ -1907,9 +1796,7 @@ def test_failed_cli_attempt_creates_only_the_planned_missing_run_directory(
         encoding="utf-8",
     )
     controller = ExperimentLifecycleController(
-        catalog=ExperimentCatalog.from_toml(
-            config_dir / "experiment_catalog.toml"
-        ),
+        catalog=ExperimentCatalog.from_toml(config_dir / "experiment_catalog.toml"),
         state_root=archive_root / ".experiment-lifecycle",
         storage_state_root=archive_root / ".storage-governance",
         capacity_state_root=staging_root / ".storage-governance",
@@ -1996,9 +1883,7 @@ def test_execute_reviewer_writes_uniform_receipt_and_allows_review(
     controller.seal(label, manifest_path=manifest)
     review = plan.run_dir / "review" / "review.json"
 
-    def fake_run(
-        command: tuple[str, ...], *, check: bool
-    ) -> subprocess.CompletedProcess[str]:
+    def fake_run(command: tuple[str, ...], *, check: bool) -> subprocess.CompletedProcess[str]:
         assert check is False
         atomic_write_signed_json(
             review,
@@ -2016,9 +1901,7 @@ def test_execute_reviewer_writes_uniform_receipt_and_allows_review(
     )
 
     assert receipt == plan.run_dir / "review" / "review_execution.json"
-    assert controller.review(label, review_manifest_path=review).state == (
-        LifecycleState.REVIEWED
-    )
+    assert controller.review(label, review_manifest_path=review).state == (LifecycleState.REVIEWED)
 
 
 def test_execute_reviewer_rejects_a_decorative_module_argument(
@@ -2093,9 +1976,7 @@ def test_execute_reviewer_rejects_same_size_raw_mutation(
     controller.seal(label, manifest_path=manifest)
     review = plan.run_dir / "review" / "review.json"
 
-    def fake_run(
-        command: tuple[str, ...], *, check: bool
-    ) -> subprocess.CompletedProcess[str]:
+    def fake_run(command: tuple[str, ...], *, check: bool) -> subprocess.CompletedProcess[str]:
         artifact.write_bytes(b"BBBB")
         atomic_write_signed_json(
             review,
@@ -2120,12 +2001,7 @@ def test_initial_transition_recovers_an_orphan_payload(
 ) -> None:
     controller = _controller(tmp_path)
     plan = _plan(tmp_path, "stage00_baseline_attempt01")
-    event_sidecar = (
-        controller.state_root
-        / "events"
-        / plan.run_label
-        / "0000-PLANNED.json.sha256"
-    )
+    event_sidecar = controller.state_root / "events" / plan.run_label / "0000-PLANNED.json.sha256"
     original_replace = os.replace
     failed = False
 
@@ -2152,9 +2028,7 @@ def test_initial_transition_recovers_an_orphan_current_record(
 ) -> None:
     controller = _controller(tmp_path)
     plan = _plan(tmp_path, "stage00_baseline_attempt01")
-    record_sidecar = controller._record_path(plan.run_label).with_suffix(
-        ".json.sha256"
-    )
+    record_sidecar = controller._record_path(plan.run_label).with_suffix(".json.sha256")
     original_replace = os.replace
     failed = False
 
@@ -2253,9 +2127,7 @@ def test_complete_lifecycle_reaches_closed_only_after_retention_and_gate(
         label,
         retention_receipt_path=receipt,
         content_inventory_path=inventory_path,
-    ).state == (
-        LifecycleState.RETAINED
-    )
+    ).state == (LifecycleState.RETAINED)
     with pytest.raises(LifecycleError, match="performance gate"):
         controller.close(
             label,
@@ -2275,9 +2147,7 @@ def test_complete_lifecycle_reaches_closed_only_after_retention_and_gate(
                 backend="windows_native",
                 workers=1,
             ),
-            storage_reconciliation_path=_storage_reconciliation(
-                controller, tmp_path, label
-            ),
+            storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
         )
     closed = controller.close(
         label,
@@ -2297,9 +2167,7 @@ def test_complete_lifecycle_reaches_closed_only_after_retention_and_gate(
             backend="windows_native",
             workers=1,
         ),
-        storage_reconciliation_path=_storage_reconciliation(
-            controller, tmp_path, label
-        ),
+        storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
     )
     assert closed.state == LifecycleState.CLOSED
     assert controller.audit()["passed"] is True
@@ -2316,20 +2184,13 @@ def test_new_current_close_demotes_previous_current_in_same_transaction(
 
     _close_current_accepted(controller, tmp_path, second)
 
-    first_record = next(
-        item for item in controller.records() if item.run_label == first
-    )
+    first_record = next(item for item in controller.records() if item.run_label == first)
     assert first_record.state == LifecycleState.CLOSED
-    assert first_record.retention_class == (
-        RetentionClassV3.CURRENT_ACCEPTED_FULL
-    )
+    assert first_record.retention_class == (RetentionClassV3.CURRENT_ACCEPTED_FULL)
     supersession = json.loads(
-        (
-            controller.state_root
-            / "close"
-            / "supersessions"
-            / f"{first}.json"
-        ).read_text(encoding="utf-8")
+        (controller.state_root / "close" / "supersessions" / f"{first}.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert supersession["effective_retention_class"] == (
         RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE.value
@@ -2369,12 +2230,9 @@ def test_new_current_close_demotes_segment_leaf_archive(
     _close_current_accepted(controller, tmp_path, second)
 
     supersession = json.loads(
-        (
-            controller.state_root
-            / "close"
-            / "supersessions"
-            / f"{first}.json"
-        ).read_text(encoding="utf-8")
+        (controller.state_root / "close" / "supersessions" / f"{first}.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert supersession["effective_retention_class"] == (
         RetentionClassV3.SUPERSEDED_ACCEPTED_CAPSULE.value
@@ -2468,9 +2326,7 @@ def test_retention_binding_rejects_archive_tampering(
         controller.close(
             label,
             performance=ClosePerformance.from_dict(performance),
-            storage_reconciliation_path=_storage_reconciliation(
-                controller, tmp_path, label
-            ),
+            storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
         )
 
 
@@ -2648,9 +2504,7 @@ def test_compaction_plan_is_deterministic_and_apply_rejects_drift(
     )
     review = plan.run_dir / "review" / "review.json"
     review.parent.mkdir()
-    _write_signed_json(
-        review, {"run_label": label, "status": "ACCEPTED", "files": {}}
-    )
+    _write_signed_json(review, {"run_label": label, "status": "ACCEPTED", "files": {}})
     controller.seal(label, manifest_path=control / "manifest.json")
     _review_execution(controller, label, review)
     controller.review(
@@ -2669,11 +2523,7 @@ def test_compaction_plan_is_deterministic_and_apply_rejects_drift(
         content_inventory_path=_content_inventory(plan.run_dir, label),
     )
     assert _path == (
-        controller.state_root
-        / "compaction"
-        / "plans"
-        / label
-        / f"{compaction.plan_sha256}.json"
+        controller.state_root / "compaction" / "plans" / label / f"{compaction.plan_sha256}.json"
     )
     assert raw.relative_to(plan.run_dir).as_posix() in {
         item.relative_path for item in compaction.delete
@@ -2723,9 +2573,7 @@ def test_compaction_apply_deletes_only_controller_plan(tmp_path: Path) -> None:
     )
     review = plan.run_dir / "review" / "review.json"
     review.parent.mkdir()
-    _write_signed_json(
-        review, {"run_label": label, "status": "ACCEPTED", "files": {}}
-    )
+    _write_signed_json(review, {"run_label": label, "status": "ACCEPTED", "files": {}})
     controller.seal(label, manifest_path=control / "manifest.json")
     _review_execution(controller, label, review)
     controller.review(
@@ -2766,12 +2614,12 @@ def test_compaction_apply_deletes_only_controller_plan(tmp_path: Path) -> None:
 
     assert replayed.receipt_sha256 == receipt.receipt_sha256
     deleted_rows = (
-        controller.state_root / "compaction/deleted_files.csv"
-    ).read_text(encoding="utf-8").splitlines()
-    assert len(deleted_rows) == 2
-    source_bytes = sum(
-        item.byte_count for item in (*compaction.keep, *compaction.delete)
+        (controller.state_root / "compaction/deleted_files.csv")
+        .read_text(encoding="utf-8")
+        .splitlines()
     )
+    assert len(deleted_rows) == 2
+    source_bytes = sum(item.byte_count for item in (*compaction.keep, *compaction.delete))
     closed = controller.close(
         label,
         performance=ClosePerformance(
@@ -2790,9 +2638,7 @@ def test_compaction_apply_deletes_only_controller_plan(tmp_path: Path) -> None:
             backend=compaction.io_backend,
             workers=compaction.io_workers,
         ),
-        storage_reconciliation_path=_storage_reconciliation(
-            controller, tmp_path, label
-        ),
+        storage_reconciliation_path=_storage_reconciliation(controller, tmp_path, label),
     )
     assert closed.state == LifecycleState.CLOSED
 
@@ -2811,9 +2657,7 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
         archive_root=archive,
     )
     label = "stage05.2_benchmark_attempt48"
-    generation_relative = (
-        f"stage05.2/runs/{label}/generation-0001"
-    )
+    generation_relative = f"stage05.2/runs/{label}/generation-0001"
     generation = archive / generation_relative
     manifest = generation / "control" / "manifest.json"
     manifest.parent.mkdir(parents=True)
@@ -2882,9 +2726,7 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
             "run_label": label,
             "status": "PARTIAL",
             "retention_class": "superseded_metadata",
-            "content_inventory_sha256": hashlib.sha256(
-                inventory_path.read_bytes()
-            ).hexdigest(),
+            "content_inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
             "failure_identity": {},
         },
     )
@@ -2892,16 +2734,10 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
         "run_label": label,
         "review_status": "PARTIAL",
         "retention_class": "superseded_metadata",
-        "review_manifest_relative_path": review_path.relative_to(
-            gate_root
-        ).as_posix(),
+        "review_manifest_relative_path": review_path.relative_to(gate_root).as_posix(),
         "review_manifest_sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
-        "content_inventory_relative_path": inventory_path.relative_to(
-            gate_root
-        ).as_posix(),
-        "content_inventory_sha256": hashlib.sha256(
-            inventory_path.read_bytes()
-        ).hexdigest(),
+        "content_inventory_relative_path": inventory_path.relative_to(gate_root).as_posix(),
+        "content_inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
         "archive_root_alias": "e_archive",
         "archive_root_resolved_path": str(archive),
         "archive_generation_relative_path": generation_relative,
@@ -2924,24 +2760,18 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
         lambda *_args, **_kwargs: gate,
     )
 
-    compaction, plan_path, prepared_path = (
-        controller.prepare_historical_compaction(
-            label,
-            repository=tmp_path,
-            migration_ledger_path=migration_ledger,
-            historical_gate_path=gate_path,
-        )
+    compaction, plan_path, prepared_path = controller.prepare_historical_compaction(
+        label,
+        repository=tmp_path,
+        migration_ledger_path=migration_ledger,
+        historical_gate_path=gate_path,
     )
 
     assert not controller._record_path(label).exists()
     assert plan_path.is_file()
     assert prepared_path.is_file()
-    assert {item.relative_path for item in compaction.keep} == {
-        "control/manifest.json"
-    }
-    assert {item.relative_path for item in compaction.delete} == {
-        "instance/events.parquet"
-    }
+    assert {item.relative_path for item in compaction.keep} == {"control/manifest.json"}
+    assert {item.relative_path for item in compaction.delete} == {"instance/events.parquet"}
     with pytest.raises(LifecycleError, match="active writer"):
         controller.apply_historical_compaction(
             label,
@@ -2972,15 +2802,18 @@ def test_historical_compaction_requires_gate_plan_and_closes_import(
     assert controller._load(label).state == LifecycleState.CLOSED
     assert controller.audit()["passed"] is True
     assert lifecycle_module._load_signed_json(prepared_path)["state"] == "COMMITTED"
-    assert controller.apply_historical_compaction(
-        label,
-        repository=tmp_path,
-        migration_ledger_path=migration_ledger,
-        historical_gate_path=gate_path,
-        plan_path=plan_path,
-        expected_plan_sha256=compaction.plan_sha256,
-        writer_is_active=lambda _path: False,
-    ) == receipt
+    assert (
+        controller.apply_historical_compaction(
+            label,
+            repository=tmp_path,
+            migration_ledger_path=migration_ledger,
+            historical_gate_path=gate_path,
+            plan_path=plan_path,
+            expected_plan_sha256=compaction.plan_sha256,
+            writer_is_active=lambda _path: False,
+        )
+        == receipt
+    )
 
 
 def test_ci_audit_accepts_the_catalogued_runner_surface() -> None:

@@ -116,21 +116,57 @@ def test_exact_completion_order_is_backend_observed_and_host_preserved(
         distance_backend="python",
     )
     packed = _pack(instance, (("C1", "C2"), ("C1",)))
-    local = tuple(
-        int(value)
-        for value in native_core._test_exact_completion_order_v2(*packed)
-    )
+    local = tuple(int(value) for value in native_core._test_exact_completion_order_v2(*packed))
     assert local == (1, 0)
 
     endpoint = tmp_path / "completion-order.sock"
     with NativeHostScheduler(endpoint):
         host = tuple(
             int(value)
-            for value in native_core._test_exact_completion_order_v2(
-                *packed, str(endpoint)
-            )
+            for value in native_core._test_exact_completion_order_v2(*packed, str(endpoint))
         )
     assert host == local
+
+
+def test_host_exact_physical_receipt_has_actual_worker_and_times(tmp_path: Path) -> None:
+    packed = _pack(_instance(), (("C1",), ("C1",)))
+    endpoint = tmp_path / "physical-exact-receipt.sock"
+    with NativeHostScheduler(endpoint, worker_threads=2):
+        semantic, physical, tasks = native_core._test_exact_physical_receipt_v2(
+            *packed,
+            str(endpoint),
+        )
+
+    assert sorted(semantic.tolist()) == [0, 1]
+    assert sorted(physical.tolist()) == [0, 1]
+    assert tasks.shape == (2, 7)
+    assert tasks[:, 0].tolist() == [0, 1]
+    assert set(tasks[:, 1]).issubset({0, 1})
+    assert tasks[:, 2:4].tolist() == [[0, 1], [1, 2]]
+    assert np.all(tasks[:, 4] <= tasks[:, 5])
+    assert np.all(tasks[:, 5] <= tasks[:, 6])
+
+
+def test_host_exact_parallel_uses_all_nonempty_balanced_chunks(tmp_path: Path) -> None:
+    route_count = 25
+    worker_count = 24
+    packed = _pack(_instance(), tuple(("C1",) for _ in range(route_count)))
+    endpoint = tmp_path / "balanced-physical-exact-receipt.sock"
+    with NativeHostScheduler(
+        endpoint,
+        worker_threads=worker_count,
+        request_threads=1,
+    ):
+        _semantic, _physical, tasks = native_core._test_exact_physical_receipt_v2(
+            *packed,
+            str(endpoint),
+        )
+
+    assert tasks.shape == (worker_count, 7)
+    bounds = tasks[:, 2:4].tolist()
+    assert bounds[0] == [0, 2]
+    assert bounds[1:] == [[index, index + 1] for index in range(2, route_count)]
+    assert all(first < last for first, last in bounds)
 
 
 def test_empty_exact_route_payload_is_local_host_equivalent(tmp_path: Path) -> None:
@@ -140,16 +176,12 @@ def test_empty_exact_route_payload_is_local_host_equivalent(tmp_path: Path) -> N
 
     endpoint = tmp_path / "empty-exact-route.sock"
     with NativeHostScheduler(endpoint):
-        host_hash = native_core._test_exact_payload_hash_v2(
-            *packed, str(endpoint)
-        )
+        host_hash = native_core._test_exact_payload_hash_v2(*packed, str(endpoint))
     assert host_hash == local_hash
 
 
 def test_initial_and_lane_hashes_bind_exact_completion_order() -> None:
-    initial_a, initial_b, lane_a, lane_b = (
-        native_core._test_initial_completion_hash_v2()
-    )
+    initial_a, initial_b, lane_a, lane_b = native_core._test_initial_completion_hash_v2()
     assert initial_a != initial_b
     assert lane_a != lane_b
 
@@ -582,13 +614,9 @@ def test_screen_route_batch_transaction_v2_preserves_order_and_cache_semantics()
     instance = _instance()
     scalar_inputs = _screen_pack(instance, ("C1",), full=True)
     common = scalar_inputs[:8]
-    c1_index = next(
-        index for index, node in enumerate(instance.nodes) if node.name == "C1"
-    )
+    c1_index = next(index for index, node in enumerate(instance.nodes) if node.name == "C1")
     route_offsets = np.asarray([0, 1, 2, 3, 5], dtype=np.int64)
-    route_indices = np.asarray(
-        [c1_index, -1, c1_index, c1_index, c1_index], dtype=np.int64
-    )
+    route_indices = np.asarray([c1_index, -1, c1_index, c1_index, c1_index], dtype=np.int64)
     candidate_ids = np.asarray([10, 11, 12, 13], dtype=np.int64)
     options = scalar_inputs[9]
     incremental = np.zeros((4, 6), dtype=np.float64)
@@ -717,8 +745,8 @@ def test_native_exact_and_screen_batches_preserve_empty_route_semantics() -> Non
     exact_inputs = list(_pack(instance, (("C1",),)))
     exact_inputs[6] = np.asarray([0, 0], dtype=np.int64)
     exact_inputs[7] = np.asarray([], dtype=np.int64)
-    path_offsets, path_indices, status, reason, metrics, _, _ = (
-        exact_charging_batch_numeric(*exact_inputs)
+    path_offsets, path_indices, status, reason, metrics, _, _ = exact_charging_batch_numeric(
+        *exact_inputs
     )
     expected = solve_exact_charging(instance, ())
     assert _decode_paths(instance, path_offsets, path_indices) == (expected.route,)

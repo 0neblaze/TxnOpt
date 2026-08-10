@@ -10,7 +10,9 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, cast
+from functools import wraps
+from pathlib import Path
+from typing import Any, Concatenate, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -45,6 +47,7 @@ from evrptw.candidate_transaction import (
     NegativeCacheCommit,
     NegativeSequenceCacheBatch,
     NegativeSequenceCacheSnapshot,
+    decode_native_candidate_screening_payload,
     execute_candidate_transaction,
     native_screen_candidate_batch,
 )
@@ -112,6 +115,8 @@ from evrptw.objective import (
     compare_objectives,
 )
 from evrptw.stage04 import Stage04Config
+from evrptw.stage052_event_spool import Stage052EventSpool
+from evrptw.stage052_semantic_journal import SEMANTIC_TRAJECTORY_IMPLEMENTATION_STATUSES
 from evrptw.validation import validate_routes
 from evrptw.warm_start import WarmStartValidationConfig, verify_warm_start_provenance
 
@@ -310,6 +315,7 @@ class ALNSResult:
     candidate_transaction_statistics: dict[str, object] = field(default_factory=dict)
     candidate_transaction_events: tuple[dict[str, object], ...] = ()
     native_execution_statistics: dict[str, object] = field(default_factory=dict)
+    native_control_journal_events: tuple[dict[str, object], ...] = ()
     candidate_work_hash: str = ""
     route_result_hash: str = ""
     candidate_work_events: tuple[dict[str, object], ...] = ()
@@ -460,6 +466,9 @@ class _Evaluator:
         self.native_runtime = native_runtime
         self.native_execution_config = native_execution_config
         self.pending_candidate_cache: dict[tuple[str, ...], ChargingSubproblemResult] = {}
+        self.pending_candidate_cache_contexts: dict[
+            tuple[str, ...], tuple[str, int | None, str]
+        ] = {}
         self.pending_negative_screening_sequences: dict[tuple[str, ...], str] = {}
         self.backend_metrics = BackendMetrics(self.backend.value, batch_size)
         self.reachability_index = (
@@ -496,6 +505,10 @@ class _Evaluator:
         self.screening_exact_call_blocked = 0
         self.screening_runtime = 0.0
         self.screening_reason_counts: dict[str, int] = {}
+        self.route_merge_profile_cache: dict[
+            tuple[str, ...],
+            tuple[bool, float, float, int],
+        ] = {}
 
     def _record_exact_budget_boundary(self) -> None:
         controller = self.exact_call_controller
@@ -522,12 +535,28 @@ class _Evaluator:
                     event,
                 )
 
+    def _stage_pending_candidate_cache(
+        self,
+        sequence: tuple[str, ...],
+        result: ChargingSubproblemResult,
+    ) -> None:
+        if sequence not in self.pending_candidate_cache:
+            self.pending_candidate_cache_contexts[sequence] = (
+                self.lane,
+                self.iteration,
+                self.operator,
+            )
+        self.pending_candidate_cache[sequence] = result
+
     def _discard_pending_candidate_cache(self, reason: str) -> None:
         if not self.pending_candidate_cache and not self.pending_negative_screening_sequences:
+            if self.pending_candidate_cache_contexts:
+                raise RuntimeError("pending candidate cache contexts outlive their entries")
             return
         discarded = len(self.pending_candidate_cache)
         discarded_negative = len(self.pending_negative_screening_sequences)
         self.pending_candidate_cache.clear()
+        self.pending_candidate_cache_contexts.clear()
         self.pending_negative_screening_sequences.clear()
         if self.measurement_trace is not None:
             self.measurement_trace.events.append(
@@ -546,8 +575,13 @@ class _Evaluator:
 
     def _commit_pending_candidate_cache(self) -> None:
         if not self.pending_candidate_cache and not self.pending_negative_screening_sequences:
+            if self.pending_candidate_cache_contexts:
+                raise RuntimeError("pending candidate cache contexts outlive their entries")
             return
         pending = tuple(self.pending_candidate_cache.items())
+        pending_contexts = dict(self.pending_candidate_cache_contexts)
+        if set(pending_contexts) != set(self.pending_candidate_cache):
+            raise RuntimeError("pending candidate cache entries lost their exact-work contexts")
         pending_negative = dict(self.pending_negative_screening_sequences)
         local_insertions: list[tuple[str, ...]] = []
         negative_insertions: list[tuple[str, ...]] = []
@@ -607,14 +641,17 @@ class _Evaluator:
             for store in stores:
                 if self.measurement_trace is None:
                     continue
+                store_lane, store_iteration, store_operator = pending_contexts[
+                    store.key.customer_sequence
+                ]
                 for evicted in store.evicted:
                     self.measurement_trace.record_cache_event(
                         operation="evict",
                         route_key=evicted.route_key,
                         cache_key_digest=evicted.digest,
-                        lane=self.lane,
-                        iteration=self.iteration,
-                        operator=self.operator,
+                        lane=store_lane,
+                        iteration=store_iteration,
+                        operator=store_operator,
                         reason="lru_capacity_or_memory",
                         current_entries=store.current_entries,
                         current_bytes=store.current_bytes,
@@ -623,9 +660,9 @@ class _Evaluator:
                     operation=("store" if store.stored else "oversize_not_cached"),
                     route_key=store.key.route_key,
                     cache_key_digest=store.key.digest,
-                    lane=self.lane,
-                    iteration=self.iteration,
-                    operator=self.operator,
+                    lane=store_lane,
+                    iteration=store_iteration,
+                    operator=store_operator,
                     reason=store.reason,
                     entry_bytes=store.entry_bytes,
                     current_entries=store.current_entries,
@@ -633,13 +670,18 @@ class _Evaluator:
                 )
             if self.measurement_trace is not None:
                 for reconciliation in reconciled_existing:
+                    (
+                        reconciliation_lane,
+                        reconciliation_iteration,
+                        reconciliation_operator,
+                    ) = pending_contexts[reconciliation.key.customer_sequence]
                     self.measurement_trace.record_cache_event(
                         operation="reconcile",
                         route_key=reconciliation.key.route_key,
                         cache_key_digest=reconciliation.key.digest,
-                        lane=self.lane,
-                        iteration=self.iteration,
-                        operator=self.operator,
+                        lane=reconciliation_lane,
+                        iteration=reconciliation_iteration,
+                        operator=reconciliation_operator,
                         reason="equivalent_existing",
                         pending_result_digest=reconciliation.pending_result_digest,
                         existing_result_digest=reconciliation.existing_result_digest,
@@ -698,6 +740,7 @@ class _Evaluator:
                     self.negative_screening_sequences.pop(sequence, None)
             raise
         self.pending_candidate_cache.clear()
+        self.pending_candidate_cache_contexts.clear()
         self.pending_negative_screening_sequences.clear()
 
     @contextmanager
@@ -752,6 +795,454 @@ class _Evaluator:
     @property
     def pair_pruning_enabled(self) -> bool:
         return self.candidate_transaction_runtime is not None
+
+    def route_merge_profile_metrics(
+        self,
+        sequences: Sequence[tuple[str, ...]],
+    ) -> tuple[tuple[bool, float, float, int, int], ...]:
+        """Refresh route profiles through the native cache when it is enabled."""
+
+        runtime = self.candidate_transaction_runtime
+        native_runtime = self.native_runtime
+        if runtime is None or native_runtime is None:
+            return self._route_merge_profile_metrics_legacy(sequences)
+
+        ordered = tuple(sequences)
+        if not ordered or any(not sequence for sequence in ordered):
+            raise ValueError("route-merge profile routes must be non-empty")
+        incumbents = tuple(self.incumbent_route_result(sequence) for sequence in ordered)
+        cached_before = tuple(self.has_cached_route(sequence) for sequence in ordered)
+        plan = runtime.plan_route_merge_profiles(
+            ordered,
+            tuple(
+                incumbent is not None or cached
+                for incumbent, cached in zip(incumbents, cached_before, strict=True)
+            ),
+            native_runtime.context.name_to_index,
+        )
+        exact_delta = [0] * len(ordered)
+        for route_index in plan.miss_indices:
+            index = int(route_index)
+            exact_delta[index] = 0 if cached_before[index] else 1
+
+        observable_hit_indices = tuple(
+            index
+            for index, incumbent in enumerate(incumbents)
+            if plan.hit_flags[index] == 1 and incumbent is None and self.screening_enabled
+        )
+        screening_by_index: dict[int, ScreeningResult] = {}
+        try:
+            if observable_hit_indices:
+                screening_started = time.perf_counter()
+                screening = native_screen_candidate_batch(
+                    self.instance,
+                    tuple(ordered[index] for index in observable_hit_indices),
+                    native_runtime=native_runtime,
+                    transaction_runtime=runtime,
+                    negative_cache=self.negative_screening_sequences,
+                    deadline=self.deadline,
+                )
+                self.screening_runtime += time.perf_counter() - screening_started
+                for batch_index, route_index in enumerate(observable_hit_indices):
+                    screening_result = screening.screening_result(batch_index)
+                    if (
+                        not screening_result.accepted
+                        or screening.native_status(batch_index) != "screened"
+                    ):
+                        raise RuntimeError("cached route-merge profile no longer passes screening")
+                    screening_by_index[route_index] = screening_result
+
+            miss_set = {int(index) for index in plan.miss_indices}
+            profiles_by_index: dict[int, tuple[bool, float, float, int]] = {}
+            index = 0
+            while index < len(ordered):
+                sequence = ordered[index]
+                if index not in miss_set:
+                    incumbent = incumbents[index]
+                    if incumbent is not None:
+                        self._precomputed_route(sequence, incumbent)
+                    else:
+                        if self.screening_enabled:
+                            self._record_route_merge_profile_screening_pass(
+                                sequence,
+                                screening_by_index[index],
+                            )
+                        cached, _digest = self._lookup_cached_result(sequence, "unchanged")
+                        if cached is None:
+                            raise RuntimeError(
+                                "route-merge profile cache lost its exact cache entry"
+                            )
+                    index += 1
+                    continue
+                last = index + 1
+                while last < len(ordered) and last in miss_set:
+                    last += 1
+                results = self.route_batch(
+                    ordered[index:last],
+                    route_change_status="unchanged",
+                )
+                for route_index, exact_result in enumerate(results, start=index):
+                    if not exact_result.feasible:
+                        profile = (False, 0.0, 0.0, 0)
+                    else:
+                        objective = SolutionObjective.from_route(
+                            self.instance,
+                            exact_result.route,
+                            total_distance=exact_result.distance,
+                            total_charging_time=exact_result.charging_time,
+                        )
+                        profile = (
+                            True,
+                            objective.total_distance,
+                            objective.total_charging_time,
+                            objective.charging_count,
+                        )
+                    profiles_by_index[route_index] = profile
+                index = last
+            runtime.commit_route_merge_profiles(
+                plan,
+                tuple(profiles_by_index[int(index)] for index in plan.miss_indices),
+            )
+        except BaseException:
+            runtime.rollback_route_merge_profiles(plan)
+            raise
+
+        runtime.record_route_merge_profile_cache(
+            hits=plan.hits,
+            misses=plan.misses,
+            invalidations=plan.invalidations,
+        )
+        return tuple(
+            (
+                bool(plan.feasible_flags[index]),
+                float(plan.objective_metrics[index, 0]),
+                float(plan.objective_metrics[index, 1]),
+                int(plan.charging_counts[index]),
+                exact_delta[index],
+            )
+            for index in range(len(ordered))
+        )
+
+    def _route_merge_profile_metrics_legacy(
+        self,
+        sequences: Sequence[tuple[str, ...]],
+    ) -> tuple[tuple[bool, float, float, int, int], ...]:
+        """Preserve the non-native profile path for historical configurations."""
+
+        ordered = tuple(sequences)
+        if not ordered or any(not sequence for sequence in ordered):
+            raise ValueError("route-merge profile routes must be non-empty")
+        current = set(ordered)
+        removed = set(self.route_merge_profile_cache) - current
+        stale = {
+            sequence
+            for sequence in current.intersection(self.route_merge_profile_cache)
+            if self.incumbent_route_result(sequence) is None and not self.has_cached_route(sequence)
+        }
+        invalidated = tuple(sorted(removed | stale))
+        for sequence in invalidated:
+            del self.route_merge_profile_cache[sequence]
+        missing = tuple(
+            sequence for sequence in ordered if sequence not in self.route_merge_profile_cache
+        )
+        exact_delta = {
+            sequence: 0 if self.has_cached_route(sequence) else 1 for sequence in missing
+        }
+        observable_hits = tuple(
+            sequence
+            for sequence in ordered
+            if sequence in self.route_merge_profile_cache
+            and self.incumbent_route_result(sequence) is None
+            and self.screening_enabled
+        )
+        screening_by_sequence: dict[tuple[str, ...], ScreeningResult] = {}
+        if observable_hits:
+            transaction_runtime = self.candidate_transaction_runtime
+            native_runtime = self.native_runtime
+            if transaction_runtime is None or native_runtime is None:
+                raise RuntimeError("route-merge profile cache lacks native screening runtime")
+            screening_started = time.perf_counter()
+            screening = native_screen_candidate_batch(
+                self.instance,
+                observable_hits,
+                native_runtime=native_runtime,
+                transaction_runtime=transaction_runtime,
+                negative_cache=self.negative_screening_sequences,
+                deadline=self.deadline,
+            )
+            screening_completed = time.perf_counter()
+            self.screening_runtime += screening_completed - screening_started
+            for index, sequence in enumerate(observable_hits):
+                result = screening.screening_result(index)
+                if not result.accepted or screening.native_status(index) != "screened":
+                    raise RuntimeError("cached route-merge profile no longer passes screening")
+                screening_by_sequence[sequence] = result
+
+        def store_profile(
+            sequence: tuple[str, ...],
+            result: ChargingSubproblemResult,
+        ) -> None:
+            if not result.feasible:
+                profile = (False, 0.0, 0.0, 0)
+            else:
+                objective = SolutionObjective.from_route(
+                    self.instance,
+                    result.route,
+                    total_distance=result.distance,
+                    total_charging_time=result.charging_time,
+                )
+                profile = (
+                    True,
+                    objective.total_distance,
+                    objective.total_charging_time,
+                    objective.charging_count,
+                )
+            self.route_merge_profile_cache[sequence] = profile
+
+        missing_set = set(missing)
+        index = 0
+        while index < len(ordered):
+            sequence = ordered[index]
+            if sequence not in missing_set:
+                incumbent = self.incumbent_route_result(sequence)
+                if incumbent is not None:
+                    # A profile-cache hit replaces profile construction only.
+                    # Replay the unchanged incumbent through the established
+                    # precomputed-route path so deadline boundaries and
+                    # canonical route-evaluation events remain identical.
+                    self._precomputed_route(sequence, incumbent)
+                else:
+                    if self.screening_enabled:
+                        self._record_route_merge_profile_screening_pass(
+                            sequence,
+                            screening_by_sequence[sequence],
+                        )
+                    cached, _digest = self._lookup_cached_result(sequence, "unchanged")
+                    if cached is None:
+                        raise RuntimeError("route-merge profile cache lost its exact cache entry")
+                index += 1
+                continue
+            last = index + 1
+            while last < len(ordered) and ordered[last] in missing_set:
+                last += 1
+            group = ordered[index:last]
+            results = self.route_batch(group, route_change_status="unchanged")
+            for group_sequence, profile_result in zip(group, results, strict=True):
+                store_profile(group_sequence, profile_result)
+            index = last
+        runtime = self.candidate_transaction_runtime
+        if runtime is not None:
+            runtime.record_route_merge_profile_cache(
+                hits=len(ordered) - len(missing),
+                misses=len(missing),
+                invalidations=len(invalidated),
+            )
+        return tuple(
+            (*self.route_merge_profile_cache[sequence], exact_delta.get(sequence, 0))
+            for sequence in ordered
+        )
+
+    def _record_route_merge_profile_screening_pass(
+        self,
+        sequence: tuple[str, ...],
+        result: ScreeningResult,
+    ) -> None:
+        """Replay one cached profile's native decision into scalar semantics."""
+
+        if self.screening_config is None or not result.accepted or result.reason:
+            raise RuntimeError("route-merge profile screening pass is invalid")
+        if self.cache_incremental_enabled and sequence not in self.propagation_snapshots:
+            self.propagation_snapshots[sequence] = build_route_propagation_snapshot(
+                self.instance,
+                sequence,
+                epsilon=self.screening_config.epsilon,
+            )
+        self.screening_calls += 1
+        self.screening_passes += 1
+        if self.measurement_trace is not None:
+            route_key = self.measurement_trace.register_route(sequence)
+            observed = self.measurement_trace._offset()
+            self.measurement_trace.record_screening_decision(
+                sequence,
+                lane=self.lane,
+                iteration=self.iteration,
+                operator=self.operator,
+                status="pass",
+                first_failed_check=result.first_failed_check,
+                reason=result.reason,
+                checks=result.checks,
+                demand=result.demand,
+                min_time_window_slack=result.min_time_window_slack,
+                distance_lower_bound=result.distance_lower_bound,
+                distance_increment_lower_bound=result.distance_increment_lower_bound,
+                single_segment_reachable=result.single_segment_reachable,
+                structural_energy_lower_bound=result.structural_energy_lower_bound,
+                negative_cache_hit=False,
+                exact_call_blocked=False,
+                started_at=observed,
+                completed_at=observed,
+                registered_route_key=route_key,
+            )
+
+    def native_route_merge_candidate_pool(
+        self,
+        sequences: Sequence[tuple[str, ...]],
+        objective_metrics: Sequence[tuple[float, float]],
+        *,
+        epsilon: float,
+    ) -> tuple[
+        tuple[tuple[str, ...], ...],
+        tuple[tuple[int, int, tuple[str, ...], tuple[str, ...]], ...],
+        tuple[int, int],
+        tuple[tuple[int, int, int, str], ...],
+        tuple[tuple[bool, str], ...],
+    ]:
+        """Construct and attest one complete native route-merge candidate pool."""
+
+        transaction_runtime = self.candidate_transaction_runtime
+        native_runtime = self.native_runtime
+        if transaction_runtime is None or native_runtime is None:
+            raise RuntimeError("native route-merge candidate pool runtime is incomplete")
+        if len(sequences) != len(objective_metrics) or len(sequences) < 2:
+            raise ValueError("native route-merge profiles are incomplete")
+        context = native_runtime.context
+        context.assert_matches(self.instance)
+        offsets = np.empty(len(sequences) + 1, dtype=np.int64)
+        offsets[0] = 0
+        flattened: list[int] = []
+        for route_index, sequence in enumerate(sequences):
+            if not sequence:
+                raise ValueError("native route-merge routes must not be empty")
+            flattened.extend(context.name_to_index[name] for name in sequence)
+            offsets[route_index + 1] = len(flattened)
+        indices = np.asarray(flattened, dtype=np.int64)
+        metrics = np.asarray(objective_metrics, dtype=np.float64)
+        raw = transaction_runtime.execute_route_merge_candidate_pool_screened(
+            context.node_kind,
+            context.demand,
+            context.ready_time,
+            context.due_date,
+            context.service_time,
+            context.distance,
+            context.reachable,
+            context.vehicle,
+            offsets,
+            indices,
+            metrics,
+            epsilon,
+        )
+        if not isinstance(raw, tuple) or len(raw) != 7:
+            raise RuntimeError("native route-merge candidate pool result is invalid")
+        (
+            candidate_offsets,
+            candidate_indices,
+            raw_metadata,
+            raw_pruning,
+            raw_pruned_pair_metadata,
+            screening_payload,
+            native_timings,
+        ) = raw
+        if (
+            not isinstance(candidate_offsets, np.ndarray)
+            or candidate_offsets.dtype != np.int64
+            or candidate_offsets.ndim != 1
+            or candidate_offsets.size == 0
+            or not isinstance(candidate_indices, np.ndarray)
+            or candidate_indices.dtype != np.int64
+            or candidate_indices.ndim != 1
+            or not isinstance(raw_metadata, np.ndarray)
+            or raw_metadata.dtype != np.int64
+            or raw_metadata.shape != (candidate_offsets.size - 1, 5)
+            or not isinstance(raw_pruning, np.ndarray)
+            or raw_pruning.dtype != np.int64
+            or raw_pruning.shape != (2,)
+            or int(candidate_offsets[0]) != 0
+            or int(candidate_offsets[-1]) != candidate_indices.size
+            or np.any(candidate_offsets[1:] < candidate_offsets[:-1])
+            or np.any(candidate_indices < 0)
+            or np.any(candidate_indices >= len(context.node_names))
+            or np.any(raw_pruning < 0)
+            or not isinstance(raw_pruned_pair_metadata, np.ndarray)
+            or raw_pruned_pair_metadata.dtype != np.int64
+            or raw_pruned_pair_metadata.ndim != 2
+            or raw_pruned_pair_metadata.shape[1] != 4
+            or raw_pruned_pair_metadata.shape[0] != int(raw_pruning[0])
+            or np.any(raw_pruned_pair_metadata < 0)
+            or not isinstance(native_timings, np.ndarray)
+            or native_timings.dtype != np.float64
+            or native_timings.shape != (2,)
+            or not np.all(np.isfinite(native_timings))
+            or np.any(native_timings < 0.0)
+        ):
+            raise RuntimeError("native route-merge candidate pool arrays are invalid")
+        candidates: list[tuple[str, ...]] = []
+        metadata: list[tuple[int, int, tuple[str, ...], tuple[str, ...]]] = []
+        for candidate_index in range(candidate_offsets.size - 1):
+            first = int(candidate_offsets[candidate_index])
+            last = int(candidate_offsets[candidate_index + 1])
+            candidate = tuple(
+                context.node_names[int(node)] for node in candidate_indices[first:last]
+            )
+            left, right, source_index, target_index, position = (
+                int(value) for value in raw_metadata[candidate_index]
+            )
+            if (
+                not 0 <= left < right < len(sequences)
+                or source_index not in {left, right}
+                or target_index not in {left, right}
+                or source_index == target_index
+                or not 0 <= position <= len(sequences[target_index])
+            ):
+                raise RuntimeError("native route-merge metadata is invalid")
+            source = sequences[source_index]
+            target = sequences[target_index]
+            expected = target[:position] + source + target[position:]
+            if candidate != expected:
+                raise RuntimeError("native route-merge candidate does not replay")
+            candidates.append(candidate)
+            metadata.append((left, right, source, target))
+        packed_candidates = tuple(candidates)
+        candidate_ids = np.arange(len(packed_candidates), dtype=np.int64)
+        native_runtime.record_screening(
+            float(native_timings[1]),
+            batch_candidates=len(packed_candidates),
+        )
+        screening = decode_native_candidate_screening_payload(
+            screening_payload,
+            candidates=packed_candidates,
+            candidate_ids=candidate_ids,
+            route_offsets=candidate_offsets,
+            route_indices=candidate_indices,
+        )
+        decisions = tuple(
+            (screening.accepted(index), screening.reason(index))
+            for index in range(len(packed_candidates))
+        )
+        transaction_runtime.record_route_merge_screening(
+            candidates=len(decisions),
+            rejections=sum(not accepted for accepted, _reason in decisions),
+        )
+        reason_names = {2: "capacity_prefilter", 3: "forward_time_window_prefilter"}
+        pruned_pair_metadata = tuple(
+            (int(left), int(right), int(skipped), reason_names.get(int(reason), ""))
+            for left, right, skipped, reason in raw_pruned_pair_metadata
+        )
+        if sum(skipped for _left, _right, skipped, _reason in pruned_pair_metadata) != int(
+            raw_pruning[1]
+        ) or any(
+            not 0 <= left < right < len(sequences)
+            or skipped <= 0
+            or reason not in reason_names.values()
+            for left, right, skipped, reason in pruned_pair_metadata
+        ):
+            raise RuntimeError("native route-merge pruned-pair metadata is invalid")
+        return (
+            packed_candidates,
+            tuple(metadata),
+            (int(raw_pruning[0]), int(raw_pruning[1])),
+            pruned_pair_metadata,
+            decisions,
+        )
 
     @property
     def candidate_control_route_change_limit(self) -> int | None:
@@ -865,6 +1356,7 @@ class _Evaluator:
             )
         )
         pending_snapshot = dict(self.pending_candidate_cache)
+        pending_context_snapshot = dict(self.pending_candidate_cache_contexts)
         pending_negative_snapshot = dict(self.pending_negative_screening_sequences)
         native_negative_cache_snapshot: NativeNegativeCacheSnapshot = (
             transaction_runtime.snapshot_negative_cache_state()
@@ -886,6 +1378,8 @@ class _Evaluator:
         def rollback_protocol_state() -> None:
             self.pending_candidate_cache.clear()
             self.pending_candidate_cache.update(pending_snapshot)
+            self.pending_candidate_cache_contexts.clear()
+            self.pending_candidate_cache_contexts.update(pending_context_snapshot)
             self.pending_negative_screening_sequences.clear()
             self.pending_negative_screening_sequences.update(pending_negative_snapshot)
             if self.route_cache is not None and route_cache_snapshot is not None:
@@ -1137,7 +1631,7 @@ class _Evaluator:
                 elif resolution == "exact":
                     result = exact_results[index]
                     resolved[index] = result
-                    self.pending_candidate_cache[clean[index]] = result
+                    self._stage_pending_candidate_cache(clean[index], result)
                 elif resolution == "not_selected":
                     resolved[index] = _candidate_control_skip_result("not_selected")
                 elif resolution == "round_budget_exhausted":
@@ -1699,9 +2193,7 @@ class _Evaluator:
                     route_change_status,
                     stage_candidate_transaction=True,
                 ),
-                stage_cache_write=lambda sequence, result: self.pending_candidate_cache.__setitem__(
-                    sequence, result
-                ),
+                stage_cache_write=self._stage_pending_candidate_cache,
                 commit_cache_writes=self._commit_pending_candidate_cache,
                 rollback_cache_writes=self._discard_pending_candidate_cache,
                 rejected_result=rejected,
@@ -2454,7 +2946,7 @@ class _Evaluator:
         if self.exact_call_controller is not None:
             self.exact_call_controller.complete(1)
         if self.exact_call_controller is not None and not transactional_deadline:
-            self.pending_candidate_cache[sequence] = result
+            self._stage_pending_candidate_cache(sequence, result)
         elif not transactional_deadline and self.route_cache is None and self.local_cache_enabled:
             # Stage 0--3.1 retain their historical lane-local cache.  Stage
             # 3.2 has only the bounded RouteEvaluationCache so the memory cap
@@ -2971,7 +3463,7 @@ class _Evaluator:
                 self.exact_call_controller is not None
                 and not (partial_budget_batch or transactional_deadline)
             ):
-                self.pending_candidate_cache[sequence] = result
+                self._stage_pending_candidate_cache(sequence, result)
             elif (
                 not partial_budget_batch
                 and not transactional_deadline
@@ -3278,7 +3770,22 @@ def _solve_alns(
         else None
     )
     candidate_transaction_runtime = (
-        NativeCandidateTransactionRuntime(candidate_transaction_config)
+        NativeCandidateTransactionRuntime(
+            candidate_transaction_config,
+            persistent_worker_threads=(
+                native_execution_config.compute_threads_per_shard
+                if native_execution_config is not None
+                and native_execution_config.mode == "per_solve_runtime"
+                else 0
+            ),
+            task_receipt_path=(
+                Path(native_execution_config.task_receipt_path)
+                if native_execution_config is not None
+                and native_execution_config.mode == "per_solve_runtime"
+                and native_execution_config.task_receipt_path is not None
+                else None
+            ),
+        )
         if candidate_transaction_config is not None
         else None
     )
@@ -5661,9 +6168,7 @@ def _full_native_maximum_stagnation(
             )
             if is_global_best:
                 if not candidate_key:
-                    raise RuntimeError(
-                        "full native global-best event has no candidate objective"
-                    )
+                    raise RuntimeError("full native global-best event has no candidate objective")
                 best_key = candidate_key
                 improved = True
         stagnation = 0 if improved else stagnation + 1
@@ -5708,7 +6213,59 @@ def _full_native_acceptance_rate(
     )
 
 
+@dataclass(slots=True)
+class _FullNativeSpoolCleanup:
+    measurement_trace: Stage03Trace | None = None
+    runtime_projection: Stage052EventSpool | None = None
+
+    def cleanup(self) -> None:
+        errors: list[BaseException] = []
+        if self.runtime_projection is not None:
+            try:
+                self.runtime_projection.close()
+            except BaseException as error:
+                errors.append(error)
+            self.runtime_projection = None
+        if self.measurement_trace is not None:
+            try:
+                self.measurement_trace.release_runtime_semantic_storage()
+            except BaseException as error:
+                errors.append(error)
+            self.measurement_trace = None
+        if errors:
+            raise BaseExceptionGroup("full-native spool cleanup failed", errors)
+
+
+def _with_full_native_spool_cleanup[**FullNativeParameters](
+    function: Callable[
+        Concatenate[_FullNativeSpoolCleanup, FullNativeParameters],
+        ALNSResult,
+    ],
+) -> Callable[FullNativeParameters, ALNSResult]:
+    @wraps(function)
+    def wrapped(
+        *args: FullNativeParameters.args,
+        **kwargs: FullNativeParameters.kwargs,
+    ) -> ALNSResult:
+        cleanup = _FullNativeSpoolCleanup()
+        try:
+            return function(cleanup, *args, **kwargs)
+        except BaseException as primary_error:
+            try:
+                cleanup.cleanup()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "full-native solve and spool cleanup failed",
+                    [primary_error, cleanup_error],
+                ) from None
+            raise
+
+    return wrapped
+
+
+@_with_full_native_spool_cleanup
 def _solve_full_native_alns(
+    spool_cleanup: _FullNativeSpoolCleanup,
     instance: Instance,
     *,
     seed: int,
@@ -5791,6 +6348,7 @@ def _solve_full_native_alns(
             and exact_deadline_config.mode == "exact_call_budget"
             else None
         ),
+        task_receipt_path=config.task_receipt_path,
         dispatcher=dispatcher,
     )
     protocol_seconds = time.perf_counter() - protocol_started
@@ -5805,6 +6363,7 @@ def _solve_full_native_alns(
         if measurement_config is not None and measurement_config.enabled
         else None
     )
+    spool_cleanup.measurement_trace = measurement_trace
     if measurement_trace is not None:
         cache_keys = RouteEvaluationCache(instance, cache_incremental_config)
         for journal_event in native_result.exact_journal_events:
@@ -5832,47 +6391,54 @@ def _solve_full_native_alns(
                 cache_key_digest=cache_keys.make_key(sequence).digest,
                 route_change_status="changed",
             )
-        for journal_event in native_result.control_journal_events:
-            event = dict(journal_event)
-            if event.get("event_type") != "screening_decision":
-                continue
-            sequence = tuple(cast(list[str], event["customer_sequence"]))
-            raw_iteration = int(cast(int, event["iteration"]))
-            checks = tuple(
-                ScreeningCheckTrace(
-                    check=str(check["check"]),
-                    status=str(check["status"]),
-                    value=cast(float | bool | None, check["value"]),
-                    reason=str(check["reason"]),
+        if measurement_trace.config.externalize_runtime_semantic_events:
+            measurement_trace.import_screening_statistics(native_result.screening_statistics)
+        else:
+            for screening_row in range(len(native_result.screening_journal)):
+                sequence = native_result.screening_journal.route_sequence(screening_row)
+                route_key = measurement_trace.register_route(sequence)
+                event = native_result.screening_journal.semantic_event(
+                    screening_row,
+                    route_key=route_key,
                 )
-                for check in cast(list[dict[str, object]], event["checks"])
-            )
-            measurement_trace.record_screening_decision(
-                sequence,
-                lane=str(event["lane"]),
-                iteration=None if raw_iteration < 0 else raw_iteration,
-                operator=str(event["operator"]),
-                status=str(event["status"]),
-                first_failed_check=str(event["first_failed_check"]),
-                reason=str(event["reason"]),
-                checks=checks,
-                demand=float(cast(float, event["demand"])),
-                min_time_window_slack=float(cast(float, event["min_time_window_slack"])),
-                distance_lower_bound=float(cast(float, event["distance_lower_bound"])),
-                distance_increment_lower_bound=cast(
-                    float | None, event["distance_increment_lower_bound"]
-                ),
-                single_segment_reachable=bool(event["single_segment_reachable"]),
-                structural_energy_lower_bound=float(
-                    cast(float, event["structural_energy_lower_bound"])
-                ),
-                negative_cache_hit=bool(event["negative_cache_hit"]),
-                exact_call_blocked=bool(event["exact_call_blocked"]),
-                started_at=0.0,
-                completed_at=0.0,
-            )
+                measurement_trace.record_screening_decision(
+                    sequence,
+                    lane=str(event["lane"]),
+                    iteration=cast(int | None, event["iteration"]),
+                    operator=str(event["operator"]),
+                    status=str(event["status"]),
+                    first_failed_check=str(event["first_failed_check"]),
+                    reason=str(event["reason"]),
+                    checks=tuple(
+                        ScreeningCheckTrace(
+                            check=str(check["check"]),
+                            status=str(check["status"]),
+                            value=cast(float | bool | None, check["value"]),
+                            reason=str(check["reason"]),
+                        )
+                        for check in cast(list[dict[str, object]], event["checks"])
+                    ),
+                    demand=float(cast(float, event["demand"])),
+                    min_time_window_slack=float(cast(float, event["min_time_window_slack"])),
+                    distance_lower_bound=float(cast(float, event["distance_lower_bound"])),
+                    distance_increment_lower_bound=cast(
+                        float | None,
+                        event["distance_increment_lower_bound"],
+                    ),
+                    single_segment_reachable=bool(event["single_segment_reachable"]),
+                    structural_energy_lower_bound=float(
+                        cast(float, event["structural_energy_lower_bound"])
+                    ),
+                    negative_cache_hit=bool(event["negative_cache_hit"]),
+                    exact_call_blocked=bool(event["exact_call_blocked"]),
+                    started_at=0.0,
+                    completed_at=0.0,
+                    registered_route_key=route_key,
+                )
         measurement_trace.events.extend(
-            dict(event) for event in native_result.control_journal_events
+            dict(event)
+            for event in native_result.control_journal_events
+            if event.get("event_type") != "screening_decision"
         )
     validation_started = time.perf_counter()
     routes = tuple(tuple(result.route) for result in native_result.exact_results)
@@ -5906,16 +6472,52 @@ def _solve_full_native_alns(
     if fallback_count != 0 or native_runtime.fallback_count != 0:
         raise RuntimeError("full native ALNS used a forbidden fallback")
     native_statistics = config.to_dict()
+    native_projection_hasher = hashlib.sha256(b"stage05.2-native-canonical-row-projection-v1")
+    native_projection_stream_counts = [0] * 11
+    native_projection_columns = (
+        native_result.canonical_event_journal.event_ids,
+        native_result.canonical_event_journal.stream_codes,
+        native_result.canonical_event_journal.event_codes,
+        native_result.canonical_event_journal.lane_ids,
+        native_result.canonical_event_journal.operator_ids,
+        native_result.canonical_event_journal.iterations,
+        native_result.canonical_event_journal.transaction_ids,
+        native_result.canonical_event_journal.subject_ids,
+        native_result.canonical_event_journal.status_codes,
+        native_result.canonical_event_journal.flags,
+    )
+    native_projection_count = len(native_projection_columns[0])
+    for row in range(native_projection_count):
+        values = tuple(int(column[row]) for column in native_projection_columns)
+        native_projection_hasher.update(struct.pack("<10q", *values))
+        native_projection_stream_counts[values[1]] += 1
+    native_projection_hasher.update(struct.pack("<q", native_projection_count))
+    native_projection_hasher.update(struct.pack("<11q", *native_projection_stream_counts))
+    native_projection_sha256 = native_projection_hasher.hexdigest()
     causal_stream_counts = [int(value) for value in native_result.causal_journal.stream_counts]
     candidate_control_semantics_complete = all(
         causal_stream_counts[index] > 0 for index in (1, 3, 4)
     )
     stage04_semantics_complete = all(causal_stream_counts[index] > 0 for index in (0, 5))
+    work_pool_statistics = dict(native_result.work_pool_statistics)
+    work_pool_complete = work_pool_statistics.get("schema_version") in {
+        "stage05.2-full-native-work-pool-v2",
+        "stage05.2-full-native-work-pool-v3",
+    } and all(
+        work_pool_statistics.get(field) == 0
+        for field in (
+            "pending_tasks",
+            "active_tasks",
+            "queue_full_count",
+            "rejected_count",
+        )
+    )
     instrumentation_complete = (
         candidate_control_semantics_complete
         and stage04_semantics_complete
         and native_result.causal_journal.complete_search_semantics
         and int(native_result.timings["work_pool_active_tasks_at_return"]) == 0
+        and work_pool_complete
     )
     native_statistics.update(
         {
@@ -5994,8 +6596,14 @@ def _solve_full_native_alns(
             "transaction_sha256": native_result.transaction_sha256,
             "exact_journal_sha256": native_result.exact_journal_sha256,
             "control_journal_sha256": native_result.control_journal_sha256,
+            "canonical_event_journal_sha256": (
+                native_result.canonical_event_journal.transaction_sha256
+            ),
+            "canonical_event_count": len(native_result.canonical_event_journal.event_ids),
+            "canonical_event_projection_sha256": native_projection_sha256,
             "counters": dict(native_result.counters),
             "timings": dict(native_result.timings),
+            "work_pool_statistics": work_pool_statistics,
             "candidate_control_semantics_complete": (candidate_control_semantics_complete),
             "stage04_semantics_complete": stage04_semantics_complete,
             "instrumentation_complete": instrumentation_complete,
@@ -6210,10 +6818,50 @@ def _solve_full_native_alns(
         "station_reachability": station_reachability,
     }
     if measurement_trace is not None and measurement_trace.runtime_semantic_enabled:
-        exact_result_events = tuple(
-            {
+        # A Stage 5.2 axis owns exactly one active non-daemon trace writer.  Stop
+        # the solver spool before constructing the native semantic projection;
+        # its frames remain readable until ownership transfer completes.
+        measurement_trace.seal_runtime_semantic_storage()
+        native_event_ids = native_result.canonical_event_journal.event_ids
+        native_journal = native_result.canonical_event_journal
+        native_row_lengths = {
+            field: len(getattr(native_journal, field))
+            for field in (
+                "event_ids",
+                "stream_codes",
+                "event_codes",
+                "lane_ids",
+                "operator_ids",
+                "iterations",
+                "transaction_ids",
+                "subject_ids",
+                "status_codes",
+                "flags",
+            )
+        }
+        native_row_count = len(native_event_ids)
+        if native_row_count == 0 or any(
+            length != native_row_count for length in native_row_lengths.values()
+        ):
+            raise RuntimeError(
+                "full native canonical event journal field lengths do not reconcile: "
+                f"{native_row_lengths!r}"
+            )
+        canonical_transaction_ids = {
+            int(transaction_id)
+            for transaction_id in native_result.canonical_event_journal.transaction_ids
+            if int(transaction_id) >= 0
+        }
+        exact_results_by_context: dict[
+            tuple[str, int | None, str],
+            list[dict[str, object]],
+        ] = {}
+        for runtime_event in measurement_trace.runtime_semantic_events:
+            if runtime_event.get("semantic_stream") != "exact_result":
+                continue
+            exact_result_event = {
                 key: value
-                for key, value in event.items()
+                for key, value in runtime_event.items()
                 if key
                 not in {
                     "semantic_stream",
@@ -6221,10 +6869,671 @@ def _solve_full_native_alns(
                     "runtime_causal_event_id",
                 }
             }
-            for event in measurement_trace.runtime_semantic_events
-            if event.get("semantic_stream") == "exact_result"
-        )
-        runtime_projection: list[tuple[str, Mapping[str, object]]] = []
+            context = (
+                str(exact_result_event["lane"]),
+                cast(int | None, exact_result_event["iteration"]),
+                str(exact_result_event["operator"]),
+            )
+            exact_results_by_context.setdefault(context, []).append(exact_result_event)
+        runtime_projection = Stage052EventSpool(prefix="stage052-native-projection-")
+        spool_cleanup.runtime_projection = runtime_projection
+        canonical_stream_codes = {
+            "candidate_state": 0,
+            "operator": 1,
+            "stage04": 2,
+            "candidate_transaction": 3,
+            "exact_work": 4,
+            "exact_result": 5,
+            "cache": 6,
+            "screening": 7,
+            "deadline": 8,
+            "termination": 9,
+        }
+        quality_operators = {
+            "relocate",
+            "swap",
+            "two_opt_star",
+            "route_segment_destroy",
+            "ejection_chain",
+        }
+        full_operator_index = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
+        quality_subject = {"relocate": 0, "swap": 1, "two_opt_star": 2}
+        constraint_subject = {
+            "station_pressure": 0,
+            "time_window_conflict": 1,
+            "worst_energy_detour": 2,
+            "shaw_related": 3,
+        }
+        stage04_projection_ordinal = 0
+        native_projection_index = 0
+        projection_ordinal_counters: dict[tuple[object, ...], int] = {}
+        projection_transaction_contexts: dict[int, tuple[int, int, int]] = {}
+
+        def validate_runtime_projection_event(
+            index: int,
+            semantic_stream: str,
+            event: Mapping[str, object],
+            screening_flags: int | None,
+        ) -> None:
+            nonlocal stage04_projection_ordinal
+            event_type = str(event.get("event_type", ""))
+            status_text = str(event.get("status", ""))
+            stream_code = canonical_stream_codes.get(semantic_stream)
+            if stream_code is None:
+                raise RuntimeError("full native runtime projection has an unknown stream")
+            if semantic_stream == "candidate_transaction":
+                if event_type == "candidate_initial_solution":
+                    event_code = 1 if status_text == "submitted" else 11
+                else:
+                    event_code = {
+                        "candidate_plan_decision": 2,
+                        "candidate_control_budget": 5,
+                        "candidate_route_result": 7,
+                        "parallel_batch": 8,
+                        "candidate_plan_attempted": 10,
+                        "candidate_control_round": (13 if status_text == "started" else 17),
+                    }[event_type]
+            elif semantic_stream == "screening":
+                event_code = 3
+            elif semantic_stream == "cache":
+                event_code = 4
+            elif semantic_stream == "exact_work":
+                event_code = 6
+            elif semantic_stream == "exact_result":
+                event_code = 9
+            elif semantic_stream == "operator":
+                event_code = 14
+            elif semantic_stream == "candidate_state":
+                event_code = 15
+            elif semantic_stream == "stage04":
+                event_code = 12 if stage04_projection_ordinal == 0 else 16
+                stage04_projection_ordinal += 1
+            elif semantic_stream == "deadline":
+                event_code = 18
+            elif semantic_stream == "termination":
+                event_code = 19
+            else:  # pragma: no cover - stream lookup above is exhaustive
+                raise AssertionError("unreachable semantic stream")
+
+            if semantic_stream in {"deadline", "termination"}:
+                lane_id = -1
+                operator_id = -1
+            else:
+                lane_value = event.get("lane")
+                operator_value = event.get("operator")
+                if event_type in {
+                    "candidate_initial_solution",
+                    "candidate_plan_attempted",
+                }:
+                    lane_value = "initialization"
+                    operator_value = "initial_solution"
+                elif event_type == "candidate_control_budget":
+                    context_parts = str(event.get("context", "")).split(":", 2)
+                    if len(context_parts) < 2:
+                        raise RuntimeError("full native budget event lost its semantic context")
+                    lane_value, operator_value = context_parts[:2]
+                elif semantic_stream == "stage04":
+                    lane_value, operator_value = "all", "stage04"
+                elif event_type == "candidate_control_round":
+                    lane_value, operator_value = "all", "candidate_control"
+                elif semantic_stream == "operator":
+                    operator_value = event.get("operator")
+                    if not isinstance(operator_value, str):
+                        raise RuntimeError("full native operator event lost its operator")
+                    lane_value = (
+                        "constraint_lane"
+                        if event.get("track") == "constraint_lane"
+                        or operator_value in constraint_subject
+                        else "quality_shadow"
+                        if operator_value in quality_operators
+                        else "legacy"
+                    )
+                if not isinstance(lane_value, str) or not isinstance(
+                    operator_value,
+                    str,
+                ):
+                    raise RuntimeError("full native runtime event lost its lane/operator context")
+                lane_id = native_semantic_context_id(lane_value)
+                operator_id = native_semantic_context_id(operator_value)
+            iteration_value = (
+                event.get("iterations")
+                if semantic_stream == "termination"
+                else event.get("iteration")
+            )
+            iteration = -1 if iteration_value is None else int(cast(int, iteration_value))
+            transaction_id = int(native_journal.transaction_ids[index])
+            subject = 0
+            status_code = 0
+            flags = 0
+            ordinal_key: tuple[object, ...]
+            if event_code == 2:
+                subject = int(cast(int, event.get("candidate_id", 0)))
+                status_code, flags = 2, 1
+            elif event_code == 3:
+                if screening_flags is None:
+                    raise RuntimeError("full native screening event lost its expected flags")
+                phase = bool(screening_flags & 5)
+                ordinal_key = (event_code, transaction_id, phase)
+                subject = projection_ordinal_counters.get(ordinal_key, 0)
+                projection_ordinal_counters[ordinal_key] = subject + 1
+                status_code = int(status_text == "pass")
+                flags = screening_flags
+            elif event_code == 4:
+                operation = str(event.get("operation", ""))
+                ordinal_key = (event_code, transaction_id, operation)
+                subject = projection_ordinal_counters.get(ordinal_key, 0)
+                projection_ordinal_counters[ordinal_key] = subject + 1
+                status_code = int(operation == "hit")
+                flags = 1
+            elif event_code in {5, 6}:
+                subject = int(
+                    cast(
+                        int,
+                        event.get("requested", event.get("requested_calls", 0)),
+                    )
+                )
+                status_code, flags = (1, 0) if event_code == 5 else (subject, 1)
+            elif event_code in {7, 9}:
+                ordinal_key = (event_code, transaction_id)
+                subject = projection_ordinal_counters.get(ordinal_key, 0)
+                projection_ordinal_counters[ordinal_key] = subject + 1
+                feasible = bool(event.get("feasible", True))
+                status_code = 0 if feasible else 1
+                flags = (7 if feasible else 3) if event_code == 7 else 0
+            elif event_code == 8:
+                subject = len(cast(list[object], event["submission_order"]))
+            elif event_code == 10:
+                subject = int(cast(int, event.get("candidate_id", 0)))
+                status_code = 5
+            elif event_code == 11:
+                status_code = 1
+            elif event_code in {13, 17}:
+                subject = int(cast(int, event.get("iteration", 0)))
+            elif event_code == 14:
+                operator_name = str(event["operator"])
+                if operator_name in quality_subject:
+                    ordinal_key = (
+                        event_code,
+                        "quality_shadow",
+                        operator_name,
+                        iteration,
+                    )
+                    subject = projection_ordinal_counters.get(ordinal_key, 0)
+                    projection_ordinal_counters[ordinal_key] = subject + 1
+                elif operator_name in constraint_subject:
+                    subject = constraint_subject[operator_name]
+                else:
+                    ordinal_key = (event_code, "legacy", iteration)
+                    subject = projection_ordinal_counters.get(ordinal_key, 0)
+                    projection_ordinal_counters[ordinal_key] = subject + 1
+                status_code = int(
+                    bool(
+                        event.get(
+                            "_operator_native_candidate_feasible",
+                            event.get("candidate_feasible"),
+                        )
+                    )
+                    or (
+                        operator_name in constraint_subject
+                        and status_text == "candidate_proposed"
+                        and str(event.get("reason")) == "constraint_ranked_removal"
+                    )
+                )
+                flags = int(bool(event.get("accepted")))
+            elif event_code == 15:
+                operator_name = str(event["operator"])
+                subject = (
+                    quality_subject[operator_name]
+                    if operator_name in quality_subject
+                    else constraint_subject[operator_name]
+                    if operator_name in constraint_subject
+                    else full_operator_index[operator_name]
+                )
+                status_code = int(bool(event.get("accepted")))
+                flags = int(bool(event.get("candidate_feasible")))
+            elif event_code == 16:
+                stage_type = str(event.get("type", ""))
+                if stage_type.startswith("stage04_segment_"):
+                    role = str(event["operator"])
+                    subject = full_operator_index[role.removeprefix("neighborhood:")]
+                    status_code = int(stage_type == "stage04_segment_update")
+                else:
+                    subject = {
+                        "stage04_reheat": 100,
+                        "stage04_restart": 101,
+                        "stage04_intensification_end": 102,
+                    }[stage_type]
+                    status_code = 1
+            elif event_code in {18, 19}:
+                subject = -1
+                status_code = {
+                    "iteration_limit": 0,
+                    "exact_call_budget_exhausted": 1,
+                    "wall_clock_deadline": 2,
+                    "candidate_control_exhausted": 3,
+                }[status_text]
+                flags = int(event_code == 18)
+
+            if transaction_id < 0:
+                if event_code not in {12, 13, 16, 17, 18, 19, 20}:
+                    raise RuntimeError(
+                        "full native canonical event journal lost transaction ownership"
+                    )
+            else:
+                transaction_context = (
+                    lane_id,
+                    operator_id,
+                    -1 if lane_id == native_semantic_context_id("initialization") else iteration,
+                )
+                previous_context = projection_transaction_contexts.setdefault(
+                    transaction_id,
+                    transaction_context,
+                )
+                if previous_context != transaction_context:
+                    raise RuntimeError(
+                        "full native canonical event journal mixes transaction contexts"
+                    )
+
+            expected = (
+                index + 1,
+                stream_code,
+                event_code,
+                lane_id,
+                operator_id,
+                iteration,
+                subject,
+                status_code,
+                flags,
+            )
+            observed = (
+                int(native_journal.event_ids[index]),
+                int(native_journal.stream_codes[index]),
+                int(native_journal.event_codes[index]),
+                int(native_journal.lane_ids[index]),
+                int(native_journal.operator_ids[index]),
+                int(native_journal.iterations[index]),
+                int(native_journal.subject_ids[index]),
+                int(native_journal.status_codes[index]),
+                int(native_journal.flags[index]),
+            )
+            if observed != expected:
+                raise RuntimeError(
+                    "full native canonical event journal does not match runtime projection: "
+                    f"index={index}, stream={semantic_stream!r}, "
+                    f"event_type={event_type!r}, native={observed!r}, "
+                    f"expected={expected!r}"
+                )
+
+        def append_runtime_projection(
+            value: tuple[str, Mapping[str, object]],
+            *,
+            native_backed: bool = True,
+        ) -> None:
+            nonlocal native_projection_index
+            semantic_stream, raw_event = value
+            index = native_projection_index
+            if native_backed and index >= len(native_event_ids):
+                raise RuntimeError("full native runtime projection exceeds canonical event journal")
+            event_id = len(runtime_projection) + 1
+            if native_backed and int(native_event_ids[index]) != index + 1:
+                raise RuntimeError("full native canonical event IDs are not contiguous")
+            event = dict(raw_event)
+            if any(
+                key in event
+                for key in (
+                    "semantic_stream",
+                    "semantic_event_id",
+                    "runtime_causal_event_id",
+                )
+            ):
+                raise RuntimeError("full native projection event already owns semantic identity")
+            raw_screening_flags = event.pop("_native_expected_flags", None)
+            expected_screening_flags = (
+                None if raw_screening_flags is None else int(cast(int, raw_screening_flags))
+            )
+            if native_backed:
+                validate_runtime_projection_event(
+                    index,
+                    semantic_stream,
+                    event,
+                    expected_screening_flags,
+                )
+            event.update(
+                {
+                    "semantic_stream": semantic_stream,
+                    "semantic_event_id": event_id,
+                    "runtime_causal_event_id": event_id,
+                }
+            )
+            if native_backed:
+                event.update(
+                    {
+                        "runtime_native_event_id": int(native_journal.event_ids[index]),
+                        "runtime_native_stream_code": int(
+                            native_result.canonical_event_journal.stream_codes[index]
+                        ),
+                        "runtime_native_event_code": int(
+                            native_result.canonical_event_journal.event_codes[index]
+                        ),
+                        "runtime_native_lane_id": int(
+                            native_result.canonical_event_journal.lane_ids[index]
+                        ),
+                        "runtime_native_operator_id": int(
+                            native_result.canonical_event_journal.operator_ids[index]
+                        ),
+                        "runtime_native_iteration": int(
+                            native_result.canonical_event_journal.iterations[index]
+                        ),
+                        "runtime_native_transaction_id": int(
+                            native_result.canonical_event_journal.transaction_ids[index]
+                        ),
+                        "runtime_native_subject_id": int(
+                            native_result.canonical_event_journal.subject_ids[index]
+                        ),
+                        "runtime_native_status_code": int(
+                            native_result.canonical_event_journal.status_codes[index]
+                        ),
+                        "runtime_native_flags": int(
+                            native_result.canonical_event_journal.flags[index]
+                        ),
+                    }
+                )
+                native_projection_index += 1
+            runtime_projection.append((semantic_stream, event))
+
+        def extend_runtime_projection(
+            values: Iterable[tuple[str, Mapping[str, object]]],
+        ) -> None:
+            for value in values:
+                append_runtime_projection(value)
+
+        control_events_by_transaction: dict[int, list[dict[str, object]]] = {}
+        control_transactions_by_context: dict[tuple[str, int | None, str], list[int]] = {}
+        control_transaction_order: list[int] = []
+        for raw_control_event in native_result.control_journal_events:
+            raw_transaction_id = raw_control_event.get("native_transaction_id")
+            if isinstance(raw_transaction_id, bool) or not isinstance(raw_transaction_id, int):
+                raise RuntimeError("full native control event lost its transaction identity")
+            transaction_events = control_events_by_transaction.setdefault(raw_transaction_id, [])
+            if not transaction_events and raw_transaction_id in canonical_transaction_ids:
+                control_transaction_order.append(raw_transaction_id)
+                context = (
+                    str(raw_control_event["lane"]),
+                    cast(int | None, raw_control_event.get("iteration")),
+                    str(raw_control_event["operator"]),
+                )
+                control_transactions_by_context.setdefault(context, []).append(raw_transaction_id)
+            transaction_events.append(dict(raw_control_event))
+        if any(
+            not events or events[-1].get("event_type") != "candidate_cache_transaction"
+            for events in control_events_by_transaction.values()
+        ):
+            raise RuntimeError("full native control transaction is not committed")
+
+        control_decisions_emitted: set[int] = set()
+        control_stores_emitted: set[int] = set()
+        control_transactions_finished: set[int] = set()
+        control_lookup_cursors: dict[int, int] = {}
+        control_work_seen: dict[int, int] = {}
+        work_by_transaction: dict[int, list[Mapping[str, object]]] = {}
+        for work in native_result.candidate_work:
+            transaction_id = int(cast(int, work["_native_transaction_id"]))
+            if transaction_id not in control_events_by_transaction:
+                raise RuntimeError("full native exact work has no signed control transaction")
+            first_canonical_event_id = int(
+                cast(int, work["_native_first_canonical_result_event_id"])
+            )
+            if transaction_id not in canonical_transaction_ids or first_canonical_event_id == 0:
+                # Rolled-back physical work remains auditable but owns no
+                # canonical runtime semantics.
+                continue
+            work_by_transaction.setdefault(transaction_id, []).append(work)
+
+        cache_state: dict[str, tuple[tuple[str, ...], str, int]] = {}
+        cache_seen_keys: set[str] = set()
+        cache_replay_statistics = [0] * 11
+
+        def control_rows(transaction_id: int, event_type: str) -> list[dict[str, object]]:
+            return [
+                event
+                for event in control_events_by_transaction[transaction_id]
+                if event.get("event_type") == event_type
+            ]
+
+        def append_control_decisions(transaction_id: int) -> None:
+            if transaction_id in control_decisions_emitted:
+                return
+            events = control_events_by_transaction[transaction_id]
+            for raw_event in events:
+                if raw_event.get("event_type") != "candidate_plan_decision":
+                    continue
+                if raw_event.get("lane") == "initialization":
+                    continue
+                event = {
+                    key: value
+                    for key, value in raw_event.items()
+                    if key not in {"native_transaction_id", "batch_ordinal"}
+                }
+                append_runtime_projection(("candidate_transaction", event), native_backed=False)
+            control_decisions_emitted.add(transaction_id)
+
+        def append_control_lookup(
+            raw_event: Mapping[str, object],
+            *,
+            native_backed: bool,
+        ) -> tuple[str, tuple[str, ...]]:
+            raw_sequence = raw_event.get("customer_sequence")
+            if not isinstance(raw_sequence, list) or not all(
+                isinstance(node, str) for node in raw_sequence
+            ):
+                raise RuntimeError("full native cache lookup lost its route")
+            sequence = tuple(raw_sequence)
+            route_key = measurement_trace.register_route(sequence)
+            result = str(raw_event.get("result"))
+            if result not in {"hit", "miss"}:
+                raise RuntimeError("full native cache lookup has an invalid result")
+            present = route_key in cache_state
+            if present != (result == "hit"):
+                raise RuntimeError(
+                    "full native cache lookup disagrees with the replayed LRU state: "
+                    f"route_key={route_key!r}, result={result!r}"
+                )
+            cache_replay_statistics[0] += 1
+            cache_replay_statistics[1 if present else 2] += 1
+            cache_seen_keys.add(route_key)
+            cache_replay_statistics[10] = len(cache_seen_keys)
+            if present:
+                retained = cache_state.pop(route_key)
+                cache_state[route_key] = retained
+            append_runtime_projection(
+                (
+                    "cache",
+                    {
+                        "event_type": "cache_event",
+                        "operation": result,
+                        "route_key": route_key,
+                        "cache_key_digest": cache_keys.make_key(sequence).digest,
+                        "lane": raw_event.get("lane"),
+                        "iteration": raw_event.get("iteration"),
+                        "operator": raw_event.get("operator"),
+                        "current_entries": len(cache_state),
+                        "current_bytes": cache_replay_statistics[8],
+                    },
+                ),
+                native_backed=native_backed,
+            )
+            return result, sequence
+
+        def append_control_lookups_for_work(
+            transaction_id: int,
+            sequences: Sequence[Sequence[str]],
+        ) -> None:
+            append_control_decisions(transaction_id)
+            lookups = control_rows(transaction_id, "cache_event")
+            cursor = control_lookup_cursors.get(transaction_id, 0)
+            matched = 0
+            while matched < len(sequences):
+                if cursor >= len(lookups):
+                    raise RuntimeError("full native control journal lost an exact-work cache miss")
+                raw_event = lookups[cursor]
+                raw_sequence = cast(list[str], raw_event["customer_sequence"])
+                matches_work = raw_event.get("result") == "miss" and tuple(raw_sequence) == tuple(
+                    sequences[matched]
+                )
+                append_control_lookup(raw_event, native_backed=matches_work)
+                cursor += 1
+                matched += int(matches_work)
+            control_lookup_cursors[transaction_id] = cursor
+
+        def append_control_store_rows(transaction_id: int) -> None:
+            if transaction_id in control_stores_emitted:
+                return
+            for raw_event in control_rows(transaction_id, "cache_store_receipt"):
+                raw_sequence = raw_event.get("customer_sequence")
+                if not isinstance(raw_sequence, list) or not all(
+                    isinstance(node, str) for node in raw_sequence
+                ):
+                    raise RuntimeError("full native cache store lost its route")
+                sequence = tuple(raw_sequence)
+                route_key = measurement_trace.register_route(sequence)
+                digest = cache_keys.make_key(sequence).digest
+                status = str(raw_event.get("status"))
+                entry_bytes = int(cast(int, raw_event["entry_bytes"]))
+                expected_evictions = int(cast(int, raw_event["eviction_count"]))
+                evicted: list[tuple[str, tuple[str, ...], str, int]] = []
+                if status == "store":
+                    if route_key in cache_state:
+                        raise RuntimeError("full native cache store targets an existing route")
+                    while cache_state and (
+                        len(cache_state) >= cache_incremental_config.max_entries
+                        or cache_replay_statistics[8] + entry_bytes
+                        > cache_incremental_config.max_memory_bytes
+                    ):
+                        evicted_key = next(iter(cache_state))
+                        evicted_sequence, evicted_digest, evicted_bytes = cache_state.pop(
+                            evicted_key
+                        )
+                        cache_replay_statistics[8] -= evicted_bytes
+                        evicted.append(
+                            (
+                                evicted_key,
+                                evicted_sequence,
+                                evicted_digest,
+                                evicted_bytes,
+                            )
+                        )
+                    if len(evicted) != expected_evictions:
+                        raise RuntimeError("full native cache eviction count does not replay")
+                    cache_state[route_key] = (sequence, digest, entry_bytes)
+                    cache_replay_statistics[3] += 1
+                    cache_replay_statistics[4] += len(evicted)
+                    cache_replay_statistics[8] += entry_bytes
+                    cache_replay_statistics[6] = len(cache_state)
+                    cache_replay_statistics[7] = max(cache_replay_statistics[7], len(cache_state))
+                    cache_replay_statistics[9] = max(
+                        cache_replay_statistics[9], cache_replay_statistics[8]
+                    )
+                elif status == "reconcile":
+                    if route_key not in cache_state or expected_evictions != 0:
+                        raise RuntimeError("full native cache reconciliation has no existing route")
+                elif status == "oversize_not_cached":
+                    if (
+                        route_key in cache_state
+                        or expected_evictions != 0
+                        or entry_bytes <= cache_incremental_config.max_memory_bytes
+                    ):
+                        raise RuntimeError("full native oversize cache receipt is invalid")
+                    cache_replay_statistics[5] += 1
+                else:
+                    raise RuntimeError("full native cache store status is invalid")
+                for evicted_key, _, evicted_digest, _ in evicted:
+                    append_runtime_projection(
+                        (
+                            "cache",
+                            {
+                                "event_type": "cache_event",
+                                "operation": "evict",
+                                "route_key": evicted_key,
+                                "cache_key_digest": evicted_digest,
+                                "lane": raw_event.get("lane"),
+                                "iteration": raw_event.get("iteration"),
+                                "operator": raw_event.get("operator"),
+                                "native_transaction_id": transaction_id,
+                                "reason": "lru_capacity_or_memory",
+                                "current_entries": len(cache_state),
+                                "current_bytes": cache_replay_statistics[8],
+                            },
+                        ),
+                        native_backed=False,
+                    )
+                append_runtime_projection(
+                    (
+                        "cache",
+                        {
+                            "event_type": "cache_event",
+                            "operation": status,
+                            "route_key": route_key,
+                            "cache_key_digest": digest,
+                            "lane": raw_event.get("lane"),
+                            "iteration": raw_event.get("iteration"),
+                            "operator": raw_event.get("operator"),
+                            "native_transaction_id": transaction_id,
+                            "reason": (
+                                "stored"
+                                if status == "store"
+                                else "equivalent_existing"
+                                if status == "reconcile"
+                                else "entry_exceeds_max_memory_bytes"
+                            ),
+                            "entry_bytes": entry_bytes,
+                            "current_entries": len(cache_state),
+                            "current_bytes": cache_replay_statistics[8],
+                        },
+                    ),
+                    native_backed=False,
+                )
+            control_stores_emitted.add(transaction_id)
+
+        def finish_control_transaction(
+            transaction_id: int,
+            *,
+            stores_before_remaining_lookups: bool = False,
+        ) -> None:
+            if transaction_id in control_transactions_finished:
+                return
+            append_control_decisions(transaction_id)
+            lookups = control_rows(transaction_id, "cache_event")
+            cursor = control_lookup_cursors.get(transaction_id, 0)
+            if stores_before_remaining_lookups:
+                append_control_store_rows(transaction_id)
+            for raw_event in lookups[cursor:]:
+                append_control_lookup(
+                    raw_event,
+                    native_backed=stores_before_remaining_lookups,
+                )
+            control_lookup_cursors[transaction_id] = len(lookups)
+            if not stores_before_remaining_lookups:
+                append_control_store_rows(transaction_id)
+            aggregate = control_events_by_transaction[transaction_id][-1]
+            raw_statistics = aggregate.get("cache_statistics")
+            if (
+                not isinstance(raw_statistics, list)
+                or len(raw_statistics) != len(cache_replay_statistics)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in raw_statistics
+                )
+                or list(raw_statistics) != cache_replay_statistics
+            ):
+                raise RuntimeError(
+                    "full native cache statistics do not replay from signed control rows: "
+                    f"transaction={transaction_id}, native={raw_statistics!r}, "
+                    f"replayed={cache_replay_statistics!r}, "
+                    f"control_order={control_transaction_order!r}, "
+                    f"finished={sorted(control_transactions_finished)!r}"
+                )
+            control_transactions_finished.add(transaction_id)
+
         initial_runtime_objective = SolutionObjective.zero()
         for sequence in initial_customer_sequences:
             exact = solve_exact_charging(instance, sequence)
@@ -6251,23 +7560,36 @@ def _solve_full_native_alns(
                 exact_evaluation_ids_by_context.setdefault(context, []).append(
                     next_exact_evaluation_id
                 )
-        exact_results_by_context: dict[tuple[str, int | None, str], list[dict[str, object]]] = {}
-        for raw_event in exact_result_events:
-            context = (
-                str(raw_event["lane"]),
-                cast(int | None, raw_event["iteration"]),
-                str(raw_event["operator"]),
+        screening_by_context: dict[tuple[str, int | None, str], list[int]] = {}
+        for screening_row in range(len(native_result.screening_journal)):
+            screening_transaction_id = int(
+                native_result.screening_journal.transaction_ids[screening_row]
             )
-            exact_results_by_context.setdefault(context, []).append(dict(raw_event))
-        screening_by_context: dict[tuple[str, int | None, str], list[dict[str, object]]] = {}
-        for raw_event in native_result.control_journal_events:
-            if raw_event.get("event_type") != "screening_decision":
+            screening_event_id = int(
+                native_result.screening_journal.canonical_event_ids[screening_row]
+            )
+            if screening_transaction_id not in canonical_transaction_ids or screening_event_id == 0:
+                # A boundary rollback preserves physical screening evidence
+                # independently of the canonical semantic journal.
                 continue
-            event = dict(raw_event)
-            screening_sequence = cast(list[str], event.pop("customer_sequence"))
-            screening_transaction_id = int(cast(int, event.pop("transaction_id")))
-            screening_canonical_event_id = int(cast(int, event.pop("canonical_event_id")))
-            screening_raw_iteration = cast(int | None, event.get("iteration"))
+            if screening_event_id <= 0 or screening_event_id > native_row_count:
+                raise RuntimeError("full native screening journal has an invalid canonical ID")
+            screening_native_index = screening_event_id - 1
+            if (
+                int(native_result.canonical_event_journal.stream_codes[screening_native_index]) != 7
+                or int(native_result.canonical_event_journal.event_codes[screening_native_index])
+                != 3
+                or int(
+                    native_result.canonical_event_journal.transaction_ids[screening_native_index]
+                )
+                != screening_transaction_id
+            ):
+                raise RuntimeError(
+                    "full native screening journal canonical identity does not reconcile"
+                )
+            lane, screening_raw_iteration, operator = native_result.screening_journal.context(
+                screening_row
+            )
             screening_iteration = None if screening_raw_iteration == -1 else screening_raw_iteration
             if (
                 screening_iteration is not None
@@ -6276,57 +7598,96 @@ def _solve_full_native_alns(
                 # Work from an interrupted candidate round is retained only in
                 # native accounting.  It has no committed rich semantic row.
                 continue
-            event["iteration"] = screening_iteration
-            event["route_key"] = measurement_trace.register_route(screening_sequence)
-            event["_native_expected_flags"] = (
-                int(bool(event.get("physical_evaluated")))
-                | (int(bool(event.get("negative_cache_hit"))) << 1)
-                | (int(bool(event.get("physical_owner"))) << 2)
-                | (int(cast(int, event.get("reachability_queries", 0))) << 8)
-            )
-            event["_native_transaction_id"] = screening_transaction_id
-            event["_native_canonical_event_id"] = screening_canonical_event_id
-            for telemetry_field in (
-                "physical_evaluated",
-                "physical_owner",
-                "reachability_queries",
-                "screening_ordinal",
-            ):
-                event.pop(telemetry_field, None)
             context = (
-                str(event["lane"]),
+                lane,
                 screening_iteration,
-                str(event["operator"]),
+                operator,
             )
-            screening_by_context.setdefault(context, []).append(event)
+            screening_by_context.setdefault(context, []).append(screening_row)
+
+        def append_screening_through(maximum_event_id: int) -> None:
+            selected_by_context: dict[tuple[str, int | None, str], list[int]] = {}
+            selected_rows: list[int] = []
+            for context, pending in screening_by_context.items():
+                selected = [
+                    row
+                    for row in pending
+                    if int(native_result.screening_journal.canonical_event_ids[row])
+                    <= maximum_event_id
+                ]
+                if selected:
+                    selected_by_context[context] = selected
+                    selected_rows.extend(selected)
+            selected_rows.sort(
+                key=lambda row: int(native_result.screening_journal.canonical_event_ids[row])
+            )
+            for row in selected_rows:
+                screening_event_id = int(native_result.screening_journal.canonical_event_ids[row])
+                expected_event_id = int(native_event_ids[native_projection_index])
+                if screening_event_id != expected_event_id:
+                    raise RuntimeError(
+                        "full native screening projection is not globally causal: "
+                        f"row={row}, screening_event_id={screening_event_id}, "
+                        f"expected_event_id={expected_event_id}, "
+                        "screening_transaction="
+                        f"{int(native_result.screening_journal.transaction_ids[row])}"
+                    )
+                route_key = measurement_trace.register_route(
+                    native_result.screening_journal.route_sequence(row)
+                )
+                append_runtime_projection(
+                    (
+                        "screening",
+                        native_result.screening_journal.semantic_event(
+                            row,
+                            route_key=route_key,
+                        ),
+                    )
+                )
+            for context, selected in selected_by_context.items():
+                selected_set = set(selected)
+                remaining_rows = [
+                    row for row in screening_by_context[context] if row not in selected_set
+                ]
+                if remaining_rows:
+                    screening_by_context[context] = remaining_rows
+                else:
+                    screening_by_context.pop(context, None)
 
         def append_screening_context(
             context: tuple[str, int | None, str],
             *,
             limit: int | None = None,
         ) -> None:
-            pending = screening_by_context.get(context, [])
-            selected = pending if limit is None else pending[:limit]
-            runtime_projection.extend(
-                (
-                    "screening",
-                    {
-                        key: value
-                        for key, value in event.items()
-                        if key
-                        not in {
-                            "_native_transaction_id",
-                            "_native_canonical_event_id",
-                        }
-                    },
-                )
-                for event in selected
+            pending = sorted(
+                screening_by_context.get(context, []),
+                key=lambda row: int(native_result.screening_journal.canonical_event_ids[row]),
             )
-            remaining_screening = pending[len(selected) :]
-            if remaining_screening:
-                screening_by_context[context] = remaining_screening
-            else:
-                screening_by_context.pop(context, None)
+            selected_count = len(pending) if limit is None else min(limit, len(pending))
+            if selected_count:
+                append_screening_through(
+                    int(
+                        native_result.screening_journal.canonical_event_ids[
+                            pending[selected_count - 1]
+                        ]
+                    )
+                )
+
+        def append_screening_transaction(transaction_id: int) -> None:
+            selected_rows: list[int] = []
+            for pending in screening_by_context.values():
+                selected_rows.extend(
+                    row
+                    for row in pending
+                    if int(native_result.screening_journal.transaction_ids[row]) == transaction_id
+                )
+            if selected_rows:
+                append_screening_through(
+                    max(
+                        int(native_result.screening_journal.canonical_event_ids[row])
+                        for row in selected_rows
+                    )
+                )
 
         def append_exact_context(
             work: Mapping[str, object],
@@ -6347,7 +7708,9 @@ def _solve_full_native_alns(
                 and int(
                     cast(
                         int,
-                        pending_screening[consumed_screening].get("_native_canonical_event_id", -1),
+                        native_result.screening_journal.canonical_event_ids[
+                            pending_screening[consumed_screening]
+                        ],
                     )
                 )
                 < first_result_event_id
@@ -6361,8 +7724,14 @@ def _solve_full_native_alns(
                     (
                         index
                         for index in range(matched_screening, len(transaction_screening))
-                        if transaction_screening[index].get("route_key") == route_key
-                        and transaction_screening[index].get("status") == "pass"
+                        if measurement_trace.register_route(
+                            native_result.screening_journal.route_sequence(
+                                transaction_screening[index]
+                            )
+                        )
+                        == route_key
+                        and native_result.screening_journal.status(transaction_screening[index])
+                        == "pass"
                     ),
                     None,
                 )
@@ -6374,22 +7743,9 @@ def _solve_full_native_alns(
                     )
                 matched_screening = matching_index + 1
             append_screening_context(context, limit=consumed_screening)
-            for sequence in sequences:
-                runtime_projection.append(
-                    (
-                        "cache",
-                        {
-                            "event_type": "cache_event",
-                            "operation": "miss",
-                            "route_key": measurement_trace.register_route(sequence),
-                            "lane": lane,
-                            "iteration": iteration,
-                            "operator": operator,
-                        },
-                    )
-                )
+            append_control_lookups_for_work(transaction_id, sequences)
             requested = len(sequences)
-            runtime_projection.append(
+            append_runtime_projection(
                 (
                     "candidate_transaction",
                     {
@@ -6405,7 +7761,7 @@ def _solve_full_native_alns(
                     },
                 )
             )
-            runtime_projection.append(
+            append_runtime_projection(
                 (
                     "exact_work",
                     {
@@ -6511,8 +7867,14 @@ def _solve_full_native_alns(
                     "full native exact-result rich payload order does not match "
                     "the producer-hashed journal"
                 )
-            runtime_projection.extend(("candidate_transaction", event) for event in producer_events)
-            runtime_projection.extend(("exact_result", event) for event in rich_results)
+            extend_runtime_projection(("candidate_transaction", event) for event in producer_events)
+            extend_runtime_projection(("exact_result", event) for event in rich_results)
+            control_work_seen[transaction_id] = control_work_seen.get(transaction_id, 0) + 1
+            if control_work_seen[transaction_id] == len(work_by_transaction[transaction_id]):
+                if lane == "initialization":
+                    append_control_store_rows(transaction_id)
+                else:
+                    finish_control_transaction(transaction_id)
             return requested
 
         initial_work = next(
@@ -6522,7 +7884,7 @@ def _solve_full_native_alns(
         if initial_work is None:
             raise RuntimeError("full native semantic projection lost initialization")
         initial_sequences = [list(sequence) for sequence in initial_customer_sequences]
-        runtime_projection.append(
+        append_runtime_projection(
             (
                 "candidate_transaction",
                 {
@@ -6544,12 +7906,14 @@ def _solve_full_native_alns(
         )
         if initial_plan is None:
             raise RuntimeError("full native semantic projection lost initial plan")
-        runtime_projection.append(("candidate_transaction", initial_plan))
+        initial_plan.pop("native_transaction_id", None)
+        initial_plan.pop("batch_ordinal", None)
+        append_runtime_projection(("candidate_transaction", initial_plan))
         append_exact_context(
             initial_work,
             remaining=config.candidate_control_config.max_exact_calls_per_round,
         )
-        runtime_projection.append(
+        append_runtime_projection(
             (
                 "candidate_transaction",
                 {
@@ -6570,21 +7934,11 @@ def _solve_full_native_alns(
                 "initial_solution",
             ):
                 append_screening_context(initialization_context)
-        for sequence in initial_customer_sequences:
-            runtime_projection.append(
-                (
-                    "cache",
-                    {
-                        "event_type": "cache_event",
-                        "operation": "hit",
-                        "route_key": measurement_trace.register_route(sequence),
-                        "lane": "initialization",
-                        "iteration": None,
-                        "operator": "initial_solution",
-                    },
-                )
-            )
-        runtime_projection.append(
+        finish_control_transaction(
+            int(cast(int, initial_work["_native_transaction_id"])),
+            stores_before_remaining_lookups=True,
+        )
+        append_runtime_projection(
             (
                 "candidate_transaction",
                 {
@@ -6596,35 +7950,22 @@ def _solve_full_native_alns(
                 },
             )
         )
-        bootstrap_work = [
-            work
-            for work in native_result.candidate_work
-            if work is not initial_work and work["iteration"] is None
-        ]
-        for work in bootstrap_work:
-            append_exact_context(
-                work,
-                remaining=config.candidate_control_config.max_exact_calls_per_round,
-            )
-        for bootstrap_context in tuple(screening_by_context):
-            if bootstrap_context[1] is None:
-                append_screening_context(bootstrap_context)
-        runtime_projection.append(("stage04", dict(stage04_event_log[0])))
+        for transaction_id in control_transaction_order:
+            transaction_events = control_events_by_transaction[transaction_id]
+            if (
+                transaction_id not in control_transactions_finished
+                and transaction_events[0].get("iteration") is None
+            ):
+                for work in work_by_transaction.get(transaction_id, []):
+                    append_exact_context(
+                        work,
+                        remaining=config.candidate_control_config.max_exact_calls_per_round,
+                    )
+                append_screening_transaction(transaction_id)
+                if transaction_id not in control_transactions_finished:
+                    finish_control_transaction(transaction_id)
+        append_runtime_projection(("stage04", dict(stage04_event_log[0])))
 
-        quality_operators = {
-            "relocate",
-            "swap",
-            "two_opt_star",
-            "route_segment_destroy",
-            "ejection_chain",
-        }
-        work_by_iteration_lane: dict[tuple[int, str], list[Mapping[str, object]]] = {}
-        for work in native_result.candidate_work:
-            if work is initial_work or work["iteration"] is None:
-                continue
-            work_by_iteration_lane.setdefault(
-                (int(cast(int, work["iteration"])), str(work["lane"])), []
-            ).append(work)
         events_by_iteration_lane: dict[tuple[int, str], list[dict[str, object]]] = {}
         for semantic_index, semantic_event in enumerate(semantic_events):
             operator = str(semantic_event["operator"])
@@ -6664,11 +8005,18 @@ def _solve_full_native_alns(
             # the cross-runtime canonical decision journal.  The lane still
             # owns one canonical candidate-state row even when every operator
             # row in that lane is aggregate telemetry.
-            runtime_projection.extend(
-                ("operator", event)
-                for event in lane_events
-                if not str(event.get("status", "")).endswith("_aggregate")
-            )
+            for event in lane_events:
+                status = str(event.get("status", ""))
+                if status in SEMANTIC_TRAJECTORY_IMPLEMENTATION_STATUSES:
+                    continue
+                # The native causal journal intentionally excludes aggregate
+                # summaries.  Exact-infeasible and Candidate-Control aggregate
+                # rows are still canonical search decisions, so retain them as
+                # semantic-only rows without consuming a native event ID.
+                append_runtime_projection(
+                    ("operator", event),
+                    native_backed=not status.endswith("_aggregate"),
+                )
             accepted = any(
                 bool(event.get("_operator_native_accepted", event.get("accepted")))
                 for event in lane_events
@@ -6725,7 +8073,7 @@ def _solve_full_native_alns(
                 if accepted
                 else "candidate rejected by lexicographic acceptance"
             )
-            runtime_projection.append(
+            append_runtime_projection(
                 (
                     "candidate_state",
                     {
@@ -6756,7 +8104,7 @@ def _solve_full_native_alns(
         for iteration in range(native_result.counters["iterations"]):
             iteration_completed = iteration in completed_candidate_iterations
             round_budget = config.candidate_control_config.max_exact_calls_per_round
-            runtime_projection.append(
+            append_runtime_projection(
                 (
                     "candidate_transaction",
                     {
@@ -6770,14 +8118,24 @@ def _solve_full_native_alns(
             )
             used = 0
             for lane in ("legacy", "quality_shadow", "constraint_lane"):
-                for work in work_by_iteration_lane.get((iteration, lane), []):
-                    used += append_exact_context(
-                        work,
-                        remaining=max(
-                            0,
-                            round_budget - used - len(cast(list[list[str]], work["sequences"])),
-                        ),
-                    )
+                lane_transactions = [
+                    transaction_id
+                    for context, transaction_ids in control_transactions_by_context.items()
+                    if context[:2] == (lane, iteration)
+                    for transaction_id in transaction_ids
+                ]
+                for transaction_id in lane_transactions:
+                    for work in work_by_transaction.get(transaction_id, []):
+                        used += append_exact_context(
+                            work,
+                            remaining=max(
+                                0,
+                                round_budget - used - len(cast(list[list[str]], work["sequences"])),
+                            ),
+                        )
+                    append_screening_transaction(transaction_id)
+                    if transaction_id not in control_transactions_finished:
+                        finish_control_transaction(transaction_id)
                 for screening_context in tuple(screening_by_context):
                     if screening_context[:2] == (lane, iteration):
                         append_screening_context(screening_context)
@@ -6786,13 +8144,13 @@ def _solve_full_native_alns(
             if iteration_completed:
                 append_lane_outcome(iteration, "constraint_lane")
                 append_lane_outcome(iteration, "legacy")
-            runtime_projection.extend(
+            extend_runtime_projection(
                 ("stage04", dict(event))
                 for event in stage04_event_log[1:]
                 if int(cast(int, event.get("iteration", -1))) == iteration
             )
             if iteration_completed:
-                runtime_projection.append(
+                append_runtime_projection(
                     (
                         "candidate_transaction",
                         {
@@ -6816,8 +8174,16 @@ def _solve_full_native_alns(
                     "full native semantic projection lost screening contexts: "
                     f"{stale_screening_contexts!r}"
                 )
+        for transaction_id in control_transaction_order:
+            if transaction_id not in control_transactions_finished:
+                finish_control_transaction(transaction_id)
+        if any(
+            control_work_seen.get(transaction_id, 0) != len(work_items)
+            for transaction_id, work_items in work_by_transaction.items()
+        ):
+            raise RuntimeError("full native control projection lost exact work")
         if termination_reason != "iteration_limit":
-            runtime_projection.append(
+            append_runtime_projection(
                 (
                     "deadline",
                     {
@@ -6837,7 +8203,7 @@ def _solve_full_native_alns(
                     },
                 )
             )
-        runtime_projection.append(
+        append_runtime_projection(
             (
                 "termination",
                 {
@@ -6852,603 +8218,20 @@ def _solve_full_native_alns(
                 },
             )
         )
-        native_event_ids = native_result.canonical_event_journal.event_ids
-        canonical_stream_codes = {
-            "candidate_state": 0,
-            "operator": 1,
-            "stage04": 2,
-            "candidate_transaction": 3,
-            "exact_work": 4,
-            "exact_result": 5,
-            "cache": 6,
-            "screening": 7,
-            "deadline": 8,
-            "termination": 9,
-        }
-        expected_stream_codes = [
-            canonical_stream_codes[semantic_stream]
-            for semantic_stream, _event in runtime_projection
-        ]
-        stage04_event_ordinal = 0
-        expected_event_codes: list[int] = []
-        for semantic_stream, projected_event in runtime_projection:
-            event_type = str(projected_event.get("event_type", ""))
-            status = str(projected_event.get("status", ""))
-            if semantic_stream == "candidate_transaction":
-                if event_type == "candidate_initial_solution":
-                    event_code = 1 if status == "submitted" else 11
-                else:
-                    event_code = {
-                        "candidate_plan_decision": 2,
-                        "candidate_control_budget": 5,
-                        "candidate_route_result": 7,
-                        "parallel_batch": 8,
-                        "candidate_plan_attempted": 10,
-                        "candidate_control_round": (13 if status == "started" else 17),
-                    }[event_type]
-            elif semantic_stream == "screening":
-                event_code = 3
-            elif semantic_stream == "cache":
-                event_code = 4
-            elif semantic_stream == "exact_work":
-                event_code = 6
-            elif semantic_stream == "exact_result":
-                event_code = 9
-            elif semantic_stream == "operator":
-                event_code = 14
-            elif semantic_stream == "candidate_state":
-                event_code = 15
-            elif semantic_stream == "stage04":
-                event_code = 12 if stage04_event_ordinal == 0 else 16
-                stage04_event_ordinal += 1
-            elif semantic_stream == "deadline":
-                event_code = 18
-            elif semantic_stream == "termination":
-                event_code = 19
-            else:
-                raise RuntimeError("full native runtime projection has an unknown semantic stream")
-            expected_event_codes.append(event_code)
-        native_stream_codes = [
-            int(value) for value in native_result.canonical_event_journal.stream_codes
-        ]
-        native_event_codes = [
-            int(value) for value in native_result.canonical_event_journal.event_codes
-        ]
-        expected_lane_ids: list[int] = []
-        expected_operator_ids: list[int] = []
-        expected_iterations: list[int] = []
-        for semantic_stream, projected_event in runtime_projection:
-            event_type = str(projected_event.get("event_type", ""))
-            if semantic_stream in {"deadline", "termination"}:
-                expected_lane_ids.append(-1)
-                expected_operator_ids.append(-1)
-            else:
-                lane_value = projected_event.get("lane")
-                operator_value = projected_event.get("operator")
-                if event_type in {
-                    "candidate_initial_solution",
-                    "candidate_plan_attempted",
-                }:
-                    lane_value = "initialization"
-                    operator_value = "initial_solution"
-                elif event_type == "candidate_control_budget":
-                    context_parts = str(projected_event.get("context", "")).split(":", 2)
-                    if len(context_parts) < 2:
-                        raise RuntimeError("full native budget event lost its semantic context")
-                    lane_value, operator_value = context_parts[:2]
-                elif semantic_stream == "stage04":
-                    lane_value, operator_value = "all", "stage04"
-                elif event_type == "candidate_control_round":
-                    lane_value, operator_value = "all", "candidate_control"
-                elif semantic_stream == "operator":
-                    operator_value = projected_event.get("operator")
-                    if not isinstance(operator_value, str):
-                        raise RuntimeError("full native operator event lost its operator")
-                    lane_value = (
-                        "constraint_lane"
-                        if projected_event.get("track") == "constraint_lane"
-                        or operator_value
-                        in {
-                            "station_pressure",
-                            "time_window_conflict",
-                            "worst_energy_detour",
-                            "shaw_related",
-                        }
-                        else "quality_shadow"
-                        if operator_value in quality_operators
-                        else "legacy"
-                    )
-                if not isinstance(lane_value, str) or not isinstance(operator_value, str):
-                    raise RuntimeError("full native runtime event lost its lane/operator context")
-                expected_lane_ids.append(native_semantic_context_id(lane_value))
-                expected_operator_ids.append(native_semantic_context_id(operator_value))
-            projected_iteration_value = projected_event.get("iteration")
-            if semantic_stream == "termination":
-                projected_iteration_value = projected_event.get("iterations")
-            expected_iterations.append(
-                -1 if projected_iteration_value is None else cast(int, projected_iteration_value)
-            )
-        native_lane_ids = [int(value) for value in native_result.canonical_event_journal.lane_ids]
-        native_operator_ids = [
-            int(value) for value in native_result.canonical_event_journal.operator_ids
-        ]
-        native_iterations = [
-            int(value) for value in native_result.canonical_event_journal.iterations
-        ]
-        native_transaction_ids = [
-            int(value) for value in native_result.canonical_event_journal.transaction_ids
-        ]
-        native_subject_ids = [
-            int(value) for value in native_result.canonical_event_journal.subject_ids
-        ]
-        native_status_codes = [
-            int(value) for value in native_result.canonical_event_journal.status_codes
-        ]
-        native_flags = [int(value) for value in native_result.canonical_event_journal.flags]
-        native_row_lengths = {
-            "event_ids": len(native_event_ids),
-            "stream_codes": len(native_stream_codes),
-            "event_codes": len(native_event_codes),
-            "lane_ids": len(native_lane_ids),
-            "operator_ids": len(native_operator_ids),
-            "iterations": len(native_iterations),
-            "transaction_ids": len(native_transaction_ids),
-            "subject_ids": len(native_subject_ids),
-            "status_codes": len(native_status_codes),
-            "flags": len(native_flags),
-        }
-        expected_row_count = len(runtime_projection)
-        if expected_row_count == 0 or any(
-            length != expected_row_count for length in native_row_lengths.values()
-        ):
-            comparable_rows = zip(
-                expected_stream_codes,
-                expected_event_codes,
-                expected_lane_ids,
-                expected_operator_ids,
-                expected_iterations,
-                native_stream_codes,
-                native_event_codes,
-                native_lane_ids,
-                native_operator_ids,
-                native_iterations,
-                strict=False,
-            )
-            first_divergence = next(
-                (
-                    (index, row[:5], row[5:])
-                    for index, row in enumerate(comparable_rows)
-                    if row[:5] != row[5:]
-                ),
-                None,
-            )
-            divergence_index = (
-                first_divergence[0]
-                if first_divergence is not None
-                else min(expected_row_count, len(native_event_ids))
-            )
-            context_start = max(0, divergence_index - 2)
-            context_end = min(expected_row_count, divergence_index + 3)
-            runtime_context = [
-                (index, runtime_projection[index]) for index in range(context_start, context_end)
-            ]
-            mismatch_native_context = [
-                (
-                    index,
-                    native_stream_codes[index],
-                    native_event_codes[index],
-                    native_lane_ids[index],
-                    native_operator_ids[index],
-                    native_iterations[index],
-                    native_subject_ids[index],
-                    native_status_codes[index],
-                    native_flags[index],
-                )
-                for index in range(
-                    context_start,
-                    min(len(native_event_ids), divergence_index + 3),
-                )
-            ]
-            raise RuntimeError(
-                "full native canonical event journal length mismatch: "
-                f"runtime={expected_row_count}, native_fields={native_row_lengths}, "
-                f"first_divergence={first_divergence!r}, "
-                f"runtime_context={runtime_context!r}, "
-                f"native_context={mismatch_native_context!r}, "
-                f"semantic_termination="
-                f"{native_result.semantic_stream.termination.tolist()}, "
-                f"runtime_stream_counts="
-                f"{np.bincount(expected_stream_codes, minlength=11).tolist()}, "
-                f"native_stream_counts="
-                f"{native_result.canonical_event_journal.stream_counts.tolist()}"
-            )
-        full_operator_index = {name: index for index, name in enumerate(FULL_NATIVE_OPERATOR_NAMES)}
-        quality_subject = {"relocate": 0, "swap": 1, "two_opt_star": 2}
-        constraint_subject = {
-            "station_pressure": 0,
-            "time_window_conflict": 1,
-            "worst_energy_detour": 2,
-            "shaw_related": 3,
-        }
-        ordinal_counters: dict[tuple[object, ...], int] = {}
-        expected_subject_ids: list[int] = []
-        expected_status_codes: list[int] = []
-        expected_flags: list[int] = []
-        for index, ((_semantic_stream, projected_event), event_code) in enumerate(
-            zip(runtime_projection, expected_event_codes, strict=True)
-        ):
-            transaction_id = native_transaction_ids[index]
-            event_type = str(projected_event.get("event_type", ""))
-            status_text = str(projected_event.get("status", ""))
-            subject = 0
-            status_code = 0
-            flags = 0
-            ordinal_key: tuple[object, ...]
-            if event_code == 2:
-                subject = int(cast(int, projected_event.get("candidate_id", 0)))
-                status_code, flags = 2, 1
-            elif event_code == 3:
-                phase = bool(int(cast(int, projected_event["_native_expected_flags"])) & 5)
-                ordinal_key = (event_code, transaction_id, phase)
-                subject = ordinal_counters.get(ordinal_key, 0)
-                ordinal_counters[ordinal_key] = subject + 1
-                status_code = int(status_text == "pass")
-                flags = int(cast(int, projected_event["_native_expected_flags"]))
-            elif event_code == 4:
-                operation = str(projected_event.get("operation", ""))
-                ordinal_key = (event_code, transaction_id, operation)
-                subject = ordinal_counters.get(ordinal_key, 0)
-                ordinal_counters[ordinal_key] = subject + 1
-                status_code = int(operation == "hit")
-                flags = 1
-            elif event_code in {5, 6}:
-                subject = int(
-                    cast(
-                        int,
-                        projected_event.get(
-                            "requested",
-                            projected_event.get("requested_calls", 0),
-                        ),
-                    )
-                )
-                status_code, flags = (1, 0) if event_code == 5 else (subject, 1)
-            elif event_code in {7, 9}:
-                ordinal_key = (event_code, transaction_id)
-                subject = ordinal_counters.get(ordinal_key, 0)
-                ordinal_counters[ordinal_key] = subject + 1
-                feasible = bool(projected_event.get("feasible", True))
-                status_code = 0 if feasible else 1
-                flags = (7 if feasible else 3) if event_code == 7 else 0
-            elif event_code == 8:
-                subject = len(cast(list[object], projected_event["submission_order"]))
-            elif event_code == 10:
-                subject = int(cast(int, projected_event.get("candidate_id", 0)))
-                status_code = 5
-            elif event_code == 11:
-                status_code = 1
-            elif event_code in {13, 17}:
-                subject = int(cast(int, projected_event.get("iteration", 0)))
-            elif event_code == 14:
-                operator_name = str(projected_event["operator"])
-                if operator_name in quality_subject:
-                    ordinal_key = (
-                        event_code,
-                        "quality_shadow",
-                        operator_name,
-                        expected_iterations[index],
-                    )
-                    subject = ordinal_counters.get(ordinal_key, 0)
-                    ordinal_counters[ordinal_key] = subject + 1
-                elif operator_name in constraint_subject:
-                    subject = constraint_subject[operator_name]
-                else:
-                    ordinal_key = (
-                        event_code,
-                        "legacy",
-                        expected_iterations[index],
-                    )
-                    subject = ordinal_counters.get(ordinal_key, 0)
-                    ordinal_counters[ordinal_key] = subject + 1
-                status_code = int(
-                    bool(
-                        projected_event.get(
-                            "_operator_native_candidate_feasible",
-                            projected_event.get("candidate_feasible"),
-                        )
-                    )
-                    or (
-                        operator_name in constraint_subject
-                        and status_text == "candidate_proposed"
-                        and str(projected_event.get("reason")) == "constraint_ranked_removal"
-                    )
-                )
-                flags = int(bool(projected_event.get("accepted")))
-            elif event_code == 15:
-                operator_name = str(projected_event["operator"])
-                subject = (
-                    quality_subject[operator_name]
-                    if operator_name in quality_subject
-                    else constraint_subject[operator_name]
-                    if operator_name in constraint_subject
-                    else full_operator_index[operator_name]
-                )
-                status_code = int(bool(projected_event.get("accepted")))
-                flags = int(bool(projected_event.get("candidate_feasible")))
-            elif event_code == 16:
-                stage_type = str(projected_event.get("type", ""))
-                if stage_type.startswith("stage04_segment_"):
-                    role = str(projected_event["operator"])
-                    subject = full_operator_index[role.removeprefix("neighborhood:")]
-                    status_code = int(stage_type == "stage04_segment_update")
-                else:
-                    subject = {
-                        "stage04_reheat": 100,
-                        "stage04_restart": 101,
-                        "stage04_intensification_end": 102,
-                    }[stage_type]
-                    status_code = 1
-            elif event_code in {18, 19}:
-                subject = -1
-                status_code = {
-                    "iteration_limit": 0,
-                    "exact_call_budget_exhausted": 1,
-                    "wall_clock_deadline": 2,
-                    "candidate_control_exhausted": 3,
-                }[status_text]
-                flags = int(event_code == 18)
-            expected_subject_ids.append(subject)
-            expected_status_codes.append(status_code)
-            expected_flags.append(flags)
-        transaction_contexts: dict[int, tuple[int, int, int]] = {}
-        transaction_context_valid = True
-        transaction_optional_codes = {12, 13, 16, 17, 18, 19, 20}
-        for index, transaction_id in enumerate(native_transaction_ids):
-            if transaction_id < 0:
-                transaction_context_valid = (
-                    transaction_context_valid
-                    and expected_event_codes[index] in transaction_optional_codes
-                )
-                continue
-            transaction_context = (
-                expected_lane_ids[index],
-                expected_operator_ids[index],
-                -1
-                if expected_lane_ids[index] == native_semantic_context_id("initialization")
-                else expected_iterations[index],
-            )
-            previous_context = transaction_contexts.setdefault(transaction_id, transaction_context)
-            transaction_context_valid = (
-                transaction_context_valid and previous_context == transaction_context
-            )
-        first_context_mismatch = next(
-            (
-                index
-                for index, native_context in enumerate(
-                    zip(
-                        native_lane_ids,
-                        native_operator_ids,
-                        native_iterations,
-                        strict=True,
-                    )
-                )
-                if native_context
-                != (
-                    expected_lane_ids[index],
-                    expected_operator_ids[index],
-                    expected_iterations[index],
-                )
-            ),
-            None,
-        )
-        first_subject_mismatch = next(
-            (
-                index
-                for index, (native_subject, expected_subject) in enumerate(
-                    zip(native_subject_ids, expected_subject_ids, strict=True)
-                )
-                if native_subject != expected_subject
-            ),
-            None,
-        )
-        first_status_mismatch = next(
-            (
-                index
-                for index, (native_status, expected_status) in enumerate(
-                    zip(native_status_codes, expected_status_codes, strict=True)
-                )
-                if native_status != expected_status
-            ),
-            None,
-        )
-        first_flags_mismatch = next(
-            (
-                index
-                for index, (native_flag, expected_flag) in enumerate(
-                    zip(native_flags, expected_flags, strict=True)
-                )
-                if native_flag != expected_flag
-            ),
-            None,
-        )
-        first_stream_mismatch = next(
-            (
-                index
-                for index, (native_code, expected_code) in enumerate(
-                    zip(
-                        native_stream_codes,
-                        expected_stream_codes,
-                        strict=False,
-                    )
-                )
-                if native_code != expected_code
-            ),
-            None,
-        )
-        first_event_mismatch = next(
-            (
-                index
-                for index, (native_code, expected_code) in enumerate(
-                    zip(
-                        native_event_codes,
-                        expected_event_codes,
-                        strict=False,
-                    )
-                )
-                if native_code != expected_code
-            ),
-            None,
-        )
-        mismatch_candidates = (
-            first_stream_mismatch,
-            first_event_mismatch,
-            first_context_mismatch,
-            first_subject_mismatch,
-            first_status_mismatch,
-            first_flags_mismatch,
-        )
-        mismatch_index = min(
-            (index for index in mismatch_candidates if index is not None),
-            default=0,
-        )
-        mismatch_start = max(0, mismatch_index - 3)
-        mismatch_end = mismatch_index + 4
-        native_context = (
-            None
-            if first_context_mismatch is None
-            else (
-                native_lane_ids[first_context_mismatch],
-                native_operator_ids[first_context_mismatch],
-                native_iterations[first_context_mismatch],
-            )
-        )
-        expected_context = (
-            None
-            if first_context_mismatch is None
-            else (
-                expected_lane_ids[first_context_mismatch],
-                expected_operator_ids[first_context_mismatch],
-                expected_iterations[first_context_mismatch],
-            )
-        )
-        expected_operator_name = (
-            None
-            if first_context_mismatch is None
-            else runtime_projection[first_context_mismatch][1].get("operator")
-        )
-        native_subject = (
-            None if first_subject_mismatch is None else native_subject_ids[first_subject_mismatch]
-        )
-        expected_subject = (
-            None if first_subject_mismatch is None else expected_subject_ids[first_subject_mismatch]
-        )
-        expected_subject_event = (
-            None if first_subject_mismatch is None else runtime_projection[first_subject_mismatch]
-        )
-        native_status = (
-            None if first_status_mismatch is None else native_status_codes[first_status_mismatch]
-        )
-        expected_status = (
-            None if first_status_mismatch is None else expected_status_codes[first_status_mismatch]
-        )
-        native_flag = None if first_flags_mismatch is None else native_flags[first_flags_mismatch]
-        expected_flag = (
-            None if first_flags_mismatch is None else expected_flags[first_flags_mismatch]
-        )
-        native_event_window = list(
-            zip(
-                native_stream_codes[mismatch_start:mismatch_end],
-                native_event_codes[mismatch_start:mismatch_end],
-                native_subject_ids[mismatch_start:mismatch_end],
-                native_status_codes[mismatch_start:mismatch_end],
-                native_flags[mismatch_start:mismatch_end],
-                strict=True,
-            )
-        )
         if (
-            len(native_event_ids) != len(runtime_projection)
-            or int(native_result.canonical_event_journal.stream_codes[-1]) != 9
-            or int(native_result.canonical_event_journal.event_codes[-1]) != 19
-            or first_stream_mismatch is not None
-            or first_event_mismatch is not None
-            or native_lane_ids != expected_lane_ids
-            or native_operator_ids != expected_operator_ids
-            or native_iterations != expected_iterations
-            or native_subject_ids != expected_subject_ids
-            or native_status_codes != expected_status_codes
-            or native_flags != expected_flags
-            or not transaction_context_valid
+            native_projection_index != native_row_count
+            or int(native_journal.stream_codes[-1]) != 9
+            or int(native_journal.event_codes[-1]) != 19
         ):
             raise RuntimeError(
-                "full native canonical event journal does not cover every runtime event: "
-                f"native={len(native_event_ids)}, runtime={len(runtime_projection)}, "
-                f"first_stream_mismatch={first_stream_mismatch}, "
-                f"first_event_mismatch={first_event_mismatch}, "
-                f"first_context_mismatch={first_context_mismatch}, "
-                f"native_context={native_context}, "
-                f"expected_context={expected_context}, "
-                f"expected_operator_name={expected_operator_name}, "
-                f"first_subject_mismatch={first_subject_mismatch}, "
-                f"native_subject={native_subject}, "
-                f"expected_subject={expected_subject}, "
-                f"expected_subject_event={expected_subject_event!r}, "
-                f"first_status_mismatch={first_status_mismatch}, "
-                f"native_status={native_status}, "
-                f"expected_status={expected_status}, "
-                f"first_flags_mismatch={first_flags_mismatch}, "
-                f"native_flags={native_flag}, "
-                f"expected_flags={expected_flag}, "
-                f"lane_match={native_lane_ids == expected_lane_ids}, "
-                f"operator_match={native_operator_ids == expected_operator_ids}, "
-                f"iteration_match={native_iterations == expected_iterations}, "
-                f"subject_match={native_subject_ids == expected_subject_ids}, "
-                f"status_match={native_status_codes == expected_status_codes}, "
-                f"flags_match={native_flags == expected_flags}, "
-                f"transaction_context_valid={transaction_context_valid}, "
-                f"native_stream_window="
-                f"{native_stream_codes[mismatch_start:mismatch_end]}, "
-                f"runtime_stream_window="
-                f"{expected_stream_codes[mismatch_start:mismatch_end]}, "
-                f"native_event_window={native_event_window!r}, "
-                f"runtime_event_window={runtime_projection[mismatch_start:mismatch_end]!r}"
+                "full native canonical event journal does not cover every native-backed "
+                "runtime event: "
+                f"native={native_row_count}, native_consumed={native_projection_index}, "
+                f"runtime={len(runtime_projection)}"
             )
-        source_bound_projection = [
-            (
-                semantic_stream,
-                {
-                    **{
-                        key: value
-                        for key, value in event.items()
-                        if key != "_native_expected_flags"
-                    },
-                    "runtime_native_lane_id": native_lane_ids[index],
-                    "runtime_native_operator_id": native_operator_ids[index],
-                    "runtime_native_iteration": native_iterations[index],
-                    "runtime_native_transaction_id": int(
-                        native_result.canonical_event_journal.transaction_ids[index]
-                    ),
-                    "runtime_native_subject_id": int(
-                        native_result.canonical_event_journal.subject_ids[index]
-                    ),
-                    "runtime_native_status_code": int(
-                        native_result.canonical_event_journal.status_codes[index]
-                    ),
-                    "runtime_native_flags": int(native_result.canonical_event_journal.flags[index]),
-                },
-            )
-            for index, (semantic_stream, event) in enumerate(runtime_projection)
-        ]
-        measurement_trace.import_runtime_semantic_journal(
-            (
-                int(native_event_id),
-                semantic_stream,
-                event,
-            )
-            for native_event_id, (semantic_stream, event) in zip(
-                native_event_ids,
-                source_bound_projection,
-                strict=True,
-            )
-        )
+
+        measurement_trace.adopt_runtime_semantic_spool(runtime_projection)
+        spool_cleanup.runtime_projection = None
     result = ALNSResult(
         feasible=True,
         routes=routes,
@@ -7508,6 +8291,9 @@ def _solve_full_native_alns(
         screening_statistics=dict(native_result.screening_statistics),
         candidate_control_statistics=candidate_control_statistics,
         native_execution_statistics=native_statistics,
+        native_control_journal_events=tuple(
+            dict(event) for event in native_result.control_journal_events
+        ),
         candidate_work_hash=native_result.candidate_work_hash,
         route_result_hash=native_result.route_result_hash,
         candidate_work_events=tuple(

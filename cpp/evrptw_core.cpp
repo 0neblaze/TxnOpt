@@ -52,11 +52,15 @@
 
 #include "formal_objective.hpp"
 #include "native_concurrency.hpp"
+#include "native_exact_parallel.hpp"
 #include "native_candidate_plan_runtime.hpp"
 #include "native_candidate_transaction_executor.hpp"
 #include "native_kernel_client.hpp"
 #include "native_search_core.hpp"
 #include "native_solver_kernels.hpp"
+#ifdef __linux__
+#include "native_task_receipt_spool.hpp"
+#endif
 
 namespace py = pybind11;
 
@@ -90,6 +94,7 @@ thread_local std::string native_candidate_session_token;
 thread_local std::int64_t screen_batch_thread_launch_failure_after = -1;
 thread_local bool candidate_round_projection_failure_injection = false;
 thread_local bool candidate_round_semantic_failure_injection = false;
+thread_local NativeWorkPool* candidate_round_work_pool_context = nullptr;
 
 template <typename Callback>
 class ScopeRollback final {
@@ -1360,7 +1365,12 @@ route_merge_candidate_pool_owned_v2(
     double load_capacity,
     double epsilon,
     bool pair_pruning,
-    bool preserve_duplicates) {
+    bool preserve_duplicates,
+    std::span<const std::int64_t> node_kind = {},
+    std::span<const double> ready_time = {},
+    std::span<const double> due_date = {},
+    std::span<const double> service_time = {},
+    bool time_window_pair_pruning = false) {
     constexpr auto maximum_i64_size =
         static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
     if (route_offsets.size() < 3
@@ -1370,7 +1380,12 @@ route_merge_candidate_pool_owned_v2(
         || route_objective_metrics.size() % 2 != 0
         || route_objective_metrics.size() / 2 != route_offsets.size() - 1
         || !std::isfinite(load_capacity) || load_capacity < 0.0
-        || !std::isfinite(epsilon) || epsilon < 0.0) {
+        || !std::isfinite(epsilon) || epsilon < 0.0
+        || (time_window_pair_pruning
+            && (node_kind.size() != demand.size()
+                || ready_time.size() != demand.size()
+                || due_date.size() != demand.size()
+                || service_time.size() != demand.size()))) {
         throw std::invalid_argument("route-merge candidate-pool input/config is invalid");
     }
     const auto route_count = route_offsets.size() - 1;
@@ -1378,6 +1393,28 @@ route_merge_candidate_pool_owned_v2(
     const auto* indices = route_indices.data();
     const auto* metrics = route_objective_metrics.data();
     const auto* demands = demand.data();
+    std::size_t depot = 0;
+    if (time_window_pair_pruning) {
+        const auto depot_count = static_cast<std::size_t>(std::count(
+            node_kind.begin(), node_kind.end(), std::int64_t{0}));
+        if (depot_count != 1) {
+            throw std::invalid_argument(
+                "route-merge time-window bound requires exactly one depot");
+        }
+        depot = static_cast<std::size_t>(
+            std::find(node_kind.begin(), node_kind.end(), std::int64_t{0})
+            - node_kind.begin());
+        for (std::size_t node = 0; node < demand.size(); ++node) {
+            if (!std::isfinite(ready_time[node])
+                || !std::isfinite(due_date[node])
+                || !std::isfinite(service_time[node])
+                || ready_time[node] > due_date[node] + epsilon
+                || service_time[node] < 0.0) {
+                throw std::invalid_argument(
+                    "route-merge time-window arrays are invalid");
+            }
+        }
+    }
     if (offsets[0] != 0
         || offsets[route_count]
             != static_cast<std::int64_t>(route_indices.size())) {
@@ -1461,6 +1498,8 @@ route_merge_candidate_pool_owned_v2(
     std::unordered_set<std::string> seen;
     std::int64_t pruned_pairs = 0;
     std::int64_t pruned_candidates = 0;
+    std::vector<std::int64_t> pruned_pair_metadata;
+    std::vector<std::int64_t> pruned_pair_reason_codes;
     const auto key_for = [](const std::vector<std::int64_t>& route) {
         std::string key;
         key.resize(route.size() * sizeof(std::int64_t));
@@ -1469,10 +1508,48 @@ route_merge_candidate_pool_owned_v2(
         }
         return key;
     };
+    const auto violates_optimistic_time_windows = [&](const Pair& pair) {
+        if (!time_window_pair_pruning) {
+            return false;
+        }
+        std::vector<std::int64_t> jobs;
+        jobs.reserve(routes[pair.left].size() + routes[pair.right].size());
+        jobs.insert(jobs.end(), routes[pair.left].begin(), routes[pair.left].end());
+        jobs.insert(jobs.end(), routes[pair.right].begin(), routes[pair.right].end());
+        std::stable_sort(jobs.begin(), jobs.end(), [&](const auto left, const auto right) {
+            if (due_date[static_cast<std::size_t>(left)]
+                != due_date[static_cast<std::size_t>(right)]) {
+                return due_date[static_cast<std::size_t>(left)]
+                    < due_date[static_cast<std::size_t>(right)];
+            }
+            return left < right;
+        });
+        double mandatory_service = 0.0;
+        for (const auto node_value : jobs) {
+            const auto node = static_cast<std::size_t>(node_value);
+            // A customer's due time bounds service start, so only service
+            // that must precede this EDF prefix is part of the safe lower
+            // bound. Travel and release times are deliberately ignored.
+            if (std::max(0.0, ready_time[depot]) + mandatory_service
+                > due_date[node] + epsilon) {
+                return true;
+            }
+            mandatory_service += service_time[node];
+            if (!std::isfinite(mandatory_service)) {
+                return true;
+            }
+        }
+        return std::max(0.0, ready_time[depot]) + mandatory_service
+            > due_date[depot] + epsilon;
+    };
     for (const auto& pair : pairs) {
-        if (pair_pruning
+        const auto capacity_rejected = pair_pruning
             && route_demands[pair.left] + route_demands[pair.right]
-                > load_capacity + epsilon) {
+                > load_capacity + epsilon;
+        const auto time_window_rejected = pair_pruning
+            && !capacity_rejected
+            && violates_optimistic_time_windows(pair);
+        if (capacity_rejected || time_window_rejected) {
             ++pruned_pairs;
             const auto skipped =
                 routes[pair.left].size() + routes[pair.right].size() + 2;
@@ -1484,6 +1561,12 @@ route_merge_candidate_pool_owned_v2(
                     "route-merge pruned-candidate count overflowed");
             }
             pruned_candidates += static_cast<std::int64_t>(skipped);
+            pruned_pair_metadata.insert(
+                pruned_pair_metadata.end(),
+                {static_cast<std::int64_t>(pair.left),
+                 static_cast<std::int64_t>(pair.right),
+                 static_cast<std::int64_t>(skipped)});
+            pruned_pair_reason_codes.push_back(capacity_rejected ? 2 : 3);
             continue;
         }
         for (const auto& [source_index, target_index] : std::array{
@@ -1531,6 +1614,8 @@ route_merge_candidate_pool_owned_v2(
         std::move(candidate_indices),
         std::move(metadata),
         {pruned_pairs, pruned_candidates},
+        std::move(pruned_pair_metadata),
+        std::move(pruned_pair_reason_codes),
         static_cast<std::int64_t>(route_count),
     };
     result.validate();
@@ -1563,7 +1648,8 @@ py::tuple project_route_merge_candidate_pool_v2(
         std::move(pruning_output));
 }
 
-py::tuple route_merge_candidate_pool_v2(
+evrptw::native_search::RouteMergeCandidatePoolV2
+route_merge_candidate_pool_owned_from_python_v2(
     py::handle route_offsets,
     py::handle route_indices,
     py::handle route_objective_metrics,
@@ -1582,7 +1668,7 @@ py::tuple route_merge_candidate_pool_v2(
     if (metrics_array.shape(1) != 2) {
         throw std::invalid_argument("route-merge candidate-pool input/config is invalid");
     }
-    const auto pool = route_merge_candidate_pool_owned_v2(
+    const auto spans = std::tuple{
         std::span<const std::int64_t>{
             checked_data<std::int64_t>(offsets_array),
             static_cast<std::size_t>(offsets_array.size())},
@@ -1594,9 +1680,95 @@ py::tuple route_merge_candidate_pool_v2(
             static_cast<std::size_t>(metrics_array.size())},
         std::span<const double>{
             checked_data<double>(demand_array),
-            static_cast<std::size_t>(demand_array.size())},
+            static_cast<std::size_t>(demand_array.size())}};
+    py::gil_scoped_release release;
+    return route_merge_candidate_pool_owned_v2(
+        std::get<0>(spans),
+        std::get<1>(spans),
+        std::get<2>(spans),
+        std::get<3>(spans),
         load_capacity, epsilon, pair_pruning, preserve_duplicates);
-    return project_route_merge_candidate_pool_v2(pool);
+}
+
+evrptw::native_search::RouteMergeCandidatePoolV2
+route_merge_candidate_pool_owned_from_python_v3(
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_objective_metrics,
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    double load_capacity,
+    double epsilon) {
+    auto offsets_array = checked_array<std::int64_t>(
+        route_offsets, "route_offsets", 1);
+    auto indices_array = checked_array<std::int64_t>(
+        route_indices, "route_indices", 1);
+    auto metrics_array = checked_array<double>(
+        route_objective_metrics, "route_objective_metrics", 2);
+    auto kind_array = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+    auto demand_array = checked_array<double>(demand, "demand", 1);
+    auto ready_array = checked_array<double>(ready_time, "ready_time", 1);
+    auto due_array = checked_array<double>(due_date, "due_date", 1);
+    auto service_array = checked_array<double>(service_time, "service_time", 1);
+    if (metrics_array.shape(1) != 2) {
+        throw std::invalid_argument(
+            "route-merge candidate-pool objective metrics are invalid");
+    }
+    const auto spans = std::tuple{
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(offsets_array),
+            static_cast<std::size_t>(offsets_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(indices_array),
+            static_cast<std::size_t>(indices_array.size())},
+        std::span<const double>{
+            checked_data<double>(metrics_array),
+            static_cast<std::size_t>(metrics_array.size())},
+        std::span<const std::int64_t>{
+            checked_data<std::int64_t>(kind_array),
+            static_cast<std::size_t>(kind_array.size())},
+        std::span<const double>{
+            checked_data<double>(demand_array),
+            static_cast<std::size_t>(demand_array.size())},
+        std::span<const double>{
+            checked_data<double>(ready_array),
+            static_cast<std::size_t>(ready_array.size())},
+        std::span<const double>{
+            checked_data<double>(due_array),
+            static_cast<std::size_t>(due_array.size())},
+        std::span<const double>{
+            checked_data<double>(service_array),
+            static_cast<std::size_t>(service_array.size())}};
+    py::gil_scoped_release release;
+    return route_merge_candidate_pool_owned_v2(
+        std::get<0>(spans), std::get<1>(spans), std::get<2>(spans),
+        std::get<4>(spans), load_capacity, epsilon, true, false,
+        std::get<3>(spans), std::get<5>(spans), std::get<6>(spans),
+        std::get<7>(spans), true);
+}
+
+py::tuple route_merge_candidate_pool_v2(
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_objective_metrics,
+    py::handle demand,
+    double load_capacity,
+    double epsilon,
+    bool pair_pruning,
+    bool preserve_duplicates) {
+    return project_route_merge_candidate_pool_v2(
+        route_merge_candidate_pool_owned_from_python_v2(
+            route_offsets,
+            route_indices,
+            route_objective_metrics,
+            demand,
+            load_capacity,
+            epsilon,
+            pair_pruning,
+            preserve_duplicates));
 }
 
 evrptw::native_search::CandidatePlanPoolV1
@@ -6195,6 +6367,53 @@ py::array_t<std::int64_t> test_exact_completion_order_v2(
     return output;
 }
 
+py::tuple test_exact_physical_receipt_v2(
+    py::handle node_kind, py::handle ready_time, py::handle due_date,
+    py::handle service_time, py::handle distance, py::handle vehicle,
+    py::handle order_offsets, py::handle order_indices,
+    py::handle deadline_remaining, py::handle batch_size,
+    const std::string& scheduler_endpoint) {
+#ifdef __linux__
+    if (scheduler_endpoint.empty()) {
+        throw std::invalid_argument(
+            "native exact physical receipt test requires a scheduler endpoint");
+    }
+    NativeSchedulerThreadContext scheduler_context(
+        scheduler_endpoint, true, nullptr);
+#else
+    static_cast<void>(scheduler_endpoint);
+    throw std::runtime_error(
+        "native exact physical receipt test requires Linux");
+#endif
+    const auto result = exact_charging_batch_owned_from_python_v2(
+        node_kind, ready_time, due_date, service_time, distance, vehicle,
+        order_offsets, order_indices, deadline_remaining, batch_size);
+    if (result.physical_completion_order.empty()
+        || result.physical_task_receipts.empty()
+        || result.physical_task_receipts.size() % 7 != 0) {
+        throw std::runtime_error(
+            "native exact physical receipt is unavailable");
+    }
+    py::array_t<std::int64_t> semantic(result.completion_order.size());
+    py::array_t<std::int64_t> physical(
+        result.physical_completion_order.size());
+    py::array_t<std::int64_t> tasks(
+        {static_cast<py::ssize_t>(
+             result.physical_task_receipts.size() / 7),
+         py::ssize_t(7)});
+    std::copy(
+        result.completion_order.begin(), result.completion_order.end(),
+        checked_data(semantic));
+    std::copy(
+        result.physical_completion_order.begin(),
+        result.physical_completion_order.end(), checked_data(physical));
+    std::copy(
+        result.physical_task_receipts.begin(),
+        result.physical_task_receipts.end(), checked_data(tasks));
+    return py::make_tuple(
+        std::move(semantic), std::move(physical), std::move(tasks));
+}
+
 std::string test_exact_payload_hash_v2(
     py::handle node_kind, py::handle ready_time, py::handle due_date,
     py::handle service_time, py::handle distance, py::handle vehicle,
@@ -7706,7 +7925,8 @@ py::tuple constraint_removal_v2(
 
 evrptw::native_search::ScreenBatchResultV2
 screen_route_batch_transaction_owned_v2(
-    const evrptw::native_search::ScreenBatchInputV2& input) {
+    const evrptw::native_search::ScreenBatchInputV2& input,
+    NativeWorkPool* persistent_work_pool = nullptr) {
     constexpr auto maximum_i64_size =
         static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
     const auto node_count = input.node_kind.size();
@@ -7904,7 +8124,49 @@ screen_route_batch_transaction_owned_v2(
         auto* worker_telemetry_collector =
             evrptw::native_client::telemetry_collector;
 #endif
-        {
+        if (persistent_work_pool != nullptr) {
+            if (persistent_work_pool->thread_count() < input.worker_count) {
+                throw std::invalid_argument(
+                    "persistent candidate-round work pool is undersized");
+            }
+            if (injected_launch_failure_after >= 0) {
+                throw std::system_error(
+                    std::make_error_code(
+                        std::errc::resource_unavailable_try_again),
+                    "injected native screen-batch thread launch failure");
+            }
+            persistent_work_pool->parallel_for(
+                screen_indices.size(),
+                [&](const std::size_t position) {
+#ifdef __linux__
+                    NativeSchedulerThreadContext scheduler_context(
+                        worker_scheduler_endpoint,
+                        worker_scheduler_required,
+                        worker_telemetry_collector);
+#endif
+                    const auto index = screen_indices[position];
+                    const auto begin = static_cast<std::size_t>(offsets[index]);
+                    const auto end = static_cast<std::size_t>(offsets[index + 1]);
+                    const auto candidate_route = input.route_indices.subspan(
+                        begin, end - begin);
+                    outputs[index] = dispatch_screen_route(
+                        kinds,
+                        demands,
+                        ready,
+                        due,
+                        service,
+                        distances,
+                        reachable_values,
+                        vehicle_values,
+                        candidate_route.data(),
+                        candidate_route.size(),
+                        node_count,
+                        depot,
+                        recharge_nodes,
+                        option_values,
+                        incremental_values + index * 6);
+                });
+        } else {
             std::vector<std::jthread> workers;
             workers.reserve(active_workers);
             try {
@@ -8160,7 +8422,8 @@ ScreenBatchPythonProblemV2::execute(
         worker_count,
     };
     py::gil_scoped_release release;
-    return screen_route_batch_transaction_owned_v2(input);
+    return screen_route_batch_transaction_owned_v2(
+        input, candidate_round_work_pool_context);
 }
 
 evrptw::native_search::ScreenBatchResultV2
@@ -8287,6 +8550,123 @@ py::tuple screen_route_batch_transaction_v2(
         negative_indices,
         negative_reason_codes,
         1);
+}
+
+py::tuple route_merge_candidate_pool_screened_v3(
+    py::handle node_kind,
+    py::handle demand,
+    py::handle ready_time,
+    py::handle due_date,
+    py::handle service_time,
+    py::handle distance,
+    py::handle reachable,
+    py::handle vehicle,
+    py::handle route_offsets,
+    py::handle route_indices,
+    py::handle route_objective_metrics,
+    double epsilon,
+    std::int64_t worker_count) {
+    const auto vehicle_array = checked_array<double>(vehicle, "vehicle", 1);
+    if (vehicle_array.shape(0) != 5) {
+        throw std::invalid_argument(
+            "route-merge screening vehicle must contain five values");
+    }
+    const auto* vehicle_values = checked_data<double>(vehicle_array);
+    const auto pool_started = std::chrono::steady_clock::now();
+    auto pool_state = route_merge_candidate_pool_owned_from_python_v3(
+        route_offsets,
+        route_indices,
+        route_objective_metrics,
+        node_kind,
+        demand,
+        ready_time,
+        due_date,
+        service_time,
+        vehicle_values[1],
+        epsilon);
+    auto pool = project_route_merge_candidate_pool_v2(pool_state);
+    py::array_t<std::int64_t> pruned_pair_metadata(
+        std::vector<py::ssize_t>{
+            static_cast<py::ssize_t>(
+                pool_state.pruned_pair_reason_codes.size()),
+            4});
+    auto* pruned_values = checked_data(pruned_pair_metadata);
+    for (std::size_t pair = 0;
+         pair < pool_state.pruned_pair_reason_codes.size(); ++pair) {
+        pruned_values[pair * 4] = pool_state.pruned_pair_metadata[pair * 3];
+        pruned_values[pair * 4 + 1] =
+            pool_state.pruned_pair_metadata[pair * 3 + 1];
+        pruned_values[pair * 4 + 2] =
+            pool_state.pruned_pair_metadata[pair * 3 + 2];
+        pruned_values[pair * 4 + 3] =
+            pool_state.pruned_pair_reason_codes[pair];
+    }
+    const auto pool_finished = std::chrono::steady_clock::now();
+
+    const auto candidate_offsets = checked_array<std::int64_t>(
+        pool[0], "route_merge_candidate_offsets", 1);
+    if (candidate_offsets.size() == 0) {
+        throw std::runtime_error(
+            "route-merge candidate pool returned no offset sentinel");
+    }
+    const auto candidate_count = candidate_offsets.size() - 1;
+    py::array_t<std::int64_t> candidate_ids(candidate_count);
+    auto* candidate_id_values = checked_data(candidate_ids);
+    for (py::ssize_t index = 0; index < candidate_count; ++index) {
+        candidate_id_values[index] = static_cast<std::int64_t>(index);
+    }
+    py::array_t<double> options(4);
+    auto* option_values = checked_data(options);
+    option_values[0] = 0.0;
+    option_values[1] = epsilon;
+    option_values[2] = 0.0;
+    option_values[3] = 0.0;
+    py::array_t<double> incremental(
+        std::vector<py::ssize_t>{candidate_count, 6});
+    std::fill_n(
+        checked_data(incremental),
+        static_cast<std::size_t>(incremental.size()),
+        0.0);
+    py::array_t<std::int64_t> negative_offsets(1);
+    checked_data(negative_offsets)[0] = 0;
+    py::array_t<std::int64_t> negative_indices(0);
+    py::array_t<std::int64_t> negative_reason_codes(0);
+
+    const auto screening_started = std::chrono::steady_clock::now();
+    auto screening = screen_route_batch_transaction_impl(
+        node_kind,
+        demand,
+        ready_time,
+        due_date,
+        service_time,
+        distance,
+        reachable,
+        vehicle,
+        pool[0],
+        pool[1],
+        candidate_ids,
+        options,
+        incremental,
+        negative_offsets,
+        negative_indices,
+        negative_reason_codes,
+        worker_count);
+    const auto screening_finished = std::chrono::steady_clock::now();
+    py::array_t<double> timings(2);
+    auto* timing_values = checked_data(timings);
+    timing_values[0] =
+        std::chrono::duration<double>(pool_finished - pool_started).count();
+    timing_values[1] =
+        std::chrono::duration<double>(screening_finished - screening_started)
+            .count();
+    return py::make_tuple(
+        pool[0],
+        pool[1],
+        pool[2],
+        pool[3],
+        std::move(pruned_pair_metadata),
+        std::move(screening),
+        std::move(timings));
 }
 
 py::tuple project_candidate_round_result_v2(
@@ -8952,6 +9332,462 @@ py::tuple candidate_round_transaction_v2(
     return extended;
 }
 
+class NativeRouteMergeProfileCacheV1 final {
+public:
+    py::tuple plan(
+        py::handle route_offsets,
+        py::handle route_indices,
+        py::handle available_flags) {
+        if (plan_active_) {
+            throw std::logic_error("route-merge profile cache already has an active plan");
+        }
+        auto offsets_array = checked_array<std::int64_t>(
+            route_offsets, "route_merge_profile_offsets", 1);
+        auto indices_array = checked_array<std::int64_t>(
+            route_indices, "route_merge_profile_indices", 1);
+        auto available_array = checked_array<std::int64_t>(
+            available_flags, "route_merge_profile_available", 1);
+        if (offsets_array.size() < 2
+            || available_array.size() != offsets_array.size() - 1) {
+            throw std::invalid_argument("route-merge profile cache input is invalid");
+        }
+        const auto* offsets = checked_data<std::int64_t>(offsets_array);
+        const auto* indices = checked_data<std::int64_t>(indices_array);
+        const auto* available = checked_data<std::int64_t>(available_array);
+        const auto route_count = static_cast<std::size_t>(available_array.size());
+        if (offsets[0] != 0
+            || offsets[route_count] != indices_array.size()) {
+            throw std::invalid_argument("route-merge profile offsets are invalid");
+        }
+        std::vector<std::string> keys;
+        keys.reserve(route_count);
+        std::unordered_set<std::string> current;
+        current.reserve(route_count);
+        for (std::size_t route = 0; route < route_count; ++route) {
+            if (offsets[route] < 0 || offsets[route] >= offsets[route + 1]
+                || offsets[route + 1] > indices_array.size()
+                || (available[route] != 0 && available[route] != 1)) {
+                throw std::invalid_argument(
+                    "route-merge profile route/availability is invalid");
+            }
+            std::string key;
+            const auto size = static_cast<std::size_t>(
+                offsets[route + 1] - offsets[route]);
+            key.resize(size * sizeof(std::int64_t));
+            std::memcpy(
+                key.data(), indices + offsets[route], key.size());
+            current.insert(key);
+            keys.push_back(std::move(key));
+        }
+
+        std::unordered_set<std::string> invalidated_keys;
+        invalidated_keys.reserve(entries_.size());
+        for (const auto& [key, profile] : entries_) {
+            static_cast<void>(profile);
+            if (!current.contains(key)) {
+                invalidated_keys.insert(key);
+            }
+        }
+        for (std::size_t route = 0; route < route_count; ++route) {
+            if (available[route] == 0) {
+                if (entries_.contains(keys[route])) {
+                    invalidated_keys.insert(keys[route]);
+                }
+            }
+        }
+        const auto invalidations = static_cast<std::int64_t>(
+            invalidated_keys.size());
+
+        py::array_t<std::int64_t> hit_flags(route_count);
+        py::array_t<std::int64_t> feasible_flags(route_count);
+        py::array_t<double> objective_metrics(
+            std::vector<py::ssize_t>{
+                static_cast<py::ssize_t>(route_count), 2});
+        py::array_t<std::int64_t> charging_counts(route_count);
+        auto* hit_values = checked_data(hit_flags);
+        auto* feasible_values = checked_data(feasible_flags);
+        auto* metric_values = checked_data(objective_metrics);
+        auto* count_values = checked_data(charging_counts);
+        std::fill_n(hit_values, route_count, std::int64_t{0});
+        std::fill_n(feasible_values, route_count, std::int64_t{0});
+        std::fill_n(metric_values, route_count * 2, 0.0);
+        std::fill_n(count_values, route_count, std::int64_t{0});
+        pending_keys_ = keys;
+        pending_miss_indices_.clear();
+        for (std::size_t route = 0; route < route_count; ++route) {
+            const auto found = invalidated_keys.contains(keys[route])
+                ? entries_.end()
+                : entries_.find(keys[route]);
+            if (found == entries_.end()) {
+                pending_miss_indices_.push_back(
+                    static_cast<std::int64_t>(route));
+                continue;
+            }
+            hit_values[route] = 1;
+            feasible_values[route] = found->second.feasible ? 1 : 0;
+            metric_values[route * 2] = found->second.distance;
+            metric_values[route * 2 + 1] = found->second.charging_time;
+            count_values[route] = found->second.charging_count;
+        }
+        py::array_t<std::int64_t> miss_indices(pending_miss_indices_.size());
+        std::copy(
+            pending_miss_indices_.begin(), pending_miss_indices_.end(),
+            checked_data(miss_indices));
+        py::array_t<std::int64_t> counters(3);
+        auto* counter_values = checked_data(counters);
+        counter_values[0] = static_cast<std::int64_t>(route_count)
+            - static_cast<std::int64_t>(pending_miss_indices_.size());
+        counter_values[1] = static_cast<std::int64_t>(pending_miss_indices_.size());
+        counter_values[2] = invalidations;
+        auto receipt = py::make_tuple(
+            std::move(hit_flags), std::move(feasible_flags),
+            std::move(objective_metrics), std::move(charging_counts),
+            std::move(miss_indices), std::move(counters));
+        pending_removed_entries_.clear();
+        pending_removed_entries_.reserve(invalidated_keys.size());
+        for (const auto& key : invalidated_keys) {
+            auto node = entries_.extract(key);
+            if (node.empty()) {
+                throw std::logic_error(
+                    "route-merge profile invalidation target disappeared");
+            }
+            pending_removed_entries_.push_back(std::move(node));
+        }
+        plan_active_ = true;
+        return receipt;
+    }
+
+    void commit(
+        py::handle miss_indices,
+        py::handle feasible_flags,
+        py::handle objective_metrics,
+        py::handle charging_counts) {
+        if (!plan_active_) {
+            throw std::logic_error("route-merge profile cache has no active plan");
+        }
+        auto miss_array = checked_array<std::int64_t>(
+            miss_indices, "route_merge_profile_miss_indices", 1);
+        auto feasible_array = checked_array<std::int64_t>(
+            feasible_flags, "route_merge_profile_feasible", 1);
+        auto metrics_array = checked_array<double>(
+            objective_metrics, "route_merge_profile_metrics", 2);
+        auto counts_array = checked_array<std::int64_t>(
+            charging_counts, "route_merge_profile_charging_counts", 1);
+        const auto miss_count = pending_miss_indices_.size();
+        if (static_cast<std::size_t>(miss_array.size()) != miss_count
+            || static_cast<std::size_t>(feasible_array.size()) != miss_count
+            || metrics_array.shape(0) != static_cast<py::ssize_t>(miss_count)
+            || metrics_array.shape(1) != 2
+            || static_cast<std::size_t>(counts_array.size()) != miss_count) {
+            throw std::invalid_argument("route-merge profile commit shape is invalid");
+        }
+        const auto* misses = checked_data<std::int64_t>(miss_array);
+        const auto* feasible = checked_data<std::int64_t>(feasible_array);
+        const auto* metrics = checked_data<double>(metrics_array);
+        const auto* counts = checked_data<std::int64_t>(counts_array);
+        std::vector<Profile> profiles;
+        profiles.reserve(miss_count);
+        for (std::size_t index = 0; index < miss_count; ++index) {
+            const auto route = pending_miss_indices_[index];
+            if (misses[index] != route || route < 0
+                || static_cast<std::size_t>(route) >= pending_keys_.size()
+                || (feasible[index] != 0 && feasible[index] != 1)
+                || !std::isfinite(metrics[index * 2])
+                || !std::isfinite(metrics[index * 2 + 1])
+                || metrics[index * 2] < 0.0
+                || metrics[index * 2 + 1] < 0.0
+                || counts[index] < 0) {
+                throw std::invalid_argument(
+                    "route-merge profile commit values are invalid");
+            }
+            profiles.push_back(Profile{
+                feasible[index] != 0,
+                metrics[index * 2],
+                metrics[index * 2 + 1],
+                counts[index]});
+        }
+        std::vector<std::string> inserted_keys;
+        inserted_keys.reserve(miss_count);
+        try {
+            for (std::size_t index = 0; index < miss_count; ++index) {
+                const auto route = pending_miss_indices_[index];
+                const auto& profile = profiles[index];
+                const auto& key = pending_keys_[static_cast<std::size_t>(route)];
+                const auto found = entries_.find(key);
+                if (found != entries_.end()
+                    && std::tie(
+                           found->second.feasible, found->second.distance,
+                           found->second.charging_time,
+                           found->second.charging_count)
+                        != std::tie(
+                           profile.feasible, profile.distance,
+                           profile.charging_time, profile.charging_count)) {
+                    throw std::runtime_error(
+                        "duplicate route-merge profile changed within one commit");
+                }
+                if (found == entries_.end()) {
+                    inserted_keys.push_back(key);
+                    entries_.emplace(key, profile);
+                }
+            }
+        } catch (...) {
+            for (const auto& key : inserted_keys) {
+                entries_.erase(key);
+            }
+            throw;
+        }
+        clear_plan(false);
+    }
+
+    void rollback() { clear_plan(true); }
+
+private:
+    struct Profile final {
+        bool feasible = false;
+        double distance = 0.0;
+        double charging_time = 0.0;
+        std::int64_t charging_count = 0;
+    };
+
+    using EntryMap = std::unordered_map<std::string, Profile>;
+
+    void clear_plan(const bool restore_invalidated) {
+        if (restore_invalidated) {
+            for (auto& node : pending_removed_entries_) {
+                const auto inserted = entries_.insert(std::move(node));
+                if (!inserted.inserted) {
+                    throw std::logic_error(
+                        "route-merge profile rollback key already exists");
+                }
+            }
+        }
+        pending_removed_entries_.clear();
+        pending_keys_.clear();
+        pending_miss_indices_.clear();
+        plan_active_ = false;
+    }
+
+    EntryMap entries_;
+    std::vector<EntryMap::node_type> pending_removed_entries_;
+    std::vector<std::string> pending_keys_;
+    std::vector<std::int64_t> pending_miss_indices_;
+    bool plan_active_ = false;
+};
+
+#ifdef __linux__
+py::dict native_task_receipt_descriptor(
+    const evrptw::native_telemetry::TaskReceiptFileDescriptor& receipt) {
+    py::dict output;
+    output["schema_version"] =
+        "stage05.2-native-work-task-receipts-v3";
+    output["path"] = receipt.path;
+    output["sha256"] = receipt.sha256;
+    output["bytes"] = receipt.bytes;
+    output["count"] = receipt.count;
+    output["storage_model"] = "bounded_async_fifo_stream";
+    output["receipt_batch_capacity"] = receipt.receipt_batch_capacity;
+    output["queue_bound_batches"] = receipt.queue_bound_batches;
+    output["peak_queued_batches"] = receipt.peak_queued_batches;
+    output["submitted_batches"] = receipt.submitted_batches;
+    output["completed_batches"] = receipt.completed_batches;
+    output["dropped_count"] = receipt.dropped_count;
+    output["producer_wait_seconds"] = receipt.producer_wait_seconds;
+    output["writer_wall_seconds"] = receipt.writer_wall_seconds;
+    output["writer_cpu_seconds"] = receipt.writer_cpu_seconds;
+    output["serialization_seconds"] = receipt.serialization_seconds;
+    output["write_seconds"] = receipt.write_seconds;
+    output["file_fsync_seconds"] = receipt.file_fsync_seconds;
+    output["atomic_publish_seconds"] = receipt.atomic_publish_seconds;
+    output["parent_fsync_seconds"] = receipt.parent_fsync_seconds;
+    return output;
+}
+#endif
+
+class NativeCandidateRoundRuntimeV2 final {
+public:
+    explicit NativeCandidateRoundRuntimeV2(
+        const std::int64_t worker_count,
+        const std::string& task_receipt_path = "")
+        : worker_count_(validated_worker_count(worker_count)),
+#ifdef __linux__
+          task_receipt_spool_(
+              task_receipt_path.empty()
+                  ? nullptr
+                  : std::make_shared<
+                      evrptw::native_telemetry::TaskReceiptSpool>(
+                          task_receipt_path)),
+#endif
+          work_pool_(
+              worker_count_,
+              0,
+#ifdef __linux__
+              task_receipt_spool_
+                  ? NativeWorkPool::TaskReceiptSink(
+                      [spool = task_receipt_spool_](
+                          const NativeWorkPool::TaskReceipt& receipt) {
+                          spool->record(receipt);
+                      })
+                  : NativeWorkPool::TaskReceiptSink{},
+              task_receipt_spool_
+                  ? NativeWorkPool::TaskReceiptFlush(
+                      [spool = task_receipt_spool_]() { spool->flush(); })
+                  : NativeWorkPool::TaskReceiptFlush{}
+#else
+              NativeWorkPool::TaskReceiptSink{},
+              NativeWorkPool::TaskReceiptFlush{}
+#endif
+          ) {
+#ifndef __linux__
+        if (!task_receipt_path.empty()) {
+            throw std::invalid_argument(
+                "native task-receipt streaming requires Linux");
+        }
+#endif
+    }
+
+    NativeCandidateRoundRuntimeV2(const NativeCandidateRoundRuntimeV2&) = delete;
+    NativeCandidateRoundRuntimeV2& operator=(
+        const NativeCandidateRoundRuntimeV2&) = delete;
+
+    py::tuple execute(const py::args& arguments) {
+        if (arguments.size() != 31) {
+            throw std::invalid_argument(
+                "candidate-round runtime execute requires 31 arguments");
+        }
+        if (candidate_round_work_pool_context != nullptr) {
+            throw std::logic_error(
+                "candidate-round persistent work-pool dispatch is nested");
+        }
+        candidate_round_work_pool_context = &work_pool_;
+        ScopeRollback clear_context([this]() noexcept {
+            if (candidate_round_work_pool_context == &work_pool_) {
+                candidate_round_work_pool_context = nullptr;
+            }
+        });
+        return candidate_round_transaction_v2(
+            arguments[0], arguments[1], arguments[2], arguments[3],
+            arguments[4], arguments[5], arguments[6], arguments[7],
+            arguments[8], arguments[9], arguments[10], arguments[11],
+            arguments[12], arguments[13], arguments[14], arguments[15],
+            arguments[16], arguments[17], arguments[18], arguments[19],
+            arguments[20], arguments[21], arguments[22], arguments[23],
+            arguments[24], arguments[25], arguments[26], arguments[27],
+            arguments[28], arguments[29], arguments[30]);
+    }
+
+    py::tuple execute_screening(const py::args& arguments) {
+        if (arguments.size() != 16) {
+            throw std::invalid_argument(
+                "candidate-round runtime screening requires 16 arguments");
+        }
+        if (candidate_round_work_pool_context != nullptr) {
+            throw std::logic_error(
+                "candidate-round persistent work-pool dispatch is nested");
+        }
+        candidate_round_work_pool_context = &work_pool_;
+        ScopeRollback clear_context([this]() noexcept {
+            if (candidate_round_work_pool_context == &work_pool_) {
+                candidate_round_work_pool_context = nullptr;
+            }
+        });
+        return screen_route_batch_transaction_impl(
+            arguments[0], arguments[1], arguments[2], arguments[3],
+            arguments[4], arguments[5], arguments[6], arguments[7],
+            arguments[8], arguments[9], arguments[10], arguments[11],
+            arguments[12], arguments[13], arguments[14], arguments[15],
+            worker_count_);
+    }
+
+    py::tuple execute_route_merge_pool_screened(const py::args& arguments) {
+        if (arguments.size() != 12) {
+            throw std::invalid_argument(
+                "candidate-round route-merge screening requires 12 arguments");
+        }
+        if (candidate_round_work_pool_context != nullptr) {
+            throw std::logic_error(
+                "candidate-round persistent work-pool dispatch is nested");
+        }
+        candidate_round_work_pool_context = &work_pool_;
+        ScopeRollback clear_context([this]() noexcept {
+            if (candidate_round_work_pool_context == &work_pool_) {
+                candidate_round_work_pool_context = nullptr;
+            }
+        });
+        return route_merge_candidate_pool_screened_v3(
+            arguments[0], arguments[1], arguments[2], arguments[3],
+            arguments[4], arguments[5], arguments[6], arguments[7],
+            arguments[8], arguments[9], arguments[10],
+            py::cast<double>(arguments[11]), worker_count_);
+    }
+
+    [[nodiscard]] py::dict statistics() {
+        work_pool_.wait_until_idle();
+        const auto statistics = work_pool_.statistics();
+        py::dict output;
+#ifdef __linux__
+        output["schema_version"] = task_receipt_spool_
+            ? "stage05.2-candidate-round-work-pool-v3"
+            : "stage05.2-candidate-round-work-pool-v2";
+#else
+        output["schema_version"] = "stage05.2-candidate-round-work-pool-v2";
+#endif
+        output["thread_count"] = worker_count_;
+        output["maximum_pending_tasks"] =
+            work_pool_.maximum_pending_task_count();
+        output["pending_tasks"] = statistics.pending_tasks;
+        output["active_tasks"] = statistics.active_tasks;
+        output["peak_pending_tasks"] = statistics.peak_pending_tasks;
+        output["peak_active_tasks"] = statistics.peak_active_tasks;
+        output["queue_full_count"] = statistics.queue_full_count;
+        output["rejected_count"] = statistics.rejected_count;
+        output["completed_tasks"] = statistics.completed_tasks;
+        output["total_wait_seconds"] = statistics.total_wait_seconds;
+        output["maximum_wait_seconds"] = statistics.maximum_wait_seconds;
+        output["total_service_seconds"] = statistics.total_service_seconds;
+        output["maximum_service_seconds"] = statistics.maximum_service_seconds;
+        output["wait_histogram"] = py::cast(statistics.wait_histogram);
+        output["service_histogram"] = py::cast(statistics.service_histogram);
+        output["task_receipt_dropped_count"] =
+            statistics.task_receipt_dropped_count;
+#ifdef __linux__
+        if (task_receipt_spool_) {
+            output["task_receipts"] = native_task_receipt_descriptor(
+                task_receipt_spool_->finalize(
+                    statistics.completed_tasks,
+                    statistics.task_receipt_dropped_count));
+            return output;
+        }
+#endif
+        output["task_receipt_capacity"] = NativeWorkPool::maximum_task_receipts;
+        py::list task_receipts;
+        for (const auto& receipt : statistics.task_receipts) {
+            task_receipts.append(py::make_tuple(
+                receipt.task_sequence, receipt.worker_index,
+                receipt.first_index, receipt.last_index,
+                receipt.submitted_nanoseconds, receipt.started_nanoseconds,
+                receipt.completed_nanoseconds));
+        }
+        output["task_receipts"] = std::move(task_receipts);
+        return output;
+    }
+
+private:
+    static std::int64_t validated_worker_count(const std::int64_t value) {
+        if (value <= 0 || value > 256) {
+            throw std::invalid_argument(
+                "candidate-round runtime worker count must be in [1, 256]");
+        }
+        return value;
+    }
+
+    std::int64_t worker_count_;
+#ifdef __linux__
+    std::shared_ptr<evrptw::native_telemetry::TaskReceiptSpool>
+        task_receipt_spool_;
+#endif
+    NativeWorkPool work_pool_;
+};
+
 py::tuple full_native_alns_v1(
     py::handle node_kind,
     py::handle demand,
@@ -9614,19 +10450,17 @@ public:
         flags_.resize(write);
         stream_counts_.fill(0);
         terminal_recorded_ = false;
-        std::unordered_map<std::int64_t, std::int64_t> transaction_map;
         std::int64_t next_transaction = 0;
         for (std::size_t row = 0; row < write; ++row) {
             event_ids_[row] = static_cast<std::int64_t>(row);
             ++stream_counts_[static_cast<std::size_t>(stream_codes_[row])];
-            auto& transaction = transaction_ids_[row];
+            const auto transaction = transaction_ids_[row];
             if (transaction >= 0) {
-                const auto [entry, inserted] = transaction_map.emplace(
-                    transaction, next_transaction);
-                if (inserted) {
-                    ++next_transaction;
+                if (transaction == std::numeric_limits<std::int64_t>::max()) {
+                    throw std::overflow_error(
+                        "native causal transaction identity overflow");
                 }
-                transaction = entry->second;
+                next_transaction = std::max(next_transaction, transaction + 1);
             }
         }
         return next_transaction;
@@ -9837,6 +10671,13 @@ class NativeCanonicalEventJournalV2 {
 public:
     static constexpr std::size_t stream_count = 11;
 
+    struct CompactionResult {
+        std::int64_t next_transaction_id = 0;
+        // Indexed by the old one-based event id.  Zero means that the event
+        // was intentionally discarded by boundary compaction.
+        std::vector<std::int64_t> canonical_event_id_remap;
+    };
+
     struct Snapshot {
         std::size_t row_count = 0;
         std::array<std::int64_t, stream_count> stream_counts{};
@@ -9881,11 +10722,25 @@ public:
         terminal_recorded_ = snapshot.terminal_recorded;
     }
 
-    [[nodiscard]] std::int64_t discard_uncommitted_semantics_since(
+    [[nodiscard]] CompactionResult discard_uncommitted_semantics_since(
         const Snapshot& snapshot) {
         if (snapshot.row_count > event_ids_.size()) {
             throw std::logic_error(
                 "native canonical boundary snapshot is invalid");
+        }
+        CompactionResult result;
+        result.canonical_event_id_remap.resize(event_ids_.size() + 1, 0);
+        for (std::size_t row = 0; row < snapshot.row_count; ++row) {
+            const auto old_event_id = event_ids_[row];
+            if (old_event_id <= 0
+                || static_cast<std::size_t>(old_event_id)
+                    >= result.canonical_event_id_remap.size()) {
+                throw std::logic_error(
+                    "native canonical prefix event identity is invalid");
+            }
+            result.canonical_event_id_remap[
+                static_cast<std::size_t>(old_event_id)] =
+                static_cast<std::int64_t>(row) + 1;
         }
         auto write = snapshot.row_count;
         for (auto read = snapshot.row_count; read < event_ids_.size(); ++read) {
@@ -9896,6 +10751,16 @@ public:
                     NativeCanonicalStreamCode::operator_event)) {
                 continue;
             }
+            const auto old_event_id = event_ids_[read];
+            if (old_event_id <= 0
+                || static_cast<std::size_t>(old_event_id)
+                    >= result.canonical_event_id_remap.size()) {
+                throw std::logic_error(
+                    "native canonical retained event identity is invalid");
+            }
+            result.canonical_event_id_remap[
+                static_cast<std::size_t>(old_event_id)] =
+                static_cast<std::int64_t>(write) + 1;
             stream_codes_[write] = stream_codes_[read];
             event_codes_[write] = event_codes_[read];
             lane_ids_[write] = lane_ids_[read];
@@ -9919,22 +10784,20 @@ public:
         flags_.resize(write);
         stream_counts_.fill(0);
         terminal_recorded_ = false;
-        std::unordered_map<std::int64_t, std::int64_t> transaction_map;
-        std::int64_t next_transaction = 0;
         for (std::size_t row = 0; row < write; ++row) {
             event_ids_[row] = static_cast<std::int64_t>(row) + 1;
             ++stream_counts_[static_cast<std::size_t>(stream_codes_[row])];
-            auto& transaction = transaction_ids_[row];
+            const auto transaction = transaction_ids_[row];
             if (transaction >= 0) {
-                const auto [entry, inserted] = transaction_map.emplace(
-                    transaction, next_transaction);
-                if (inserted) {
-                    ++next_transaction;
+                if (transaction == std::numeric_limits<std::int64_t>::max()) {
+                    throw std::overflow_error(
+                        "native canonical transaction identity overflow");
                 }
-                transaction = entry->second;
+                result.next_transaction_id = std::max(
+                    result.next_transaction_id, transaction + 1);
             }
         }
-        return next_transaction;
+        return result;
     }
 
     std::int64_t append(
@@ -10996,124 +11859,39 @@ private:
 #else
                 constexpr auto remote_scheduler = false;
 #endif
-                if (remote_scheduler || routes.route_count() <= 1
-                    || owner_.worker_count_ <= 1) {
+                if (remote_scheduler) {
                     output = exact_charging_batch_owned(
                         problem, route_offsets, route_indices, owner_.depot_,
                         owner_.exact_recharge_stations_, deadline_remaining,
                         batch_size);
                 } else {
-                    const auto route_count = routes.route_count();
-                    const auto chunk_count = std::min<std::size_t>(
-                        static_cast<std::size_t>(owner_.worker_count_),
-                        route_count);
-                    const auto chunk_size =
-                        (route_count + chunk_count - 1) / chunk_count;
-                    const auto actual_chunk_count =
-                        (route_count + chunk_size - 1) / chunk_size;
-                    std::vector<evrptw::native_kernels::ExactBatchOutput>
-                        chunk_outputs(actual_chunk_count);
-                    std::vector<std::size_t> chunk_first(actual_chunk_count);
-                    std::vector<std::size_t> completion_rank(
-                        actual_chunk_count);
-                    std::atomic<std::size_t> completion_serial{0};
-                    owner_.work_pool_->parallel_for(
-                        actual_chunk_count, [&](const std::size_t chunk) {
-                            const auto first = chunk * chunk_size;
-                            const auto last = std::min(
-                                route_count, first + chunk_size);
-                            chunk_first[chunk] = first;
-                            std::vector<std::int64_t> chunk_offsets{0};
-                            std::vector<std::int64_t> chunk_indices;
-                            for (auto route = first; route < last; ++route) {
-                                const auto sequence = routes.route(route);
-                                chunk_indices.insert(
-                                    chunk_indices.end(), sequence.begin(),
-                                    sequence.end());
-                                chunk_offsets.push_back(
-                                    static_cast<std::int64_t>(
-                                        chunk_indices.size()));
-                            }
-                            const auto remaining = deadline_remaining
-                                - std::chrono::duration<double>(
-                                    std::chrono::steady_clock::now() - started)
-                                      .count();
-                            chunk_outputs[chunk] = exact_charging_batch_owned(
-                                problem, chunk_offsets, chunk_indices,
-                                owner_.depot_, owner_.exact_recharge_stations_,
-                                remaining, batch_size);
-                            completion_rank[chunk] =
-                                completion_serial.fetch_add(
-                                    1, std::memory_order_relaxed);
-                        });
-
-                    output.path_offsets.push_back(0);
-                    output.statuses.reserve(route_count);
-                    output.reasons.reserve(route_count);
-                    output.metrics.reserve(route_count * 4);
-                    output.label_counters.reserve(route_count * 3);
-                    output.batch_counters.assign(10, 0);
-                    output.batch_counters[0] =
-                        static_cast<std::int64_t>(route_count);
-                    output.batch_counters[1] =
-                        static_cast<std::int64_t>(route_count);
-                    output.batch_counters[4] = 1;
-                    output.batch_counters[8] = 1;
-                    output.batch_counters[9] = batch_size;
-                    for (std::size_t chunk = 0;
-                         chunk < actual_chunk_count; ++chunk) {
-                        const auto& child = chunk_outputs[chunk];
-                        const auto path_base = output.path_offsets.back();
-                        for (std::size_t row = 1;
-                             row < child.path_offsets.size(); ++row) {
-                            output.path_offsets.push_back(
-                                path_base + child.path_offsets[row]);
-                        }
-                        output.path_indices.insert(
-                            output.path_indices.end(), child.path_indices.begin(),
-                            child.path_indices.end());
-                        output.statuses.insert(
-                            output.statuses.end(), child.statuses.begin(),
-                            child.statuses.end());
-                        output.reasons.insert(
-                            output.reasons.end(), child.reasons.begin(),
-                            child.reasons.end());
-                        output.metrics.insert(
-                            output.metrics.end(), child.metrics.begin(),
-                            child.metrics.end());
-                        output.label_counters.insert(
-                            output.label_counters.end(),
-                            child.label_counters.begin(),
-                            child.label_counters.end());
-                        output.batch_counters[2] += child.batch_counters[2];
-                        output.batch_counters[3] += child.batch_counters[3];
-                        output.batch_counters[5] += child.batch_counters[5];
-                        output.batch_counters[6] += child.batch_counters[6];
-                        output.batch_counters[7] += child.batch_counters[7];
+                    if (owner_.work_pool_ == nullptr) {
+                        throw std::runtime_error(
+                            "full-native exact work pool is disabled");
                     }
-                    std::vector<std::size_t> chunks_by_completion(
-                        actual_chunk_count);
-                    std::iota(
-                        chunks_by_completion.begin(),
-                        chunks_by_completion.end(), std::size_t{0});
-                    std::stable_sort(
-                        chunks_by_completion.begin(),
-                        chunks_by_completion.end(),
-                        [&](const auto left, const auto right) {
-                            return completion_rank[left]
-                                < completion_rank[right];
-                        });
-                    for (const auto chunk : chunks_by_completion) {
-                        for (const auto ordinal :
-                             chunk_outputs[chunk].completion_order) {
-                            output.completion_order.push_back(
-                                static_cast<std::int64_t>(chunk_first[chunk])
-                                + ordinal);
-                        }
-                    }
+                    const auto run_batch = [&](
+                        const std::int64_t* offsets,
+                        const std::int64_t* indices,
+                        const std::size_t route_count,
+                        const double remaining) {
+                        const std::vector<std::int64_t> owned_offsets(
+                            offsets, offsets + route_count + 1);
+                        const std::vector<std::int64_t> owned_indices(
+                            indices, indices + offsets[route_count]);
+                        return exact_charging_batch_owned(
+                            problem, owned_offsets, owned_indices,
+                            owner_.depot_, owner_.exact_recharge_stations_,
+                            remaining, batch_size);
+                    };
+                    output = evrptw::native_parallel::
+                        run_exact_charging_parallel(
+                            *owner_.work_pool_, route_offsets.data(),
+                            route_indices.data(), routes.route_count(),
+                            deadline_remaining, run_batch);
                     evrptw::native_kernels::validate_exact_batch_output(
                         output, problem.node_kind.data(), route_offsets.data(),
-                        route_indices.data(), problem.node_count(), route_count,
+                        route_indices.data(), problem.node_count(),
+                        routes.route_count(),
                         route_indices.size(), owner_.depot_, batch_size);
                 }
             }
@@ -11439,6 +12217,8 @@ public:
         const auto initialization_control_journal_size = control_journal_.size();
         const auto initialization_screening_journal_size =
             screening_journal_.size();
+        const auto initialization_screening_outcome_size =
+            screening_journal_outcomes_.size();
         const auto initialization_screening_occupancy_size =
             screening_occupancies_.size();
         const auto initialization_exact_occupancy_size =
@@ -11472,6 +12252,7 @@ public:
              initialization_exact_journal_size,
              initialization_control_journal_size,
              initialization_screening_journal_size,
+             initialization_screening_outcome_size,
              initialization_screening_occupancy_size,
              initialization_exact_occupancy_size,
              initialization_screening_statistics,
@@ -11504,6 +12285,8 @@ public:
                 exact_journal_.resize(initialization_exact_journal_size);
                 control_journal_.resize(initialization_control_journal_size);
                 screening_journal_.resize(initialization_screening_journal_size);
+                screening_journal_outcomes_.resize(
+                    initialization_screening_outcome_size);
                 screening_occupancies_.resize(
                     initialization_screening_occupancy_size);
                 exact_launch_occupancies_.resize(
@@ -12037,6 +12820,7 @@ public:
         auto prepared_best_exact = prepared_current_exact;
         auto prepared_best_objective_integer = prepared_current_objective_integer;
         auto prepared_best_objective_float = prepared_current_objective_float;
+        NativeRouteCacheV2::StoreSummary warm_store_summary;
         if (owned_initialized_state.has_value()) {
             const auto owned_hashes = exact_semantic_hashes_owned(
                 live_problem_->initial_route_offsets,
@@ -12044,7 +12828,7 @@ public:
                 owned_initialized_state->exact);
             const auto owned_entry_bytes = exact_entry_bytes_owned(
                 owned_initialized_state->exact);
-            route_cache_.begin_store_exact_many_atomic_owned(
+            warm_store_summary = route_cache_.begin_store_exact_many_atomic_owned(
                 evrptw::native_search::RouteBatchViewV2{
                     live_problem_->initial_route_offsets,
                     live_problem_->initial_route_indices},
@@ -12052,7 +12836,7 @@ public:
                 owned_hashes,
                 owned_entry_bytes);
         } else {
-            route_cache_.begin_store_exact_many_atomic(
+            auto raw_store_summary = route_cache_.begin_store_exact_many_atomic(
                 initial_route_offsets,
                 initial_route_indices,
                 exact_payload[0],
@@ -12063,6 +12847,22 @@ public:
                 exact_payload[5],
                 semantic_hashes,
                 entry_bytes);
+            const auto raw_statuses = py::cast<py::array_t<std::int64_t>>(
+                raw_store_summary[0]);
+            const auto raw_evictions = py::cast<py::array_t<std::int64_t>>(
+                raw_store_summary[1]);
+            const auto raw_statistics = py::cast<py::array_t<std::int64_t>>(
+                raw_store_summary[2]);
+            warm_store_summary.statuses.assign(
+                checked_data<std::int64_t>(raw_statuses),
+                checked_data<std::int64_t>(raw_statuses) + raw_statuses.size());
+            warm_store_summary.eviction_counts.assign(
+                checked_data<std::int64_t>(raw_evictions),
+                checked_data<std::int64_t>(raw_evictions) + raw_evictions.size());
+            std::copy_n(
+                checked_data<std::int64_t>(raw_statistics),
+                warm_store_summary.statistics.size(),
+                warm_store_summary.statistics.begin());
         }
         route_cache_.prepare_store_commit();
         route_cache_.commit_store_batch_noexcept();
@@ -12154,7 +12954,26 @@ public:
         }
         initial_control_journal.ranking_float = {
             optimistic_plan_distance.value()};
+        initial_control_journal.objective_integer.assign(
+            checked_data<std::int64_t>(prepared_current_objective_integer),
+            checked_data<std::int64_t>(prepared_current_objective_integer)
+                + prepared_current_objective_integer.size());
+        initial_control_journal.objective_float.assign(
+            checked_data<double>(prepared_current_objective_float),
+            checked_data<double>(prepared_current_objective_float)
+                + prepared_current_objective_float.size());
         initial_control_journal.route_resolutions.assign(route_count, 2);
+        initial_control_journal.cache_lookup_flags = warm_hit_flags_before;
+        initial_control_journal.cache_lookup_flags.insert(
+            initial_control_journal.cache_lookup_flags.end(),
+            warm_hit_flags_after.begin(), warm_hit_flags_after.end());
+        initial_control_journal.cache_store_statuses =
+            warm_store_summary.statuses;
+        initial_control_journal.cache_eviction_counts =
+            warm_store_summary.eviction_counts;
+        initial_control_journal.cache_entry_bytes.assign(
+            checked_data<std::int64_t>(entry_bytes),
+            checked_data<std::int64_t>(entry_bytes) + entry_bytes.size());
         if (owned_initialized_state.has_value()) {
             const auto& statistics = route_cache_.statistics_owned();
             initial_control_journal.cache_statistics.assign(
@@ -12176,7 +12995,7 @@ public:
                 checked_data<std::int64_t>(initial_budget_state)
                     + initial_budget_state.size());
         }
-        initial_control_journal.protocol_flags = {0, 0, 0, 0};
+        initial_control_journal.protocol_flags = {0, 0, 0, 0, 0};
         append_control_journal_causal(
             std::list<ControlJournalBatch>{initial_control_journal});
         control_journal_.push_back(std::move(initial_control_journal));
@@ -12622,39 +13441,9 @@ public:
             append_candidate_transaction_trace_v2(
                 execution.result, execution.trace, transaction_id);
 
-            ControlJournalBatch control;
-            control.context = context;
-            control.transaction_id = transaction_id;
-            control.plan_offsets = execution.result.plan_offsets;
-            control.route_offsets = execution.result.route_offsets;
-            control.route_indices = execution.result.route_indices;
-            control.ranked = execution.result.ranked;
-            control.selected = execution.result.selected;
-            control.statuses = execution.result.statuses;
-            control.ranking_integer = execution.trace.ranking_integer;
-            control.ranking_float = execution.trace.ranking_float;
-            control.route_resolutions = execution.result.route_resolutions;
-            control.cache_statistics = execution.result.cache_statistics;
-            control.budget_state = execution.result.budget_state;
-            control.protocol_flags = {
-                suppress_attempted_plan_journal_ ? 1 : 0,
-                suppress_round_budget_ ? 1 : 0,
-                suppress_plan_screening_negative_cache_ ? 1 : 0,
-                allow_partial_customer_coverage_ ? 1 : 0,
-            };
-            std::unordered_set<std::int64_t> selected(
-                control.selected.begin(), control.selected.end());
-            control.decision_codes.reserve(execution.result.statuses.size());
-            for (std::size_t plan = 0;
-                 plan < execution.result.statuses.size(); ++plan) {
-                control.decision_codes.push_back(
-                    execution.trace.eligible_flags[plan] == 0 ? 0
-                    : execution.trace.attempted_flags[plan] != 0 ? 1
-                    : selected.contains(static_cast<std::int64_t>(plan)) ? 2
-                    : 3);
-            }
             std::list<ControlJournalBatch> staged_control;
-            staged_control.push_back(std::move(control));
+            staged_control.push_back(make_control_journal_batch(
+                execution, context, transaction_id, local_options));
 
             if (candidate_round_mirror_tamper_injection_
                 && projector == nullptr) {
@@ -13262,7 +14051,9 @@ public:
         const auto pool_state = route_merge_candidate_pool_owned_v2(
             legacy_lane.route_offsets, legacy_lane.route_indices, route_metrics,
             live_problem_->demand,
-            live_problem_->vehicle[1], screening_epsilon_, true, false);
+            live_problem_->vehicle[1], screening_epsilon_, true, false,
+            live_problem_->node_kind, live_problem_->ready_time,
+            live_problem_->due_date, live_problem_->service_time, true);
         last_route_merge_semantic_outcome_.emplace();
         const auto candidate_count = pool_state.candidate_count();
         metadata[3] = static_cast<std::int64_t>(candidate_count);
@@ -13301,6 +14092,9 @@ public:
             evrptw::native_client::telemetry_collector;
 #endif
         execute_native_work([&]() {
+            if (candidate_count == 0) {
+                return;
+            }
 #ifdef __linux__
             if (!merge_scheduler_endpoint.empty()) {
                 merge_screening = dispatch_screen_routes(
@@ -13355,17 +14149,21 @@ public:
                 ++screening_reason_counts_[screen.codes[1]];
             }
             ScreeningJournalRow screening_journal;
+            ScreeningJournalOutcome screening_outcome;
             screening_journal.context = {
                 stable_int63("legacy"), stable_int63("route_merge"), iteration};
-            screening_journal.route.assign(
+            screening_outcome.route.assign(
                 candidate_nodes + first, candidate_nodes + last);
             std::copy(
                 screen.codes.begin(), screen.codes.end(),
-                screening_journal.codes.begin());
+                screening_outcome.codes.begin());
             std::copy(
                 screen.metrics.begin(), screen.metrics.end(),
-                screening_journal.metrics.begin());
+                screening_outcome.metrics.begin());
+            screening_journal.outcome_id = static_cast<std::int64_t>(
+                screening_journal_outcomes_.size());
             screening_journal.flags = {1, 0, 1, screen.reachability_queries};
+            screening_journal_outcomes_.push_back(std::move(screening_outcome));
             screening_journal_.push_back(std::move(screening_journal));
             if (screen.codes[0] != 1) {
                 continue;
@@ -15046,13 +15844,22 @@ public:
                     std::span<const std::optional<
                         evrptw::native_search::LaneStateV2>>(
                             live_lane_states_.data(), 3));
+                const evrptw::native_search::CandidateTransactionOptionsV2
+                    reference_options{true, false, false, true, false, false};
                 auto execution = execute_native_work([&]() {
                     return executor.execute_with_trace(
-                        std::move(request), {true, false, false, true, false});
+                        std::move(request), reference_options);
                 });
                 const auto transaction_id = allocate_causal_transaction();
                 append_candidate_transaction_trace_v2(
                     execution.result, execution.trace, transaction_id);
+                std::list<ControlJournalBatch> staged_control;
+                staged_control.push_back(make_control_journal_batch(
+                    execution, insertion_context, transaction_id,
+                    reference_options, true));
+                append_control_journal_causal(staged_control);
+                control_journal_.splice(
+                    control_journal_.end(), staged_control);
                 const auto distance = execution.result.feasible_order.empty()
                     ? std::optional<double>{
                         std::numeric_limits<double>::infinity()}
@@ -16365,6 +17172,8 @@ public:
         const auto bootstrap_control_journal_size = control_journal_.size();
         const auto bootstrap_exact_journal_size = exact_journal_.size();
         const auto bootstrap_screening_journal_size = screening_journal_.size();
+        const auto bootstrap_screening_outcome_size =
+            screening_journal_outcomes_.size();
         const auto bootstrap_exact_occupancies_size =
             exact_launch_occupancies_.size();
         const auto bootstrap_screening_occupancies_size =
@@ -16441,6 +17250,7 @@ public:
              bootstrap_causal_snapshot, bootstrap_canonical_snapshot,
              bootstrap_control_journal_size, bootstrap_exact_journal_size,
              bootstrap_screening_journal_size,
+             bootstrap_screening_outcome_size,
              bootstrap_exact_occupancies_size,
              bootstrap_screening_occupancies_size,
              bootstrap_exact_backend_totals, bootstrap_cache_coverage,
@@ -16485,6 +17295,8 @@ public:
                 control_journal_.resize(bootstrap_control_journal_size);
                 exact_journal_.resize(bootstrap_exact_journal_size);
                 screening_journal_.resize(bootstrap_screening_journal_size);
+                screening_journal_outcomes_.resize(
+                    bootstrap_screening_outcome_size);
                 exact_launch_occupancies_.resize(
                     bootstrap_exact_occupancies_size);
                 screening_occupancies_.resize(
@@ -16652,9 +17464,12 @@ public:
                 throw std::logic_error(
                     "full native bootstrap fixed-work boundary crossed an active transaction");
             }
-            const auto canonical_next =
+            const auto canonical_compaction =
                 canonical_event_journal_.discard_uncommitted_semantics_since(
                     canonical_bootstrap_round_snapshot);
+            remap_auxiliary_canonical_event_ids(canonical_compaction);
+            const auto canonical_next =
+                canonical_compaction.next_transaction_id;
             const auto causal_next =
                 causal_journal_.discard_uncommitted_semantics_since(
                     causal_bootstrap_round_snapshot);
@@ -16787,9 +17602,12 @@ public:
                 constraint_segment_rewards_ = bootstrap_constraint_rewards;
                 constraint_segment_calls_ = bootstrap_constraint_calls;
                 constraint_totals_ = bootstrap_constraint_totals;
-                const auto canonical_next =
+                const auto canonical_compaction =
                     canonical_event_journal_.discard_uncommitted_semantics_since(
                         canonical_bootstrap_round_snapshot);
+                remap_auxiliary_canonical_event_ids(canonical_compaction);
+                const auto canonical_next =
+                    canonical_compaction.next_transaction_id;
                 const auto causal_next =
                     causal_journal_.discard_uncommitted_semantics_since(
                         causal_bootstrap_round_snapshot);
@@ -17018,6 +17836,8 @@ public:
         const auto round_control_journal_size = control_journal_.size();
         const auto round_exact_journal_size = exact_journal_.size();
         const auto round_screening_journal_size = screening_journal_.size();
+        const auto round_screening_outcome_size =
+            screening_journal_outcomes_.size();
         const auto round_exact_occupancies_size =
             exact_launch_occupancies_.size();
         const auto round_screening_occupancies_size =
@@ -17083,6 +17903,7 @@ public:
              round_causal_snapshot, round_canonical_snapshot,
              round_control_journal_size, round_exact_journal_size,
              round_screening_journal_size, round_exact_occupancies_size,
+             round_screening_outcome_size,
              round_screening_occupancies_size, round_exact_backend_totals,
              round_cache_coverage, round_screening_statistics,
              round_screening_reasons, round_screening_seconds,
@@ -17117,6 +17938,8 @@ public:
                 control_journal_.resize(round_control_journal_size);
                 exact_journal_.resize(round_exact_journal_size);
                 screening_journal_.resize(round_screening_journal_size);
+                screening_journal_outcomes_.resize(
+                    round_screening_outcome_size);
                 exact_launch_occupancies_.resize(round_exact_occupancies_size);
                 screening_occupancies_.resize(
                     round_screening_occupancies_size);
@@ -17282,9 +18105,12 @@ public:
                 throw std::logic_error(
                     "full native fixed-work boundary crossed an active transaction");
             }
-            const auto canonical_next =
+            const auto canonical_compaction =
                 canonical_event_journal_.discard_uncommitted_semantics_since(
                     round_canonical_snapshot);
+            remap_auxiliary_canonical_event_ids(canonical_compaction);
+            const auto canonical_next =
+                canonical_compaction.next_transaction_id;
             const auto causal_next =
                 causal_journal_.discard_uncommitted_semantics_since(
                     round_causal_snapshot);
@@ -20550,6 +21376,14 @@ public:
         return static_cast<std::size_t>(work_pool_->thread_count());
     }
 
+    [[nodiscard]] std::size_t work_pool_maximum_pending_tasks() const noexcept {
+        return work_pool_->maximum_pending_task_count();
+    }
+
+    [[nodiscard]] NativeWorkPool::Statistics work_pool_statistics() const noexcept {
+        return work_pool_->statistics();
+    }
+
     void suppress_plan_screening_negative_cache(bool suppress) noexcept {
         suppress_plan_screening_negative_cache_ = suppress;
     }
@@ -20884,19 +21718,31 @@ public:
                 "full native search engine must be initialized before journal inspection");
         }
         py::tuple batches(exact_journal_.size());
-        std::string evidence("stage05.2-native-exact-journal-v2");
+        std::string evidence("stage05.2-native-exact-journal-v3");
         for (std::size_t ordinal = 0; ordinal < exact_journal_.size(); ++ordinal) {
             const auto& batch = exact_journal_[ordinal];
             if (batch.transaction_id < 0
                 || batch.canonical_event_ids.size()
                     != batch.results.size() * 2 + 1
-                || std::any_of(
-                    batch.canonical_event_ids.begin(),
-                    batch.canonical_event_ids.end(),
-                    [](const std::int64_t event_id) { return event_id <= 0; })
-                || !std::is_sorted(
-                    batch.canonical_event_ids.begin(),
-                    batch.canonical_event_ids.end())) {
+                || batch.physical_completion_order.size()
+                    != batch.completion_order.size()
+                || batch.physical_task_receipts.size() % 7 != 0
+                || [&batch]() {
+                    const auto all_zero = std::all_of(
+                        batch.canonical_event_ids.begin(),
+                        batch.canonical_event_ids.end(),
+                        [](const std::int64_t value) { return value == 0; });
+                    const auto all_positive = std::all_of(
+                        batch.canonical_event_ids.begin(),
+                        batch.canonical_event_ids.end(),
+                        [](const std::int64_t value) { return value > 0; });
+                    const auto strictly_increasing = std::adjacent_find(
+                        batch.canonical_event_ids.begin(),
+                        batch.canonical_event_ids.end(),
+                        std::greater_equal<std::int64_t>{})
+                        == batch.canonical_event_ids.end();
+                    return !(all_zero || (all_positive && strictly_increasing));
+                }()) {
                 throw std::logic_error(
                     "full native exact journal causal identity is invalid");
             }
@@ -20920,6 +21766,12 @@ public:
                 {static_cast<py::ssize_t>(batch.results.size()), py::ssize_t(3)});
             py::array_t<std::int64_t> completion_order(
                 batch.completion_order.size());
+            py::array_t<std::int64_t> physical_completion_order(
+                batch.physical_completion_order.size());
+            py::array_t<std::int64_t> physical_task_receipts(
+                {static_cast<py::ssize_t>(
+                     batch.physical_task_receipts.size() / 7),
+                 py::ssize_t(7)});
             py::array_t<std::int64_t> transaction_id(1);
             checked_data(transaction_id)[0] = batch.transaction_id;
             py::array_t<std::int64_t> canonical_event_ids(
@@ -20931,6 +21783,14 @@ public:
             std::copy(
                 batch.completion_order.begin(), batch.completion_order.end(),
                 checked_data(completion_order));
+            std::copy(
+                batch.physical_completion_order.begin(),
+                batch.physical_completion_order.end(),
+                checked_data(physical_completion_order));
+            std::copy(
+                batch.physical_task_receipts.begin(),
+                batch.physical_task_receipts.end(),
+                checked_data(physical_task_receipts));
             for (std::size_t route = 0; route < batch.results.size(); ++route) {
                 const auto& result = batch.results[route];
                 path_indices.insert(
@@ -20960,7 +21820,9 @@ public:
                 std::move(path_indices_array), std::move(statuses),
                 std::move(reasons), std::move(metrics), std::move(labels),
                 std::move(completion_order), std::move(transaction_id),
-                std::move(canonical_event_ids));
+                std::move(canonical_event_ids),
+                std::move(physical_completion_order),
+                std::move(physical_task_receipts));
             append_nested_evidence(evidence, batch_payload);
             batches[static_cast<py::ssize_t>(ordinal)] = std::move(batch_payload);
         }
@@ -20979,7 +21841,7 @@ public:
                 "full native control journal is not at a committed boundary");
         }
         py::tuple batches(control_journal_.size());
-        std::string evidence("stage05.2-native-control-journal-v2");
+        std::string evidence("stage05.2-native-control-journal-v4");
         py::ssize_t ordinal = 0;
         for (const auto& batch : control_journal_) {
             const auto integer_array = [](const auto& values) {
@@ -20989,6 +21851,8 @@ public:
             };
             py::array_t<std::int64_t> context(3);
             std::copy(batch.context.begin(), batch.context.end(), checked_data(context));
+            auto transaction_id = integer_array(
+                std::array<std::int64_t, 1>{batch.transaction_id});
             auto plan_offsets = integer_array(batch.plan_offsets);
             auto route_offsets = integer_array(batch.route_offsets);
             auto route_indices = integer_array(batch.route_indices);
@@ -21006,18 +21870,40 @@ public:
             std::copy(
                 batch.ranking_float.begin(), batch.ranking_float.end(),
                 checked_data(ranking_float));
+            py::array_t<std::int64_t> objective_integer(
+                {static_cast<py::ssize_t>(batch.decision_codes.size()),
+                 py::ssize_t(2)});
+            std::copy(
+                batch.objective_integer.begin(), batch.objective_integer.end(),
+                checked_data(objective_integer));
+            py::array_t<double> objective_float(
+                {static_cast<py::ssize_t>(batch.decision_codes.size()),
+                 py::ssize_t(2)});
+            std::copy(
+                batch.objective_float.begin(), batch.objective_float.end(),
+                checked_data(objective_float));
             auto resolutions = integer_array(batch.route_resolutions);
+            auto cache_lookup_flags = integer_array(batch.cache_lookup_flags);
+            auto cache_store_statuses = integer_array(batch.cache_store_statuses);
+            auto cache_eviction_counts = integer_array(batch.cache_eviction_counts);
+            auto cache_entry_bytes = integer_array(batch.cache_entry_bytes);
             auto cache_statistics = integer_array(batch.cache_statistics);
             auto budget_state = integer_array(batch.budget_state);
             auto protocol_flags = integer_array(batch.protocol_flags);
             auto batch_payload = py::make_tuple(
-                std::move(context), std::move(plan_offsets),
+                std::move(context), std::move(transaction_id),
+                std::move(plan_offsets),
                 std::move(route_offsets), std::move(route_indices),
                 std::move(ranked), std::move(selected),
                 std::move(decisions), std::move(statuses),
                 std::move(ranking_integer), std::move(ranking_float),
-                std::move(resolutions), std::move(cache_statistics),
-                std::move(budget_state), std::move(protocol_flags));
+                std::move(resolutions), std::move(cache_lookup_flags),
+                std::move(cache_store_statuses),
+                std::move(cache_eviction_counts),
+                std::move(cache_entry_bytes),
+                std::move(cache_statistics),
+                std::move(budget_state), std::move(protocol_flags),
+                std::move(objective_integer), std::move(objective_float));
             append_nested_evidence(evidence, batch_payload);
             batches[ordinal++] = std::move(batch_payload);
         }
@@ -21045,30 +21931,35 @@ public:
         py::array_t<std::int64_t> screening_contexts({
             static_cast<py::ssize_t>(screening_journal_.size()), py::ssize_t{3}});
         py::array_t<std::int64_t> screening_route_offsets(
-            screening_journal_.size() + 1);
+            screening_journal_outcomes_.size() + 1);
         std::size_t screening_route_index_count = 0;
         checked_data(screening_route_offsets)[0] = 0;
-        for (std::size_t row = 0; row < screening_journal_.size(); ++row) {
-            screening_route_index_count += screening_journal_[row].route.size();
-            checked_data(screening_route_offsets)[row + 1] =
+        for (std::size_t outcome = 0;
+             outcome < screening_journal_outcomes_.size(); ++outcome) {
+            screening_route_index_count +=
+                screening_journal_outcomes_[outcome].route.size();
+            checked_data(screening_route_offsets)[outcome + 1] =
                 static_cast<std::int64_t>(screening_route_index_count);
         }
         py::array_t<std::int64_t> screening_route_indices(
             screening_route_index_count);
+        py::array_t<std::int64_t> screening_outcome_ids(
+            screening_journal_.size());
         py::array_t<std::int64_t> screening_codes({
-            static_cast<py::ssize_t>(screening_journal_.size()), py::ssize_t{16}});
+            static_cast<py::ssize_t>(screening_journal_outcomes_.size()),
+            py::ssize_t{16}});
         py::array_t<double> screening_metrics({
-            static_cast<py::ssize_t>(screening_journal_.size()), py::ssize_t{15}});
+            static_cast<py::ssize_t>(screening_journal_outcomes_.size()),
+            py::ssize_t{15}});
         py::array_t<std::int64_t> screening_flags({
             static_cast<py::ssize_t>(screening_journal_.size()), py::ssize_t{4}});
         py::array_t<std::int64_t> screening_transaction_ids(
             screening_journal_.size());
         py::array_t<std::int64_t> screening_canonical_event_ids(
             screening_journal_.size());
-        std::size_t screening_route_cursor = 0;
         for (std::size_t row = 0; row < screening_journal_.size(); ++row) {
             const auto& journal = screening_journal_[row];
-            if (journal.transaction_id < 0 || journal.canonical_event_id <= 0) {
+            if (journal.transaction_id < 0 || journal.canonical_event_id < 0) {
                 throw std::logic_error(
                     "full native screening journal causal identity is invalid");
             }
@@ -21076,28 +21967,40 @@ public:
                 journal.transaction_id;
             checked_data(screening_canonical_event_ids)[row] =
                 journal.canonical_event_id;
+            if (journal.outcome_id < 0
+                || static_cast<std::size_t>(journal.outcome_id)
+                    >= screening_journal_outcomes_.size()) {
+                throw std::logic_error(
+                    "full native screening journal outcome identity is invalid");
+            }
+            checked_data(screening_outcome_ids)[row] = journal.outcome_id;
             std::copy(
                 journal.context.begin(), journal.context.end(),
                 checked_data(screening_contexts) + row * 3);
             std::copy(
-                journal.route.begin(), journal.route.end(),
-                checked_data(screening_route_indices) + screening_route_cursor);
-            screening_route_cursor += journal.route.size();
-            std::copy(
-                journal.codes.begin(), journal.codes.end(),
-                checked_data(screening_codes) + row * 16);
-            std::copy(
-                journal.metrics.begin(), journal.metrics.end(),
-                checked_data(screening_metrics) + row * 15);
-            std::copy(
                 journal.flags.begin(), journal.flags.end(),
                 checked_data(screening_flags) + row * 4);
+        }
+        for (std::size_t outcome = 0;
+             outcome < screening_journal_outcomes_.size(); ++outcome) {
+            const auto& journal_outcome = screening_journal_outcomes_[outcome];
+            std::copy(
+                journal_outcome.route.begin(), journal_outcome.route.end(),
+                checked_data(screening_route_indices)
+                    + checked_data(screening_route_offsets)[outcome]);
+            std::copy(
+                journal_outcome.codes.begin(), journal_outcome.codes.end(),
+                checked_data(screening_codes) + outcome * 16);
+            std::copy(
+                journal_outcome.metrics.begin(), journal_outcome.metrics.end(),
+                checked_data(screening_metrics) + outcome * 15);
         }
         auto screening_payload = py::make_tuple(
             std::move(screening_statistics), std::move(reason_codes),
             std::move(reason_counts), std::move(screening_timing),
             std::move(screening_contexts), std::move(screening_route_offsets),
-            std::move(screening_route_indices), std::move(screening_codes),
+            std::move(screening_route_indices), std::move(screening_outcome_ids),
+            std::move(screening_codes),
             std::move(screening_metrics), std::move(screening_flags),
             std::move(screening_occupancies),
             std::move(screening_transaction_ids),
@@ -21363,6 +22266,8 @@ private:
         std::vector<std::int64_t> route_indices;
         std::vector<NativeRouteCacheV2::ExactPayload> results;
         std::vector<std::int64_t> completion_order;
+        std::vector<std::int64_t> physical_completion_order;
+        std::vector<std::int64_t> physical_task_receipts;
         std::vector<std::int64_t> canonical_event_ids;
     };
 
@@ -21379,7 +22284,14 @@ private:
         std::vector<std::int64_t> statuses;
         std::vector<std::int64_t> ranking_integer;
         std::vector<double> ranking_float;
+        std::vector<std::int64_t> objective_integer;
+        std::vector<double> objective_float;
         std::vector<std::int64_t> route_resolutions;
+        // Per route: -1 means no physical cache lookup/store occurred.
+        std::vector<std::int64_t> cache_lookup_flags;
+        std::vector<std::int64_t> cache_store_statuses;
+        std::vector<std::int64_t> cache_eviction_counts;
+        std::vector<std::int64_t> cache_entry_bytes;
         std::vector<std::int64_t> cache_statistics;
         std::vector<std::int64_t> budget_state;
         std::vector<std::int64_t> protocol_flags;
@@ -21388,13 +22300,17 @@ private:
     struct ScreeningJournalRow {
         std::array<std::int64_t, 3> context{};
         std::int64_t transaction_id = -1;
-        std::vector<std::int64_t> route;
-        std::array<std::int64_t, 16> codes{};
-        std::array<double, 15> metrics{};
+        std::int64_t outcome_id = -1;
         // physical_evaluated, negative_cache_hit, physical_owner,
         // optimistic-reachability matrix queries.
         std::array<std::int64_t, 4> flags{};
         std::int64_t canonical_event_id = -1;
+    };
+
+    struct ScreeningJournalOutcome {
+        std::vector<std::int64_t> route;
+        std::array<std::int64_t, 16> codes{};
+        std::array<double, 15> metrics{};
     };
 
     struct OperatorSemanticOutcomeState {
@@ -21539,6 +22455,7 @@ private:
     std::array<std::int64_t, 3> causal_context_{-1, -1, -1};
     std::int64_t causal_context_transaction_id_ = -1;
     std::vector<ScreeningJournalRow> screening_journal_;
+    std::vector<ScreeningJournalOutcome> screening_journal_outcomes_;
     // Semantic route decisions and physical kernel calls are distinct because
     // a native transaction may deduplicate repeated route sequences.
     std::array<std::int64_t, 8> screening_statistics_{};
@@ -22288,6 +23205,7 @@ private:
             checked_data<std::int64_t>(route_indices) + route_indices.size());
         batch.completion_order.assign(
             completion_order.begin(), completion_order.end());
+        batch.physical_completion_order = batch.completion_order;
         if (batch.completion_order.size() != route_count) {
             throw std::logic_error(
                 "full native exact journal completion order is incomplete");
@@ -22377,6 +23295,16 @@ private:
         batch.route_offsets = route_offsets;
         batch.route_indices = route_indices;
         batch.completion_order = exact_payload.completion_order;
+        batch.physical_completion_order = exact_payload.physical_completion_order.empty()
+            ? exact_payload.completion_order
+            : exact_payload.physical_completion_order;
+        batch.physical_task_receipts = exact_payload.physical_task_receipts;
+        if (batch.physical_completion_order.size()
+                != batch.completion_order.size()
+            || batch.physical_task_receipts.size() % 7 != 0) {
+            throw std::logic_error(
+                "full native owned exact physical receipt is invalid");
+        }
         batch.results.reserve(route_count);
         for (std::size_t route = 0; route < route_count; ++route) {
             NativeRouteCacheV2::ExactPayload result;
@@ -22473,18 +23401,42 @@ private:
         auto logical_semantic_ordinal =
             canonical_event_journal_.screening_count_for_transaction(
                 transaction_id, false);
+        std::unordered_map<std::size_t, std::int64_t> outcome_ids;
+        outcome_ids.reserve(evaluated_rows.size());
         for (std::size_t semantic = 0; semantic < semantic_rows.size(); ++semantic) {
             const auto unique_row = semantic_rows[semantic];
             const auto& output = outputs[unique_row];
             ScreeningJournalRow journal;
             journal.context = context;
             journal.transaction_id = transaction_id;
-            journal.route.assign(
-                route_indices + route_offsets[semantic],
-                route_indices + route_offsets[semantic + 1]);
-            std::copy(output.codes.begin(), output.codes.end(), journal.codes.begin());
-            std::copy(
-                output.metrics.begin(), output.metrics.end(), journal.metrics.begin());
+            const auto [outcome, inserted] = outcome_ids.try_emplace(
+                unique_row,
+                static_cast<std::int64_t>(screening_journal_outcomes_.size()));
+            if (inserted) {
+                ScreeningJournalOutcome stored_outcome;
+                stored_outcome.route.assign(
+                    route_indices + route_offsets[semantic],
+                    route_indices + route_offsets[semantic + 1]);
+                std::copy(
+                    output.codes.begin(), output.codes.end(),
+                    stored_outcome.codes.begin());
+                std::copy(
+                    output.metrics.begin(), output.metrics.end(),
+                    stored_outcome.metrics.begin());
+                screening_journal_outcomes_.push_back(std::move(stored_outcome));
+            } else {
+                const auto& stored_route = screening_journal_outcomes_[
+                    static_cast<std::size_t>(outcome->second)].route;
+                const auto* first = route_indices + route_offsets[semantic];
+                const auto* last = route_indices + route_offsets[semantic + 1];
+                if (stored_route.size()
+                        != static_cast<std::size_t>(last - first)
+                    || !std::equal(stored_route.begin(), stored_route.end(), first)) {
+                    throw std::logic_error(
+                        "full native screening outcome aliases different routes");
+                }
+            }
+            journal.outcome_id = outcome->second;
             journal.flags[0] = physically_evaluated.contains(unique_row) ? 1 : 0;
             journal.flags[1] = negative_hits[unique_row] != 0 ? 1 : 0;
             journal.flags[2] = (
@@ -22513,6 +23465,132 @@ private:
             screening_journal_.push_back(std::move(journal));
         }
         screening_seconds_ += elapsed_seconds;
+    }
+
+    [[nodiscard]] ControlJournalBatch make_control_journal_batch(
+        const evrptw::native_search::CandidateTransactionExecutionV2& execution,
+        const std::array<std::int64_t, 3>& context,
+        const std::int64_t transaction_id,
+        const evrptw::native_search::CandidateTransactionOptionsV2& options,
+        const bool reference_distance_resolution = false) const {
+        if (!live_problem_.has_value()) {
+            throw std::logic_error(
+                "full native control journal lost its problem state");
+        }
+        ControlJournalBatch control;
+        control.context = context;
+        control.transaction_id = transaction_id;
+        control.plan_offsets = execution.result.plan_offsets;
+        control.route_offsets = execution.result.route_offsets;
+        control.route_indices = execution.result.route_indices;
+        control.ranked = execution.result.ranked;
+        control.selected = execution.result.selected;
+        control.statuses = execution.result.statuses;
+        control.ranking_integer = execution.trace.ranking_integer;
+        control.ranking_float = execution.trace.ranking_float;
+        control.objective_integer = execution.result.objective_integer;
+        control.objective_float = execution.result.objective_float;
+        control.route_resolutions = execution.result.route_resolutions;
+        control.cache_lookup_flags.assign(
+            execution.result.route_resolutions.size(), -1);
+        control.cache_store_statuses.assign(
+            execution.result.route_resolutions.size(), -1);
+        control.cache_eviction_counts.assign(
+            execution.result.route_resolutions.size(), 0);
+        control.cache_entry_bytes.assign(
+            execution.result.route_resolutions.size(), -1);
+        for (const auto& plan_trace : execution.trace.plans) {
+            if (plan_trace.plan_id < 0
+                || static_cast<std::size_t>(plan_trace.plan_id + 1)
+                    >= execution.result.plan_offsets.size()) {
+                throw std::logic_error(
+                    "full native control trace has an invalid plan identity");
+            }
+            const auto plan = static_cast<std::size_t>(plan_trace.plan_id);
+            const auto first_route = static_cast<std::size_t>(
+                execution.result.plan_offsets[plan]);
+            const auto last_route = static_cast<std::size_t>(
+                execution.result.plan_offsets[plan + 1]);
+            std::size_t lookup_ordinal = 0;
+            for (auto route = first_route; route < last_route; ++route) {
+                if (execution.result.route_resolutions[route] == 3) {
+                    continue;
+                }
+                if (lookup_ordinal >= plan_trace.cache_hit_flags.size()) {
+                    throw std::logic_error(
+                        "full native control trace lost a cache lookup flag");
+                }
+                control.cache_lookup_flags[route] =
+                    plan_trace.cache_hit_flags[lookup_ordinal++];
+            }
+            if (lookup_ordinal != plan_trace.cache_hit_flags.size()) {
+                throw std::logic_error(
+                    "full native control trace has excess cache lookup flags");
+            }
+            const auto stores_committed =
+                execution.result.statuses[plan] != 3
+                || options.suppress_attempted_plan_journal
+                || options.allow_partial_customer_coverage;
+            if (!stores_committed) {
+                continue;
+            }
+            if (plan_trace.missing_local_rows.size()
+                    != plan_trace.cache_store_statuses.size()
+                || plan_trace.missing_local_rows.size()
+                    != plan_trace.cache_eviction_counts.size()) {
+                throw std::logic_error(
+                    "full native control trace cache stores do not align");
+            }
+            if (plan_trace.missing_local_rows.empty()) {
+                continue;
+            }
+            const auto cache_entry_bytes =
+                evrptw::native_search::exact_entry_bytes_v2(
+                    *live_problem_, plan_trace.exact);
+            if (cache_entry_bytes.size()
+                != plan_trace.missing_local_rows.size()) {
+                throw std::logic_error(
+                    "full native control trace cache sizes do not align");
+            }
+            for (std::size_t store = 0;
+                 store < plan_trace.missing_local_rows.size(); ++store) {
+                const auto local_route = plan_trace.missing_local_rows[store];
+                if (local_route < 0
+                    || static_cast<std::size_t>(local_route)
+                        >= last_route - first_route) {
+                    throw std::logic_error(
+                        "full native control trace store route is invalid");
+                }
+                const auto route = first_route
+                    + static_cast<std::size_t>(local_route);
+                control.cache_store_statuses[route] =
+                    plan_trace.cache_store_statuses[store];
+                control.cache_eviction_counts[route] =
+                    plan_trace.cache_eviction_counts[store];
+                control.cache_entry_bytes[route] = cache_entry_bytes[store];
+            }
+        }
+        control.cache_statistics = execution.result.cache_statistics;
+        control.budget_state = execution.result.budget_state;
+        control.protocol_flags = {
+            options.suppress_attempted_plan_journal ? 1 : 0,
+            options.suppress_round_budget ? 1 : 0,
+            options.suppress_screening_negative_cache ? 1 : 0,
+            options.allow_partial_customer_coverage ? 1 : 0,
+            reference_distance_resolution ? 1 : 0,
+        };
+        const std::unordered_set<std::int64_t> selected(
+            control.selected.begin(), control.selected.end());
+        control.decision_codes.reserve(execution.result.statuses.size());
+        for (std::size_t plan = 0;
+             plan < execution.result.statuses.size(); ++plan) {
+            control.decision_codes.push_back(
+                execution.trace.eligible_flags[plan] == 0 ? 0
+                : execution.trace.attempted_flags[plan] != 0 ? 1
+                : selected.contains(static_cast<std::int64_t>(plan)) ? 2
+                : 3);
+        }
+        return control;
     }
 
     void append_control_journal_causal(
@@ -22620,6 +23698,45 @@ private:
             causal_journal_.rollback_noexcept(causal_before);
             canonical_event_journal_.rollback_noexcept(canonical_before);
             throw;
+        }
+    }
+
+    void remap_auxiliary_canonical_event_ids(
+        const NativeCanonicalEventJournalV2::CompactionResult& compaction) {
+        const auto remap = [&compaction](const std::int64_t old_event_id) {
+            if (old_event_id <= 0
+                || static_cast<std::size_t>(old_event_id)
+                    >= compaction.canonical_event_id_remap.size()) {
+                return std::int64_t{0};
+            }
+            return compaction.canonical_event_id_remap[
+                static_cast<std::size_t>(old_event_id)];
+        };
+
+        // One exact batch is either fully canonical or fully physical-only.
+        // Validate that invariant before mutating any auxiliary journal.
+        for (const auto& batch : exact_journal_) {
+            auto has_canonical = false;
+            auto has_discarded = false;
+            for (const auto event_id : batch.canonical_event_ids) {
+                if (remap(event_id) == 0) {
+                    has_discarded = true;
+                } else {
+                    has_canonical = true;
+                }
+            }
+            if (has_canonical && has_discarded) {
+                throw std::logic_error(
+                    "native exact journal has partially discarded canonical semantics");
+            }
+        }
+        for (auto& batch : exact_journal_) {
+            for (auto& event_id : batch.canonical_event_ids) {
+                event_id = remap(event_id);
+            }
+        }
+        for (auto& row : screening_journal_) {
+            row.canonical_event_id = remap(row.canonical_event_id);
         }
     }
 
@@ -23407,7 +24524,8 @@ py::tuple full_native_alns_v2(
     py::handle stage04_integer,
     py::handle stage04_float,
     py::handle operator_integer,
-    py::handle operator_float) {
+    py::handle operator_float,
+    const std::string& task_receipt_path) {
     const auto owned_request = owned_native_search_request_v2(
         node_kind, demand, ready_time, due_date, service_time, distance,
         reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
@@ -23484,6 +24602,34 @@ py::tuple full_native_alns_v2(
 #else
         base_control_values[3];
 #endif
+#ifdef __linux__
+    std::shared_ptr<evrptw::native_telemetry::TaskReceiptSpool>
+        local_task_receipt_spool;
+    std::shared_ptr<NativeWorkPool> local_work_pool;
+    if (!task_receipt_path.empty()) {
+        if (client_dispatch_threads <= 0
+            || scheduler_work_pool_context != nullptr
+            || !native_kernel_scheduler_endpoint.empty()) {
+            throw std::invalid_argument(
+                "full native task-receipt path requires a local work pool");
+        }
+        local_task_receipt_spool = std::make_shared<
+            evrptw::native_telemetry::TaskReceiptSpool>(task_receipt_path);
+        local_work_pool = std::make_shared<NativeWorkPool>(
+            client_dispatch_threads,
+            0,
+            [spool = local_task_receipt_spool](
+                const NativeWorkPool::TaskReceipt& receipt) {
+                spool->record(receipt);
+            },
+            [spool = local_task_receipt_spool]() { spool->flush(); });
+    }
+#else
+    if (!task_receipt_path.empty()) {
+        throw std::invalid_argument(
+            "full native task-receipt streaming requires Linux");
+    }
+#endif
     NativeSearchEngineV2 engine(
         base_control_values[4],
         protocol_values[2],
@@ -23493,7 +24639,11 @@ py::tuple full_native_alns_v2(
         protocol_values[1],
         options[1],
         client_dispatch_threads,
+#ifdef __linux__
+        local_work_pool ? local_work_pool : scheduler_work_pool_context);
+#else
         scheduler_work_pool_context);
+#endif
     if (initial_mirror_schema_failure_context != 0) {
         engine.inject_initial_mirror_schema_failure_once(
             initial_mirror_schema_failure_context);
@@ -24290,6 +25440,70 @@ py::tuple full_native_alns_v2(
         0
 #endif
     );
+    const auto work_pool_snapshot = engine.work_pool_statistics();
+    py::dict work_pool_statistics;
+#ifdef __linux__
+    work_pool_statistics["schema_version"] = local_task_receipt_spool
+        ? "stage05.2-full-native-work-pool-v3"
+        : "stage05.2-full-native-work-pool-v2";
+#else
+    work_pool_statistics["schema_version"] =
+        "stage05.2-full-native-work-pool-v2";
+#endif
+    work_pool_statistics["thread_count"] = engine.work_pool_thread_count();
+    work_pool_statistics["maximum_pending_tasks"] =
+        engine.work_pool_maximum_pending_tasks();
+    work_pool_statistics["pending_tasks"] =
+        work_pool_snapshot.pending_tasks;
+    work_pool_statistics["active_tasks"] =
+        work_pool_snapshot.active_tasks;
+    work_pool_statistics["peak_pending_tasks"] =
+        work_pool_snapshot.peak_pending_tasks;
+    work_pool_statistics["peak_active_tasks"] =
+        work_pool_snapshot.peak_active_tasks;
+    work_pool_statistics["queue_full_count"] =
+        work_pool_snapshot.queue_full_count;
+    work_pool_statistics["rejected_count"] =
+        work_pool_snapshot.rejected_count;
+    work_pool_statistics["completed_tasks"] =
+        work_pool_snapshot.completed_tasks;
+    work_pool_statistics["total_wait_seconds"] =
+        work_pool_snapshot.total_wait_seconds;
+    work_pool_statistics["maximum_wait_seconds"] =
+        work_pool_snapshot.maximum_wait_seconds;
+    work_pool_statistics["total_service_seconds"] =
+        work_pool_snapshot.total_service_seconds;
+    work_pool_statistics["maximum_service_seconds"] =
+        work_pool_snapshot.maximum_service_seconds;
+    work_pool_statistics["wait_histogram"] =
+        py::cast(work_pool_snapshot.wait_histogram);
+    work_pool_statistics["service_histogram"] =
+        py::cast(work_pool_snapshot.service_histogram);
+    work_pool_statistics["task_receipt_dropped_count"] =
+        work_pool_snapshot.task_receipt_dropped_count;
+#ifdef __linux__
+    if (local_task_receipt_spool) {
+        work_pool_statistics["task_receipts"] =
+            native_task_receipt_descriptor(
+                local_task_receipt_spool->finalize(
+                    work_pool_snapshot.completed_tasks,
+                    work_pool_snapshot.task_receipt_dropped_count));
+    } else {
+#endif
+    work_pool_statistics["task_receipt_capacity"] =
+        NativeWorkPool::maximum_task_receipts;
+    py::list task_receipts;
+    for (const auto& receipt : work_pool_snapshot.task_receipts) {
+        task_receipts.append(py::make_tuple(
+            receipt.task_sequence, receipt.worker_index,
+            receipt.first_index, receipt.last_index,
+            receipt.submitted_nanoseconds, receipt.started_nanoseconds,
+            receipt.completed_nanoseconds));
+    }
+    work_pool_statistics["task_receipts"] = std::move(task_receipts);
+#ifdef __linux__
+    }
+#endif
     std::string evidence("stage05.2-full-native-alns-v2");
     const auto append_raw_array = [&](const auto& array) {
         evidence.append(
@@ -24348,7 +25562,8 @@ py::tuple full_native_alns_v2(
         std::move(control_journal),
         std::move(causal_journal),
         std::move(canonical_event_journal),
-        std::move(initial_state_receipt));
+        std::move(initial_state_receipt),
+        std::move(work_pool_statistics));
 }
 
 #ifdef __linux__
@@ -24738,7 +25953,8 @@ py::tuple full_native_alns_host_v2(
             reachable, vehicle, lexical_rank, node_name_offsets, node_name_bytes,
             initial_route_offsets, initial_route_indices, control,
             deadline_remaining, protocol_control, protocol_options,
-            stage04_integer, stage04_float, operator_integer, operator_float);
+            stage04_integer, stage04_float, operator_integer, operator_float,
+            "");
     } catch (...) {
         const auto solve_error = std::current_exception();
         std::string solve_error_message = "unknown native solve failure";
@@ -24929,6 +26145,14 @@ PYBIND11_MODULE(_core, module) {
         static_cast<bool>(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE);
     module.attr("__build_cpp_source_kind__") = EVRPTW_BUILD_CPP_SOURCE_KIND;
     module.attr("__build_source_attestation_version__") = 1;
+    module.attr("__build_performance_profile__") =
+        EVRPTW_BUILD_PERFORMANCE_PROFILE;
+    module.attr("__build_compiler_id__") = EVRPTW_BUILD_COMPILER_ID;
+    module.attr("__build_compiler_version__") = EVRPTW_BUILD_COMPILER_VERSION;
+    module.attr("__build_interprocedural_optimization__") =
+        static_cast<bool>(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION);
+    module.attr("__build_host_native__") =
+        static_cast<bool>(EVRPTW_BUILD_HOST_NATIVE);
     module.def("stage052_native_architecture_capabilities_v2", []() {
         // These values are production gates, not aspirational feature flags.
         // Flip a field only together with its end-to-end differential and
@@ -25486,6 +26710,20 @@ PYBIND11_MODULE(_core, module) {
         py::arg("batch_size"),
         py::arg("scheduler_endpoint") = "");
     module.def(
+        "_test_exact_physical_receipt_v2",
+        &test_exact_physical_receipt_v2,
+        py::arg("node_kind"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("vehicle"),
+        py::arg("order_offsets"),
+        py::arg("order_indices"),
+        py::arg("deadline_remaining"),
+        py::arg("batch_size"),
+        py::arg("scheduler_endpoint"));
+    module.def(
         "_test_exact_payload_hash_v2",
         &test_exact_payload_hash_v2,
         py::arg("node_kind"),
@@ -25574,6 +26812,22 @@ PYBIND11_MODULE(_core, module) {
         py::arg("negative_indices"),
         py::arg("negative_reason_codes"));
     module.def(
+        "route_merge_candidate_pool_screened_v3",
+        &route_merge_candidate_pool_screened_v3,
+        py::arg("node_kind"),
+        py::arg("demand"),
+        py::arg("ready_time"),
+        py::arg("due_date"),
+        py::arg("service_time"),
+        py::arg("distance"),
+        py::arg("reachable"),
+        py::arg("vehicle"),
+        py::arg("route_offsets"),
+        py::arg("route_indices"),
+        py::arg("route_objective_metrics"),
+        py::arg("epsilon"),
+        py::arg("worker_count") = 1);
+    module.def(
         "candidate_round_transaction_v1",
         &candidate_round_transaction_v1,
         py::arg("node_kind"),
@@ -25632,6 +26886,38 @@ PYBIND11_MODULE(_core, module) {
         py::arg("batch_size"),
         py::arg("context_ids"),
         py::arg("resource_receipt"));
+    py::class_<NativeRouteMergeProfileCacheV1>(
+        module, "NativeRouteMergeProfileCacheV1")
+        .def(py::init<>())
+        .def(
+            "plan",
+            &NativeRouteMergeProfileCacheV1::plan,
+            py::arg("route_offsets"),
+            py::arg("route_indices"),
+            py::arg("available_flags"))
+        .def(
+            "commit",
+            &NativeRouteMergeProfileCacheV1::commit,
+            py::arg("miss_indices"),
+            py::arg("feasible_flags"),
+            py::arg("objective_metrics"),
+            py::arg("charging_counts"))
+        .def("rollback", &NativeRouteMergeProfileCacheV1::rollback);
+    py::class_<NativeCandidateRoundRuntimeV2>(
+        module, "NativeCandidateRoundRuntimeV2")
+        .def(
+            py::init<std::int64_t, const std::string&>(),
+            py::arg("worker_count"),
+            py::arg("task_receipt_path") = "")
+        .def("execute", &NativeCandidateRoundRuntimeV2::execute)
+        .def(
+            "execute_screening",
+            &NativeCandidateRoundRuntimeV2::execute_screening)
+        .def(
+            "execute_route_merge_pool_screened",
+            &NativeCandidateRoundRuntimeV2::
+                execute_route_merge_pool_screened)
+        .def("statistics", &NativeCandidateRoundRuntimeV2::statistics);
     module.def(
         "full_native_alns_v1",
         &full_native_alns_v1,
@@ -25718,7 +27004,8 @@ PYBIND11_MODULE(_core, module) {
         py::arg("stage04_integer"),
         py::arg("stage04_float"),
         py::arg("operator_integer"),
-        py::arg("operator_float"));
+        py::arg("operator_float"),
+        py::arg("task_receipt_path") = "");
 #ifdef __linux__
     module.def(
         "native_search_request_host_receipt_v2",

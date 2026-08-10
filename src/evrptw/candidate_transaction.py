@@ -17,7 +17,8 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -27,6 +28,12 @@ from evrptw.native_kernels import (
     NATIVE_KERNEL_ABI_VERSION,
     NativeKernelRuntime,
 )
+from evrptw.stage052_physical_telemetry import (
+    validate_native_work_task_receipt_stream,
+)
+
+if TYPE_CHECKING:
+    from evrptw.neighborhoods import ScreeningResult
 
 CANDIDATE_TRANSACTION_SCHEMA_VERSION = "stage05.2-native-candidate-transaction-v1"
 STAGE052_NEGATIVE_SCREENING_RESULT_CACHE_ENTRIES = 65_536
@@ -56,6 +63,17 @@ _NATIVE_SCREEN_STATUSES = {
     1: "duplicate",
     2: "negative_cache_hit",
 }
+_SCREEN_CHECK_BY_CODE = {
+    1: "route_structure",
+    2: "capacity_lower_bound",
+    3: "forward_time_window",
+    4: "backward_time_window",
+    5: "time_window_slack",
+    6: "shortest_distance_lower_bound",
+    7: "single_segment_battery_reachability",
+    8: "structural_energy_lower_bound",
+}
+_SCREEN_CHECK_STATUS_BY_CODE = {0: "fail", 1: "pass", 2: "recorded"}
 
 
 class BoundedScreeningResultCache[ResultT]:
@@ -173,9 +191,7 @@ class BoundedNegativeSequenceCache(Mapping[CustomerSequence, str]):
             existing = self._entries.get(sequence)
             if existing is not None and existing != reason:
                 raise RuntimeError("candidate negative cache reason changed during commit")
-        additions = tuple(
-            sequence for sequence in entries if sequence not in self._entries
-        )
+        additions = tuple(sequence for sequence in entries if sequence not in self._entries)
         rollover = len(self._entries) + len(additions) > self.capacity
         previous_entries: OrderedDict[CustomerSequence, str] | None = None
         evicted_count = 0
@@ -186,9 +202,7 @@ class BoundedNegativeSequenceCache(Mapping[CustomerSequence, str]):
                     "one candidate transaction exceeds the negative sequence cache capacity"
                 )
             previous_entries = self._entries
-            evicted_count = sum(
-                sequence not in replacement for sequence in previous_entries
-            )
+            evicted_count = sum(sequence not in replacement for sequence in previous_entries)
             self._entries = replacement
         else:
             for sequence in additions:
@@ -357,6 +371,61 @@ class CandidateScreeningBatch:
     def native_status(self, index: int) -> str:
         return _NATIVE_SCREEN_STATUSES[int(self.statuses[index])]
 
+    def screening_result(self, index: int) -> ScreeningResult:
+        """Materialize one scalar-compatible decision from the typed batch."""
+
+        if not 0 <= index < len(self.sequences):
+            raise IndexError("native screening result index is out of range")
+        from evrptw.measurement import ScreeningCheckTrace
+        from evrptw.neighborhoods import ScreeningResult, screening_check_explanation
+
+        check_count = int(self.codes[index, 7])
+        if not 0 <= check_count <= 8:
+            raise RuntimeError("native screening check count is invalid")
+        checks: list[ScreeningCheckTrace] = []
+        for check_ordinal in range(check_count):
+            packed_check = int(self.codes[index, 8 + check_ordinal])
+            check_code, status_code = divmod(packed_check, 10)
+            try:
+                check_name = _SCREEN_CHECK_BY_CODE[check_code]
+                check_status = _SCREEN_CHECK_STATUS_BY_CODE[status_code]
+            except KeyError as error:
+                raise RuntimeError("native screening check identity is invalid") from error
+            checks.append(
+                ScreeningCheckTrace(
+                    check=check_name,
+                    status=check_status,
+                    value=(
+                        bool(self.metrics[index, 7 + check_ordinal])
+                        if check_code in {1, 7}
+                        else float(self.metrics[index, 7 + check_ordinal])
+                    ),
+                    reason=screening_check_explanation(
+                        check_code,
+                        check_status,
+                        event_count=check_count,
+                    ),
+                )
+            )
+        failed_check_code = int(self.codes[index, 2])
+        distance_increment = float(self.metrics[index, 4])
+        return ScreeningResult(
+            accepted=self.accepted(index),
+            reason=self.reason(index),
+            demand=float(self.metrics[index, 0]),
+            optimistic_finish_time=float(self.metrics[index, 1]),
+            energy_reachable=bool(self.codes[index, 4]),
+            checks=tuple(checks),
+            first_failed_check=_SCREEN_CHECK_BY_CODE.get(failed_check_code, ""),
+            min_time_window_slack=float(self.metrics[index, 2]),
+            distance_lower_bound=float(self.metrics[index, 3]),
+            distance_increment_lower_bound=(
+                None if math.isnan(distance_increment) else distance_increment
+            ),
+            single_segment_reachable=bool(self.codes[index, 3]),
+            structural_energy_lower_bound=float(self.metrics[index, 5]),
+        )
+
     def integrity_evidence(self) -> dict[str, object]:
         """Return compact byte evidence for independent ABI digest replay."""
 
@@ -468,10 +537,92 @@ class NativeNegativeCacheSnapshot:
 
 
 @dataclass(slots=True)
+class NativeRouteMergeProfilePlan:
+    """One reversible native cache lookup and invalidation plan."""
+
+    hit_flags: npt.NDArray[np.int64]
+    feasible_flags: npt.NDArray[np.int64]
+    objective_metrics: npt.NDArray[np.float64]
+    charging_counts: npt.NDArray[np.int64]
+    miss_indices: npt.NDArray[np.int64]
+    hits: int
+    misses: int
+    invalidations: int
+    active: bool = True
+
+
+def validate_native_work_pool_task_receipts(
+    payload: Mapping[str, object],
+    *,
+    worker_threads: int,
+    expected_receipt_path: Path | None = None,
+) -> object:
+    """Validate the bounded physical task trace shared by native pools."""
+
+    schema = payload.get("schema_version")
+    capacity = payload.get("task_receipt_capacity")
+    dropped = payload.get("task_receipt_dropped_count")
+    completed = payload.get("completed_tasks")
+    receipts = payload.get("task_receipts")
+    if schema in {
+        "stage05.2-candidate-round-work-pool-v3",
+        "stage05.2-full-native-work-pool-v3",
+    }:
+        if (
+            isinstance(dropped, bool)
+            or not isinstance(dropped, int)
+            or dropped != 0
+            or isinstance(completed, bool)
+            or not isinstance(completed, int)
+            or completed < 0
+            or expected_receipt_path is None
+        ):
+            raise RuntimeError("native streamed work-pool task receipt is invalid")
+        return validate_native_work_task_receipt_stream(
+            receipts,
+            expected_path=expected_receipt_path,
+            completed_tasks=completed,
+            worker_threads=worker_threads,
+        )
+    if (
+        capacity != 65_536
+        or isinstance(dropped, bool)
+        or not isinstance(dropped, int)
+        or dropped != 0
+        or isinstance(completed, bool)
+        or not isinstance(completed, int)
+        or completed < 0
+        or not isinstance(receipts, list)
+        or len(receipts) > capacity
+        or completed != len(receipts)
+    ):
+        raise RuntimeError("native work-pool task receipt envelope is invalid")
+    sequences: set[int] = set()
+    for row in receipts:
+        if not isinstance(row, tuple) or len(row) != 7:
+            raise RuntimeError("native work-pool task receipt row is invalid")
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in row):
+            raise RuntimeError("native work-pool task receipt value is invalid")
+        sequence, worker, first, last, submitted, started, finished = row
+        if (
+            sequence < 0
+            or sequence in sequences
+            or not 0 <= worker < worker_threads
+            or not 0 <= first < last
+            or not 0 <= submitted <= started <= finished
+        ):
+            raise RuntimeError("native work-pool task receipt failed reconciliation")
+        sequences.add(sequence)
+    return receipts
+
+
+@dataclass(slots=True)
 class NativeCandidateTransactionRuntime:
     """Solve-local owner of compact transaction evidence."""
 
     config: NativeCandidateTransactionConfig
+    persistent_worker_threads: int = 0
+    task_receipt_path: Path | None = None
     events: list[dict[str, object]] = field(default_factory=list)
     transaction_count: int = 0
     input_candidate_count: int = 0
@@ -480,6 +631,22 @@ class NativeCandidateTransactionRuntime:
     protocol_invocations: int = 0
     protocol_total_seconds: float = 0.0
     protocol_queue_wait_seconds: float = 0.0
+    route_merge_pool_invocations: int = 0
+    route_merge_pool_completions: int = 0
+    route_merge_pool_failures: int = 0
+    route_merge_pool_seconds: float = 0.0
+    route_merge_pool_input_routes: int = 0
+    route_merge_pool_output_candidates: int = 0
+    route_merge_pool_pruned_pairs: int = 0
+    route_merge_pool_pruned_candidates: int = 0
+    route_merge_screening_invocations: int = 0
+    route_merge_screening_failures: int = 0
+    route_merge_screening_seconds: float = 0.0
+    route_merge_screened_candidates: int = 0
+    route_merge_screening_rejections: int = 0
+    route_merge_profile_cache_hits: int = 0
+    route_merge_profile_cache_misses: int = 0
+    route_merge_profile_cache_invalidations: int = 0
     _negative_cache_initialized: bool = False
     _negative_cache_sequences: set[CustomerSequence] = field(default_factory=set)
     _negative_cache_offsets: npt.NDArray[np.int64] = field(
@@ -497,6 +664,437 @@ class NativeCandidateTransactionRuntime:
     _negative_cache_stores: int = 0
     _negative_cache_evictions: int = 0
     _negative_cache_rollovers: int = 0
+    _native_work_pool: Any = field(init=False, repr=False, default=None)
+    _native_route_merge_profile_cache: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.persistent_worker_threads, bool)
+            or not isinstance(self.persistent_worker_threads, int)
+            or not 0 <= self.persistent_worker_threads <= 256
+        ):
+            raise ValueError("persistent worker threads must be in [0, 256]")
+        if self.task_receipt_path is not None:
+            self.task_receipt_path = self.task_receipt_path.resolve()
+            if self.persistent_worker_threads == 0:
+                raise ValueError("native task-receipt streaming requires a persistent work pool")
+        from evrptw import _core as native_core
+
+        self._native_route_merge_profile_cache = native_core.NativeRouteMergeProfileCacheV1()
+        if self.persistent_worker_threads > 0:
+            self._native_work_pool = native_core.NativeCandidateRoundRuntimeV2(
+                self.persistent_worker_threads,
+                str(self.task_receipt_path) if self.task_receipt_path is not None else "",
+            )
+
+    def plan_route_merge_profiles(
+        self,
+        sequences: tuple[CustomerSequence, ...],
+        available_flags: tuple[bool, ...],
+        name_to_index: Mapping[str, int],
+    ) -> NativeRouteMergeProfilePlan:
+        """Plan one native profile-cache generation without Python key tables."""
+
+        if not sequences or len(available_flags) != len(sequences):
+            raise ValueError("route-merge profile plan inputs are invalid")
+        route_offsets, route_indices = _pack_route_rows(sequences, name_to_index)
+        if np.any(route_indices < 0):
+            raise ValueError("route-merge profile contains an unknown node")
+        available = np.ascontiguousarray(available_flags, dtype=np.int64)
+        raw = self._native_route_merge_profile_cache.plan(
+            route_offsets,
+            route_indices,
+            available,
+        )
+        if not isinstance(raw, tuple) or len(raw) != 6:
+            self._native_route_merge_profile_cache.rollback()
+            raise RuntimeError("native route-merge profile plan is invalid")
+        route_count = len(sequences)
+        hit_flags = _strict_array(
+            raw[0], name="route-merge profile hits", dtype=np.dtype(np.int64), shape=(route_count,)
+        )
+        feasible_flags = _strict_array(
+            raw[1],
+            name="route-merge profile feasibility",
+            dtype=np.dtype(np.int64),
+            shape=(route_count,),
+        )
+        objective_metrics = _strict_array(
+            raw[2],
+            name="route-merge profile objectives",
+            dtype=np.dtype(np.float64),
+            shape=(route_count, 2),
+        )
+        charging_counts = _strict_array(
+            raw[3],
+            name="route-merge profile charging counts",
+            dtype=np.dtype(np.int64),
+            shape=(route_count,),
+        )
+        miss_indices_value = raw[4]
+        counters = _strict_array(
+            raw[5],
+            name="route-merge profile counters",
+            dtype=np.dtype(np.int64),
+            shape=(3,),
+        )
+        if not isinstance(miss_indices_value, np.ndarray) or miss_indices_value.dtype != np.int64:
+            self._native_route_merge_profile_cache.rollback()
+            raise RuntimeError("native route-merge profile miss indices are invalid")
+        miss_indices = _strict_array(
+            miss_indices_value,
+            name="route-merge profile miss indices",
+            dtype=np.dtype(np.int64),
+            shape=(int(counters[1]),),
+        )
+        if (
+            np.any((hit_flags != 0) & (hit_flags != 1))
+            or np.any((feasible_flags != 0) & (feasible_flags != 1))
+            or np.any(~np.isfinite(objective_metrics))
+            or np.any(objective_metrics < 0.0)
+            or np.any(charging_counts < 0)
+            or np.any(counters < 0)
+            or int(counters[0]) + int(counters[1]) != route_count
+            or int(np.sum(hit_flags)) != int(counters[0])
+            or (
+                miss_indices.size > 0
+                and (
+                    int(miss_indices[0]) < 0
+                    or int(miss_indices[-1]) >= route_count
+                    or np.any(np.diff(miss_indices) <= 0)
+                    or np.any(hit_flags[miss_indices] != 0)
+                )
+            )
+        ):
+            self._native_route_merge_profile_cache.rollback()
+            raise RuntimeError("native route-merge profile plan failed reconciliation")
+        return NativeRouteMergeProfilePlan(
+            hit_flags=hit_flags,
+            feasible_flags=feasible_flags,
+            objective_metrics=objective_metrics,
+            charging_counts=charging_counts,
+            miss_indices=miss_indices,
+            hits=int(counters[0]),
+            misses=int(counters[1]),
+            invalidations=int(counters[2]),
+        )
+
+    def commit_route_merge_profiles(
+        self,
+        plan: NativeRouteMergeProfilePlan,
+        profiles: tuple[tuple[bool, float, float, int], ...],
+    ) -> None:
+        """Commit profiles for exactly the native plan's ordered misses."""
+
+        if not plan.active or len(profiles) != plan.misses:
+            raise RuntimeError("route-merge profile commit does not match its active plan")
+        feasible = np.ascontiguousarray([int(profile[0]) for profile in profiles], dtype=np.int64)
+        metrics = np.ascontiguousarray(
+            [(profile[1], profile[2]) for profile in profiles], dtype=np.float64
+        ).reshape(plan.misses, 2)
+        counts = np.ascontiguousarray([profile[3] for profile in profiles], dtype=np.int64)
+        self._native_route_merge_profile_cache.commit(
+            plan.miss_indices,
+            feasible,
+            metrics,
+            counts,
+        )
+        for row, route_index in enumerate(plan.miss_indices):
+            index = int(route_index)
+            plan.feasible_flags[index] = feasible[row]
+            plan.objective_metrics[index] = metrics[row]
+            plan.charging_counts[index] = counts[row]
+        plan.active = False
+
+    def rollback_route_merge_profiles(self, plan: NativeRouteMergeProfilePlan) -> None:
+        """Discard an active native profile-cache plan."""
+
+        if plan.active:
+            self._native_route_merge_profile_cache.rollback()
+            plan.active = False
+
+    def execute_native_round(self, *arguments: object) -> object:
+        """Dispatch through the solve-local persistent pool when configured."""
+
+        if self._native_work_pool is not None:
+            entrypoint = cast(Callable[..., object], self._native_work_pool.execute)
+        else:
+            from evrptw import _core as native_core
+
+            entrypoint = cast(Callable[..., object], native_core.candidate_round_transaction_v2)
+        return entrypoint(*arguments)
+
+    def execute_route_merge_candidate_pool(self, *arguments: object) -> object:
+        """Build one complete route-merge pool in one native crossing."""
+
+        from evrptw import _core as native_core
+
+        self.route_merge_pool_invocations += 1
+        started = time.perf_counter()
+        try:
+            entrypoint = cast(
+                Callable[..., object],
+                native_core.route_merge_candidate_pool_v2,
+            )
+            result = entrypoint(*arguments)
+        except BaseException:
+            self.route_merge_pool_failures += 1
+            raise
+        finally:
+            self.route_merge_pool_seconds += time.perf_counter() - started
+        if not isinstance(result, tuple) or len(result) != 4:
+            self.route_merge_pool_failures += 1
+            raise RuntimeError("native route-merge candidate pool receipt is invalid")
+        offsets, _indices, _metadata, pruning = result
+        if (
+            not isinstance(offsets, np.ndarray)
+            or offsets.ndim != 1
+            or offsets.size == 0
+            or not isinstance(pruning, np.ndarray)
+            or pruning.shape != (2,)
+        ):
+            self.route_merge_pool_failures += 1
+            raise RuntimeError("native route-merge candidate pool arrays are invalid")
+        route_offsets = arguments[0] if arguments else None
+        if not isinstance(route_offsets, np.ndarray) or route_offsets.ndim != 1:
+            self.route_merge_pool_failures += 1
+            raise RuntimeError("native route-merge route offsets are invalid")
+        self.route_merge_pool_completions += 1
+        self.route_merge_pool_input_routes += int(route_offsets.size - 1)
+        self.route_merge_pool_output_candidates += int(offsets.size - 1)
+        self.route_merge_pool_pruned_pairs += int(pruning[0])
+        self.route_merge_pool_pruned_candidates += int(pruning[1])
+        return result
+
+    def execute_route_merge_screening(self, *arguments: object) -> object:
+        """Screen one route-merge pool natively without changing cache state."""
+
+        self.route_merge_screening_invocations += 1
+        started = time.perf_counter()
+        try:
+            if self._native_work_pool is not None:
+                entrypoint = cast(
+                    Callable[..., object],
+                    self._native_work_pool.execute_screening,
+                )
+            else:
+                from evrptw import _core as native_core
+
+                entrypoint = cast(
+                    Callable[..., object],
+                    native_core.screen_route_batch_transaction_v2,
+                )
+            return entrypoint(*arguments)
+        except BaseException:
+            self.route_merge_screening_failures += 1
+            raise
+        finally:
+            self.route_merge_screening_seconds += time.perf_counter() - started
+
+    def execute_candidate_screening(self, *arguments: object) -> object:
+        """Use the solve-local persistent pool for a generic screening batch."""
+
+        if self._native_work_pool is not None:
+            entrypoint = cast(
+                Callable[..., object],
+                self._native_work_pool.execute_screening,
+            )
+        else:
+            from evrptw import _core as native_core
+
+            entrypoint = cast(
+                Callable[..., object],
+                native_core.screen_route_batch_transaction_v2,
+            )
+        return entrypoint(*arguments)
+
+    def execute_route_merge_candidate_pool_screened(self, *arguments: object) -> tuple[object, ...]:
+        """Build and screen the full route-merge pool in one native crossing."""
+
+        self.route_merge_pool_invocations += 1
+        self.route_merge_screening_invocations += 1
+        try:
+            if self._native_work_pool is not None:
+                entrypoint = cast(
+                    Callable[..., object],
+                    self._native_work_pool.execute_route_merge_pool_screened,
+                )
+            else:
+                from evrptw import _core as native_core
+
+                entrypoint = cast(
+                    Callable[..., object],
+                    native_core.route_merge_candidate_pool_screened_v3,
+                )
+            raw = entrypoint(*arguments)
+            if not isinstance(raw, tuple) or len(raw) != 7:
+                raise RuntimeError("native route-merge pool-screening receipt is invalid")
+            (
+                offsets,
+                _indices,
+                _metadata,
+                pruning,
+                pruned_pair_metadata,
+                screening,
+                timings,
+            ) = raw
+            if (
+                not isinstance(offsets, np.ndarray)
+                or offsets.dtype != np.int64
+                or offsets.ndim != 1
+                or offsets.size == 0
+                or not isinstance(pruning, np.ndarray)
+                or pruning.dtype != np.int64
+                or pruning.shape != (2,)
+                or not isinstance(pruned_pair_metadata, np.ndarray)
+                or pruned_pair_metadata.dtype != np.int64
+                or pruned_pair_metadata.ndim != 2
+                or pruned_pair_metadata.shape != (int(pruning[0]), 4)
+                or not isinstance(screening, tuple)
+                or len(screening) != 7
+                or not isinstance(timings, np.ndarray)
+                or timings.dtype != np.float64
+                or timings.shape != (2,)
+                or not np.all(np.isfinite(timings))
+                or np.any(timings < 0.0)
+            ):
+                raise RuntimeError("native route-merge pool-screening arrays are invalid")
+            route_offsets = arguments[8] if len(arguments) > 8 else None
+            if (
+                not isinstance(route_offsets, np.ndarray)
+                or route_offsets.dtype != np.int64
+                or route_offsets.ndim != 1
+                or route_offsets.size < 3
+            ):
+                raise RuntimeError("native route-merge route offsets are invalid")
+            self.route_merge_pool_completions += 1
+            self.route_merge_pool_seconds += float(timings[0])
+            self.route_merge_screening_seconds += float(timings[1])
+            self.route_merge_pool_input_routes += int(route_offsets.size - 1)
+            self.route_merge_pool_output_candidates += int(offsets.size - 1)
+            self.route_merge_pool_pruned_pairs += int(pruning[0])
+            self.route_merge_pool_pruned_candidates += int(pruning[1])
+            return raw
+        except BaseException:
+            self.route_merge_pool_failures += 1
+            self.route_merge_screening_failures += 1
+            raise
+
+    def record_route_merge_screening(
+        self,
+        *,
+        candidates: int,
+        rejections: int,
+    ) -> None:
+        if (
+            isinstance(candidates, bool)
+            or not isinstance(candidates, int)
+            or candidates < 0
+            or isinstance(rejections, bool)
+            or not isinstance(rejections, int)
+            or not 0 <= rejections <= candidates
+        ):
+            raise ValueError("route-merge screening counters are invalid")
+        self.route_merge_screened_candidates += candidates
+        self.route_merge_screening_rejections += rejections
+
+    def native_work_pool_statistics(self) -> dict[str, object]:
+        if self._native_work_pool is None:
+            return {"enabled": False}
+        raw = self._native_work_pool.statistics()
+        if not isinstance(raw, dict):
+            raise RuntimeError("native candidate work-pool statistics are invalid")
+        common_fields = {
+            "schema_version",
+            "thread_count",
+            "maximum_pending_tasks",
+            "pending_tasks",
+            "active_tasks",
+            "peak_pending_tasks",
+            "peak_active_tasks",
+            "queue_full_count",
+            "rejected_count",
+            "completed_tasks",
+            "total_wait_seconds",
+            "maximum_wait_seconds",
+            "total_service_seconds",
+            "maximum_service_seconds",
+            "wait_histogram",
+            "service_histogram",
+            "task_receipt_dropped_count",
+            "task_receipts",
+        }
+        schema = raw.get("schema_version")
+        expected_fields = (
+            common_fields | {"task_receipt_capacity"}
+            if schema == "stage05.2-candidate-round-work-pool-v2"
+            else common_fields
+        )
+        if set(raw) != expected_fields or schema not in {
+            "stage05.2-candidate-round-work-pool-v2",
+            "stage05.2-candidate-round-work-pool-v3",
+        }:
+            raise RuntimeError("native candidate work-pool schema is invalid")
+        if (schema == "stage05.2-candidate-round-work-pool-v3") != (
+            self.task_receipt_path is not None
+        ):
+            raise RuntimeError("native candidate work-pool receipt mode differs")
+        if raw.get("thread_count") != self.persistent_worker_threads:
+            raise RuntimeError("native candidate work-pool thread count diverged")
+        for field_name in (
+            "maximum_pending_tasks",
+            "pending_tasks",
+            "active_tasks",
+            "peak_pending_tasks",
+            "peak_active_tasks",
+            "queue_full_count",
+            "rejected_count",
+            "completed_tasks",
+        ):
+            value = raw.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError("native candidate work-pool counter is invalid")
+        for field_name in (
+            "total_wait_seconds",
+            "maximum_wait_seconds",
+            "total_service_seconds",
+            "maximum_service_seconds",
+        ):
+            value = raw.get(field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise RuntimeError("native candidate work-pool timing is invalid")
+        for field_name in ("wait_histogram", "service_histogram"):
+            histogram = raw.get(field_name)
+            if (
+                not isinstance(histogram, list)
+                or len(histogram) != 32
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in histogram
+                )
+            ):
+                raise RuntimeError("native candidate work-pool histogram is invalid")
+        if any(
+            raw.get(field_name) != 0
+            for field_name in (
+                "pending_tasks",
+                "active_tasks",
+                "queue_full_count",
+                "rejected_count",
+            )
+        ):
+            raise RuntimeError("native candidate work-pool resource gate failed")
+        raw["task_receipts"] = validate_native_work_pool_task_receipts(
+            raw,
+            worker_threads=self.persistent_worker_threads,
+            expected_receipt_path=self.task_receipt_path,
+        )
+        return {"enabled": True, **raw}
 
     def snapshot_protocol_state(
         self,
@@ -534,12 +1132,8 @@ class NativeCandidateTransactionRuntime:
         return NativeNegativeCacheSnapshot(
             initialized=self._negative_cache_initialized,
             sequences=frozenset(self._negative_cache_sequences),
-            offsets=self._negative_cache_offsets[
-                : self._negative_cache_entry_count + 1
-            ].copy(),
-            indices=self._negative_cache_indices[
-                : self._negative_cache_index_count
-            ].copy(),
+            offsets=self._negative_cache_offsets[: self._negative_cache_entry_count + 1].copy(),
+            indices=self._negative_cache_indices[: self._negative_cache_index_count].copy(),
             reason_codes=self._negative_cache_reason_codes[
                 : self._negative_cache_entry_count
             ].copy(),
@@ -588,9 +1182,7 @@ class NativeCandidateTransactionRuntime:
             "native_candidate_transaction_fallbacks": self.fallback_count,
             "native_worker_protocol_invocations": self.protocol_invocations,
             "native_worker_protocol_total_seconds": self.protocol_total_seconds,
-            "native_worker_protocol_queue_wait_seconds": (
-                self.protocol_queue_wait_seconds
-            ),
+            "native_worker_protocol_queue_wait_seconds": (self.protocol_queue_wait_seconds),
             "negative_screening_sequence_cache": {
                 "backend": "bounded_generation_safe_rejection",
                 "capacity": STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES,
@@ -600,7 +1192,39 @@ class NativeCandidateTransactionRuntime:
                 "evictions": self._negative_cache_evictions,
                 "rollovers": self._negative_cache_rollovers,
             },
+            "native_candidate_work_pool": self.native_work_pool_statistics(),
+            "native_route_merge_candidate_pool": {
+                "invocations": self.route_merge_pool_invocations,
+                "completions": self.route_merge_pool_completions,
+                "failures": self.route_merge_pool_failures,
+                "seconds": self.route_merge_pool_seconds,
+                "input_routes": self.route_merge_pool_input_routes,
+                "output_candidates": self.route_merge_pool_output_candidates,
+                "pruned_pairs": self.route_merge_pool_pruned_pairs,
+                "pruned_candidates": self.route_merge_pool_pruned_candidates,
+                "screening_invocations": self.route_merge_screening_invocations,
+                "screening_failures": self.route_merge_screening_failures,
+                "screening_seconds": self.route_merge_screening_seconds,
+                "screened_candidates": self.route_merge_screened_candidates,
+                "screening_rejections": self.route_merge_screening_rejections,
+                "profile_cache_hits": self.route_merge_profile_cache_hits,
+                "profile_cache_misses": self.route_merge_profile_cache_misses,
+                "profile_cache_invalidations": (self.route_merge_profile_cache_invalidations),
+            },
         }
+
+    def record_route_merge_profile_cache(
+        self,
+        *,
+        hits: int,
+        misses: int,
+        invalidations: int,
+    ) -> None:
+        if min(hits, misses, invalidations) < 0:
+            raise ValueError("route-merge profile cache counters must be non-negative")
+        self.route_merge_profile_cache_hits += hits
+        self.route_merge_profile_cache_misses += misses
+        self.route_merge_profile_cache_invalidations += invalidations
 
     def record(self, audit: CandidateTransactionAudit) -> None:
         self.transaction_count += 1
@@ -716,9 +1340,7 @@ class NativeCandidateTransactionRuntime:
             raise ValueError("negative cache contains an unknown screening reason") from error
         required_entries = self._negative_cache_entry_count + len(additions)
         if required_entries > STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES:
-            raise RuntimeError(
-                "negative cache append exceeds the bounded generation capacity"
-            )
+            raise RuntimeError("negative cache append exceeds the bounded generation capacity")
         required_indices = self._negative_cache_index_count + len(packed_indices)
         self._negative_cache_offsets = _grow_int64_buffer(
             self._negative_cache_offsets,
@@ -765,9 +1387,7 @@ class NativeCandidateTransactionRuntime:
         """Atomically start a bounded safe-rejection cache generation."""
 
         if len(entries) > STAGE052_NEGATIVE_SEQUENCE_CACHE_ENTRIES:
-            raise RuntimeError(
-                "negative cache replacement exceeds the bounded generation capacity"
-            )
+            raise RuntimeError("negative cache replacement exceeds the bounded generation capacity")
         packed_routes = tuple(entries)
         packed_offsets, packed_indices = _pack_route_rows(
             packed_routes,
@@ -912,11 +1532,9 @@ def native_screen_candidate_batch(
         )
     )
 
-    from evrptw import _core as native_core
-
     started = time.perf_counter()
     try:
-        payload = native_core.screen_route_batch_transaction_v2(
+        payload = transaction_runtime.execute_candidate_screening(
             context.node_kind,
             context.demand,
             context.ready_time,
@@ -1124,9 +1742,7 @@ def execute_candidate_transaction[ResultT](
                 else:
                     screening_rejections += 1
                 if reason:
-                    screening_reason_counts[reason] = (
-                        screening_reason_counts.get(reason, 0) + 1
-                    )
+                    screening_reason_counts[reason] = screening_reason_counts.get(reason, 0) + 1
                 resolved[index] = rejected_result(sequence, reason, native_status)
                 continue
             screening_passes += 1

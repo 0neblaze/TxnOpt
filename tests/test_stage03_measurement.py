@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.models import Instance, Node, NodeType, Vehicle
 from evrptw.neighborhoods import OperatorProfile
 from evrptw.objective import SolutionObjective
+from evrptw.stage052_event_spool import Stage052EventSpool
 
 
 def _instance() -> Instance:
@@ -69,18 +71,14 @@ def test_stage03_trace_keeps_canonical_route_dictionary_and_call_states() -> Non
     assert trace.cache_hits == 1
     assert trace.route_evaluations[0].route_key == trace.route_evaluations[1].route_key
     payload = trace.to_dict()
-    assert payload["route_dictionary"] == {
-        trace.route_evaluations[0].route_key: ["C1", "C2"]
-    }
+    assert payload["route_dictionary"] == {trace.route_evaluations[0].route_key: ["C1", "C2"]}
     assert "runtime_semantic_events" not in payload
     assert trace.runtime_semantic_events == ()
     assert Stage03Trace.from_dict(payload).runtime_semantic_events == ()
 
 
 def test_runtime_semantic_journal_is_explicit_and_round_trips() -> None:
-    trace = Stage03Trace(
-        MeasurementConfig(record_runtime_semantic_events=True)
-    )
+    trace = Stage03Trace(MeasurementConfig(record_runtime_semantic_events=True))
     trace.record_route_evaluation(
         ("C1", "C2"),
         lane="legacy",
@@ -125,9 +123,7 @@ def test_runtime_semantic_journal_is_explicit_and_round_trips() -> None:
 
 
 def test_runtime_semantic_journal_rolls_back_atomically() -> None:
-    trace = Stage03Trace(
-        MeasurementConfig(record_runtime_semantic_events=True)
-    )
+    trace = Stage03Trace(MeasurementConfig(record_runtime_semantic_events=True))
     trace.record_runtime_semantic_event("operator", {"event_type": "before"})
     checkpoint = trace.snapshot_runtime_semantic_journal()
     trace.record_runtime_semantic_event("exact_work", {"event_type": "work"})
@@ -143,15 +139,11 @@ def test_runtime_semantic_journal_rolls_back_atomically() -> None:
             "runtime_causal_event_id": 1,
         },
     )
-    assert trace.record_runtime_semantic_event(
-        "deadline", {"event_type": "deadline"}
-    ) == 2
+    assert trace.record_runtime_semantic_event("deadline", {"event_type": "deadline"}) == 2
 
 
 def test_runtime_semantic_import_preserves_external_causal_ids_atomically() -> None:
-    trace = Stage03Trace(
-        MeasurementConfig(record_runtime_semantic_events=True)
-    )
+    trace = Stage03Trace(MeasurementConfig(record_runtime_semantic_events=True))
     trace.record_runtime_semantic_event("operator", {"event_type": "old"})
 
     trace.import_runtime_semantic_journal(
@@ -161,13 +153,8 @@ def test_runtime_semantic_import_preserves_external_causal_ids_atomically() -> N
         )
     )
 
-    assert [
-        event["runtime_causal_event_id"]
-        for event in trace.runtime_semantic_events
-    ] == [1, 2]
-    assert [
-        event["semantic_event_id"] for event in trace.runtime_semantic_events
-    ] == [1, 2]
+    assert [event["runtime_causal_event_id"] for event in trace.runtime_semantic_events] == [1, 2]
+    assert [event["semantic_event_id"] for event in trace.runtime_semantic_events] == [1, 2]
 
     before = trace.runtime_semantic_events
     with pytest.raises(
@@ -181,6 +168,140 @@ def test_runtime_semantic_import_preserves_external_causal_ids_atomically() -> N
             )
         )
     assert trace.runtime_semantic_events == before
+
+
+def test_runtime_semantic_import_can_take_validated_event_ownership() -> None:
+    trace = Stage03Trace(MeasurementConfig(record_runtime_semantic_events=True))
+    first: dict[str, object] = {"event_type": "first"}
+    second: dict[str, object] = {"event_type": "second"}
+
+    trace.import_runtime_semantic_journal(
+        (
+            (1, "operator", first),
+            (2, "exact_work", second),
+        ),
+        take_ownership=True,
+    )
+
+    assert trace.runtime_semantic_events[0] is first
+    assert trace.runtime_semantic_events[1] is second
+    assert first["semantic_event_id"] == 1
+    assert second["runtime_causal_event_id"] == 2
+
+
+def test_external_runtime_semantic_import_has_one_active_writer_lifecycle() -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(
+            record_runtime_semantic_events=True,
+            externalize_runtime_semantic_events=True,
+        )
+    )
+    for ordinal in range(300):
+        trace.record_runtime_semantic_event(
+            "operator",
+            {"event_type": "old", "ordinal": ordinal},
+        )
+    assert (
+        sum(
+            thread.name == "s52-event-write" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        == 1
+    )
+
+    trace.import_runtime_semantic_journal(
+        (ordinal, "operator", {"event_type": "new", "ordinal": ordinal})
+        for ordinal in range(1, 301)
+    )
+
+    assert (
+        sum(
+            thread.name == "s52-event-write" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        == 1
+    )
+    assert len(trace.runtime_semantic_pipeline_receipts) == 1
+    trace.seal_runtime_semantic_storage()
+    assert not any(
+        thread.name == "s52-event-write" and thread.is_alive() for thread in threading.enumerate()
+    )
+    assert len(trace.runtime_semantic_pipeline_receipts) == 2
+    audit_paths = tuple(
+        audit_path for _receipt, audit_path in trace.runtime_semantic_pipeline_evidence
+    )
+    assert audit_paths and all(path.is_file() for path in audit_paths)
+    trace.release_runtime_semantic_storage()
+    assert trace.runtime_semantic_pipeline_receipts == ()
+    assert all(not path.exists() for path in audit_paths)
+
+
+def test_external_runtime_semantic_projection_adopts_spool_without_reencoding() -> None:
+    trace = Stage03Trace(
+        MeasurementConfig(
+            record_runtime_semantic_events=True,
+            externalize_runtime_semantic_events=True,
+        )
+    )
+    trace.record_runtime_semantic_event("operator", {"event_type": "superseded"})
+    trace.seal_runtime_semantic_storage()
+    projection = Stage052EventSpool(prefix="stage052-test-projection-")
+    projection.append(
+        (
+            "operator",
+            {
+                "event_type": "projected",
+                "semantic_stream": "operator",
+                "semantic_event_id": 1,
+                "runtime_causal_event_id": 1,
+            },
+        )
+    )
+    projection.append(
+        (
+            "termination",
+            {
+                "event_type": "termination",
+                "semantic_stream": "termination",
+                "semantic_event_id": 2,
+                "runtime_causal_event_id": 2,
+            },
+        )
+    )
+
+    trace.adopt_runtime_semantic_spool(projection)
+
+    assert trace._runtime_semantic_spool is projection
+    assert len(trace.runtime_semantic_pipeline_receipts) == 1
+    assert [event["event_type"] for event in trace.runtime_semantic_events] == [
+        "projected",
+        "termination",
+    ]
+    assert not any(
+        thread.name == "s52-event-write" and thread.is_alive() for thread in threading.enumerate()
+    )
+    trace.seal_runtime_semantic_storage()
+    assert len(trace.runtime_semantic_pipeline_receipts) == 2
+    trace.release_runtime_semantic_storage()
+
+
+def test_native_screening_statistics_import_avoids_per_row_materialization() -> None:
+    trace = Stage03Trace(MeasurementConfig())
+    statistics = {
+        "screening_calls": 248,
+        "screening_passes": 149,
+        "screening_rejections": 99,
+        "screening_cache_hits": 83,
+        "screening_exact_call_blocked": 0,
+        "screening_reason_counts": {"capacity_prefilter": 99},
+    }
+
+    trace.import_screening_statistics(statistics)
+
+    assert trace.screening_decisions == []
+    assert trace.screening_counts == statistics
+    with pytest.raises(RuntimeError, match="only be imported once"):
+        trace.import_screening_statistics(statistics)
 
 
 def test_runtime_semantic_journal_rejects_hidden_payload() -> None:
@@ -201,9 +322,7 @@ def test_runtime_semantic_journal_rejects_hidden_payload() -> None:
 
 
 def test_runtime_semantic_journal_rejects_corrupt_persisted_causal_ids() -> None:
-    trace = Stage03Trace(
-        MeasurementConfig(record_runtime_semantic_events=True)
-    )
+    trace = Stage03Trace(MeasurementConfig(record_runtime_semantic_events=True))
     trace.record_runtime_semantic_event("operator", {"event_type": "first"})
     trace.record_runtime_semantic_event("exact_work", {"event_type": "second"})
     payload = trace.to_dict()

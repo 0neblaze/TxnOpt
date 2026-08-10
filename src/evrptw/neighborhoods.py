@@ -6,7 +6,7 @@ import math
 import random
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from functools import lru_cache
@@ -978,9 +978,7 @@ def _candidate_route_batch_with_status(
                 route_change_status="changed",
                 prescreened=True,
                 exact_budget=exact_budget,
-                base_sequences=(
-                    None if base_sequences is None else tuple(base_sequences)
-                ),
+                base_sequences=(None if base_sequences is None else tuple(base_sequences)),
             )
         )
     return _route_batch_with_status(evaluator, ordered, "changed")
@@ -1841,13 +1839,44 @@ def propose_route_merge(
 
     profiles: list[_RouteProfile] = []
     events: list[NeighborhoodEvent] = []
-    profile_exact_deltas = [
-        0 if _is_cached_route(evaluator, sequence) else 1 for sequence in sequences
-    ]
-    profile_results = _route_batch_with_status(evaluator, sequences, "unchanged")
-    for index, (sequence, result) in enumerate(zip(sequences, profile_results, strict=True)):
-        exact_delta = profile_exact_deltas[index]
-        if not result.feasible:
+    native_pool = getattr(evaluator, "native_route_merge_candidate_pool", None)
+    profile_provider = getattr(evaluator, "route_merge_profile_metrics", None)
+    native_pair_pipeline = (
+        callable(native_pool)
+        and callable(profile_provider)
+        and bool(getattr(evaluator, "pair_pruning_enabled", False))
+    )
+    if native_pair_pipeline:
+        profile_metrics = cast(
+            Callable[
+                [RouteSequences],
+                tuple[tuple[bool, float, float, int, int], ...],
+            ],
+            profile_provider,
+        )(sequences)
+    else:
+        profile_exact_deltas = [
+            0 if _is_cached_route(evaluator, sequence) else 1 for sequence in sequences
+        ]
+        profile_results = _route_batch_with_status(evaluator, sequences, "unchanged")
+        profile_metrics_list: list[tuple[bool, float, float, int, int]] = []
+        for index, result in enumerate(profile_results):
+            if result.feasible:
+                objective = _route_objective(instance, result)
+                metrics = (
+                    True,
+                    objective.total_distance,
+                    objective.total_charging_time,
+                    objective.charging_count,
+                    profile_exact_deltas[index],
+                )
+            else:
+                metrics = (False, 0.0, 0.0, 0, profile_exact_deltas[index])
+            profile_metrics_list.append(metrics)
+        profile_metrics = tuple(profile_metrics_list)
+    for index, (sequence, metrics) in enumerate(zip(sequences, profile_metrics, strict=True)):
+        feasible, distance, charging_time, charging_count, exact_delta = metrics
+        if not feasible:
             events.append(
                 NeighborhoodEvent(
                     "route_merge",
@@ -1858,37 +1887,44 @@ def propose_route_merge(
                 )
             )
             continue
-        objective = _route_objective(instance, result)
         profiles.append(
             _RouteProfile(
                 index,
                 sequence,
-                sum(instance.by_name[name].demand for name in sequence),
-                objective.total_distance,
-                objective.total_charging_time,
-                objective.charging_count,
+                (
+                    0.0
+                    if native_pair_pipeline
+                    else sum(instance.by_name[name].demand for name in sequence)
+                ),
+                distance,
+                charging_time,
+                charging_count,
             )
         )
     if len(profiles) != len(sequences):
         return MoveProposal("route_merge", None, tuple(events))
 
-    pairs = sorted(
-        (
+    pairs = (
+        []
+        if native_pair_pipeline
+        else sorted(
             (
-                len(left.sequence) + len(right.sequence),
-                left.demand + right.demand,
-                -(left.distance + right.distance),
-                -(left.charging_time + right.charging_time),
-                left.index,
-                right.index,
-            ),
-            left,
-            right,
+                (
+                    len(left.sequence) + len(right.sequence),
+                    left.demand + right.demand,
+                    -(left.distance + right.distance),
+                    -(left.charging_time + right.charging_time),
+                    left.index,
+                    right.index,
+                ),
+                left,
+                right,
+            )
+            for position, left in enumerate(profiles)
+            for right in profiles[position + 1 :]
         )
-        for position, left in enumerate(profiles)
-        for right in profiles[position + 1 :]
     )
-    if bool(getattr(evaluator, "pair_pruning_enabled", False)):
+    if not native_pair_pipeline and bool(getattr(evaluator, "pair_pruning_enabled", False)):
         capacity_feasible_pairs: list[
             tuple[
                 tuple[int, float, float, float, int, int],
@@ -1913,6 +1949,7 @@ def propose_route_merge(
             sequences,
             evaluator,
             pairs,
+            profiles,
             events,
             config,
         )
@@ -2027,9 +2064,39 @@ def _route_merge_pair_capacity_event(
     if left.demand + right.demand <= instance.vehicle.load_capacity + _EPSILON:
         return None
     skipped_count = len(left.sequence) + len(right.sequence) + 2
+    return _route_merge_pair_capacity_event_from_native(left, right, skipped_count)
+
+
+def _route_merge_pair_capacity_event_from_native(
+    left: _RouteProfile,
+    right: _RouteProfile,
+    skipped_count: int,
+) -> NeighborhoodEvent:
+    """Project one native capacity receipt into the canonical event schema."""
+
+    return _route_merge_pair_prefilter_event_from_native(
+        left,
+        right,
+        skipped_count,
+        "capacity_prefilter",
+    )
+
+
+def _route_merge_pair_prefilter_event_from_native(
+    left: _RouteProfile,
+    right: _RouteProfile,
+    skipped_count: int,
+    reason: str,
+) -> NeighborhoodEvent:
+    """Project one safe native pair-level rejection into raw audit telemetry."""
+
+    if skipped_count != len(left.sequence) + len(right.sequence) + 2:
+        raise RuntimeError("native route-merge skipped-candidate count is invalid")
+    if reason not in {"capacity_prefilter", "forward_time_window_prefilter"}:
+        raise RuntimeError("native route-merge pair rejection reason is invalid")
     pair_identity = {
         "left": {"index": left.index, "sequence": left.sequence},
-        "reason": "capacity_prefilter",
+        "reason": reason,
         "right": {"index": right.index, "sequence": right.sequence},
         "schema_version": "route-merge-pair-pruning-v1",
         "skipped_candidate_count": skipped_count,
@@ -2045,7 +2112,7 @@ def _route_merge_pair_capacity_event(
     return NeighborhoodEvent(
         "route_merge",
         "pair_prefilter_rejected_aggregate",
-        "capacity_prefilter",
+        reason,
         route_indices=(left.index, right.index),
         candidate_route_sequences=(left.sequence, right.sequence),
         prefilter_passed=False,
@@ -2059,52 +2126,131 @@ def _propose_controlled_route_merge(
     sequences: RouteSequences,
     evaluator: RouteEvaluator,
     pairs: list[tuple[tuple[int, float, float, float, int, int], _RouteProfile, _RouteProfile]],
+    profiles: list[_RouteProfile],
     events: list[NeighborhoodEvent],
     config: VehicleOperatorConfig,
 ) -> MoveProposal:
     """Rank the complete merge pool before spending the shared round budget."""
 
-    metadata: list[
-        tuple[int, int, CustomerSequence, CustomerSequence],
-    ] = []
+    metadata: list[tuple[int, int, CustomerSequence, CustomerSequence],] = []
     candidates: list[CustomerSequence] = []
     base_sequences: list[CustomerSequence] = []
     seen_candidates: set[CustomerSequence] = set()
     prefilter_counts: Counter[str] = Counter()
     prefilter_digest = hashlib.sha256()
-    for _, left, right in pairs:
-        for merged, source_sequence, target_sequence in _controlled_merge_orders(
-            instance,
-            left,
-            right,
-            preserve_duplicates=False,
+    native_pool = getattr(evaluator, "native_route_merge_candidate_pool", None)
+    if callable(native_pool) and bool(getattr(evaluator, "pair_pruning_enabled", False)):
+        (
+            native_candidates,
+            native_metadata,
+            native_pruning,
+            native_pruned_pairs,
+            native_screening,
+        ) = native_pool(
+            tuple(profile.sequence for profile in profiles),
+            tuple((profile.distance, profile.charging_time) for profile in profiles),
+            epsilon=_EPSILON,
+        )
+        if native_pruning != (
+            len(native_pruned_pairs),
+            sum(skipped for _left, _right, skipped, _reason in native_pruned_pairs),
         ):
-            # Full Stage 3.4 pools can contain tens of thousands of ordinary
-            # rejections. Use the same safe screener and persist an aggregate
-            # reason/hash below instead of materialising duplicate trace rows.
-            screen = screen_route_candidate(instance, merged)
-            if not screen.accepted:
-                prefilter_counts[screen.reason] += 1
-                prefilter_digest.update(
-                    json.dumps(
-                        (screen.reason, merged),
-                        separators=(",", ":"),
-                    ).encode()
-                )
-                continue
-            if merged in seen_candidates:
-                continue
-            seen_candidates.add(merged)
-            metadata.append(
-                (
-                    left.index,
-                    right.index,
-                    source_sequence,
-                    target_sequence,
+            raise RuntimeError("native route-merge pair pruning does not replay")
+        for left_index, right_index, skipped, reason in native_pruned_pairs:
+            try:
+                left = profiles[left_index]
+                right = profiles[right_index]
+            except IndexError as error:
+                raise RuntimeError("native route-merge pruned pair is out of range") from error
+            if left.index != left_index or right.index != right_index:
+                raise RuntimeError("native route-merge pruned pair profile identity changed")
+            events.append(
+                _route_merge_pair_prefilter_event_from_native(
+                    left,
+                    right,
+                    skipped,
+                    reason,
                 )
             )
-            candidates.append(merged)
-            base_sequences.append(target_sequence)
+        if len(native_candidates) != len(native_metadata):
+            raise RuntimeError("native route-merge candidate metadata is incomplete")
+        ordered_candidates = tuple(
+            (
+                merged,
+                source_sequence,
+                target_sequence,
+            )
+            for merged, (
+                _left_index,
+                _right_index,
+                source_sequence,
+                target_sequence,
+            ) in zip(native_candidates, native_metadata, strict=True)
+        )
+        ordered_indices = tuple(
+            (left_index, right_index)
+            for (
+                left_index,
+                right_index,
+                _source_sequence,
+                _target_sequence,
+            ) in native_metadata
+        )
+        screening_decisions: tuple[tuple[bool, str], ...] | None = native_screening
+    else:
+        python_candidates: list[tuple[CustomerSequence, CustomerSequence, CustomerSequence]] = []
+        python_indices: list[tuple[int, int]] = []
+        for _, left, right in pairs:
+            for item in _controlled_merge_orders(
+                instance,
+                left,
+                right,
+                preserve_duplicates=False,
+            ):
+                python_candidates.append(item)
+                python_indices.append((left.index, right.index))
+        ordered_candidates = tuple(python_candidates)
+        ordered_indices = tuple(python_indices)
+        screening_decisions = None
+    if screening_decisions is not None and len(screening_decisions) != len(ordered_candidates):
+        raise RuntimeError("native route-merge screening decisions are incomplete")
+    for candidate_index, (
+        merged,
+        source_sequence,
+        target_sequence,
+    ) in enumerate(ordered_candidates):
+        # Full Stage 3.4 pools can contain tens of thousands of ordinary
+        # rejections. Use the same safe screener and persist an aggregate
+        # reason/hash below instead of materialising duplicate trace rows.
+        left_index, right_index = ordered_indices[candidate_index]
+        if screening_decisions is None:
+            screen = screen_route_candidate(instance, merged)
+            accepted = screen.accepted
+            reason = screen.reason
+        else:
+            accepted, reason = screening_decisions[candidate_index]
+        if not accepted:
+            prefilter_counts[reason] += 1
+            prefilter_digest.update(
+                json.dumps(
+                    (reason, merged),
+                    separators=(",", ":"),
+                ).encode()
+            )
+            continue
+        if merged in seen_candidates:
+            continue
+        seen_candidates.add(merged)
+        metadata.append(
+            (
+                left_index,
+                right_index,
+                source_sequence,
+                target_sequence,
+            )
+        )
+        candidates.append(merged)
+        base_sequences.append(target_sequence)
     events.extend(
         NeighborhoodEvent(
             "route_merge",
@@ -2217,9 +2363,7 @@ def _controlled_merge_orders(
 ) -> tuple[tuple[CustomerSequence, CustomerSequence, CustomerSequence], ...]:
     """Generate deterministic complete orders, including non-block interleavings."""
 
-    output: list[
-        tuple[CustomerSequence, CustomerSequence, CustomerSequence]
-    ] = []
+    output: list[tuple[CustomerSequence, CustomerSequence, CustomerSequence]] = []
     seen: set[CustomerSequence] = set()
 
     def add(

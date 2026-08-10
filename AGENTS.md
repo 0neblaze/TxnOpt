@@ -712,6 +712,34 @@ this repository or one of its subdirectories.
   must be at least 15%, no C/R/RC family may regress by more than 3%,
   persistence must remain at most 36%, each worker RSS at most 4,357,382,144
   bytes, and process-tree RSS at most 12 GiB.
+- Native-architecture performance take-over is owned by the deep module
+  `evrptw.stage052_performance`. The runner consumes one signed
+  `FrozenPerformanceProfile`; it must not reconstruct build flags, CPU counts,
+  affinities, worker counts, scheduler layout, or memory admission locally.
+  The profile is frozen per mode and per `c5`/`100-customer` workload class from
+  the allowed Linux/WSL x86-64 CPU affinity, physical-core/SMT topology, and
+  effective cgroup/host memory limit. The current publication host uses all 24
+  allowed logical CPUs, but 24 is not a portable source constant. Missing
+  topology has a deterministic portable fallback, odd CPU counts are balanced,
+  and a campaign never retunes or silently degrades a frozen topology.
+- Topology calibration compares approximately `N x 1`, `ceil(N/2) x 2`,
+  `ceil(N/3) x 3`, and `ceil(N/4) x 4` shard layouts, both freely scheduled and
+  mutually exclusive physical-core-first/SMT-last partitions. Host-scheduler
+  calibration also compares shared affinity with disjoint client-control and
+  scheduler-compute partitions. A single-axis PSS calibration rejects any
+  topology that would exceed 80% of effective memory, violate 20% headroom,
+  use swap, exceed a native worker/request-thread capability, or fail to admit
+  its slowest tail axis. Configured thread counts never substitute for sampled
+  process/thread identity, actual affinity, useful CPU work, or queue evidence.
+- A clean source identity may produce portable O3, portable LTO, and, only when
+  the compiler supports it, host-native LTO no-cache wheels. `fast-math` is
+  forbidden. Each build receipt binds the compiler identity and flags, CPU
+  feature mask, Git revision/tree, source inventory, and wheel/native/scheduler
+  SHA-256. Three-repeat fixed-work calibration rejects any objective, route,
+  candidate trajectory, exact order, cache lifecycle, or transaction-hash
+  drift. Selection minimizes measured mode-block startup-through-replay
+  end-to-end median; a difference below 3% or an overlapping paired confidence
+  interval selects the more portable and then lower-memory build.
 - Stage 5.2 native kernels use ABI
   `stage05.2-native-kernels-v2`. `NativeCandidateTransactionConfig` is an
   explicit `solve_alns()` opt-in and preserves the existing operator order and
@@ -728,13 +756,14 @@ this repository or one of its subdirectories.
 - Experimental native-architecture comparisons use the explicit
   `Stage052NativeExecutionConfig` schema. Passing `None` preserves the
   historical Stage 0--5.2 paths and their guards. The implemented
-  `per_solve_runtime` protocol is `candidate_round_soa_v2`: six shard
-  processes are capped at four compute threads each, and each candidate round
-  crosses the Python/native boundary exactly once with contiguous SoA inputs
-  (including typed base propagation snapshots) and structured propagation,
-  screening, ranking, cache-journal, exact-result, completion, timing, and
-  SHA-256 outputs. Python independently replays the transaction
-  hash and commits cache/control state only after the complete result passes.
+  `per_solve_runtime` protocol is `candidate_round_soa_v2`: each solve owns one
+  persistent bounded C++ work pool sized to its frozen axis allocation, and
+  each candidate round crosses the Python/native boundary exactly once with
+  contiguous SoA inputs (including typed base propagation snapshots) and
+  structured propagation, screening, ranking, cache-journal, exact-result,
+  completion, timing, and SHA-256 outputs. Python independently replays the
+  transaction hash and commits cache/control state only after the complete
+  result passes.
   Worker, deadline, integrity, or cache-commit failure rolls back the complete
   transaction and never opens the historical worker pool or another backend.
   `full_native_alns` uses `full_solve_soa_v2` and crosses the Python/C++
@@ -748,12 +777,13 @@ this repository or one of its subdirectories.
   differential, thread-equivalence, fault, sanitizer, and full-suite gates pass.
   `host_scheduler` uses `unix_shm_scheduler_v2`: a run-owned temporary service
   accepts framed Unix-domain control messages, maps contiguous POSIX shared
-  memory arrays, and dispatches the same all-or-nothing C++ solve ABI through a
-  24-request thread pool. Service loss, partial IPC, schema/hash failure, or
-  output loss fails the transaction without local recovery or fallback. The
-  Unix-domain service loop, bounded IPC reads/writes, queue, and 24 worker
-  threads are C++ owned; Python only starts/stops the temporary service and
-  validates the returned transaction. Input and output transport uses fixed
+  memory arrays, and dispatches the same all-or-nothing C++ solve ABI through
+  the frozen scheduler-compute pool and request-thread count. Service loss,
+  partial IPC, schema/hash failure, or output loss fails the transaction without
+  local recovery or fallback. The Unix-domain service loop, bounded IPC
+  reads/writes, request/work queues, and compute pool are C++ owned; Python only
+  starts/stops the temporary service and validates the returned transaction.
+  Input and output transport uses fixed
   binary headers plus typed shared-memory SoA descriptors; JSON, pickle, NumPy,
   and Python shared-memory workers are not part of the service path. The host
   scheduler and local full-native mode share the same native transaction and
@@ -765,18 +795,33 @@ this repository or one of its subdirectories.
   the client queries the isolated session's typed transaction status and
   commits local state only when the server reports the matching committed or
   rolled-back outcome; service loss or any unresolved status fails fast. These
-  experimental protocols do not select a default or
-  promote Stage 5.2 readiness; qualification still requires the new five-mode
-  Paired/Pilot evidence and independent review.
+  queues have bounded deterministic chunks and signed task receipts containing
+  submit/start/complete times and the actual worker. Queue-full, rejection, or
+  dropped-receipt counts must remain zero. Per-wave and mode-block scheduler
+  topology receipts include exactly one dedicated asynchronous task-receipt
+  writer thread in addition to compute, request, and main service threads; the
+  observed writer count must be one and is included in the expected process
+  thread total. Per-wave and mode-block scheduler
+  lifecycles are compared; mode-block reuse is selectable only when final
+  selected-build/topology session isolation, cache reset, process-tree PSS
+  stability, and semantic replay all pass. These experimental protocols do not
+  select a default or promote Stage 5.2 readiness; qualification still requires
+  the new five-mode Paired/Pilot evidence and independent review.
 - Five-mode comparisons use
   `evrptw.experiments.stage052_native_architectures` and independent replay in
   `stage052_native_architecture_review`. Paired scope is exactly 360 axes and
   Pilot scope is exactly 180 wall-clock axes. Every mode is rebuilt and rerun
   from one clean commit, frozen wheel/native hash, input, budget,
-  instrumentation envelope, and 24-compute-thread cap. Failed axes are signed
-  evidence, not deleted. The current Stage 5.2 mode is the primary denominator;
-  accepted Pilot attempt72 is drift evidence only. Neither runner starts
-  Formal, changes the production default, launches CUDA, or reuses a label.
+  instrumentation envelope, and the same host-wide CPU/memory budget; each mode
+  uses its own signed fastest-safe topology. All three native modes must pass
+  the complete correctness matrix, while promotion requires at least one native
+  mode to pass the performance gates. Failed axes are signed evidence, not
+  deleted. The independently optimized `current_stage052` mode is the primary
+  denominator; accepted Pilot attempt72 is semantic drift evidence only and is
+  never a current CPU/resource denominator. Neither runner starts Formal,
+  changes the production default, launches CUDA, or reuses a label. Pilot is
+  blocked until an independently signed Paired review proves exactly 360/360
+  valid axes for the same profile/build/source identity.
   Paired `attempt01` completed all 360 axes but is superseded before review:
   the v1 JSON producer duplicated complete in-memory measurement/event rows and
   emitted about 16 GiB for `current_stage052` alone, while the v1 reviewer

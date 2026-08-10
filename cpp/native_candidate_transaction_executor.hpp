@@ -123,6 +123,7 @@ struct CandidatePlanExecutionTraceV2 final {
     std::vector<std::int64_t> cache_hit_flags;
     std::vector<std::int64_t> missing_local_rows;
     std::vector<std::int64_t> exact_batch_sizes;
+    std::vector<std::int64_t> exact_physical_task_counts;
     std::array<std::int64_t, 3> budget_reservation{};
     native_kernels::ExactBatchOutput exact;
     std::vector<std::int64_t> cache_store_statuses;
@@ -159,9 +160,41 @@ inline void validate_candidate_plan_execution_trace_v2(
         || plan.exact.batch_counters.size()
             != plan.exact_batch_sizes.size() * 10
         || plan.exact.completion_order.size() != exact_row_count
+        || plan.exact.physical_completion_order.size() != exact_row_count
+        || plan.exact_physical_task_counts.size()
+            != plan.exact_batch_sizes.size()
+        || std::accumulate(
+               plan.exact_physical_task_counts.begin(),
+               plan.exact_physical_task_counts.end(), std::int64_t{0}) * 7
+            != static_cast<std::int64_t>(
+                plan.exact.physical_task_receipts.size())
         || plan.cache_store_statuses.size() != exact_row_count
         || plan.cache_eviction_counts.size() != exact_row_count) {
-        throw std::logic_error("native candidate plan trace shapes are invalid");
+        throw std::logic_error(
+            "native candidate plan trace shapes are invalid: exact_rows="
+            + std::to_string(exact_rows)
+            + ",budget=" + std::to_string(plan.budget_reservation[0])
+            + "/" + std::to_string(plan.budget_reservation[1])
+            + "/" + std::to_string(plan.budget_reservation[2])
+            + ",missing=" + std::to_string(plan.missing_local_rows.size())
+            + ",statuses=" + std::to_string(plan.exact.statuses.size())
+            + ",reasons=" + std::to_string(plan.exact.reasons.size())
+            + ",metrics=" + std::to_string(plan.exact.metrics.size())
+            + ",labels=" + std::to_string(plan.exact.label_counters.size())
+            + ",batch_counters="
+            + std::to_string(plan.exact.batch_counters.size())
+            + ",completion="
+            + std::to_string(plan.exact.completion_order.size())
+            + ",physical_completion="
+            + std::to_string(plan.exact.physical_completion_order.size())
+            + ",batch_sizes=" + std::to_string(plan.exact_batch_sizes.size())
+            + ",physical_task_counts="
+            + std::to_string(plan.exact_physical_task_counts.size())
+            + ",physical_task_values="
+            + std::to_string(plan.exact.physical_task_receipts.size())
+            + ",stores=" + std::to_string(plan.cache_store_statuses.size())
+            + ",evictions="
+            + std::to_string(plan.cache_eviction_counts.size()));
     }
     if (exact_row_count == 0) {
         if (!plan.exact.path_offsets.empty()
@@ -187,6 +220,14 @@ inline void validate_candidate_plan_execution_trace_v2(
         if (completion[row] != static_cast<std::int64_t>(row)) {
             throw std::logic_error(
                 "native candidate plan trace completion order is invalid");
+        }
+    }
+    completion = plan.exact.physical_completion_order;
+    std::sort(completion.begin(), completion.end());
+    for (std::size_t row = 0; row < completion.size(); ++row) {
+        if (completion[row] != static_cast<std::int64_t>(row)) {
+            throw std::logic_error(
+                "native candidate physical completion order is invalid");
         }
     }
     for (std::size_t batch = 0;
@@ -257,6 +298,26 @@ inline native_kernels::ExactBatchOutput slice_candidate_exact_batch_v2(
         if (ordinal >= first_row && ordinal < last_row) {
             output.completion_order.push_back(ordinal - first_row);
         }
+    }
+    for (const auto ordinal : plan.exact.physical_completion_order) {
+        if (ordinal >= first_row && ordinal < last_row) {
+            output.physical_completion_order.push_back(ordinal - first_row);
+        }
+    }
+    const auto first_task = std::accumulate(
+        plan.exact_physical_task_counts.begin(),
+        plan.exact_physical_task_counts.begin()
+            + static_cast<std::ptrdiff_t>(batch_index),
+        std::int64_t{0});
+    const auto task_count = plan.exact_physical_task_counts[batch_index];
+    output.physical_task_receipts.assign(
+        plan.exact.physical_task_receipts.begin() + first_task * 7,
+        plan.exact.physical_task_receipts.begin()
+            + (first_task + task_count) * 7);
+    for (std::int64_t task = 0; task < task_count; ++task) {
+        auto* row = output.physical_task_receipts.data() + task * 7;
+        row[2] -= first_row;
+        row[3] -= first_row;
     }
     return output;
 }
@@ -377,6 +438,7 @@ inline CandidateTransactionTraceWireV2 encode_candidate_transaction_trace_v2(
         add_integer(plan.cache_hit_flags);
         add_integer(plan.missing_local_rows);
         add_integer(plan.exact_batch_sizes);
+        add_integer(plan.exact_physical_task_counts);
         add_integer(plan.budget_reservation);
         add_integer(plan.exact.path_offsets);
         add_integer(plan.exact.path_indices);
@@ -385,6 +447,8 @@ inline CandidateTransactionTraceWireV2 encode_candidate_transaction_trace_v2(
         add_integer(plan.exact.label_counters);
         add_integer(plan.exact.batch_counters);
         add_integer(plan.exact.completion_order);
+        add_integer(plan.exact.physical_completion_order);
+        add_integer(plan.exact.physical_task_receipts);
         add_integer(plan.cache_store_statuses);
         add_integer(plan.cache_eviction_counts);
         add_double(plan.exact.metrics);
@@ -423,7 +487,7 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
         return std::vector<double>(values.begin(), values.end());
     };
     const auto plan_ids = integer_field(18);
-    if (wire.integer_offsets.size() != 20 + plan_ids.size() * 13
+    if (wire.integer_offsets.size() != 20 + plan_ids.size() * 16
         || wire.double_offsets.size() != 4 + plan_ids.size()) {
         throw std::runtime_error(
             "native candidate trace wire plan field count is invalid");
@@ -479,13 +543,14 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
     trace.ranking_float = copy_double(0);
     trace.plans.reserve(plan_ids.size());
     for (std::size_t plan = 0; plan < plan_ids.size(); ++plan) {
-        const auto base = 19 + plan * 13;
+        const auto base = 19 + plan * 16;
         CandidatePlanExecutionTraceV2 decoded;
         decoded.plan_id = plan_ids[plan];
         decoded.cache_hit_flags = copy_integer(base);
         decoded.missing_local_rows = copy_integer(base + 1);
         decoded.exact_batch_sizes = copy_integer(base + 2);
-        const auto reservation = integer_field(base + 3);
+        decoded.exact_physical_task_counts = copy_integer(base + 3);
+        const auto reservation = integer_field(base + 4);
         if (reservation.size() != decoded.budget_reservation.size()) {
             throw std::runtime_error(
                 "native candidate trace wire budget reservation is invalid");
@@ -493,15 +558,17 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
         std::copy(
             reservation.begin(), reservation.end(),
             decoded.budget_reservation.begin());
-        decoded.exact.path_offsets = copy_integer(base + 4);
-        decoded.exact.path_indices = copy_integer(base + 5);
-        decoded.exact.statuses = copy_integer(base + 6);
-        decoded.exact.reasons = copy_integer(base + 7);
-        decoded.exact.label_counters = copy_integer(base + 8);
-        decoded.exact.batch_counters = copy_integer(base + 9);
-        decoded.exact.completion_order = copy_integer(base + 10);
-        decoded.cache_store_statuses = copy_integer(base + 11);
-        decoded.cache_eviction_counts = copy_integer(base + 12);
+        decoded.exact.path_offsets = copy_integer(base + 5);
+        decoded.exact.path_indices = copy_integer(base + 6);
+        decoded.exact.statuses = copy_integer(base + 7);
+        decoded.exact.reasons = copy_integer(base + 8);
+        decoded.exact.label_counters = copy_integer(base + 9);
+        decoded.exact.batch_counters = copy_integer(base + 10);
+        decoded.exact.completion_order = copy_integer(base + 11);
+        decoded.exact.physical_completion_order = copy_integer(base + 12);
+        decoded.exact.physical_task_receipts = copy_integer(base + 13);
+        decoded.cache_store_statuses = copy_integer(base + 14);
+        decoded.cache_eviction_counts = copy_integer(base + 15);
         decoded.exact.metrics = copy_double(3 + plan);
         validate_candidate_plan_execution_trace_v2(decoded);
         trace.plans.push_back(std::move(decoded));
@@ -1336,7 +1403,33 @@ private:
                     plan_trace.exact.completion_order.push_back(
                         static_cast<std::int64_t>(aggregate_row_base) + ordinal);
                 }
+                for (const auto ordinal : exact.physical_completion_order) {
+                    plan_trace.exact.physical_completion_order.push_back(
+                        static_cast<std::int64_t>(aggregate_row_base) + ordinal);
+                }
+                if (exact.physical_task_receipts.size() % 7 != 0) {
+                    throw std::logic_error(
+                        "native candidate physical task receipt is invalid");
+                }
+                const auto physical_task_count = static_cast<std::int64_t>(
+                    exact.physical_task_receipts.size() / 7);
+                for (std::int64_t task = 0; task < physical_task_count; ++task) {
+                    const auto* row = exact.physical_task_receipts.data() + task * 7;
+                    plan_trace.exact.physical_task_receipts.insert(
+                        plan_trace.exact.physical_task_receipts.end(),
+                        {
+                            row[0],
+                            row[1],
+                            static_cast<std::int64_t>(aggregate_row_base) + row[2],
+                            static_cast<std::int64_t>(aggregate_row_base) + row[3],
+                            row[4],
+                            row[5],
+                            row[6],
+                        });
+                }
                 plan_trace.exact_batch_sizes.push_back(requested_exact);
+                plan_trace.exact_physical_task_counts.push_back(
+                    physical_task_count);
                 for (std::size_t exact_row = 0;
                      exact_row < missing_rows.size(); ++exact_row) {
                     const auto local = missing_rows[exact_row];

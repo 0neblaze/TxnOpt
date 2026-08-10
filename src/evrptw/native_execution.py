@@ -15,7 +15,8 @@ import os
 import struct
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Literal, cast
 
 import numpy as np
@@ -35,6 +36,7 @@ from evrptw.candidate_transaction import (
     NativeCandidateTransactionConfig,
     NativeCandidateTransactionRuntime,
     decode_native_candidate_screening_payload,
+    validate_native_work_pool_task_receipts,
 )
 from evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from evrptw.cpu_batch import BackendMetrics, decode_exact_charging_batch_numeric
@@ -345,6 +347,7 @@ class FullNativeALNSResult:
     candidate_work: tuple[Mapping[str, object], ...]
     route_results: tuple[Mapping[str, object], ...]
     control_journal_events: tuple[Mapping[str, object], ...]
+    screening_journal: NativeScreeningJournal
     control_journal_sha256: str
     control_journal_statistics: Mapping[str, int]
     route_cache_statistics: Mapping[str, int]
@@ -352,6 +355,7 @@ class FullNativeALNSResult:
     causal_journal: NativeCausalJournal
     canonical_event_journal: NativeCanonicalEventJournal
     initial_state_receipt: NativeInitialStateReceipt
+    work_pool_statistics: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,6 +410,108 @@ class NativeCanonicalEventJournal:
     flags: npt.NDArray[np.int64]
     stream_counts: npt.NDArray[np.int64]
     transaction_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeScreeningJournal:
+    """Validated typed SoA screening rows retained without Python expansion."""
+
+    node_names: tuple[str, ...]
+    lane_by_id: Mapping[int, str]
+    operator_by_id: Mapping[int, str]
+    contexts: npt.NDArray[np.int64]
+    route_offsets: npt.NDArray[np.int64]
+    route_indices: npt.NDArray[np.int64]
+    outcome_ids: npt.NDArray[np.int64]
+    codes: npt.NDArray[np.int64]
+    metrics: npt.NDArray[np.float64]
+    flags: npt.NDArray[np.int64]
+    transaction_ids: npt.NDArray[np.int64]
+    canonical_event_ids: npt.NDArray[np.int64]
+
+    def __len__(self) -> int:
+        return int(self.contexts.shape[0])
+
+    def context(self, row: int) -> tuple[str, int, str]:
+        return (
+            self.lane_by_id[int(self.contexts[row, 0])],
+            int(self.contexts[row, 2]),
+            self.operator_by_id[int(self.contexts[row, 1])],
+        )
+
+    def route_sequence(self, row: int) -> tuple[str, ...]:
+        outcome = int(self.outcome_ids[row])
+        first = int(self.route_offsets[outcome])
+        last = int(self.route_offsets[outcome + 1])
+        return tuple(self.node_names[int(index)] for index in self.route_indices[first:last])
+
+    def accepted(self, row: int) -> bool:
+        return bool(self.codes[int(self.outcome_ids[row]), 0])
+
+    def status(self, row: int) -> str:
+        return (
+            "pass"
+            if self.accepted(row)
+            else "negative_cache_hit"
+            if bool(self.flags[row, 1])
+            else "rejected"
+        )
+
+    def semantic_event(self, row: int, *, route_key: str) -> dict[str, object]:
+        """Materialize one canonical row only when its ordered turn is consumed."""
+
+        lane, raw_iteration, operator = self.context(row)
+        outcome = int(self.outcome_ids[row])
+        check_count = int(self.codes[outcome, 7])
+        checks: list[dict[str, object]] = []
+        for check_ordinal in range(check_count):
+            packed_check = int(self.codes[outcome, 8 + check_ordinal])
+            check_code, status_code = divmod(packed_check, 10)
+            check_status = _SCREEN_CHECK_STATUS_BY_CODE[status_code]
+            checks.append(
+                {
+                    "check": _SCREEN_CHECK_BY_CODE[check_code],
+                    "status": check_status,
+                    "value": float(self.metrics[outcome, 7 + check_ordinal]),
+                    "reason": screening_check_explanation(
+                        check_code,
+                        check_status,
+                        event_count=check_count,
+                    ),
+                }
+            )
+        reason_code = int(self.codes[outcome, 1])
+        failed_check_code = int(self.codes[outcome, 2])
+        accepted = self.accepted(row)
+        return {
+            "event_type": "screening_decision",
+            "status": self.status(row),
+            "lane": lane,
+            "iteration": None if raw_iteration == -1 else raw_iteration,
+            "operator": operator,
+            "route_key": route_key,
+            "first_failed_check": _SCREEN_CHECK_BY_CODE.get(failed_check_code, ""),
+            "reason": SCREEN_REASON_BY_CODE[reason_code],
+            "checks": checks,
+            "demand": float(self.metrics[outcome, 0]),
+            "min_time_window_slack": float(self.metrics[outcome, 2]),
+            "distance_lower_bound": float(self.metrics[outcome, 3]),
+            "distance_increment_lower_bound": (
+                None
+                if math.isnan(float(self.metrics[outcome, 4]))
+                else float(self.metrics[outcome, 4])
+            ),
+            "single_segment_reachable": bool(self.metrics[outcome, 6]),
+            "structural_energy_lower_bound": float(self.metrics[outcome, 5]),
+            "negative_cache_hit": bool(self.flags[row, 1]),
+            "exact_call_blocked": not accepted,
+            "_native_expected_flags": (
+                int(bool(self.flags[row, 0]))
+                | (int(bool(self.flags[row, 1])) << 1)
+                | (int(bool(self.flags[row, 2])) << 2)
+                | (int(self.flags[row, 3]) << 8)
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -526,38 +632,56 @@ def _decode_native_stage04_control_events(
     return tuple(events), _readonly_copy(control)
 
 
-def _append_u64(evidence: bytearray, value: int) -> None:
+class _StreamingSHA256Evidence:
+    """Byte sink for large native receipts without retaining a second payload."""
+
+    __slots__ = ("_hasher",)
+
+    def __init__(self, initial: bytes) -> None:
+        self._hasher = hashlib.sha256(initial)
+
+    def extend(self, values: bytes | bytearray | memoryview) -> None:
+        self._hasher.update(values)
+
+    def hexdigest(self) -> str:
+        return self._hasher.hexdigest()
+
+
+type _EvidenceSink = bytearray | _StreamingSHA256Evidence
+
+
+def _append_u64(evidence: _EvidenceSink, value: int) -> None:
     evidence.extend((value & ((1 << 64) - 1)).to_bytes(8, "little"))
 
 
 def _append_typed_values(
-    evidence: bytearray,
+    evidence: _EvidenceSink,
     values: npt.NDArray[np.generic],
 ) -> None:
     flattened = values.reshape(-1)
     _append_u64(evidence, len(flattened))
     if values.dtype == np.dtype(np.uint8):
-        evidence.extend(flattened.tobytes(order="C"))
+        evidence.extend(np.ascontiguousarray(flattened).tobytes(order="C"))
         return
     if values.dtype == np.dtype(np.int64):
-        for value in flattened:
-            _append_u64(evidence, int(value))
+        evidence.extend(
+            np.ascontiguousarray(flattened).astype(np.dtype("<i8"), copy=False).tobytes(order="C")
+        )
         return
     if values.dtype == np.dtype(np.float64):
-        for value in flattened:
-            converted = float(value)
-            bits = (
-                0x7FF8000000000000
-                if math.isnan(converted)
-                else struct.unpack("<Q", struct.pack("<d", converted))[0]
-            )
-            _append_u64(evidence, bits)
+        contiguous = np.ascontiguousarray(flattened, dtype=np.float64)
+        nan_mask = np.isnan(contiguous)
+        bits = contiguous.view(np.uint64)
+        if bool(np.any(nan_mask)):
+            bits = bits.copy()
+            bits[nan_mask] = np.uint64(0x7FF8000000000000)
+        evidence.extend(bits.astype(np.dtype("<u8"), copy=False).tobytes(order="C"))
         return
     raise RuntimeError("native semantic evidence has an unsupported dtype")
 
 
 def _append_typed_array(
-    evidence: bytearray,
+    evidence: _EvidenceSink,
     values: npt.NDArray[np.generic],
 ) -> None:
     _append_u64(evidence, values.ndim)
@@ -570,6 +694,14 @@ def _readonly_copy[T: np.generic](values: npt.NDArray[T]) -> npt.NDArray[T]:
     copied = np.ascontiguousarray(values.copy())
     copied.flags.writeable = False
     return copied
+
+
+def _readonly_borrow[T: np.generic](values: npt.NDArray[T]) -> npt.NDArray[T]:
+    """Retain an internal native result array without a second full copy."""
+
+    borrowed = np.ascontiguousarray(values)
+    borrowed.flags.writeable = False
+    return borrowed
 
 
 def _semantic_event_aggregate(
@@ -1644,7 +1776,7 @@ def decode_native_global_semantic_stream(
     )
 
 
-def _append_native_nested_evidence(evidence: bytearray, value: object) -> None:
+def _append_native_nested_evidence(evidence: _EvidenceSink, value: object) -> None:
     if value is None:
         evidence.extend(b"N")
     elif isinstance(value, tuple):
@@ -1815,7 +1947,11 @@ def decode_native_three_lane_semantic_stream(
 
     def require_tuple(value: object, size: int, name: str) -> tuple[object, ...]:
         if not isinstance(value, tuple) or len(value) != size:
-            raise RuntimeError(f"native three-lane {name} has an invalid tuple")
+            observed_size = len(value) if isinstance(value, tuple) else "not-a-tuple"
+            raise RuntimeError(
+                f"native three-lane {name} has an invalid tuple: "
+                f"type={type(value).__name__}, size={observed_size}, expected={size}"
+            )
         return value
 
     def unpack_routes(
@@ -2093,9 +2229,7 @@ def decode_native_three_lane_semantic_stream(
                 and selected_quality == -1
             )
             if terminal_quality_noop:
-                terminal_events.append(
-                    event("relocate", "not_applicable", "only_one_route")
-                )
+                terminal_events.append(event("relocate", "not_applicable", "only_one_route"))
             else:
                 terminal_events.append(
                     event(
@@ -2181,9 +2315,7 @@ def decode_native_three_lane_semantic_stream(
             probe = require_tuple(constraint[1], 3, "terminal constraint probe")
             removal = require_tuple(probe[0], 7, "terminal constraint removal")
             repair = require_tuple(probe[1], 3, "terminal constraint repair")
-            transaction = require_plan_transaction(
-                probe[2], 1, "terminal constraint"
-            )
+            transaction = require_plan_transaction(probe[2], 1, "terminal constraint")
             outcome = cast(
                 npt.NDArray[np.int64],
                 _require_array(
@@ -2197,24 +2329,12 @@ def decode_native_three_lane_semantic_stream(
                 raise RuntimeError(
                     "native three-lane terminal accepted an incomplete constraint move"
                 )
-            removed_indices = _require_vector(
-                removal[2], "terminal constraint removed customers"
-            )
-            removed_customers = tuple(
-                name_by_index[int(index)] for index in removed_indices
-            )
-            remaining_routes = unpack_routes(
-                removal[0], removal[1], "terminal constraint partial"
-            )
-            repaired_routes = unpack_routes(
-                repair[0], repair[1], "terminal constraint repaired"
-            )
-            statuses = _require_vector(
-                transaction[1], "terminal constraint statuses"
-            )
-            exact_rows = _require_vector(
-                transaction[5], "terminal constraint exact rows"
-            )
+            removed_indices = _require_vector(removal[2], "terminal constraint removed customers")
+            removed_customers = tuple(name_by_index[int(index)] for index in removed_indices)
+            remaining_routes = unpack_routes(removal[0], removal[1], "terminal constraint partial")
+            repaired_routes = unpack_routes(repair[0], repair[1], "terminal constraint repaired")
+            statuses = _require_vector(transaction[1], "terminal constraint statuses")
+            exact_rows = _require_vector(transaction[5], "terminal constraint exact rows")
             candidate_feasible = statuses.tolist() == [5]
             candidate_objective: SolutionObjective | None = None
             candidate_key: tuple[int, float, float, int] | tuple[()] = ()
@@ -2227,9 +2347,7 @@ def decode_native_three_lane_semantic_stream(
                     "terminal constraint",
                 )
             elif statuses.tolist() not in ([3], [4]):
-                raise RuntimeError(
-                    "native three-lane terminal constraint status is invalid"
-                )
+                raise RuntimeError("native three-lane terminal constraint status is invalid")
             operator = FULL_NATIVE_OPERATOR_NAMES[int(outcome[0]) + 9]
             removal_scores, removal_route_indices = _constraint_score_vectors(
                 removal,
@@ -2255,77 +2373,80 @@ def decode_native_three_lane_semantic_stream(
                 "removal_size_actual": int(selection[2]),
                 "removal_trigger": "stagnation_baseline",
             }
+
             def with_constraint_common(row: dict[str, object]) -> dict[str, object]:
                 row.update(constraint_common)
                 return row
 
             terminal_events.append(
-                with_constraint_common(event(
-                    operator,
-                    "candidate_proposed",
-                    "constraint_ranked_removal",
-                    route_indices=tuple(
-                        sorted(
-                            dict.fromkeys(
-                                int(value)
-                                for value in removal_route_indices[
-                                    : len(removed_indices)
-                                ]
+                with_constraint_common(
+                    event(
+                        operator,
+                        "candidate_proposed",
+                        "constraint_ranked_removal",
+                        route_indices=tuple(
+                            sorted(
+                                dict.fromkeys(
+                                    int(value)
+                                    for value in removal_route_indices[: len(removed_indices)]
+                                )
                             )
-                        )
-                    ),
-                    affected_route_indices=tuple(
-                        sorted(
-                            dict.fromkeys(
-                                int(value)
-                                for value in removal_route_indices[
-                                    : len(removed_indices)
-                                ]
+                        ),
+                        affected_route_indices=tuple(
+                            sorted(
+                                dict.fromkeys(
+                                    int(value)
+                                    for value in removal_route_indices[: len(removed_indices)]
+                                )
                             )
-                        )
-                    ),
-                    removed_customers=removed_customers,
-                    candidate_route_sequences=remaining_routes,
-                    prefilter_passed=True,
-                    selection_rank=1,
-                    ranking_score=float(removal_scores[0]),
-                    candidate_objective_key=candidate_key,
-                ))
+                        ),
+                        removed_customers=removed_customers,
+                        candidate_route_sequences=remaining_routes,
+                        prefilter_passed=True,
+                        selection_rank=1,
+                        ranking_score=float(removal_scores[0]),
+                        candidate_objective_key=candidate_key,
+                    )
+                )
             )
             if candidate_feasible and candidate_objective is not None:
                 terminal_events.append(
-                    with_constraint_common(event(
-                        operator,
-                        "candidate_proposed",
-                        "constraint_removal_repaired",
-                        affected_route_indices=affected_routes,
-                        removed_customers=removed_customers,
-                        candidate_route_sequences=repaired_routes,
-                        candidate_vehicle_delta=len(repaired_routes)
-                        - len(initial_customer_sequences),
-                        candidate_feasible=True,
-                        prefilter_passed=True,
-                        exact_route_evaluations=len(exact_rows),
-                        accepted=False,
-                        vehicle_reduction=candidate_objective.vehicle_count
-                        < initial_objective.vehicle_count,
-                        distance_improvement=candidate_objective.total_distance
-                        < initial_objective.total_distance - 1e-9,
-                        candidate_objective_key=candidate_key,
-                    ))
+                    with_constraint_common(
+                        event(
+                            operator,
+                            "candidate_proposed",
+                            "constraint_removal_repaired",
+                            affected_route_indices=affected_routes,
+                            removed_customers=removed_customers,
+                            candidate_route_sequences=repaired_routes,
+                            candidate_vehicle_delta=len(repaired_routes)
+                            - len(initial_customer_sequences),
+                            candidate_feasible=True,
+                            prefilter_passed=True,
+                            exact_route_evaluations=len(exact_rows),
+                            accepted=False,
+                            vehicle_reduction=candidate_objective.vehicle_count
+                            < initial_objective.vehicle_count,
+                            distance_improvement=candidate_objective.total_distance
+                            < initial_objective.total_distance - 1e-9,
+                            candidate_objective_key=candidate_key,
+                        )
+                    )
                 )
             else:
                 terminal_events.append(
-                    with_constraint_common(event(
-                        operator,
-                        "failed",
-                        "constraint_repair_infeasible",
-                        affected_route_indices=affected_routes,
-                        removed_customers=removed_customers,
-                        candidate_route_sequences=repaired_routes,
-                        prefilter_passed=True,
-                        exact_route_evaluations=len(exact_rows),
-                    ))
+                    with_constraint_common(
+                        event(
+                            operator,
+                            "failed",
+                            "constraint_repair_infeasible",
+                            affected_route_indices=affected_routes,
+                            removed_customers=removed_customers,
+                            candidate_route_sequences=repaired_routes,
+                            prefilter_passed=True,
+                            exact_route_evaluations=len(exact_rows),
+                        )
+                    )
                 )
         if payload[4] is not None or payload[5] is not None:
             raise RuntimeError("native three-lane terminal retained post-boundary semantic state")
@@ -2460,10 +2581,7 @@ def decode_native_three_lane_semantic_stream(
                     terminal_exact_evaluations = len(
                         _require_vector(terminal_transaction[5], "terminal legacy exact")
                     )
-                if (
-                    len(initial_customer_sequences) == 1
-                    and len(terminal_legacy_order) == 0
-                ):
+                if len(initial_customer_sequences) == 1 and len(terminal_legacy_order) == 0:
                     operator_replay_events.append(
                         event(
                             "route_elimination",
@@ -2546,9 +2664,7 @@ def decode_native_three_lane_semantic_stream(
         return NativeThreeLaneSemanticStream(
             neighborhood_events=(
                 ()
-                if int(termination[0]) == 1
-                and not terminal_quality_selected
-                and payload[3] is None
+                if int(termination[0]) == 1 and not terminal_quality_selected and payload[3] is None
                 else tuple(terminal_events)
             ),
             operator_weights=_readonly_copy(weights),
@@ -3146,46 +3262,93 @@ def decode_native_three_lane_semantic_stream(
         legacy_transaction, selected_legacy, legacy_objective, "legacy"
     )
 
-    refinement = require_tuple(payload[1], 4, "refinement")
-    refinement_metadata = cast(
-        npt.NDArray[np.int64],
-        _require_array(
-            refinement[0],
-            dtype=np.dtype(np.int64),
-            shape=(4,),
-            name="refinement metadata",
-        ),
+    reduced_vehicle_threshold = max(1, math.ceil(len(expected_customers) / 5.0) - 1)
+    refinement_required = (
+        len(expected_customers) > 1
+        and len(legacy_routes) < len(initial_customer_sequences)
+        and len(legacy_routes) <= reduced_vehicle_threshold
     )
-    refinement_removed_indices = _require_vector(refinement[1], "refinement removed customers")
-    if np.any(refinement_removed_indices < 0) or np.any(
-        refinement_removed_indices >= len(name_by_index)
-    ):
-        raise RuntimeError("native three-lane refinement removed customer is invalid")
-    refinement_removed = tuple(name_by_index[int(index)] for index in refinement_removed_indices)
-    refinement_status, refinement_reason, refinement_selected = _native_refinement_outcome(
-        refinement_metadata
-    )
-    refinement_partial = tuple(
-        tuple(customer for customer in route if customer not in refinement_removed)
-        for route in legacy_routes
-    )
-    refinement_partial = tuple(route for route in refinement_partial if route)
-    refinement_routes = (
-        unpack_routes(
-            require_tuple(refinement[2], 3, "refinement plan")[1],
-            require_tuple(refinement[2], 3, "refinement plan")[2],
-            "refinement final plan",
+    refinement_value = payload[1]
+    if (refinement_value is None) == refinement_required:
+        raise RuntimeError("native three-lane refinement presence diverged from its threshold")
+    refinement_event: dict[str, object] | None = None
+    refinement_selected = False
+    legacy_candidate_routes = legacy_routes
+    legacy_candidate_objective = legacy_objective
+    legacy_candidate_objective_key = legacy_objective_key
+    if refinement_value is not None:
+        refinement = require_tuple(refinement_value, 4, "refinement")
+        refinement_metadata = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                refinement[0],
+                dtype=np.dtype(np.int64),
+                shape=(4,),
+                name="refinement metadata",
+            ),
         )
-        if refinement_selected
-        else refinement_partial
-    )
-    legacy_candidate_routes = refinement_routes if refinement_selected else legacy_routes
-    legacy_candidate_objective = (
-        replay_objective(legacy_candidate_routes) if refinement_selected else legacy_objective
-    )
-    legacy_candidate_objective_key = (
-        legacy_candidate_objective.key if refinement_selected else legacy_objective_key
-    )
+        refinement_removed_indices = _require_vector(refinement[1], "refinement removed customers")
+        if np.any(refinement_removed_indices < 0) or np.any(
+            refinement_removed_indices >= len(name_by_index)
+        ):
+            raise RuntimeError("native three-lane refinement removed customer is invalid")
+        refinement_removed = tuple(
+            name_by_index[int(index)] for index in refinement_removed_indices
+        )
+        refinement_status, refinement_reason, refinement_selected = _native_refinement_outcome(
+            refinement_metadata
+        )
+        refinement_partial = tuple(
+            tuple(customer for customer in route if customer not in refinement_removed)
+            for route in legacy_routes
+        )
+        refinement_partial = tuple(route for route in refinement_partial if route)
+        refinement_routes = (
+            unpack_routes(
+                require_tuple(refinement[2], 3, "refinement plan")[1],
+                require_tuple(refinement[2], 3, "refinement plan")[2],
+                "refinement final plan",
+            )
+            if refinement_selected
+            else refinement_partial
+        )
+        legacy_candidate_routes = refinement_routes if refinement_selected else legacy_routes
+        legacy_candidate_objective = (
+            replay_objective(legacy_candidate_routes) if refinement_selected else legacy_objective
+        )
+        legacy_candidate_objective_key = (
+            legacy_candidate_objective.key if refinement_selected else legacy_objective_key
+        )
+        refinement_event = event(
+            "vehicle_reduction_refinement",
+            refinement_status,
+            refinement_reason,
+            affected_route_indices=tuple(
+                index
+                for index, (before, after) in enumerate(
+                    zip(initial_customer_sequences, refinement_routes, strict=False)
+                )
+                if before != after
+            ),
+            removed_customers=refinement_removed,
+            candidate_route_sequences=refinement_routes,
+            candidate_vehicle_delta=(
+                len(refinement_routes) - len(initial_customer_sequences)
+                if refinement_selected
+                else None
+            ),
+            candidate_feasible=refinement_selected,
+            prefilter_passed=bool(refinement_partial),
+            exact_route_evaluations=int(refinement_metadata[2]),
+            accepted=False,
+            vehicle_reduction=refinement_selected,
+            distance_improvement=(
+                refinement_selected
+                and legacy_candidate_objective.total_distance
+                < initial_objective.total_distance - 1e-9
+            ),
+            candidate_objective_key=legacy_candidate_objective_key,
+        )
 
     quality = require_tuple(payload[2], 4, "quality")
     quality_pool = require_tuple(quality[0], 5, "quality pool")
@@ -3221,7 +3384,15 @@ def decode_native_three_lane_semantic_stream(
             seen_quality.add(plan)
             quality_plans.append(plan)
             quality_sources.append(candidate)
-    quality_transaction = require_plan_transaction(quality[1], len(quality_plans), "quality")
+    normal_quality_transaction: tuple[object, ...] | None
+    if quality[1] is None:
+        if quality_plans:
+            raise RuntimeError("native three-lane quality transaction is missing")
+        normal_quality_transaction = None
+    else:
+        normal_quality_transaction = require_plan_transaction(
+            quality[1], len(quality_plans), "quality"
+        )
     quality_outcome = cast(
         npt.NDArray[np.int64],
         _require_array(quality[2], dtype=np.dtype(np.int64), shape=(4,), name="quality outcome"),
@@ -3243,10 +3414,12 @@ def decode_native_three_lane_semantic_stream(
         quality_changed: tuple[int, ...] = ()
         moved_customer_index: int | None = None
     else:
+        if normal_quality_transaction is None:
+            raise RuntimeError("native three-lane selected quality transaction is missing")
         quality_routes = quality_plans[selected_quality]
         quality_objective = replay_objective(quality_routes)
         normal_quality_key = reported_objective(
-            quality_transaction, selected_quality, quality_objective, "quality"
+            normal_quality_transaction, selected_quality, quality_objective, "quality"
         )
         quality_source = quality_sources[selected_quality]
         quality_changed = tuple(int(value) for value in changed_routes[quality_source])
@@ -3447,34 +3620,10 @@ def decode_native_three_lane_semantic_stream(
             < initial_objective.total_distance - 1e-9,
             candidate_objective_key=legacy_candidate_objective_key,
         ),
-        event(
-            "vehicle_reduction_refinement",
-            refinement_status,
-            refinement_reason,
-            affected_route_indices=tuple(
-                index
-                for index, (before, after) in enumerate(
-                    zip(initial_customer_sequences, refinement_routes, strict=False)
-                )
-                if before != after
-            ),
-            removed_customers=refinement_removed,
-            candidate_route_sequences=refinement_routes,
-            candidate_vehicle_delta=(
-                len(refinement_routes) - len(initial_customer_sequences)
-                if refinement_selected
-                else None
-            ),
-            candidate_feasible=refinement_selected,
-            prefilter_passed=bool(refinement_partial),
-            exact_route_evaluations=int(refinement_metadata[2]),
-            accepted=refinement_selected and legacy_accepted,
-            vehicle_reduction=refinement_selected,
-            distance_improvement=refinement_selected
-            and legacy_candidate_objective.total_distance < initial_objective.total_distance - 1e-9,
-            candidate_objective_key=legacy_candidate_objective_key,
-        ),
     ]
+    if refinement_event is not None:
+        refinement_event["accepted"] = refinement_selected and legacy_accepted
+        operator_events.append(refinement_event)
     if refinement_selected:
         operator_events[-1].update(
             {
@@ -9132,9 +9281,7 @@ def _decode_native_three_lane_fourth_iteration(
             removed_customers=legacy_removed,
             _operator_feasible_repair=legacy_selected,
             _operator_native_candidate_feasible=legacy_selected,
-            _operator_native_candidate_route_sequences=(
-                legacy_routes if legacy_selected else ()
-            ),
+            _operator_native_candidate_route_sequences=(legacy_routes if legacy_selected else ()),
             _operator_native_candidate_objective_key=legacy_key,
             _operator_native_accepted=legacy_accepted,
             accepted=legacy_accepted,
@@ -9604,9 +9751,18 @@ def _decode_native_three_lane_fifth_general(
     if aggregate_merge_events is not None:
         elimination_events = list(aggregate_merge_events)
 
+    reduced_vehicle_threshold = max(1, math.ceil(len(expected_customers) / 5.0) - 1)
+    refinement_required = (
+        elimination_selected
+        and len(expected_customers) > 1
+        and len(selected_routes) < len(prior_legacy)
+        and len(selected_routes) <= reduced_vehicle_threshold
+    )
     refinement = require_tuple(payload[1], 4, "refinement") if payload[1] is not None else None
-    if refinement is None and elimination_selected:
-        raise RuntimeError("native three-lane fifth selected elimination omitted refinement")
+    if (refinement is None) == refinement_required:
+        raise RuntimeError(
+            "native three-lane fifth refinement presence diverged from its threshold"
+        )
     if refinement is None:
         refinement_event = None
     else:
@@ -9654,77 +9810,114 @@ def _decode_native_three_lane_fifth_general(
         )
 
     quality = require_tuple(payload[2], 4, "quality")
-    pool = require_tuple(quality[0], 5, "quality pool")
-    quality_plan_offsets = _require_vector(pool[0], "fifth general quality plans")
-    quality_route_offsets = _require_vector(pool[1], "fifth general quality routes")
-    quality_route_indices = _require_vector(pool[2], "fifth general quality indices")
-    change_offsets = _require_vector(pool[3], "fifth general quality changes")
-    change_indices = _require_vector(pool[4], "fifth general quality change indices")
-    quality_count = len(quality_plan_offsets) - 1
-    journal = require_tuple(quality[1], 4, "quality journal")
-    quality_statuses = _require_vector(journal[0], "fifth general quality statuses")
-    exact_deltas = _require_vector(journal[3], "fifth general quality exact deltas")
-    quality_outcome = cast(npt.NDArray[np.int64], quality[2])
-    if (
-        quality_count <= 0
-        or len(quality_statuses) != quality_count
-        or np.any(quality_statuses != 0)
-        or np.any(exact_deltas != 0)
-        or quality_outcome.tolist() != [-1, 0, 0, 0]
-        or int(quality_plan_offsets[0]) != 0
-        or int(quality_plan_offsets[-1]) != len(quality_route_offsets) - 1
-        or int(quality_route_offsets[0]) != 0
-        or int(quality_route_offsets[-1]) != len(quality_route_indices)
-        or len(change_offsets) != quality_count + 1
-    ):
-        raise RuntimeError("native three-lane fifth general quality journal is invalid")
+    quality_outcome = cast(
+        npt.NDArray[np.int64],
+        _require_array(
+            quality[2],
+            dtype=np.dtype(np.int64),
+            shape=(4,),
+            name="fifth general quality outcome",
+        ),
+    )
     quality_events: list[dict[str, object]] = []
-    for candidate in range(quality_count):
-        plan = tuple(
-            tuple(
-                node_names[int(index)]
-                for index in quality_route_indices[
-                    int(quality_route_offsets[route]) : int(quality_route_offsets[route + 1])
-                ]
-            )
-            for route in range(
-                int(quality_plan_offsets[candidate]),
-                int(quality_plan_offsets[candidate + 1]),
-            )
-        )
-        changes = change_indices[
-            int(change_offsets[candidate]) : int(change_offsets[candidate + 1])
-        ]
-        if len(changes) < 2:
-            raise RuntimeError("native three-lane fifth general quality change is invalid")
-        changed = tuple(int(index) for index in changes[:-1])
-        depth = int(changes[-1])
-        changed_sequences = tuple(plan[index] for index in changed)
-        rejection = None
-        for index in changed:
-            screen = screen_route_candidate(instance, plan[index], full=True)
-            if not screen.accepted:
-                rejection = screen
-                break
-        if rejection is None:
+    if quality[0] is None:
+        no_pool_state = unpack_state(quality[3], "quality no-pool state")
+        if (
+            quality[1] is not None
+            or quality_outcome.tolist() != [-1, 0, 0, 0]
+            or no_pool_state != prior_quality
+        ):
             raise RuntimeError(
-                "native three-lane fifth general quality rejection cannot be replayed"
+                "native three-lane fifth general quality no-pool is invalid: "
+                f"journal_present={quality[1] is not None}, "
+                f"outcome={quality_outcome.tolist()}, "
+                f"prior_routes={len(prior_quality)}, "
+                f"state_matches={no_pool_state == prior_quality}"
             )
         quality_events.append(
             event(
                 "ejection_chain",
-                "prefilter_rejected",
-                rejection.reason,
-                route_indices=changed,
-                affected_route_indices=changed,
-                candidate_customer_sequence=(
-                    changed_sequences[0] if len(changed_sequences) == 1 else ()
-                ),
-                candidate_route_sequences=changed_sequences,
-                chain_depth=depth,
-                selection_rank=candidate + 1,
+                "not_applicable" if len(prior_quality) <= 1 else "failed",
+                "only_one_route" if len(prior_quality) <= 1 else "no_feasible_candidate",
             )
         )
+    else:
+        pool = require_tuple(quality[0], 5, "quality pool")
+        quality_plan_offsets = _require_vector(pool[0], "fifth general quality plans")
+        quality_route_offsets = _require_vector(pool[1], "fifth general quality routes")
+        quality_route_indices = _require_vector(pool[2], "fifth general quality indices")
+        change_offsets = _require_vector(pool[3], "fifth general quality changes")
+        change_indices = _require_vector(pool[4], "fifth general quality change indices")
+        quality_count = len(quality_plan_offsets) - 1
+        journal = require_tuple(quality[1], 4, "quality journal")
+        quality_statuses = _require_vector(journal[0], "fifth general quality statuses")
+        exact_deltas = _require_vector(journal[3], "fifth general quality exact deltas")
+        if (
+            len(quality_statuses) != quality_count
+            or np.any(quality_statuses != 0)
+            or np.any(exact_deltas != 0)
+            or quality_outcome.tolist() != [-1, 0, 0, 0]
+            or int(quality_plan_offsets[0]) != 0
+            or int(quality_plan_offsets[-1]) != len(quality_route_offsets) - 1
+            or int(quality_route_offsets[0]) != 0
+            or int(quality_route_offsets[-1]) != len(quality_route_indices)
+            or len(change_offsets) != quality_count + 1
+        ):
+            raise RuntimeError("native three-lane fifth general quality journal is invalid")
+        if quality_count == 0:
+            quality_events.append(
+                event(
+                    "ejection_chain",
+                    "failed",
+                    "no_feasible_candidate",
+                )
+            )
+        for candidate in range(quality_count):
+            plan = tuple(
+                tuple(
+                    node_names[int(index)]
+                    for index in quality_route_indices[
+                        int(quality_route_offsets[route]) : int(quality_route_offsets[route + 1])
+                    ]
+                )
+                for route in range(
+                    int(quality_plan_offsets[candidate]),
+                    int(quality_plan_offsets[candidate + 1]),
+                )
+            )
+            changes = change_indices[
+                int(change_offsets[candidate]) : int(change_offsets[candidate + 1])
+            ]
+            if len(changes) < 2:
+                raise RuntimeError("native three-lane fifth general quality change is invalid")
+            changed = tuple(int(index) for index in changes[:-1])
+            depth = int(changes[-1])
+            changed_sequences = tuple(plan[index] for index in changed)
+            rejection = None
+            for index in changed:
+                screen = screen_route_candidate(instance, plan[index], full=True)
+                if not screen.accepted:
+                    rejection = screen
+                    break
+            if rejection is None:
+                raise RuntimeError(
+                    "native three-lane fifth general quality rejection cannot be replayed"
+                )
+            quality_events.append(
+                event(
+                    "ejection_chain",
+                    "prefilter_rejected",
+                    rejection.reason,
+                    route_indices=changed,
+                    affected_route_indices=changed,
+                    candidate_customer_sequence=(
+                        changed_sequences[0] if len(changed_sequences) == 1 else ()
+                    ),
+                    candidate_route_sequences=changed_sequences,
+                    chain_depth=depth,
+                    selection_rank=candidate + 1,
+                )
+            )
     if payload[3] is not None:
         raise RuntimeError("native three-lane fifth general ran an unscheduled constraint lane")
 
@@ -10821,9 +11014,7 @@ def _decode_native_three_lane_sixth_iteration(
         "_operator_native_candidate_route_sequences": (
             repaired_routes if candidate_feasible else ()
         ),
-        "_operator_native_candidate_objective_key": (
-            reported.key if reported is not None else ()
-        ),
+        "_operator_native_candidate_objective_key": (reported.key if reported is not None else ()),
         "_operator_native_accepted": accepted,
         "_operator_destroy_name": (destroy_names[int(metadata[1])] if operator_id == 1 else ""),
         "accepted": accepted,
@@ -13677,7 +13868,7 @@ def _decode_full_native_exact_journal(
     batches_value, producer_sha256 = payload
     if not isinstance(batches_value, tuple):
         raise RuntimeError("full native exact journal batches are invalid")
-    evidence = bytearray(b"stage05.2-native-exact-journal-v2")
+    evidence = bytearray(b"stage05.2-native-exact-journal-v3")
     lane_names = (
         "initialization",
         "legacy",
@@ -13715,7 +13906,7 @@ def _decode_full_native_exact_journal(
     events: list[Mapping[str, object]] = []
     total_routes = 0
     for batch_ordinal, batch_value in enumerate(batches_value):
-        if not isinstance(batch_value, tuple) or len(batch_value) != 12:
+        if not isinstance(batch_value, tuple) or len(batch_value) != 14:
             raise RuntimeError("full native exact journal batch is invalid")
         _append_native_nested_evidence(evidence, batch_value)
         context = cast(
@@ -13753,6 +13944,30 @@ def _decode_full_native_exact_journal(
                 name="full native exact journal canonical event IDs",
             ),
         )
+        physical_completion_order_array = _require_vector(
+            batch_value[12],
+            "full native exact journal physical completion order",
+        )
+        physical_completion_order = [int(value) for value in physical_completion_order_array]
+        physical_task_value = batch_value[13]
+        if (
+            not isinstance(physical_task_value, np.ndarray)
+            or physical_task_value.dtype != np.dtype(np.int64)
+            or physical_task_value.ndim != 2
+            or physical_task_value.shape[1] != 7
+            or not physical_task_value.flags.c_contiguous
+        ):
+            raise RuntimeError("full native exact journal physical task receipt array is invalid")
+        physical_task_receipts = cast(
+            npt.NDArray[np.int64],
+            physical_task_value,
+        )
+        task_rows = physical_task_receipts.tolist()
+        canonical_ids_are_zero = bool(np.all(canonical_event_ids == 0))
+        canonical_ids_are_strict = bool(
+            np.all(canonical_event_ids > 0)
+            and np.all(canonical_event_ids[:-1] < canonical_event_ids[1:])
+        )
         if (
             route_count <= 0
             or int(route_offsets[0]) != 0
@@ -13762,11 +13977,24 @@ def _decode_full_native_exact_journal(
             or np.any(route_indices >= len(native_runtime.context.node_names))
             or len(completion_order) != route_count
             or sorted(completion_order) != list(range(route_count))
+            or sorted(physical_completion_order) != list(range(route_count))
             or transaction_id < 0
-            or np.any(canonical_event_ids <= 0)
-            or np.any(canonical_event_ids[:-1] >= canonical_event_ids[1:])
+            or not (canonical_ids_are_zero or canonical_ids_are_strict)
         ):
             raise RuntimeError("full native exact journal route SoA is invalid")
+        expected_first = 0
+        for task_ordinal, row in enumerate(task_rows):
+            if (
+                row[0] != task_ordinal
+                or row[1] < -1
+                or row[2] != expected_first
+                or not row[2] < row[3] <= route_count
+                or not 0 <= row[4] <= row[5] <= row[6]
+            ):
+                raise RuntimeError("full native exact journal physical task receipt is invalid")
+            expected_first = row[3]
+        if task_rows and expected_first != route_count:
+            raise RuntimeError("full native exact journal physical task coverage is incomplete")
         try:
             lane = lane_by_id[int(context[0])]
             operator = operator_by_id[int(context[1])]
@@ -13846,11 +14074,28 @@ def _decode_full_native_exact_journal(
             {
                 "event_type": "parallel_batch",
                 "status": "native_complete",
-                "worker_count": 0,
+                "worker_count": len({row[1] for row in task_rows if row[1] >= 0}),
                 "worker_protocol": "full_solve_soa_v2",
                 "submission_order": list(range(route_count)),
-                "completion_order": completion_order,
+                "completion_order": physical_completion_order,
                 "merge_order": list(range(route_count)),
+                "semantic_completion_order": completion_order,
+                "physical_task_receipts": task_rows,
+                "physical_observation": (
+                    "unavailable"
+                    if not task_rows
+                    else (
+                        "precomputed_input"
+                        if all(
+                            row[1] == -1 and row[4] == row[5] == row[6] == 0 for row in task_rows
+                        )
+                        else (
+                            "native_caller_observed"
+                            if all(row[1] == -1 for row in task_rows)
+                            else "native_worker_observed"
+                        )
+                    )
+                ),
                 "customer_sequences": [list(sequence) for sequence in sequences],
                 "lane": lane,
                 "iteration": iteration,
@@ -13891,13 +14136,14 @@ def _decode_full_native_control_journal(
     Mapping[str, int],
     Mapping[str, int],
     Mapping[str, object],
+    NativeScreeningJournal,
 ]:
     """Validate committed candidate-plan decisions and cache lifecycle totals."""
 
     if not isinstance(payload, tuple) or len(payload) != 3:
         raise RuntimeError("full native control journal has an invalid envelope")
     batches_value, screening_payload, producer_sha256 = payload
-    if not isinstance(screening_payload, tuple) or len(screening_payload) != 13:
+    if not isinstance(screening_payload, tuple) or len(screening_payload) != 14:
         raise RuntimeError("full native screening payload is invalid")
     (
         screening_statistics_value,
@@ -13907,6 +14153,7 @@ def _decode_full_native_control_journal(
         screening_contexts_value,
         screening_route_offsets_value,
         screening_route_indices_value,
+        screening_outcome_ids_value,
         screening_codes_value,
         screening_metrics_value,
         screening_flags_value,
@@ -13916,7 +14163,7 @@ def _decode_full_native_control_journal(
     ) = screening_payload
     if not isinstance(batches_value, tuple):
         raise RuntimeError("full native control journal batches are invalid")
-    evidence = bytearray(b"stage05.2-native-control-journal-v2")
+    evidence = _StreamingSHA256Evidence(b"stage05.2-native-control-journal-v4")
     lane_names = ("initialization", "legacy", "quality_shadow", "constraint_lane")
     operator_names = (
         "initial_solution",
@@ -13953,7 +14200,7 @@ def _decode_full_native_control_journal(
     skipped_count = 0
     final_cache_statistics: npt.NDArray[np.int64] | None = None
     for batch_ordinal, batch_value in enumerate(batches_value):
-        if not isinstance(batch_value, tuple) or len(batch_value) != 14:
+        if not isinstance(batch_value, tuple) or len(batch_value) != 21:
             raise RuntimeError("full native control journal batch is invalid")
         _append_native_nested_evidence(evidence, batch_value)
         context = cast(
@@ -13965,6 +14212,18 @@ def _decode_full_native_control_journal(
                 name="full native control context",
             ),
         )
+        transaction_id_array = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                batch_value[1],
+                dtype=np.dtype(np.int64),
+                shape=(1,),
+                name="full native control transaction identity",
+            ),
+        )
+        transaction_id = int(transaction_id_array[0])
+        if transaction_id < 0:
+            raise RuntimeError("full native control transaction identity is invalid")
         try:
             lane = lane_by_id[int(context[0])]
             operator = operator_by_id[int(context[1])]
@@ -13974,9 +14233,9 @@ def _decode_full_native_control_journal(
             ) from error
         iteration = int(context[2])
         warm_start = lane == "initialization" and operator == "initial_solution"
-        plan_offsets = _require_vector(batch_value[1], "control plan offsets")
-        route_offsets = _require_vector(batch_value[2], "control route offsets")
-        route_indices = _require_vector(batch_value[3], "control route indices")
+        plan_offsets = _require_vector(batch_value[2], "control plan offsets")
+        route_offsets = _require_vector(batch_value[3], "control route offsets")
+        route_indices = _require_vector(batch_value[4], "control route indices")
         plan_count = len(plan_offsets) - 1
         route_count = len(route_offsets) - 1
         if (
@@ -13992,14 +14251,14 @@ def _decode_full_native_control_journal(
             or np.any(route_indices >= len(node_names))
         ):
             raise RuntimeError("full native control plan SoA is invalid")
-        ranked = _require_vector(batch_value[4], "control ranked plans")
-        selected = _require_vector(batch_value[5], "control selected plans")
-        decisions = _require_vector(batch_value[6], "control decision codes")
-        statuses = _require_vector(batch_value[7], "control plan statuses")
+        ranked = _require_vector(batch_value[5], "control ranked plans")
+        selected = _require_vector(batch_value[6], "control selected plans")
+        decisions = _require_vector(batch_value[7], "control decision codes")
+        statuses = _require_vector(batch_value[8], "control plan statuses")
         ranking_integer = cast(
             npt.NDArray[np.int64],
             _require_array(
-                batch_value[8],
+                batch_value[9],
                 dtype=np.dtype(np.int64),
                 shape=(plan_count, 2),
                 name="control ranking integer metrics",
@@ -14008,17 +14267,21 @@ def _decode_full_native_control_journal(
         ranking_float = cast(
             npt.NDArray[np.float64],
             _require_array(
-                batch_value[9],
+                batch_value[10],
                 dtype=np.dtype(np.float64),
                 shape=(plan_count,),
                 name="control ranking float metrics",
             ),
         )
-        resolutions = _require_vector(batch_value[10], "control route resolutions")
+        resolutions = _require_vector(batch_value[11], "control route resolutions")
+        cache_lookup_flags = _require_vector(batch_value[12], "control cache lookup flags")
+        cache_store_statuses = _require_vector(batch_value[13], "control cache store statuses")
+        cache_eviction_counts = _require_vector(batch_value[14], "control cache eviction counts")
+        cache_entry_bytes = _require_vector(batch_value[15], "control cache entry sizes")
         cache_statistics = cast(
             npt.NDArray[np.int64],
             _require_array(
-                batch_value[11],
+                batch_value[16],
                 dtype=np.dtype(np.int64),
                 shape=(11,),
                 name="control cache statistics",
@@ -14027,7 +14290,7 @@ def _decode_full_native_control_journal(
         budget_state = cast(
             npt.NDArray[np.int64],
             _require_array(
-                batch_value[12],
+                batch_value[17],
                 dtype=np.dtype(np.int64),
                 shape=(9,),
                 name="control budget state",
@@ -14036,23 +14299,62 @@ def _decode_full_native_control_journal(
         protocol_flags = cast(
             npt.NDArray[np.int64],
             _require_array(
-                batch_value[13],
+                batch_value[18],
                 dtype=np.dtype(np.int64),
-                shape=(4,),
+                shape=(5,),
                 name="control protocol flags",
+            ),
+        )
+        objective_integer = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                batch_value[19],
+                dtype=np.dtype(np.int64),
+                shape=(plan_count, 2),
+                name="control objective integer metrics",
+            ),
+        )
+        objective_float = cast(
+            npt.NDArray[np.float64],
+            _require_array(
+                batch_value[20],
+                dtype=np.dtype(np.float64),
+                shape=(plan_count, 2),
+                name="control objective float metrics",
             ),
         )
         if np.any((protocol_flags != 0) & (protocol_flags != 1)):
             raise RuntimeError("full native control protocol flags are invalid")
         implementation_internal = bool(protocol_flags[0])
+        reference_distance_resolution = bool(protocol_flags[4])
+        if reference_distance_resolution and not implementation_internal:
+            raise RuntimeError(
+                "full native reference-distance receipt is not implementation internal"
+            )
         if iteration < 0 and not (iteration == -1 and (warm_start or implementation_internal)):
             raise RuntimeError("full native control iteration is invalid")
+        public_iteration = None if iteration < 0 else iteration
         if (
             len(ranked) != plan_count
             or set(int(value) for value in ranked) != set(range(plan_count))
             or len(decisions) != plan_count
             or len(statuses) != plan_count
             or len(resolutions) != route_count
+            or np.any(resolutions < 0)
+            or np.any(resolutions > 3)
+            or len(cache_store_statuses) != route_count
+            or len(cache_eviction_counts) != route_count
+            or len(cache_entry_bytes) != route_count
+            or len(cache_lookup_flags) != route_count * (2 if warm_start else 1)
+            or np.any(cache_lookup_flags < -1)
+            or np.any(cache_lookup_flags > 1)
+            or np.any(cache_store_statuses < -1)
+            or np.any(cache_store_statuses > 2)
+            or np.any(cache_eviction_counts < 0)
+            or np.any(cache_entry_bytes < -1)
+            or np.any(cache_eviction_counts[cache_store_statuses != 0] != 0)
+            or np.any(cache_entry_bytes[cache_store_statuses < 0] != -1)
+            or np.any(cache_entry_bytes[cache_store_statuses >= 0] <= 0)
             or any(int(value) not in decision_status for value in decisions)
             or any(int(value) < 0 or int(value) >= plan_count for value in selected)
             or (
@@ -14073,20 +14375,6 @@ def _decode_full_native_control_journal(
             for route in range(route_count)
         )
         if warm_start:
-            for result in ("miss", "hit"):
-                for sequence in routes:
-                    events.append(
-                        {
-                            "event_type": "cache_event",
-                            "operation": "lookup",
-                            "result": result,
-                            "lane": lane,
-                            "iteration": None,
-                            "operator": operator,
-                            "customer_sequence": list(sequence),
-                            "batch_ordinal": batch_ordinal,
-                        }
-                    )
             events.append(
                 {
                     "event_type": "candidate_initial_solution",
@@ -14095,6 +14383,7 @@ def _decode_full_native_control_journal(
                     "iteration": None,
                     "operator": operator,
                     "customer_sequences": [list(sequence) for sequence in routes],
+                    "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
                 }
             )
@@ -14113,6 +14402,7 @@ def _decode_full_native_control_journal(
                     "customer_sequences": [list(sequence) for sequence in routes],
                     "proposal_ordinal": 0,
                     "transaction_status_code": int(statuses[0]),
+                    "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
                 }
             )
@@ -14136,40 +14426,84 @@ def _decode_full_native_control_journal(
                         "customer_sequences": [list(sequence) for sequence in sequences],
                         "proposal_ordinal": plan,
                         "transaction_status_code": int(statuses[plan]),
+                        "native_transaction_id": transaction_id,
                         "batch_ordinal": batch_ordinal,
                     }
                 )
-        if not warm_start:
-            for raw_plan in selected:
-                plan = int(raw_plan)
-                for route in range(int(plan_offsets[plan]), int(plan_offsets[plan + 1])):
-                    resolution = int(resolutions[route])
-                    if resolution == 0:
-                        continue
-                    events.append(
-                        {
-                            "event_type": "cache_event",
-                            "operation": "lookup",
-                            "result": "hit" if resolution == 1 else "miss",
-                            "lane": lane,
-                            "iteration": iteration,
-                            "operator": operator,
-                            "customer_sequence": list(routes[route]),
-                            "batch_ordinal": batch_ordinal,
-                        }
-                    )
+        elif reference_distance_resolution:
+            if plan_count != 1 or route_count != 1:
+                raise RuntimeError("full native reference-distance receipt has an invalid shape")
+            feasible = int(statuses[0]) == 5
+            events.append(
+                {
+                    "event_type": "reference_distance_resolution",
+                    "status": "feasible" if feasible else "infeasible",
+                    "lane": lane,
+                    "iteration": public_iteration,
+                    "operator": operator,
+                    "customer_sequence": list(routes[0]),
+                    "vehicle_count": int(objective_integer[0, 0]),
+                    "charging_count": int(objective_integer[0, 1]),
+                    "reference_distance": (float(objective_float[0, 0]) if feasible else None),
+                    "reference_charging_time": (float(objective_float[0, 1]) if feasible else None),
+                    "transaction_status_code": int(statuses[0]),
+                    "native_transaction_id": transaction_id,
+                    "batch_ordinal": batch_ordinal,
+                }
+            )
+        lookup_rows = range(route_count * 2) if warm_start else range(route_count)
+        for lookup_row in lookup_rows:
+            lookup_flag = int(cache_lookup_flags[lookup_row])
+            if lookup_flag < 0:
+                continue
+            route = lookup_row % route_count
+            events.append(
+                {
+                    "event_type": "cache_event",
+                    "operation": "lookup",
+                    "result": "hit" if lookup_flag == 1 else "miss",
+                    "lane": lane,
+                    "iteration": public_iteration,
+                    "operator": operator,
+                    "customer_sequence": list(routes[route]),
+                    "native_transaction_id": transaction_id,
+                    "batch_ordinal": batch_ordinal,
+                }
+            )
+        store_status_names = {0: "store", 1: "reconcile", 2: "oversize_not_cached"}
+        for route, raw_store_status in enumerate(cache_store_statuses):
+            store_status = int(raw_store_status)
+            if store_status < 0:
+                continue
+            events.append(
+                {
+                    "event_type": "cache_store_receipt",
+                    "status": store_status_names[store_status],
+                    "eviction_count": int(cache_eviction_counts[route]),
+                    "entry_bytes": int(cache_entry_bytes[route]),
+                    "lane": lane,
+                    "iteration": public_iteration,
+                    "operator": operator,
+                    "customer_sequence": list(routes[route]),
+                    "native_transaction_id": transaction_id,
+                    "batch_ordinal": batch_ordinal,
+                }
+            )
         events.append(
             {
                 "event_type": "candidate_cache_transaction",
                 "status": "committed",
                 "lane": lane,
-                "iteration": iteration,
+                "iteration": public_iteration,
                 "operator": operator,
-                "lookups": int(np.count_nonzero(resolutions)),
-                "hits": int(np.count_nonzero(resolutions == 1)),
-                "exact_stores": int(np.count_nonzero(resolutions == 2)),
+                "lookups": int(np.count_nonzero(cache_lookup_flags >= 0)),
+                "hits": int(np.count_nonzero(cache_lookup_flags == 1)),
+                "exact_stores": int(np.count_nonzero(cache_store_statuses == 0)),
                 "cache_statistics": cache_statistics.tolist(),
                 "budget_state": budget_state.tolist(),
+                "native_transaction_id": transaction_id,
+                "implementation_internal": implementation_internal,
+                "reference_distance_resolution": reference_distance_resolution,
                 "batch_ordinal": batch_ordinal,
             }
         )
@@ -14238,21 +14572,25 @@ def _decode_full_native_control_journal(
     screening_route_indices = _require_vector(
         screening_route_indices_value, "full native screening route indices"
     )
-    screening_codes = cast(
-        npt.NDArray[np.int64],
-        _require_array(
-            screening_codes_value,
-            dtype=np.dtype(np.int64),
-            shape=(screening_row_count, 16),
-            name="full native screening codes",
-        ),
+    screening_outcome_ids = _require_vector(
+        screening_outcome_ids_value, "full native screening outcome IDs"
     )
+    if (
+        not isinstance(screening_codes_value, np.ndarray)
+        or screening_codes_value.dtype != np.dtype(np.int64)
+        or screening_codes_value.ndim != 2
+        or screening_codes_value.shape[1] != 16
+        or not screening_codes_value.flags.c_contiguous
+    ):
+        raise RuntimeError("full native screening codes have an invalid schema")
+    screening_codes = cast(npt.NDArray[np.int64], screening_codes_value)
+    screening_outcome_count = screening_codes.shape[0]
     screening_metrics = cast(
         npt.NDArray[np.float64],
         _require_array(
             screening_metrics_value,
             dtype=np.dtype(np.float64),
-            shape=(screening_row_count, 15),
+            shape=(screening_outcome_count, 15),
             name="full native screening metrics",
         ),
     )
@@ -14275,16 +14613,20 @@ def _decode_full_native_control_journal(
         != int(screening_statistics_array[1] + screening_statistics_array[2])
         or int(screening_statistics_array[5])
         != int(screening_statistics_array[6] + screening_statistics_array[7])
-        or len(screening_route_offsets) != screening_row_count + 1
+        or len(screening_route_offsets) != screening_outcome_count + 1
         or int(screening_route_offsets[0]) != 0
         or int(screening_route_offsets[-1]) != len(screening_route_indices)
         or np.any(screening_route_offsets[:-1] > screening_route_offsets[1:])
         or np.any(screening_route_indices < 0)
         or np.any(screening_route_indices >= len(node_names))
+        or len(screening_outcome_ids) != screening_row_count
+        or screening_outcome_count <= 0
+        or np.any(screening_outcome_ids < 0)
+        or np.any(screening_outcome_ids >= screening_outcome_count)
         or np.any((screening_flags[:, :3] != 0) & (screening_flags[:, :3] != 1))
         or np.any(screening_flags[:, 3] < 0)
         or np.any(screening_transaction_ids < 0)
-        or np.any(screening_canonical_event_ids <= 0)
+        or np.any(screening_canonical_event_ids < 0)
         or screening_row_count != int(screening_statistics_array[0])
         or int(np.count_nonzero(screening_flags[:, 0] & screening_flags[:, 2]))
         != int(screening_statistics_array[5])
@@ -14292,96 +14634,53 @@ def _decode_full_native_control_journal(
         raise RuntimeError("full native screening statistics do not reconcile")
     for row in range(screening_row_count):
         try:
-            lane = lane_by_id[int(screening_contexts[row, 0])]
-            operator = operator_by_id[int(screening_contexts[row, 1])]
+            lane_by_id[int(screening_contexts[row, 0])]
+            operator_by_id[int(screening_contexts[row, 1])]
         except KeyError as error:
             raise RuntimeError(
                 "full native screening journal contains an unknown context ID"
             ) from error
-        check_count = int(screening_codes[row, 7])
+        outcome = int(screening_outcome_ids[row])
+        check_count = int(screening_codes[outcome, 7])
         if check_count < 0 or check_count > 8:
             raise RuntimeError("full native screening check count is invalid")
-        checks: list[dict[str, object]] = []
         for check_ordinal in range(check_count):
-            packed_check = int(screening_codes[row, 8 + check_ordinal])
+            packed_check = int(screening_codes[outcome, 8 + check_ordinal])
             check_code, status_code = divmod(packed_check, 10)
             if (
                 check_code not in _SCREEN_CHECK_BY_CODE
                 or status_code not in _SCREEN_CHECK_STATUS_BY_CODE
             ):
                 raise RuntimeError("full native screening check code is invalid")
-            checks.append(
-                {
-                    "check": _SCREEN_CHECK_BY_CODE[check_code],
-                    "status": _SCREEN_CHECK_STATUS_BY_CODE[status_code],
-                    "value": float(screening_metrics[row, 7 + check_ordinal]),
-                    "reason": screening_check_explanation(
-                        check_code,
-                        _SCREEN_CHECK_STATUS_BY_CODE[status_code],
-                        event_count=check_count,
-                    ),
-                }
-            )
-        reason_code = int(screening_codes[row, 1])
-        failed_check_code = int(screening_codes[row, 2])
+        reason_code = int(screening_codes[outcome, 1])
+        failed_check_code = int(screening_codes[outcome, 2])
         if reason_code not in SCREEN_REASON_BY_CODE or (
             failed_check_code != 0 and failed_check_code not in _SCREEN_CHECK_BY_CODE
         ):
             raise RuntimeError("full native screening outcome code is invalid")
-        sequence = tuple(
-            node_names[int(index)]
-            for index in screening_route_indices[
-                int(screening_route_offsets[row]) : int(screening_route_offsets[row + 1])
-            ]
-        )
-        accepted = bool(screening_codes[row, 0])
-        negative_cache_hit = bool(screening_flags[row, 1])
-        events.append(
-            {
-                "event_type": "screening_decision",
-                "status": (
-                    "pass"
-                    if accepted
-                    else "negative_cache_hit"
-                    if negative_cache_hit
-                    else "rejected"
-                ),
-                "lane": lane,
-                "iteration": int(screening_contexts[row, 2]),
-                "operator": operator,
-                "transaction_id": int(screening_transaction_ids[row]),
-                "canonical_event_id": int(screening_canonical_event_ids[row]),
-                "customer_sequence": list(sequence),
-                "first_failed_check": (_SCREEN_CHECK_BY_CODE.get(failed_check_code, "")),
-                "reason": SCREEN_REASON_BY_CODE[reason_code],
-                "checks": checks,
-                "demand": float(screening_metrics[row, 0]),
-                "min_time_window_slack": float(screening_metrics[row, 2]),
-                "distance_lower_bound": float(screening_metrics[row, 3]),
-                "distance_increment_lower_bound": (
-                    None
-                    if math.isnan(float(screening_metrics[row, 4]))
-                    else float(screening_metrics[row, 4])
-                ),
-                "single_segment_reachable": bool(screening_metrics[row, 6]),
-                "structural_energy_lower_bound": float(screening_metrics[row, 5]),
-                "negative_cache_hit": negative_cache_hit,
-                "exact_call_blocked": not accepted,
-                "physical_evaluated": bool(screening_flags[row, 0]),
-                "physical_owner": bool(screening_flags[row, 2]),
-                "reachability_queries": int(screening_flags[row, 3]),
-                "screening_ordinal": row,
-            }
-        )
     _append_native_nested_evidence(evidence, screening_payload)
     if (
         not isinstance(producer_sha256, str)
         or not _is_sha256(producer_sha256)
-        or hashlib.sha256(evidence).hexdigest() != producer_sha256
+        or evidence.hexdigest() != producer_sha256
     ):
         raise RuntimeError("full native control journal SHA-256 mismatch")
     if final_cache_statistics is None:
         raise RuntimeError("full native control journal contains no transactions")
+    screening_journal = NativeScreeningJournal(
+        node_names=node_names,
+        lane_by_id=dict(lane_by_id),
+        operator_by_id=dict(operator_by_id),
+        contexts=_readonly_borrow(screening_contexts),
+        route_offsets=_readonly_borrow(screening_route_offsets),
+        route_indices=_readonly_borrow(screening_route_indices),
+        outcome_ids=_readonly_borrow(screening_outcome_ids),
+        codes=_readonly_borrow(screening_codes),
+        metrics=_readonly_borrow(screening_metrics),
+        flags=_readonly_borrow(screening_flags),
+        transaction_ids=_readonly_borrow(screening_transaction_ids),
+        canonical_event_ids=_readonly_borrow(screening_canonical_event_ids),
+    )
     cache_names = (
         "cache_lookups",
         "cache_hits",
@@ -14419,6 +14718,17 @@ def _decode_full_native_control_journal(
             "screening_semantic_passes": int(screening_statistics_array[1]),
             "screening_semantic_rejections": int(screening_statistics_array[2]),
             "screening_semantic_event_count": screening_row_count,
+            "screening_journal_bytes": int(
+                screening_contexts.nbytes
+                + screening_route_offsets.nbytes
+                + screening_route_indices.nbytes
+                + screening_outcome_ids.nbytes
+                + screening_codes.nbytes
+                + screening_metrics.nbytes
+                + screening_flags.nbytes
+                + screening_transaction_ids.nbytes
+                + screening_canonical_event_ids.nbytes
+            ),
             "screening_physical_owner_count": int(
                 np.count_nonzero(screening_flags[:, 0] & screening_flags[:, 2])
             ),
@@ -14426,6 +14736,7 @@ def _decode_full_native_control_journal(
             "candidate_screening_occupancies": [int(value) for value in screening_occupancies],
             "candidate_screening_maximum_occupancy": int(np.max(screening_occupancies, initial=0)),
         },
+        screening_journal,
     )
 
 
@@ -14686,9 +14997,8 @@ def _decode_full_native_canonical_event_journal(
     if np.any(columns[6][~transaction_optional] < 0):
         raise RuntimeError("full native canonical transaction identity is missing")
     positive_transactions = [int(value) for value in columns[6] if int(value) >= 0]
-    unique_transactions = sorted(set(positive_transactions))
-    if unique_transactions != list(range(len(unique_transactions))):
-        raise RuntimeError("full native canonical transaction identity has gaps")
+    if 0 not in positive_transactions:
+        raise RuntimeError("full native canonical initialization transaction is missing")
     stream_counts = cast(
         npt.NDArray[np.int64],
         _require_array(
@@ -15073,6 +15383,108 @@ def _decode_native_initial_state_receipt(
     )
 
 
+def _decode_full_native_work_pool_statistics(
+    payload: object,
+    *,
+    expected_threads: int,
+    expected_receipt_path: Path | None,
+) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("full native work-pool receipt is missing")
+    common_fields = {
+        "schema_version",
+        "thread_count",
+        "maximum_pending_tasks",
+        "pending_tasks",
+        "active_tasks",
+        "peak_pending_tasks",
+        "peak_active_tasks",
+        "queue_full_count",
+        "rejected_count",
+        "completed_tasks",
+        "total_wait_seconds",
+        "maximum_wait_seconds",
+        "total_service_seconds",
+        "maximum_service_seconds",
+        "wait_histogram",
+        "service_histogram",
+        "task_receipt_dropped_count",
+        "task_receipts",
+    }
+    schema = payload.get("schema_version")
+    expected_fields = (
+        common_fields | {"task_receipt_capacity"}
+        if schema == "stage05.2-full-native-work-pool-v2"
+        else common_fields
+    )
+    if set(payload) != expected_fields or schema not in {
+        "stage05.2-full-native-work-pool-v2",
+        "stage05.2-full-native-work-pool-v3",
+    }:
+        raise RuntimeError("full native work-pool receipt schema is invalid")
+    if (schema == "stage05.2-full-native-work-pool-v3") != (expected_receipt_path is not None):
+        raise RuntimeError("full native work-pool receipt mode differs")
+    integer_fields = (
+        "thread_count",
+        "maximum_pending_tasks",
+        "pending_tasks",
+        "active_tasks",
+        "peak_pending_tasks",
+        "peak_active_tasks",
+        "queue_full_count",
+        "rejected_count",
+        "completed_tasks",
+    )
+    for field_name in integer_fields:
+        value = payload.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("full native work-pool counter is invalid")
+    if payload.get("thread_count") != expected_threads:
+        raise RuntimeError("full native work-pool thread count differs")
+    for field_name in (
+        "total_wait_seconds",
+        "maximum_wait_seconds",
+        "total_service_seconds",
+        "maximum_service_seconds",
+    ):
+        value = payload.get(field_name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise RuntimeError("full native work-pool timing is invalid")
+    for field_name in ("wait_histogram", "service_histogram"):
+        histogram = payload.get(field_name)
+        if (
+            not isinstance(histogram, list)
+            or len(histogram) != 32
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in histogram
+            )
+        ):
+            raise RuntimeError("full native work-pool histogram is invalid")
+    if any(
+        payload.get(field_name) != 0
+        for field_name in (
+            "pending_tasks",
+            "active_tasks",
+            "queue_full_count",
+            "rejected_count",
+        )
+    ):
+        raise RuntimeError("full native work-pool queue gate failed")
+    result = dict(payload)
+    result["task_receipts"] = validate_native_work_pool_task_receipts(
+        payload,
+        worker_threads=expected_threads,
+        expected_receipt_path=expected_receipt_path,
+    )
+    return result
+
+
 def execute_full_native_alns(
     instance: Instance,
     *,
@@ -15092,6 +15504,7 @@ def execute_full_native_alns(
     termination_mode: str,
     operator_profile: str,
     exact_call_budget: int | None = None,
+    task_receipt_path: str | None = None,
     dispatcher: Callable[..., object] | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> FullNativeALNSResult:
@@ -15113,6 +15526,10 @@ def execute_full_native_alns(
         raise ValueError("full native v2 requires screening and cache/incremental control")
     if deadline - clock() <= 0.0:
         raise RuntimeError("full native ALNS reached its deadline before dispatch")
+    if task_receipt_path is not None and (
+        not task_receipt_path or "\x00" in task_receipt_path or dispatcher is not None
+    ):
+        raise ValueError("full native task-receipt path is invalid for this dispatcher")
     context = native_runtime.context
     context.assert_matches(instance)
     ordered_names = sorted(context.node_names)
@@ -15193,7 +15610,7 @@ def execute_full_native_alns(
     from evrptw import _core as native_core
 
     native_entrypoint = native_core.full_native_alns_v2 if dispatcher is None else dispatcher
-    payload = native_entrypoint(
+    native_arguments = (
         context.node_kind,
         context.demand,
         context.ready_time,
@@ -15216,8 +15633,15 @@ def execute_full_native_alns(
         operator_integer,
         operator_float,
     )
-    if not isinstance(payload, tuple) or len(payload) != 14:
+    payload = (
+        native_entrypoint(*native_arguments, task_receipt_path or "")
+        if dispatcher is None
+        else native_entrypoint(*native_arguments)
+    )
+    if not isinstance(payload, tuple) or len(payload) not in {14, 15}:
         raise RuntimeError("full native ALNS returned an invalid payload tuple")
+    if len(payload) == 14 and dispatcher is None:
+        raise RuntimeError("full native ALNS work-pool receipt is missing")
     route_offsets = _require_vector(payload[0], "full native route offsets")
     route_indices = _require_vector(payload[1], "full native route indices")
     if (
@@ -15273,10 +15697,36 @@ def execute_full_native_alns(
         raise RuntimeError("full native ALNS returned with active native work")
     if int(timings_array[7]) not in (0, 1):
         raise RuntimeError("full native ALNS shared-pool telemetry is invalid")
-    if int(timings_array[8]) not in (1, 4, 24):
+    if not 1 <= int(timings_array[8]) <= 256:
         raise RuntimeError("full native ALNS work-pool size is invalid")
-    if int(timings_array[7]) == 1:
-        if int(timings_array[8]) != 24 or int(timings_array[9]) != 0:
+    shared_work_pool = int(timings_array[7]) == 1
+    work_pool_statistics = (
+        _decode_full_native_work_pool_statistics(
+            payload[14],
+            expected_threads=0 if shared_work_pool else int(timings_array[8]),
+            expected_receipt_path=(
+                Path(task_receipt_path) if task_receipt_path is not None else None
+            ),
+        )
+        if len(payload) == 15
+        else {
+            "schema_version": "stage05.2-test-dispatcher-work-pool-unavailable-v1",
+            "available": False,
+        }
+    )
+    if shared_work_pool:
+        if any(
+            work_pool_statistics.get(field) != 0
+            for field in (
+                "pending_tasks",
+                "active_tasks",
+                "peak_pending_tasks",
+                "peak_active_tasks",
+                "completed_tasks",
+            )
+        ):
+            raise RuntimeError("host scheduler client executed forbidden local work")
+        if int(timings_array[9]) != 0:
             raise RuntimeError("host scheduler thread topology is invalid")
         if int(timings_array[10]) <= 0:
             raise RuntimeError("host scheduler reported no remote kernel requests")
@@ -15284,7 +15734,7 @@ def execute_full_native_alns(
             raise RuntimeError("host scheduler reported no screening-batch requests")
         if int(timings_array[12]) != 1:
             raise RuntimeError("host scheduler did not own exactly one initial search state")
-        if not (1 <= int(timings_array[14]) <= int(timings_array[13]) <= 6):
+        if not (1 <= int(timings_array[14]) <= int(timings_array[13]) <= 64):
             raise RuntimeError("host scheduler global request concurrency telemetry is invalid")
         if int(timings_array[15]) != os.getpid():
             raise RuntimeError("host scheduler peer PID does not match the client")
@@ -15376,6 +15826,7 @@ def execute_full_native_alns(
         control_journal_statistics,
         route_cache_statistics,
         screening_statistics,
+        screening_journal,
     ) = _decode_full_native_control_journal(
         payload[10],
         node_names=context.node_names,
@@ -15502,6 +15953,7 @@ def execute_full_native_alns(
         candidate_work=candidate_work,
         route_results=route_results,
         control_journal_events=control_journal_events,
+        screening_journal=screening_journal,
         control_journal_sha256=control_journal_sha256,
         control_journal_statistics=control_journal_statistics,
         route_cache_statistics=route_cache_statistics,
@@ -15509,6 +15961,7 @@ def execute_full_native_alns(
         causal_journal=causal_journal,
         canonical_event_journal=canonical_event_journal,
         initial_state_receipt=initial_state_receipt,
+        work_pool_statistics=work_pool_statistics,
     )
 
 
@@ -15717,9 +16170,7 @@ def _execute_native_candidate_round(
         dtype=np.int64,
     )
 
-    from evrptw import _core as native_core
-
-    payload = native_core.candidate_round_transaction_v2(
+    payload = transaction_runtime.execute_native_round(
         context.node_kind,
         context.demand,
         context.ready_time,
@@ -16401,6 +16852,12 @@ class Stage052NativeExecutionConfig:
     failure_policy: str = "fail_fast_no_fallback"
     fallback_allowed: bool = False
     scheduler_socket_path: str | None = None
+    total_compute_threads: int | None = None
+    frozen_performance_profile_sha256: str | None = None
+    axis_cpu_ids: tuple[int, ...] = ()
+    scheduler_cpu_ids: tuple[int, ...] = ()
+    allow_affinity_overlap: bool = False
+    task_receipt_path: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.enabled:
@@ -16411,10 +16868,46 @@ class Stage052NativeExecutionConfig:
             raise ValueError(f"unsupported Stage 5.2 native execution mode {self.mode}")
         if self.shard_processes <= 0 or self.compute_threads_per_shard <= 0:
             raise ValueError("native execution topology counts must be positive")
-        if self.compute_thread_limit != 24:
-            raise ValueError("Stage 5.2 comparisons require exactly 24 compute threads")
-        if self.scheduler_threads != 24:
-            raise ValueError("the host scheduler requires exactly 24 scheduler threads")
+        if self.scheduler_threads <= 0:
+            raise ValueError("native scheduler thread count must be positive")
+        if self.frozen_performance_profile_sha256 is None:
+            if (
+                self.total_compute_threads is not None
+                or self.axis_cpu_ids
+                or self.scheduler_cpu_ids
+                or self.allow_affinity_overlap
+            ):
+                raise ValueError("dynamic affinity requires a frozen performance profile")
+            if self.compute_thread_limit != 24:
+                raise ValueError("legacy Stage 5.2 comparisons require exactly 24 compute threads")
+            if self.scheduler_threads != 24:
+                raise ValueError("the legacy host scheduler requires 24 threads")
+        else:
+            if type(self.total_compute_threads) is not int or self.total_compute_threads <= 0:
+                raise ValueError("profile-bound execution requires a positive total CPU budget")
+            profile_sha256 = self.frozen_performance_profile_sha256
+            if len(profile_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in profile_sha256
+            ):
+                raise ValueError("frozen performance profile SHA-256 is invalid")
+            self._validate_cpu_ids("axis", self.axis_cpu_ids, required=True)
+            if len(self.axis_cpu_ids) > self.total_compute_threads:
+                raise ValueError("axis CPU allocation exceeds the total CPU budget")
+            self._validate_cpu_ids(
+                "scheduler",
+                self.scheduler_cpu_ids,
+                required=self.mode == "host_scheduler",
+            )
+            if self.mode != "host_scheduler" and self.scheduler_cpu_ids:
+                raise ValueError("non-scheduler modes cannot allocate scheduler CPUs")
+            if self.mode == "host_scheduler":
+                if self.scheduler_threads != len(self.scheduler_cpu_ids):
+                    raise ValueError(
+                        "scheduler threads must equal the frozen scheduler CPU allocation"
+                    )
+                overlap = set(self.axis_cpu_ids).intersection(self.scheduler_cpu_ids)
+                if overlap and not self.allow_affinity_overlap:
+                    raise ValueError("frozen scheduler/client CPU allocations overlap")
         if self.control_channel != "unix_domain":
             raise ValueError("the host scheduler requires a Unix-domain control channel")
         if self.data_plane != "shared_memory_soa":
@@ -16423,6 +16916,11 @@ class Stage052NativeExecutionConfig:
             raise ValueError("native execution failures must not fall back")
         if self.scheduler_socket_path is not None and not self.scheduler_socket_path:
             raise ValueError("native scheduler socket path must be non-empty when supplied")
+        if self.task_receipt_path is not None:
+            if not self.task_receipt_path or "\x00" in self.task_receipt_path:
+                raise ValueError("native task-receipt path is invalid")
+            if self.mode == "host_scheduler":
+                raise ValueError("host scheduler owns its separate task-receipt target")
         if not self.candidate_control_config.enabled:
             raise ValueError("native execution requires enabled Candidate Control")
         if self.candidate_transaction_config.implementation_mode != "candidate_transaction":
@@ -16434,12 +16932,41 @@ class Stage052NativeExecutionConfig:
 
     @property
     def compute_thread_limit(self) -> int:
+        if self.total_compute_threads is not None:
+            return self.total_compute_threads
         return self.shard_processes * self.compute_threads_per_shard
+
+    @staticmethod
+    def _validate_cpu_ids(
+        label: str,
+        cpu_ids: tuple[int, ...],
+        *,
+        required: bool,
+    ) -> None:
+        if required and not cpu_ids:
+            raise ValueError(f"frozen {label} CPU allocation is empty")
+        if any(type(cpu_id) is not int or cpu_id < 0 for cpu_id in cpu_ids):
+            raise ValueError(f"frozen {label} CPU allocation is invalid")
+        if len(set(cpu_ids)) != len(cpu_ids):
+            raise ValueError(f"frozen {label} CPU allocation contains duplicates")
+
+    def validate_runtime_affinity(self, observed_cpu_ids: Sequence[int]) -> None:
+        """Fail if a profile-bound axis is not running on its frozen CPU set."""
+
+        if self.frozen_performance_profile_sha256 is None:
+            return
+        observed = tuple(observed_cpu_ids)
+        self._validate_cpu_ids("observed", observed, required=True)
+        if set(observed) != set(self.axis_cpu_ids):
+            raise RuntimeError("runtime CPU affinity differs from the frozen profile")
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
+        payload.pop("task_receipt_path")
+        payload["task_receipt_streaming_enabled"] = self.task_receipt_path is not None
         payload["worker_protocol"] = self.worker_protocol
         payload["compute_thread_limit"] = self.compute_thread_limit
+        payload["profile_bound"] = self.frozen_performance_profile_sha256 is not None
         return payload
 
 

@@ -6,6 +6,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(PYBIND11_FINDPYTHON ON)
 set(
+  _EVRPTW_EFFECTIVE_CXX_FLAGS
+  "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}"
+)
+string(
+  TOLOWER
+  "${_EVRPTW_EFFECTIVE_CXX_FLAGS}"
+  _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER
+)
+if(
+  _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "fast-math"
+  OR _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "(^|[ ;])-ofast([ ;]|$)"
+  OR _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "/fp:fast"
+)
+  message(
+    FATAL_ERROR
+    "fast-math and equivalent unsafe floating-point modes are forbidden"
+  )
+endif()
+set(
   EVRPTW_SANITIZER
   "none"
   CACHE STRING
@@ -15,6 +34,61 @@ set_property(
   CACHE EVRPTW_SANITIZER
   PROPERTY STRINGS none address-undefined thread
 )
+set(
+  EVRPTW_PERFORMANCE_PROFILE
+  "portable-o3"
+  CACHE STRING
+  "Native performance profile: portable-o3, portable-lto, or host-native-lto"
+)
+set_property(
+  CACHE EVRPTW_PERFORMANCE_PROFILE
+  PROPERTY STRINGS portable-o3 portable-lto host-native-lto
+)
+set(
+  _EVRPTW_PERFORMANCE_PROFILES
+  portable-o3
+  portable-lto
+  host-native-lto
+)
+if(NOT EVRPTW_PERFORMANCE_PROFILE IN_LIST _EVRPTW_PERFORMANCE_PROFILES)
+  message(
+    FATAL_ERROR
+    "EVRPTW_PERFORMANCE_PROFILE must be portable-o3, portable-lto, or host-native-lto"
+  )
+endif()
+set(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION 0)
+set(EVRPTW_BUILD_HOST_NATIVE 0)
+if(EVRPTW_PERFORMANCE_PROFILE MATCHES "-lto$")
+  if(NOT EVRPTW_SANITIZER STREQUAL "none")
+    message(
+      FATAL_ERROR
+      "LTO performance profiles cannot be combined with sanitizer builds"
+    )
+  endif()
+  include(CheckIPOSupported)
+  check_ipo_supported(
+    RESULT EVRPTW_IPO_SUPPORTED
+    OUTPUT EVRPTW_IPO_DIAGNOSTIC
+    LANGUAGES CXX
+  )
+  if(NOT EVRPTW_IPO_SUPPORTED)
+    message(FATAL_ERROR "LTO is unavailable: ${EVRPTW_IPO_DIAGNOSTIC}")
+  endif()
+  set(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION 1)
+endif()
+if(EVRPTW_PERFORMANCE_PROFILE STREQUAL "host-native-lto")
+  if(
+    NOT UNIX
+    OR APPLE
+    OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"
+  )
+    message(
+      FATAL_ERROR
+      "host-native-lto is restricted to Linux/WSL x86-64"
+    )
+  endif()
+  set(EVRPTW_BUILD_HOST_NATIVE 1)
+endif()
 option(
   EVRPTW_ALLOW_DIRTY_BUILD
   "Allow a development-only native build from a dirty tracked source tree"
@@ -197,6 +271,11 @@ set(EVRPTW_BUILD_ATTESTATION_DEFINITIONS
   EVRPTW_BUILD_SOURCE_DIRTY=${EVRPTW_BUILD_SOURCE_DIRTY}
   EVRPTW_BUILD_DEVELOPMENT_OVERRIDE=${EVRPTW_BUILD_DEVELOPMENT_OVERRIDE}
   EVRPTW_BUILD_CPP_SOURCE_KIND="${EVRPTW_BUILD_CPP_SOURCE_KIND}"
+  EVRPTW_BUILD_PERFORMANCE_PROFILE="${EVRPTW_PERFORMANCE_PROFILE}"
+  EVRPTW_BUILD_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+  EVRPTW_BUILD_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+  EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION=${EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION}
+  EVRPTW_BUILD_HOST_NATIVE=${EVRPTW_BUILD_HOST_NATIVE}
 )
 target_compile_definitions(_core PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS})
 if(TARGET _native_host_scheduler)
@@ -205,14 +284,30 @@ if(TARGET _native_host_scheduler)
   )
 endif()
 
+if(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION)
+  set_property(TARGET _core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  if(TARGET _native_host_scheduler)
+    set_property(
+      TARGET _native_host_scheduler
+      PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE
+    )
+  endif()
+endif()
+
 if(MSVC)
   target_compile_options(_core PRIVATE /O2)
 else()
   target_compile_options(_core PRIVATE -O3 -Wall -Wextra -Wpedantic)
+  if(EVRPTW_BUILD_HOST_NATIVE)
+    target_compile_options(_core PRIVATE -march=native)
+  endif()
   if(TARGET _native_host_scheduler)
     target_compile_options(
       _native_host_scheduler PRIVATE -O3 -Wall -Wextra -Wpedantic
     )
+    if(EVRPTW_BUILD_HOST_NATIVE)
+      target_compile_options(_native_host_scheduler PRIVATE -march=native)
+    endif()
   endif()
 endif()
 

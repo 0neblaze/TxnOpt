@@ -1,36 +1,53 @@
 from __future__ import annotations
 
+import copy
+import gc
 import hashlib
 import json
+import pickle
 import struct
 import subprocess
 import tracemalloc
 import zipfile
 from collections import Counter
-from dataclasses import asdict
+from collections.abc import Iterable
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
 
 from evrptw.alns import ALNSResult
+from evrptw.cache_incremental import RouteCacheKey, canonical_instance_hash
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
+    _axis_end_to_end_seconds,
+    _axis_payload_with_persistence,
     _canonical_semantic_events,
     _common_prefix,
+    _comparison_projection_from_selected,
     _comparison_semantic_events,
     _describe_first_divergence,
+    _external_semantic_trajectory,
     _load_axis_record,
+    _NativeCanonicalProjectionHasher,
     _raw_axis_inventory,
+    _relative_time_improvement,
+    _replay_canonical_journal,
     _replay_initial_state_receipt,
     _replay_physical_screening,
+    _replay_raw_native_control_journal,
     _replay_record,
     _review_build_attestation,
+    _review_mode_wave_resources,
+    _review_scheduler_runtime_statistics,
+    _RowEvidenceAccumulator,
     _scheduler_screening_occupancy,
     _semantic_trajectory,
+    _trajectory_row,
     load_records,
     render_report,
     review_records,
@@ -39,33 +56,55 @@ from evrptw.experiments.stage052_native_architecture_review import (
 from evrptw.experiments.stage052_native_architectures import (
     MODES,
     PAIRED_INSTANCES,
+    PREVIOUS_COMPARISON_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SEEDS,
     WARM_START_SCHEMA_VERSION,
+    ArchitectureAxisExecutionFailed,
     ArchitectureAxisTask,
     ArchitectureMode,
+    _assert_axis_publication_namespace_empty,
+    _assign_performance_topology,
     _canonical_semantic_event_sequence,
-    _canonical_semantic_streams,
     _canonical_trace_event,
+    _cgroup_counter_delta,
+    _cgroup_io_deltas,
+    _iter_semantic_candidate_trajectory,
+    _load_qualified_calibration_review,
+    _load_qualified_paired_review,
+    _performance_identity_blocks,
+    _persist_axis_terminal_transaction,
     _require_campaign_identity,
     _require_native_architecture_capabilities,
     _run_group,
+    _runtime_cgroup_snapshot,
     _semantic_candidate_trajectory,
     _solve_mode,
     _validate_native_build_attestation,
     _verify_installed_project_files,
     _write_signed_json,
+    _write_signed_json_with_receipt,
     build_axis_plan,
     expected_axis_count,
     load_warm_start_bundle,
+    performance_family_for_instance,
     rotated_modes,
     run_experiment,
     run_labels_for_scope,
 )
+from evrptw.measurement import canonical_route_key
 from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.neighborhoods import screen_route_candidate
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.stage052_performance import ExecutionTopology
+from evrptw.stage052_semantic_journal import (
+    evidence_json_value,
+    iter_canonical_semantic_events,
+    iter_verified_native_control_events,
+    iter_verified_semantic_journal,
+    write_semantic_journal,
+)
 from evrptw.validation import validate_routes
 from evrptw.warm_start import canonical_customer_sequences_sha256
 from tools.native_build_attestation import (
@@ -73,6 +112,783 @@ from tools.native_build_attestation import (
     committed_wheel_project_entries,
     committed_wheel_project_entry_sha256,
 )
+
+
+def test_signed_json_writer_is_durable_atomic_and_non_overwriting(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "axis.json"
+    observed_bytes, receipt = _write_signed_json_with_receipt(
+        path,
+        {"value": 1},
+    )
+
+    data = path.read_bytes()
+    sidecar = path.with_suffix(".json.sha256")
+    assert observed_bytes == len(data) + sidecar.stat().st_size
+    assert sidecar.read_text(encoding="ascii").strip() == hashlib.sha256(data).hexdigest()
+    assert receipt["schema_version"] == "stage05.2-signed-json-persistence-v2"
+    assert receipt["data_bytes"] == len(data)
+    assert receipt["sidecar_bytes"] == sidecar.stat().st_size
+    assert receipt["write_chunk_bytes"] == 512 * 1024
+    assert receipt["write_batch_count"] == 1
+    assert receipt["maximum_write_batch_bytes"] == len(data)
+    for field_name in (
+        "encoding_seconds",
+        "hash_seconds",
+        "write_seconds",
+        "fsync_seconds",
+        "atomic_publish_seconds",
+        "total_seconds",
+    ):
+        assert float(receipt[field_name]) >= 0.0
+    assert not tuple(tmp_path.glob("*.tmp-*"))
+    with pytest.raises(FileExistsError, match="already exists"):
+        _write_signed_json_with_receipt(path, {"value": 2})
+
+    large_path = tmp_path / "large-axis.json"
+    large_bytes, large_receipt = _write_signed_json_with_receipt(
+        large_path,
+        {"value": "x" * (1024 * 1024)},
+    )
+    assert large_bytes == (
+        large_path.stat().st_size + large_path.with_suffix(".json.sha256").stat().st_size
+    )
+    assert large_receipt["write_batch_count"] == 3
+    assert large_receipt["maximum_write_batch_bytes"] == 512 * 1024
+
+
+def test_external_semantic_trajectory_replays_operator_journal_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review_module
+
+    operator_event = {
+        "semantic_stream": "operator",
+        "runtime_event_id": 3,
+        "semantic_event_id": 2,
+        "semantic_sequence": 1,
+        "stream_ordinal": 0,
+        "iteration": 4,
+        "operator": "relocate",
+        "status": "candidate_proposed",
+        "candidate_route_sequences": [["C1", "C2"]],
+        "candidate_objective_key": [1, 10.0, 0.0, 0],
+        "_operator_native_candidate_feasible": True,
+        "native_telemetry": {"runtime_native_lane_id": 7},
+    }
+    aggregate_event = {
+        **operator_event,
+        "semantic_event_id": 3,
+        "status": "pair_prefilter_rejected_aggregate",
+        "aggregate_count": 17,
+    }
+    expected = _trajectory_row(operator_event, 0)
+    evidence = _RowEvidenceAccumulator()
+    evidence.append(expected)
+    descriptor = {
+        "schema_version": "stage05.2-external-semantic-trajectory-v1",
+        "source": "canonical_semantic_journal:operator",
+        **evidence.receipt(),
+    }
+    monkeypatch.setattr(
+        review_module,
+        "iter_verified_semantic_journal",
+        lambda _path, _descriptor: iter((operator_event, aggregate_event)),
+    )
+
+    assert _external_semantic_trajectory(
+        tmp_path / "axis.json",
+        {"canonical_semantic_journal": {"schema_version": "test"}},
+        descriptor,
+    ) == [expected]
+    with pytest.raises(RuntimeError, match="digest does not reconcile"):
+        _external_semantic_trajectory(
+            tmp_path / "axis.json",
+            {"canonical_semantic_journal": {"schema_version": "test"}},
+            {**descriptor, "sha256": "0" * 64},
+        )
+
+
+def test_run_mode_publishes_failed_axis_then_raises_fail_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    def fail_solve(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected axis failure")
+
+    monkeypatch.setattr(architectures, "_solve_mode", fail_solve)
+    labels = run_labels_for_scope("paired", 99)
+    task = ArchitectureAxisTask(
+        scope="paired",
+        repeat=0,
+        axis="fixed_work",
+        instance_name="c101C5",
+        seed=2014,
+        benchmark_dir=tmp_path,
+        output_root=tmp_path,
+        run_labels=labels,
+        scheduler_socket_path=str(tmp_path / "scheduler.sock"),
+        wheel_sha256="a" * 64,
+        native_sha256="b" * 64,
+        scheduler_sha256="c" * 64,
+        revision="d" * 40,
+        initial_customer_sequences=(),
+        initial_solution_provenance={},
+    )
+
+    with pytest.raises(ArchitectureAxisExecutionFailed) as captured:
+        architectures._run_mode(task, ArchitectureMode.CURRENT_STAGE052)
+
+    axis_path = Path(captured.value.axis_path)
+    assert axis_path.is_file()
+    assert json.loads(axis_path.read_text(encoding="utf-8"))["status"] == "failed"
+    assert axis_path.with_suffix(".json.sha256").is_file()
+    assert axis_path.with_suffix(".json.persistence").is_file()
+
+
+def test_axis_failure_is_pickle_safe_for_process_pool_transport() -> None:
+    original = ArchitectureAxisExecutionFailed(
+        "/evidence/failed-axis.json",
+        "RuntimeError",
+        "injected failure",
+    )
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert isinstance(restored, ArchitectureAxisExecutionFailed)
+    assert restored.axis_path == original.axis_path
+    assert restored.error_type == original.error_type
+    assert restored.error == original.error
+    assert str(restored) == str(original)
+
+
+def test_axis_end_to_end_uses_parent_terminal_and_independent_replay() -> None:
+    identity = {
+        "repeat": 1,
+        "axis": "fixed_work",
+        "instance": "c101_21",
+        "seed": 2014,
+    }
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        **identity,
+        "producer_pre_receipt_seconds": 2.0,
+    }
+    timing = {
+        **identity,
+        "subwave_index": 0,
+        "producer_parent_terminal_seconds": 2.4,
+    }
+    record = ReviewRecord(
+        Path("axis.json"),
+        payload,
+        {"axis_parent_terminal_timings": [timing]},
+    )
+
+    assert _axis_end_to_end_seconds(record, 0.3) == pytest.approx(2.7)
+
+    timing["producer_parent_terminal_seconds"] = 1.9
+    with pytest.raises(ValueError, match="omits producer publication"):
+        _axis_end_to_end_seconds(record, 0.3)
+
+
+def test_axis_terminal_publication_failure_rolls_back_every_created_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    axis_path = tmp_path / "axis.json"
+    bundle = axis_path.with_suffix(".semantic.bundle")
+    bundle.mkdir()
+    (bundle / "events.jsonl.gz").write_bytes(b"journal")
+    task_receipt = axis_path.with_suffix(axis_path.suffix + ".native-work-tasks.jsonl")
+    task_receipt.write_bytes(b"task\n")
+    task_sidecar = task_receipt.with_suffix(task_receipt.suffix + ".sha256")
+    task_sidecar.write_text("0" * 64 + "\n", encoding="ascii")
+    semantic = {
+        "path": bundle.name,
+        "bundle_bytes": sum(path.stat().st_size for path in bundle.iterdir()),
+        "persistence": {"formal_attributed_seconds": 0.1},
+    }
+
+    def fail_receipt(_path: Path, _payload: object) -> int:
+        raise OSError("injected terminal receipt failure")
+
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architectures._write_signed_json",
+        fail_receipt,
+    )
+    with pytest.raises(OSError, match="injected terminal receipt failure"):
+        _persist_axis_terminal_transaction(
+            path=axis_path,
+            payload={"status": "completed"},
+            semantic_journal=semantic,
+            task_receipt_path=task_receipt,
+            journal_persistence_seconds=0.1,
+            journal_persistence_wall_seconds=0.1,
+            startup_seconds=0.0,
+            axis_started=0.0,
+            created_targets={bundle, task_receipt, task_sidecar},
+        )
+
+    persistence = axis_path.with_suffix(axis_path.suffix + ".persistence")
+    assert not bundle.exists()
+    assert not task_receipt.exists()
+    assert not task_sidecar.exists()
+    assert not axis_path.exists()
+    assert not axis_path.with_suffix(axis_path.suffix + ".sha256").exists()
+    assert not persistence.exists()
+    assert not persistence.with_suffix(persistence.suffix + ".sha256").exists()
+
+
+def test_axis_terminal_collision_preserves_preexisting_evidence(
+    tmp_path: Path,
+) -> None:
+    axis_path = tmp_path / "axis.json"
+    axis_path.write_text("immutable-axis\n", encoding="utf-8")
+    axis_sidecar = axis_path.with_suffix(axis_path.suffix + ".sha256")
+    axis_sidecar.write_text("f" * 64 + "\n", encoding="ascii")
+    bundle = axis_path.with_suffix(".semantic.bundle")
+    bundle.mkdir()
+    (bundle / "events.jsonl.gz").write_bytes(b"new-journal")
+    task_receipt = axis_path.with_suffix(axis_path.suffix + ".native-work-tasks.jsonl")
+    task_receipt.write_bytes(b"new-task\n")
+    task_sidecar = task_receipt.with_suffix(task_receipt.suffix + ".sha256")
+    task_sidecar.write_text("0" * 64 + "\n", encoding="ascii")
+    semantic = {
+        "path": bundle.name,
+        "bundle_bytes": sum(path.stat().st_size for path in bundle.iterdir()),
+        "persistence": {"formal_attributed_seconds": 0.1},
+    }
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        _persist_axis_terminal_transaction(
+            path=axis_path,
+            payload={"status": "completed"},
+            semantic_journal=semantic,
+            task_receipt_path=task_receipt,
+            journal_persistence_seconds=0.1,
+            journal_persistence_wall_seconds=0.1,
+            startup_seconds=0.0,
+            axis_started=0.0,
+            created_targets={bundle, task_receipt, task_sidecar},
+        )
+
+    assert axis_path.read_text(encoding="utf-8") == "immutable-axis\n"
+    assert axis_sidecar.read_text(encoding="ascii") == "f" * 64 + "\n"
+    assert not bundle.exists()
+    assert not task_receipt.exists()
+    assert not task_sidecar.exists()
+
+
+def test_axis_namespace_preflight_preserves_preexisting_ancillary_evidence(
+    tmp_path: Path,
+) -> None:
+    axis_path = tmp_path / "axis.json"
+    bundle = axis_path.with_suffix(".semantic.bundle")
+    bundle.mkdir()
+    marker = bundle / "immutable"
+    marker.write_text("journal\n", encoding="utf-8")
+    task_receipt = axis_path.with_suffix(axis_path.suffix + ".native-work-tasks.jsonl")
+    task_receipt.write_text("task\n", encoding="utf-8")
+    task_sidecar = task_receipt.with_suffix(task_receipt.suffix + ".sha256")
+    task_sidecar.write_text("0" * 64 + "\n", encoding="ascii")
+
+    with pytest.raises(FileExistsError, match="namespace is not empty"):
+        _assert_axis_publication_namespace_empty(
+            axis_path,
+            task_receipt_path=task_receipt,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "journal\n"
+    assert task_receipt.read_text(encoding="utf-8") == "task\n"
+    assert task_sidecar.read_text(encoding="ascii") == "0" * 64 + "\n"
+
+
+def test_performance_gate_uses_fractional_time_saved_not_speedup() -> None:
+    assert _relative_time_improvement(85.0, 100.0) == pytest.approx(0.15)
+    assert _relative_time_improvement(86.0, 100.0) == pytest.approx(0.14)
+    assert 100.0 / 86.0 - 1.0 > 0.15
+    with pytest.raises(ValueError, match="positive finite"):
+        _relative_time_improvement(0.0, 100.0)
+
+
+def test_runtime_cgroup_snapshot_records_memory_io_and_event_deltas(
+    tmp_path: Path,
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    scope = cgroup_root / "stage052"
+    scope.mkdir(parents=True)
+    membership = tmp_path / "self.cgroup"
+    membership.write_text("0::/stage052\n", encoding="ascii")
+    (scope / "memory.current").write_text("100\n", encoding="ascii")
+    (scope / "memory.peak").write_text("200\n", encoding="ascii")
+    (scope / "memory.swap.current").write_text("0\n", encoding="ascii")
+    (scope / "memory.swap.peak").write_text("0\n", encoding="ascii")
+    (scope / "memory.events").write_text(
+        "low 1\nhigh 2\nmax 3\noom 4\noom_kill 5\n",
+        encoding="ascii",
+    )
+    (scope / "io.stat").write_text(
+        "8:0 rbytes=10 wbytes=20 rios=1 wios=2 dbytes=3 dios=4\n"
+        "8:16 rbytes=30 wbytes=40 rios=3 wios=4 dbytes=5 dios=6\n",
+        encoding="ascii",
+    )
+
+    before = _runtime_cgroup_snapshot(
+        cgroup_root=cgroup_root,
+        membership_path=membership,
+    )
+    assert before["status"] == "available"
+    assert before["memory_current_bytes"] == 100
+    assert before["memory_peak_bytes"] == 200
+    assert before["io"] == {
+        "read_bytes": 40,
+        "write_bytes": 60,
+        "read_operations": 4,
+        "write_operations": 6,
+        "discard_bytes": 8,
+        "discard_operations": 10,
+    }
+
+    (scope / "memory.events").write_text(
+        "low 1\nhigh 2\nmax 3\noom 4\noom_kill 6\n",
+        encoding="ascii",
+    )
+    after = _runtime_cgroup_snapshot(
+        cgroup_root=cgroup_root,
+        membership_path=membership,
+    )
+    assert _cgroup_counter_delta(before, after, "oom") == 0
+    assert _cgroup_counter_delta(before, after, "oom_kill") == 1
+    assert _cgroup_io_deltas(before, after) == {
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "read_operations": 0,
+        "write_operations": 0,
+        "discard_bytes": 0,
+        "discard_operations": 0,
+    }
+
+
+def test_runtime_cgroup_snapshot_marks_missing_membership_unavailable(
+    tmp_path: Path,
+) -> None:
+    snapshot = _runtime_cgroup_snapshot(
+        cgroup_root=tmp_path / "missing-cgroup",
+        membership_path=tmp_path / "missing-membership",
+    )
+    assert snapshot == {
+        "status": "unavailable",
+        "cgroup_path": "unavailable",
+    }
+
+
+def test_free_scheduler_topology_keeps_thread_budget_but_exposes_all_cpus() -> None:
+    task = ArchitectureAxisTask(
+        scope="paired",
+        repeat=0,
+        axis="fixed_work",
+        instance_name="c101C5",
+        seed=2014,
+        benchmark_dir=Path("/tmp/benchmarks"),
+        output_root=Path("/tmp/output"),
+        run_labels={mode.value: mode.value for mode in MODES},
+        scheduler_socket_path="/tmp/stage052.sock",
+        wheel_sha256="a" * 64,
+        native_sha256="b" * 64,
+        scheduler_sha256="c" * 64,
+        revision="d" * 40,
+        initial_customer_sequences=(("C1",),),
+        initial_solution_provenance={},
+    )
+    topology = ExecutionTopology(
+        workload_class="c5",
+        shards=((0, 1), (2, 3)),
+        worker_count=2,
+        request_threads=2,
+        affinity_policy="free_scheduler",
+    )
+    assigned = _assign_performance_topology(
+        task,
+        topology,
+        shard_index=0,
+        profile_sha256="e" * 64,
+        topology_key="per_solve_runtime:c5",
+    )
+    assert assigned.axis_cpu_ids == (0, 1, 2, 3)
+    assert assigned.threads_per_shard == 2
+    assert assigned.total_compute_threads == 4
+
+
+def _scheduler_runtime_statistics_fixture(tmp_path: Path) -> dict[str, object]:
+    histogram = [1, *([0] * 31)]
+    request_queue: dict[str, object] = {
+        "pending": 0,
+        "peak_pending": 1,
+        "queue_full_count": 0,
+        "rejected_count": 0,
+        "completed": 1,
+        "total_wait_seconds": 0.0,
+        "maximum_wait_seconds": 0.0,
+        "total_service_seconds": 0.0,
+        "maximum_service_seconds": 0.0,
+        "wait_histogram": histogram,
+        "service_histogram": histogram,
+    }
+    work_queue = {
+        **request_queue,
+        "active": 0,
+        "peak_active": 1,
+    }
+    quantiles = {
+        "wait_seconds": {"p50": 0.0, "p95": 0.0, "p99": 0.0},
+        "service_seconds": {"p50": 0.0, "p95": 0.0, "p99": 0.0},
+    }
+    receipt_path = tmp_path / "scheduler-task-receipts.jsonl"
+    task_row = (
+        '{"kind":"task","task_sequence":0,"worker_index":0,'
+        '"first_index":0,"last_index":1,'
+        '"submitted_nanoseconds":1,"started_nanoseconds":2,'
+        '"completed_nanoseconds":3}\n'
+    ).encode("ascii")
+    batch_sha256 = hashlib.sha256(task_row).hexdigest()
+    receipt_data = task_row + (
+        '{"kind":"batch","batch_ordinal":0,"row_count":1,'
+        '"first_task_sequence":0,"last_task_sequence":0,'
+        f'"sha256":"{batch_sha256}"}}\n'
+        '{"kind":"trailer",'
+        '"schema_version":"stage05.2-native-work-task-receipts-v3",'
+        '"storage_model":"bounded_async_fifo_stream",'
+        '"receipt_batch_capacity":4096,"queue_bound_batches":1,'
+        '"submitted_batches":1,"completed_batches":1,'
+        '"task_receipt_dropped_count":0,'
+        '"completed_tasks":1,"receipt_count":1}\n'
+    ).encode("ascii")
+    receipt_path.write_bytes(receipt_data)
+    receipt_sha256 = hashlib.sha256(receipt_data).hexdigest()
+    receipt_sidecar = receipt_path.with_suffix(receipt_path.suffix + ".sha256")
+    receipt_sidecar.write_text(receipt_sha256 + "\n", encoding="ascii")
+    return {
+        "schema_version": "stage05.2-native-scheduler-runtime-v3",
+        "worker_threads": 2,
+        "request_threads": 1,
+        "receipt_writer_threads": 1,
+        "peak_active_requests": 1,
+        "peak_distinct_client_pids": 1,
+        "request_queue": request_queue,
+        "work_queue": work_queue,
+        "latency_quantiles": {
+            "request_queue": quantiles,
+            "work_queue": quantiles,
+        },
+        "task_receipts": {
+            "schema_version": "stage05.2-native-work-task-receipts-v3",
+            "path": receipt_path.name,
+            "sha256": receipt_sha256,
+            "bytes": len(receipt_data),
+            "count": 1,
+            "storage_model": "bounded_async_fifo_stream",
+            "receipt_batch_capacity": 4_096,
+            "queue_bound_batches": 1,
+            "peak_queued_batches": 1,
+            "submitted_batches": 1,
+            "completed_batches": 1,
+            "dropped_count": 0,
+            "producer_wait_seconds": 0.0,
+            "writer_wall_seconds": 0.0,
+            "writer_cpu_seconds": 0.0,
+            "serialization_seconds": 0.0,
+            "write_seconds": 0.0,
+            "file_fsync_seconds": 0.0,
+            "atomic_publish_seconds": 0.0,
+            "parent_fsync_seconds": 0.0,
+            "sidecar_path": receipt_sidecar.name,
+            "sidecar_sha256": hashlib.sha256(receipt_sidecar.read_bytes()).hexdigest(),
+            "validated_worker_indices": [0],
+        },
+    }
+
+
+def test_reviewer_independently_replays_scheduler_queue_statistics(tmp_path: Path) -> None:
+    statistics = _scheduler_runtime_statistics_fixture(tmp_path)
+    _review_scheduler_runtime_statistics(
+        statistics,
+        worker_threads=2,
+        request_threads=1,
+        evidence_root=tmp_path,
+    )
+
+    request_queue = statistics["request_queue"]
+    assert isinstance(request_queue, dict)
+    request_queue["queue_full_count"] = 1
+    with pytest.raises(RuntimeError, match="queue resource gate"):
+        _review_scheduler_runtime_statistics(
+            statistics,
+            worker_threads=2,
+            request_threads=1,
+            evidence_root=tmp_path,
+        )
+
+
+def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
+    io_before = {
+        "read_bytes": 10,
+        "write_bytes": 20,
+        "read_operations": 1,
+        "write_operations": 2,
+        "discard_bytes": 0,
+        "discard_operations": 0,
+    }
+    io_after = {
+        "read_bytes": 15,
+        "write_bytes": 30,
+        "read_operations": 2,
+        "write_operations": 4,
+        "discard_bytes": 0,
+        "discard_operations": 0,
+    }
+    wave: dict[str, object] = {
+        "worker_process_lifecycle": "one_shard_per_spawned_process",
+        "worker_multiprocessing_start_method": "spawn",
+        "worker_max_tasks_per_child": 1,
+        "cgroup_before": {
+            "status": "available",
+            "cgroup_path": "/stage052",
+            "memory_current_bytes": 100,
+            "memory_peak_bytes": 200,
+            "memory_swap_current_bytes": 0,
+            "memory_swap_peak_bytes": 0,
+            "memory_events": {"oom": 0, "oom_kill": 0},
+            "io": io_before,
+        },
+        "cgroup_after": {
+            "status": "available",
+            "cgroup_path": "/stage052",
+            "memory_current_bytes": 150,
+            "memory_peak_bytes": 250,
+            "memory_swap_current_bytes": 0,
+            "memory_swap_peak_bytes": 0,
+            "memory_events": {"oom": 0, "oom_kill": 0},
+            "io": io_after,
+        },
+        "cgroup_memory_event_deltas": {"oom": 0, "oom_kill": 0},
+        "cgroup_io_deltas": {
+            "read_bytes": 5,
+            "write_bytes": 10,
+            "read_operations": 1,
+            "write_operations": 2,
+            "discard_bytes": 0,
+            "discard_operations": 0,
+        },
+        "memory_gate_bytes": 1_000,
+        "peak_aggregate_rss_bytes": 300,
+        "peak_aggregate_pss_bytes": 250,
+        "axis_count": 2,
+        "elapsed_seconds": 1.0,
+        "axes_per_hour": 7_200.0,
+        "effective_cores": 1.5,
+        "cpu_utilization_fraction_of_compute_limit": 0.75,
+        "compute_thread_limit": 2,
+        "process_tree_cpu_seconds": 1.5,
+        "thread_tree_status": "available",
+        "thread_tree": {
+            "status": "available",
+            "observation_capacity": 4096,
+            "observed_thread_identities": 1,
+            "sample_missed_processes": 0,
+            "unresolved_thread_observation_count": 0,
+            "unresolved_thread_ids": [],
+            "user_cpu_seconds": 0.25,
+            "system_cpu_seconds": 0.05,
+            "counters": {
+                "voluntary_context_switches": 3,
+                "involuntary_context_switches": 1,
+                "minor_faults": 2,
+                "major_faults": 0,
+                "schedstat_runtime_ns": 1,
+                "schedstat_runqueue_delay_ns": 2,
+                "schedstat_timeslices": 3,
+                "cpu_migrations": 1,
+            },
+            "affinity_union": [0, 1],
+            "affinity_intersection": [0, 1],
+        },
+        "thread_metrics": [
+            {
+                "pid": 1,
+                "process_create_time": 1.0,
+                "tid": 1,
+                "thread_start_time_ticks": 1,
+                "sample_count": 2,
+                "cpu_baseline_source": "monitor_start",
+                "user_cpu_seconds": 0.25,
+                "system_cpu_seconds": 0.05,
+                "counters": {
+                    "voluntary_context_switches": 3,
+                    "involuntary_context_switches": 1,
+                    "minor_faults": 2,
+                    "major_faults": 0,
+                    "schedstat_runtime_ns": 1,
+                    "schedstat_runqueue_delay_ns": 2,
+                    "schedstat_timeslices": 3,
+                    "cpu_migrations": 1,
+                },
+                "last_affinity": [0, 1],
+            }
+        ],
+        "monitor_start_boot_time_ticks": 1,
+        "thread_tree_user_cpu_seconds": 0.25,
+        "thread_tree_system_cpu_seconds": 0.05,
+        "thread_affinity_union": [0, 1],
+        "thread_affinity_intersection": [0, 1],
+        "thread_tree_schedstat": {
+            "runtime_ns": 1,
+            "runqueue_delay_ns": 2,
+            "timeslices": 3,
+        },
+        "thread_tree_context_switches": 4,
+        "thread_tree_cpu_migrations": 1,
+        "thread_tree_minor_faults": 2,
+        "thread_tree_major_faults": 0,
+    }
+    _review_mode_wave_resources(wave)
+
+    thread_tree = cast(dict[str, object], wave["thread_tree"])
+    counters = cast(dict[str, int], thread_tree["counters"])
+    counters["cpu_migrations"] += 1
+    with pytest.raises(RuntimeError, match="aggregates do not replay"):
+        _review_mode_wave_resources(wave)
+    counters["cpu_migrations"] -= 1
+
+    after = wave["cgroup_after"]
+    assert isinstance(after, dict)
+    after["memory_swap_peak_bytes"] = 1
+    with pytest.raises(RuntimeError, match="swap gate"):
+        _review_mode_wave_resources(wave)
+
+
+def _streaming_evidence_digest(rows: Iterable[object]) -> dict[str, object]:
+    digest = hashlib.sha256(b"stage05.2-test-streaming-evidence-v1")
+    count = 0
+    for row in rows:
+        encoded = json.dumps(
+            evidence_json_value(row),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        digest.update(struct.pack("<Q", len(encoded)))
+        digest.update(encoded)
+        count += 1
+    return {"count": count, "sha256": digest.hexdigest()}
+
+
+def _paired_semantic_snapshot(
+    result: ALNSResult,
+    axis_path: Path,
+    *,
+    compare_raw_neighborhood: bool = True,
+    journal_round_trip: bool = False,
+) -> dict[str, object]:
+    selected_names = (
+        "candidate_state",
+        "stage04",
+        "exact_result",
+        "deadline",
+        "termination",
+        "native_failure",
+    )
+    selected: dict[str, list[dict[str, object]]] = {name: [] for name in selected_names}
+    if journal_round_trip:
+        journal = write_semantic_journal(axis_path, result)
+        canonical_events = iter_verified_semantic_journal(axis_path, journal)
+    else:
+        canonical_events = iter_canonical_semantic_events(result)
+    for event in canonical_events:
+        stream_name = event.get("semantic_stream")
+        if isinstance(stream_name, str) and stream_name in selected:
+            selected[stream_name].append(event)
+    semantic_trajectory = list(_iter_semantic_candidate_trajectory(result))
+    comparison_projection = _comparison_projection_from_selected(
+        {"semantic_trajectory": semantic_trajectory},
+        selected,
+    )
+    snapshot: dict[str, object] = {
+        "feasible": result.feasible,
+        "customer_sequences": result.customer_sequences,
+        "objective": None if result.objective is None else result.objective.key,
+        "iterations": result.iterations,
+        "effective_iterations": result.effective_iterations,
+        "termination_reason": result.termination_reason,
+        "exact_started_calls": result.exact_started_calls,
+        "exact_completed_calls": result.exact_completed_calls,
+        "candidate_work_hash": result.candidate_work_hash,
+        "route_result_hash": result.route_result_hash,
+        "stage04_statistics": result.stage04_statistics,
+        "stage04_weight_history": _streaming_evidence_digest(result.stage04_weight_history),
+        "stage04_event_log": _streaming_evidence_digest(result.stage04_event_log),
+        "semantic_trajectory": _streaming_evidence_digest(semantic_trajectory),
+        "canonical_semantic_projection": comparison_projection,
+    }
+    if compare_raw_neighborhood:
+        snapshot["neighborhood_statistics"] = result.neighborhood_statistics
+        snapshot["neighborhood_events"] = _streaming_evidence_digest(result.neighborhood_events)
+    return snapshot
+
+
+def _release_result_runtime_semantic_storage(result: ALNSResult) -> None:
+    trace = result.measurement_trace
+    if trace is not None:
+        trace.release_runtime_semantic_storage()
+
+
+def _assert_paired_semantic_snapshots(
+    python_snapshot: dict[str, object],
+    native_snapshot: dict[str, object],
+) -> None:
+    if native_snapshot == python_snapshot:
+        return
+    changed_fields: dict[str, object] = {}
+    for key in python_snapshot.keys() | native_snapshot.keys():
+        python_value = python_snapshot.get(key)
+        native_value = native_snapshot.get(key)
+        if python_value == native_value:
+            continue
+        if key == "canonical_semantic_projection":
+            assert isinstance(python_value, list)
+            assert isinstance(native_value, list)
+            first_difference = next(
+                (
+                    (index, python_row, native_row)
+                    for index, (python_row, native_row) in enumerate(
+                        zip(python_value, native_value, strict=False)
+                    )
+                    if python_row != native_row
+                ),
+                None,
+            )
+            changed_fields[key] = {
+                "python_count": len(python_value),
+                "native_count": len(native_value),
+                "first_difference": first_difference,
+            }
+        else:
+            changed_fields[key] = {
+                "python": python_value,
+                "native": native_value,
+            }
+    pytest.fail(
+        json.dumps(
+            {"changed_fields": changed_fields},
+            sort_keys=True,
+            default=str,
+        )
+    )
 
 
 @pytest.mark.external_data
@@ -119,42 +935,56 @@ def test_full_native_first_twelve_rounds_match_python_candidate_control(
         ArchitectureMode.PYTHON_CANDIDATE_CONTROL,
         task,
     )
-    native_result, *_ = architectures._solve_mode(
-        ArchitectureMode.FULL_NATIVE_ALNS,
-        task,
-    )
-
-    assert native_result.exact_started_calls == python_result.exact_started_calls, (
-        python_result.exact_started_calls,
-        native_result.exact_started_calls,
-        tuple(
-            (
-                event.get("iteration"),
-                event.get("operator"),
-                len(event.get("sequences", [])),
-                event.get("sequences", [])[:1],
+    try:
+        native_result, *_ = architectures._solve_mode(
+            ArchitectureMode.FULL_NATIVE_ALNS,
+            task,
+        )
+        try:
+            assert native_result.exact_started_calls == python_result.exact_started_calls, (
+                python_result.exact_started_calls,
+                native_result.exact_started_calls,
+                tuple(
+                    (
+                        event.get("iteration"),
+                        event.get("operator"),
+                        len(event.get("sequences", [])),
+                        event.get("sequences", [])[:1],
+                    )
+                    for event in python_result.candidate_work_events
+                ),
+                tuple(
+                    (
+                        event.get("iteration"),
+                        event.get("operator"),
+                        len(event.get("sequences", [])),
+                        event.get("sequences", [])[:1],
+                    )
+                    for event in native_result.candidate_work_events
+                ),
             )
-            for event in python_result.candidate_work_events
-        ),
-        tuple(
-            (
-                event.get("iteration"),
-                event.get("operator"),
-                len(event.get("sequences", [])),
-                event.get("sequences", [])[:1],
+            assert _semantic_candidate_trajectory(native_result) == (
+                _semantic_candidate_trajectory(python_result)
             )
-            for event in native_result.candidate_work_events
-        ),
-    )
-    assert _semantic_candidate_trajectory(native_result) == (
-        _semantic_candidate_trajectory(python_result)
-    )
-    assert native_result.candidate_work_events == python_result.candidate_work_events, (
-        python_result.candidate_work_events,
-        native_result.candidate_work_events,
-    )
-    assert native_result.route_result_events == python_result.route_result_events
-    assert native_result.neighborhood_events == python_result.neighborhood_events
+            assert native_result.candidate_work_events == (python_result.candidate_work_events), (
+                python_result.candidate_work_events,
+                native_result.candidate_work_events,
+            )
+            assert native_result.route_result_events == python_result.route_result_events
+            assert native_result.neighborhood_events == python_result.neighborhood_events
+            assert _paired_semantic_snapshot(
+                native_result,
+                tmp_path / "twelve-round-native.json",
+                journal_round_trip=True,
+            ) == _paired_semantic_snapshot(
+                python_result,
+                tmp_path / "twelve-round-python.json",
+                journal_round_trip=True,
+            )
+        finally:
+            _release_result_runtime_semantic_storage(native_result)
+    finally:
+        _release_result_runtime_semantic_storage(python_result)
 
 
 @pytest.mark.external_data
@@ -196,224 +1026,32 @@ def test_paired_runner_full_native_replays_real_worker_count_four_axis(
         ArchitectureMode.PYTHON_CANDIDATE_CONTROL,
         task,
     )
+    try:
+        python_snapshot = _paired_semantic_snapshot(
+            python_result,
+            tmp_path / "python-candidate-control.json",
+            compare_raw_neighborhood=False,
+        )
+    finally:
+        _release_result_runtime_semantic_storage(python_result)
+    python_result = None
+    gc.collect()
     native_result, _native_seconds, _native_topology = _solve_mode(
         ArchitectureMode.FULL_NATIVE_ALNS,
         task,
     )
-
-    assert native_result.feasible and python_result.feasible
-    assert (
-        native_result.stage04_statistics["initial_temperature"]
-        == (python_result.stage04_statistics["initial_temperature"])
-    )
-    python_trajectory = _semantic_candidate_trajectory(python_result)
-    native_trajectory = _semantic_candidate_trajectory(native_result)
-    first_trajectory_difference = next(
-        (
-            (index, python_item, native_item)
-            for index, (python_item, native_item) in enumerate(
-                zip(python_trajectory, native_trajectory, strict=False)
-            )
-            if python_item != native_item
-        ),
-        None,
-    )
-    if native_trajectory != python_trajectory:
-        first_work_difference = next(
-            (
-                (index, python_item, native_item)
-                for index, (python_item, native_item) in enumerate(
-                    zip(
-                        python_result.candidate_work_events,
-                        native_result.candidate_work_events,
-                        strict=False,
-                    )
-                )
-                if python_item != native_item
-            ),
-            None,
+    try:
+        native_snapshot = _paired_semantic_snapshot(
+            native_result,
+            tmp_path / "full-native-alns.json",
+            compare_raw_neighborhood=False,
         )
-        diagnostic = {
-                "first_work_difference": first_work_difference,
-                "trajectory_lengths": {
-                "python": len(python_trajectory),
-                "native": len(native_trajectory),
-            },
-            "results": {
-                "python": {
-                    "iterations": python_result.iterations,
-                    "effective_iterations": python_result.effective_iterations,
-                    "termination_reason": python_result.termination_reason,
-                    "exact_started": python_result.exact_started_calls,
-                    "exact_completed": python_result.exact_completed_calls,
-                    "candidate_work_events": len(python_result.candidate_work_events),
-                    "route_result_events": len(python_result.route_result_events),
-                },
-                "native": {
-                    "iterations": native_result.iterations,
-                    "effective_iterations": native_result.effective_iterations,
-                    "termination_reason": native_result.termination_reason,
-                    "exact_started": native_result.exact_started_calls,
-                    "exact_completed": native_result.exact_completed_calls,
-                    "candidate_work_events": len(native_result.candidate_work_events),
-                    "route_result_events": len(native_result.route_result_events),
-                },
-            },
-            "boundary": {
-                "python_next": (
-                    python_trajectory[len(native_trajectory)]
-                    if len(native_trajectory) < len(python_trajectory)
-                    else None
-                ),
-                "native_next": (
-                    native_trajectory[len(python_trajectory)]
-                    if len(python_trajectory) < len(native_trajectory)
-                    else None
-                ),
-                "python_last": python_trajectory[-1] if python_trajectory else None,
-                "native_last": native_trajectory[-1] if native_trajectory else None,
-            },
-            "first_difference": (
-                None
-                if first_trajectory_difference is None
-                else {
-                    "index": first_trajectory_difference[0],
-                    "python_iteration": first_trajectory_difference[1].get("iteration"),
-                    "native_iteration": first_trajectory_difference[2].get("iteration"),
-                    "python_event": first_trajectory_difference[1],
-                    "native_event": first_trajectory_difference[2],
-                    "changed_fields": {
-                        key: {
-                            "python": first_trajectory_difference[1].get(key),
-                            "native": first_trajectory_difference[2].get(key),
-                        }
-                        for key in (
-                            first_trajectory_difference[1].keys()
-                            | first_trajectory_difference[2].keys()
-                        )
-                        if first_trajectory_difference[1].get(key)
-                        != first_trajectory_difference[2].get(key)
-                    },
-                }
-            ),
-        }
-        pytest.fail(json.dumps(diagnostic, sort_keys=True, default=str))
-    assert native_result.stage04_weight_history == python_result.stage04_weight_history
-    assert native_result.customer_sequences == python_result.customer_sequences, (
-        python_result.objective,
-        native_result.objective,
-        python_result.exact_started_calls,
-        native_result.exact_started_calls,
-    )
-    assert native_result.objective == python_result.objective
-    first_neighborhood_difference = next(
-        (
-            (index, python_item, native_item)
-            for index, (python_item, native_item) in enumerate(
-                zip(
-                    python_result.neighborhood_events,
-                    native_result.neighborhood_events,
-                    strict=False,
-                )
-            )
-            if python_item != native_item
-        ),
-        None,
-    )
-    if native_result.neighborhood_events != python_result.neighborhood_events:
+    finally:
+        _release_result_runtime_semantic_storage(native_result)
+    native_result = None
+    gc.collect()
 
-        def legacy_operators(result: ALNSResult) -> list[tuple[int, tuple[str, ...]]]:
-            return [
-                (
-                    iteration,
-                    tuple(
-                        dict.fromkeys(
-                            str(item["operator"])
-                            for item in result.neighborhood_events
-                            if item["iteration"] == iteration and item["track"] == "legacy"
-                        )
-                    ),
-                )
-                for iteration in range(12)
-            ]
-
-        pytest.fail(
-            f"first={first_neighborhood_difference[0] if first_neighborhood_difference else None}\n"
-            f"python={legacy_operators(python_result)}\n"
-            f"native={legacy_operators(native_result)}"
-        )
-    first_work_difference = next(
-        (
-            (index, python_item, native_item)
-            for index, (python_item, native_item) in enumerate(
-                zip(
-                    python_result.candidate_work_events,
-                    native_result.candidate_work_events,
-                    strict=False,
-                )
-            )
-            if python_item != native_item
-        ),
-        None,
-    )
-    if native_result.candidate_work_hash != python_result.candidate_work_hash:
-
-        def work_summary(items: tuple[dict[str, object], ...]) -> str:
-            return "\n".join(
-                f"{index}: iteration={item.get('iteration')}, "
-                f"operator={item.get('operator')}, "
-                f"sha={hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()}"
-                for index, item in enumerate(items)
-            )
-
-        pytest.fail(
-            "candidate work differs at "
-            f"{first_work_difference!r}\n"
-            f"python:\n{work_summary(python_result.candidate_work_events)}\n"
-            f"native:\n{work_summary(native_result.candidate_work_events)}"
-        )
-    assert native_result.route_result_hash == python_result.route_result_hash
-    assert native_result.exact_started_calls == python_result.exact_started_calls
-    assert native_result.exact_completed_calls == python_result.exact_completed_calls
-    assert native_result.neighborhood_statistics == python_result.neighborhood_statistics
-    assert native_result.stage04_statistics == python_result.stage04_statistics
-    assert native_result.stage04_event_log == python_result.stage04_event_log
-
-    def comparison_events(result: ALNSResult) -> list[object]:
-        streams = _canonical_semantic_streams(result)
-        return list(
-            _comparison_semantic_events(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "canonical_semantic_streams": streams,
-                    "canonical_semantic_events": _canonical_semantic_event_sequence(streams),
-                    "semantic_trajectory": _semantic_candidate_trajectory(result),
-                }
-            )
-        )
-
-    native_comparison = comparison_events(native_result)
-    python_comparison = comparison_events(python_result)
-    if native_comparison != python_comparison:
-        first_comparison_difference = next(
-            (
-                (index, python_item, native_item)
-                for index, (python_item, native_item) in enumerate(
-                    zip(python_comparison, native_comparison, strict=False)
-                )
-                if python_item != native_item
-            ),
-            None,
-        )
-        pytest.fail(
-            json.dumps(
-                {
-                    "first_difference": first_comparison_difference,
-                },
-                sort_keys=True,
-                default=str,
-            )
-        )
+    _assert_paired_semantic_snapshots(python_snapshot, native_snapshot)
 
 
 @pytest.mark.external_data
@@ -457,46 +1095,40 @@ def test_paired_runner_per_solve_replays_worker_count_four_axis(
         ArchitectureMode.PYTHON_CANDIDATE_CONTROL,
         task,
     )
+    try:
+        python_snapshot = _paired_semantic_snapshot(
+            python_result,
+            tmp_path / "python-candidate-control.json",
+            compare_raw_neighborhood=False,
+        )
+    finally:
+        _release_result_runtime_semantic_storage(python_result)
+    python_result = None
+    gc.collect()
     native_result, _native_seconds, _native_topology = _solve_mode(
         ArchitectureMode.PER_SOLVE_RUNTIME,
         task,
     )
-
-    assert native_result.feasible and python_result.feasible
-    assert native_result.customer_sequences == python_result.customer_sequences
-    assert native_result.objective == python_result.objective
-    assert _semantic_candidate_trajectory(native_result) == (
-        _semantic_candidate_trajectory(python_result)
-    )
-
-    def comparison_events(result: ALNSResult) -> list[object]:
-        streams = _canonical_semantic_streams(result)
-        return list(
-            _comparison_semantic_events(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "canonical_semantic_streams": streams,
-                    "canonical_semantic_events": _canonical_semantic_event_sequence(streams),
-                    "semantic_trajectory": _semantic_candidate_trajectory(result),
-                }
-            )
+    try:
+        pair_pruning_events = [
+            event
+            for event in native_result.neighborhood_events
+            if event["status"] == "pair_prefilter_rejected_aggregate"
+        ]
+        assert all(int(event["aggregate_count"]) > 0 for event in pair_pruning_events)
+        assert all(len(str(event["candidate_pool_hash"])) == 64 for event in pair_pruning_events)
+        assert native_result.native_execution_statistics["fallback_count"] == 0
+        native_snapshot = _paired_semantic_snapshot(
+            native_result,
+            tmp_path / "per-solve-runtime.json",
+            compare_raw_neighborhood=False,
         )
+    finally:
+        _release_result_runtime_semantic_storage(native_result)
+    native_result = None
+    gc.collect()
 
-    assert comparison_events(native_result) == comparison_events(python_result)
-    pair_pruning_events = [
-        event
-        for event in native_result.neighborhood_events
-        if event["status"] == "pair_prefilter_rejected_aggregate"
-    ]
-    assert all(int(event["aggregate_count"]) > 0 for event in pair_pruning_events)
-    assert all(len(str(event["candidate_pool_hash"])) == 64 for event in pair_pruning_events)
-    assert native_result.candidate_work_hash == python_result.candidate_work_hash
-    assert native_result.route_result_hash == python_result.route_result_hash
-    assert native_result.exact_started_calls == python_result.exact_started_calls
-    assert native_result.exact_completed_calls == python_result.exact_completed_calls
-    assert native_result.stage04_statistics == python_result.stage04_statistics
-    assert native_result.stage04_event_log == python_result.stage04_event_log
-    assert native_result.native_execution_statistics["fallback_count"] == 0
+    _assert_paired_semantic_snapshots(python_snapshot, native_snapshot)
 
 
 @pytest.fixture(scope="module")
@@ -550,40 +1182,34 @@ def test_paired_runner_host_scheduler_replays_shared_pool_axis(
         ArchitectureMode.PYTHON_CANDIDATE_CONTROL,
         task,
     )
+    try:
+        python_snapshot = _paired_semantic_snapshot(
+            python_result,
+            tmp_path / "python-candidate-control.json",
+            compare_raw_neighborhood=False,
+        )
+    finally:
+        _release_result_runtime_semantic_storage(python_result)
+    python_result = None
+    gc.collect()
     native_result, _native_seconds, _native_topology = _solve_mode(
         ArchitectureMode.HOST_SCHEDULER,
         task,
     )
-
-    assert native_result.feasible and python_result.feasible
-    assert native_result.customer_sequences == python_result.customer_sequences
-    assert native_result.objective == python_result.objective
-    assert _semantic_candidate_trajectory(native_result) == (
-        _semantic_candidate_trajectory(python_result)
-    )
-
-    def comparison_events(result: ALNSResult) -> list[object]:
-        streams = _canonical_semantic_streams(result)
-        return list(
-            _comparison_semantic_events(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "canonical_semantic_streams": streams,
-                    "canonical_semantic_events": _canonical_semantic_event_sequence(streams),
-                    "semantic_trajectory": _semantic_candidate_trajectory(result),
-                }
-            )
+    try:
+        assert native_result.native_execution_statistics["fallback_count"] == 0
+        assert native_result.native_execution_statistics["shared_native_work_pool"] is True
+        native_snapshot = _paired_semantic_snapshot(
+            native_result,
+            tmp_path / "host-scheduler.json",
+            compare_raw_neighborhood=False,
         )
+    finally:
+        _release_result_runtime_semantic_storage(native_result)
+    native_result = None
+    gc.collect()
 
-    assert comparison_events(native_result) == comparison_events(python_result)
-    assert native_result.candidate_work_hash == python_result.candidate_work_hash
-    assert native_result.route_result_hash == python_result.route_result_hash
-    assert native_result.exact_started_calls == python_result.exact_started_calls
-    assert native_result.exact_completed_calls == python_result.exact_completed_calls
-    assert native_result.stage04_statistics == python_result.stage04_statistics
-    assert native_result.stage04_event_log == python_result.stage04_event_log
-    assert native_result.native_execution_statistics["fallback_count"] == 0
-    assert native_result.native_execution_statistics["shared_native_work_pool"] is True
+    _assert_paired_semantic_snapshots(python_snapshot, native_snapshot)
 
 
 def test_axis_loader_releases_large_replay_only_fields_between_records(
@@ -676,6 +1302,11 @@ def test_native_build_attestation_rejects_dirty_or_mismatched_source() -> None:
         __build_development_override__=False,
         __build_cpp_source_kind__="git_blob_snapshot",
         __build_source_attestation_version__=1,
+        __build_performance_profile__="portable-o3",
+        __build_compiler_id__="GNU",
+        __build_compiler_version__="13.3.0",
+        __build_interprocedural_optimization__=False,
+        __build_host_native__=False,
     )
     assert (
         _validate_native_build_attestation(
@@ -815,6 +1446,7 @@ def _initial_four_lane_projection(*, request_sha256: str) -> tuple[dict[str, obj
     metrics = [[2.0, 2.0, 0.0, 0.0]]
     labels = [[1, 1, 0]]
     batch_counters = [1, 1, 1, 0, 1, 0, 0, 0, 1, 128]
+    completion_order = [0]
     objective_integer = [1, 0]
     objective_float = [2.0, 0.0]
     accounting = [1, 1, 0, 0]
@@ -839,6 +1471,7 @@ def _initial_four_lane_projection(*, request_sha256: str) -> tuple[dict[str, obj
     for values in (
         [value for row in labels for value in row],
         batch_counters,
+        completion_order,
         objective_integer,
     ):
         lane_evidence.extend(struct.pack("<Q", len(values)))
@@ -856,6 +1489,7 @@ def _initial_four_lane_projection(*, request_sha256: str) -> tuple[dict[str, obj
     for values in (
         [value for row in labels for value in row],
         batch_counters,
+        completion_order,
         objective_integer,
     ):
         initial_state_evidence.extend(struct.pack("<Q", len(values)))
@@ -889,6 +1523,7 @@ def _initial_four_lane_projection(*, request_sha256: str) -> tuple[dict[str, obj
             "metrics": metrics,
             "label_counters": labels,
             "batch_counters": batch_counters,
+            "completion_order": completion_order,
             "objective_integer": objective_integer,
             "objective_float": objective_float,
             "accounting": accounting,
@@ -1040,6 +1675,7 @@ def test_reviewer_rejects_rehashed_false_initial_state_identity() -> None:
         "next_iteration",
         "lane_count",
         "batch_counters",
+        "completion_order",
         "node_kind",
         "exact_batch_size",
     ],
@@ -1269,10 +1905,43 @@ def _complete_causal_streams(
                 "runtime_event_id": event_id,
                 "semantic_event_id": event_id,
                 "stream_ordinal": 0,
+                "native_telemetry": {
+                    "runtime_native_event_id": event_id,
+                    "runtime_native_stream_code": event_id - 1,
+                    "runtime_native_event_code": event_id,
+                    "runtime_native_lane_id": 0,
+                    "runtime_native_operator_id": 0,
+                    "runtime_native_iteration": event_id - 1,
+                    "runtime_native_transaction_id": event_id,
+                    "runtime_native_subject_id": 0,
+                    "runtime_native_status_code": 0,
+                    "runtime_native_flags": 0,
+                },
                 **({"status": "iteration_limit"} if stream_name == "termination" else {}),
             }
         )
     return streams
+
+
+def _full_native_inline_payload(
+    streams: dict[str, list[dict[str, object]]],
+    events: list[dict[str, object]],
+) -> dict[str, object]:
+    projection = _NativeCanonicalProjectionHasher()
+    for event in events:
+        raw_native = event.get("native_telemetry")
+        if isinstance(raw_native, dict):
+            projection.append(raw_native)
+    return {
+        "mode": "full_native_alns",
+        "canonical_semantic_streams": streams,
+        "canonical_semantic_events": events,
+        "native_execution_statistics": {
+            "canonical_event_count": projection.count,
+            "canonical_event_journal_sha256": "0" * 64,
+            "canonical_event_projection_sha256": projection.hexdigest(),
+        },
+    }
 
 
 def test_unified_causal_ids_are_monotonic_and_cover_all_required_domains() -> None:
@@ -1283,14 +1952,266 @@ def test_unified_causal_ids_are_monotonic_and_cover_all_required_domains() -> No
     assert [event["runtime_event_id"] for event in events] == list(range(1, len(events) + 1))
     assert {str(event["semantic_stream"]) for event in events} >= (_BOUNDARY_CAUSAL_STREAMS)
 
-    reviewed = _canonical_semantic_events(
-        {
-            "mode": "full_native_alns",
-            "canonical_semantic_streams": streams,
-            "canonical_semantic_events": events,
-        }
-    )
+    reviewed = _canonical_semantic_events(_full_native_inline_payload(streams, events))
     assert {str(event["semantic_stream"]) for event in reviewed} >= (_BOUNDARY_CAUSAL_STREAMS)
+
+
+def test_unified_causal_ids_reject_duplicate_native_source_identity() -> None:
+    streams = _complete_causal_streams()
+    events = _canonical_semantic_event_sequence(streams)
+    tampered_streams = {name: [dict(row) for row in rows] for name, rows in streams.items()}
+    tampered_events = [dict(event) for event in events]
+    first_native = tampered_events[0]["native_telemetry"]
+    second_native = tampered_events[1]["native_telemetry"]
+    assert isinstance(first_native, dict)
+    assert isinstance(second_native, dict)
+    second_native = dict(second_native)
+    second_native["runtime_native_event_id"] = first_native["runtime_native_event_id"]
+    tampered_events[1]["native_telemetry"] = second_native
+    second_stream = str(tampered_events[1]["semantic_stream"])
+    tampered_streams[second_stream][0] = {
+        key: value
+        for key, value in tampered_events[1].items()
+        if key not in {"semantic_stream", "semantic_sequence"}
+    }
+
+    with pytest.raises(ValueError, match="native semantic event IDs are not contiguous"):
+        _canonical_semantic_events(_full_native_inline_payload(tampered_streams, tampered_events))
+
+
+@pytest.mark.parametrize("corruption", ("tail", "digest"))
+def test_full_native_canonical_receipt_rejects_incomplete_or_tampered_projection(
+    corruption: str,
+) -> None:
+    streams = _complete_causal_streams()
+    events = _canonical_semantic_event_sequence(streams)
+    payload = copy.deepcopy(_full_native_inline_payload(streams, events))
+    raw_events = payload["canonical_semantic_events"]
+    raw_streams = payload["canonical_semantic_streams"]
+    assert isinstance(raw_events, list)
+    assert isinstance(raw_streams, dict)
+    if corruption == "tail":
+        terminal = raw_events.pop()
+        assert isinstance(terminal, dict)
+        terminal_stream = terminal["semantic_stream"]
+        stream_rows = raw_streams[terminal_stream]
+        assert isinstance(stream_rows, list)
+        stream_rows.pop()
+        message = "coverage is incomplete"
+    else:
+        first = raw_events[0]
+        assert isinstance(first, dict)
+        native_telemetry = first["native_telemetry"]
+        assert isinstance(native_telemetry, dict)
+        native_telemetry["runtime_native_flags"] = 1
+        first_stream = raw_streams[first["semantic_stream"]]
+        assert isinstance(first_stream, list)
+        first_stream[0]["native_telemetry"]["runtime_native_flags"] = 1
+        message = "digest does not replay"
+    with pytest.raises(ValueError, match=message):
+        _canonical_semantic_events(payload)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("context", "native_transaction", "source_native_transaction"),
+)
+def test_cache_commit_requires_its_exact_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    instance = parse_schneider(Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt")
+    sequence = ("C30",)
+    exact = solve_exact_charging(instance, sequence)
+    assert exact.feasible
+    route_key = canonical_route_key(sequence)
+    charging_version = "test-charging-v1"
+    objective_version = "test-objective-v1"
+    cache_digest = RouteCacheKey(
+        instance_hash=canonical_instance_hash(instance),
+        customer_sequence=sequence,
+        charging_configuration_version=charging_version,
+        objective_schema_version=objective_version,
+    ).digest
+
+    def native(event_id: int, stream_code: int, transaction_id: int) -> dict[str, int]:
+        return {
+            "runtime_native_event_id": event_id,
+            "runtime_native_stream_code": stream_code,
+            "runtime_native_event_code": event_id,
+            "runtime_native_lane_id": 0,
+            "runtime_native_operator_id": 0,
+            "runtime_native_iteration": 1,
+            "runtime_native_transaction_id": transaction_id,
+            "runtime_native_subject_id": 0,
+            "runtime_native_status_code": 0,
+            "runtime_native_flags": 0,
+        }
+
+    context = {"lane": "legacy", "iteration": 1, "operator": "route_merge"}
+    events: list[dict[str, object]] = [
+        {
+            "semantic_stream": "exact_work",
+            "event_type": "exact_batch_started",
+            **context,
+            "customer_sequences": [list(sequence)],
+            "requested_calls": 1,
+            "started_calls": 1,
+            "native_telemetry": native(1, 4, 42),
+        },
+        {
+            "semantic_stream": "exact_result",
+            "event_type": "exact_route_result",
+            **context,
+            "route_key": route_key,
+            "exact_started": True,
+            "exact_completed": True,
+            "status": "completed",
+            "feasible": True,
+            "failure_reason": exact.failure_reason,
+            "native_telemetry": native(2, 5, 42),
+        },
+        {
+            "semantic_stream": "cache",
+            "event_type": "cache_lifecycle",
+            **context,
+            "route_key": route_key,
+            "status": "store",
+            "cache_key_digest": cache_digest,
+            "entry_bytes": 1,
+            "current_entries": 1,
+            "current_bytes": 1,
+            "native_telemetry": native(3, 6, 42),
+        },
+    ]
+    if tamper == "context":
+        events[-1]["iteration"] = 2
+    elif tamper == "native_transaction":
+        raw_native = events[-1]["native_telemetry"]
+        assert isinstance(raw_native, dict)
+        raw_native["runtime_native_transaction_id"] = 43
+    else:
+        events[-1].pop("native_telemetry")
+        events[-1]["native_transaction_id"] = 43
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architecture_review.iter_verified_semantic_journal",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    payload = {
+        "canonical_semantic_journal": {"schema_version": "test"},
+        "mode": "full_native_alns",
+        "route_result_hash": "",
+        "cache_incremental_statistics": {
+            "config": {
+                "enabled": True,
+                "eviction_policy": "lru",
+                "max_entries": 8,
+                "max_memory_bytes": 1_000_000,
+                "charging_configuration_version": charging_version,
+                "objective_schema_version": objective_version,
+                "instance_hash": canonical_instance_hash(instance),
+            }
+        },
+    }
+
+    assert (
+        _replay_canonical_journal(
+            payload,
+            axis_path=tmp_path / "axis.json",
+            instance=instance,
+        )
+        == "cache store transaction does not match exact result"
+    )
+
+
+def test_reference_distance_replay_caches_each_unique_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review
+
+    instance = parse_schneider(Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt")
+    sequence = ("C30",)
+    expected = solve_exact_charging(instance, sequence)
+    assert expected.feasible
+    charging_count = sum(instance.by_name[node].kind.value == "f" for node in expected.route)
+    statistics = [0] * 11
+    events: list[dict[str, object]] = []
+    for batch_ordinal, transaction_id in enumerate((41, 42)):
+        events.extend(
+            (
+                {
+                    "event_type": "reference_distance_resolution",
+                    "native_transaction_id": transaction_id,
+                    "batch_ordinal": batch_ordinal,
+                    "customer_sequence": list(sequence),
+                    "status": "feasible",
+                    "vehicle_count": 1,
+                    "charging_count": charging_count,
+                    "reference_distance": expected.distance,
+                    "reference_charging_time": expected.charging_time,
+                },
+                {
+                    "event_type": "candidate_cache_transaction",
+                    "native_transaction_id": transaction_id,
+                    "batch_ordinal": batch_ordinal,
+                    "status": "committed",
+                    "lookups": 0,
+                    "hits": 0,
+                    "exact_stores": 0,
+                    "cache_statistics": statistics,
+                    "reference_distance_resolution": True,
+                },
+            )
+        )
+    calls = 0
+    real_solve = review.solve_exact_charging
+
+    def counted_solve(
+        observed_instance: object,
+        observed_sequence: tuple[str, ...],
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        return real_solve(observed_instance, observed_sequence)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(review, "solve_exact_charging", counted_solve)
+    monkeypatch.setattr(
+        review,
+        "iter_verified_native_control_events",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    payload = {
+        "canonical_semantic_journal": {"native_control_events": {"native_source_sha256": "a" * 64}},
+        "native_execution_statistics": {"control_journal_sha256": "a" * 64},
+        "cache_incremental_statistics": {
+            name: 0
+            for name in (
+                "cache_lookups",
+                "cache_hits",
+                "cache_misses",
+                "cache_stores",
+                "cache_evictions",
+                "cache_oversize_not_cached",
+                "entries_current",
+                "entries_peak",
+                "bytes_current",
+                "bytes_peak",
+                "unique_route_evaluations",
+            )
+        },
+    }
+
+    assert (
+        _replay_raw_native_control_journal(
+            payload,
+            axis_path=tmp_path / "axis.json",
+            instance=instance,
+        )
+        is None
+    )
+    assert calls == 1
 
 
 @pytest.mark.parametrize("missing_stream", sorted(_REQUIRED_CAUSAL_STREAMS))
@@ -1301,13 +2222,7 @@ def test_unified_causal_ids_reject_missing_required_domain(
     events = _canonical_semantic_event_sequence(streams)
 
     with pytest.raises(ValueError):
-        _canonical_semantic_events(
-            {
-                "mode": "full_native_alns",
-                "canonical_semantic_streams": streams,
-                "canonical_semantic_events": events,
-            }
-        )
+        _canonical_semantic_events(_full_native_inline_payload(streams, events))
 
 
 @pytest.mark.parametrize("corruption", ("missing", "duplicate", "out_of_order"))
@@ -1325,13 +2240,7 @@ def test_unified_causal_ids_reject_missing_duplicate_or_out_of_order_events(
         corrupted[0], corrupted[1] = corrupted[1], corrupted[0]
 
     with pytest.raises(ValueError):
-        _canonical_semantic_events(
-            {
-                "mode": "full_native_alns",
-                "canonical_semantic_streams": streams,
-                "canonical_semantic_events": corrupted,
-            }
-        )
+        _canonical_semantic_events(_full_native_inline_payload(streams, corrupted))
 
 
 def test_campaign_identity_revalidates_lease_revision_and_clean_tree(
@@ -1523,6 +2432,16 @@ def test_paired_plan_has_360_axes_and_rotates_all_five_modes(tmp_path: Path) -> 
     assert max(first_mode_counts.values()) - min(first_mode_counts.values()) <= 1
 
 
+def test_performance_identity_blocks_keep_c_r_rc_mode_e2e_separate(tmp_path: Path) -> None:
+    blocks = _performance_identity_blocks(_plan("paired", tmp_path))
+
+    assert blocks
+    for block in blocks:
+        assert len({task.repeat for task in block}) == 1
+        assert len({task.axis for task in block}) == 1
+        assert len({performance_family_for_instance(task.instance_name) for task in block}) == 1
+
+
 def test_pilot_plan_has_180_wall_clock_axes_and_independent_labels(
     tmp_path: Path,
 ) -> None:
@@ -1533,6 +2452,232 @@ def test_pilot_plan_has_180_wall_clock_axes_and_independent_labels(
     assert {task.axis for task in plan} == {"wall_clock_30"}
     assert len(set(labels.values())) == len(MODES)
     assert all("_pilot_attempt01" in label for label in labels.values())
+
+
+def test_pilot_gate_requires_signed_qualified_paired_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    wheel = "b" * 64
+    native = "c" * 64
+    scheduler = "d" * 64
+    profile = "e" * 64
+    path = tmp_path / "paired-review.json"
+    reviewer_source = Path(write_review.__code__.co_filename).resolve()
+    raw_inventory = {
+        "axis_count": 360,
+        "json_bytes": 360,
+        "sidecar_bytes": 360,
+        "tree_sha256": "0" * 64,
+        "algorithm": "test inventory",
+        "by_mode": {},
+    }
+    payload = {
+        "schema_version": "stage05.2-native-architecture-review-v9",
+        "scope": "paired",
+        "attempt": 8,
+        "axis_count": 360,
+        "axis_replay_passed": True,
+        "semantic_gates_passed": True,
+        "qualification_passed": True,
+        "review_status": "COMPARISON_COMPLETE_QUALIFIED",
+        "replay_failures": [],
+        "producer_identity": {
+            "repository_revisions": [revision],
+            "wheel_sha256": [wheel],
+            "native_sha256": [native],
+            "scheduler_sha256": [scheduler],
+            "performance_profile_sha256": [profile],
+            "run_labels": sorted(run_labels_for_scope("paired", 8).values()),
+        },
+        "reviewer_provenance": {
+            "repository_revision": revision,
+            "source_path": "src/evrptw/experiments/stage052_native_architecture_review.py",
+            "source_sha256": hashlib.sha256(reviewer_source.read_bytes()).hexdigest(),
+        },
+        "raw_axis_inventory": raw_inventory,
+        "mode_metrics": {mode.value: {} for mode in MODES},
+        "performance": {},
+        "differential_gates": {},
+        "historical_attempt72": {
+            "available": False,
+            "identity_verified": False,
+            "comparison_count": 0,
+        },
+        "cuda_evaluation_condition": {
+            "available": False,
+            "condition_met": False,
+            "median": None,
+            "p95": None,
+            "maximum": None,
+            "reason": "test",
+        },
+    }
+    report = tmp_path / "paired-review.md"
+    write_review(payload, output_json=path, output_markdown=report)
+    execution_path = tmp_path / "paired-review_execution.json"
+    monkeypatch.setattr(
+        "evrptw.experiments.stage052_native_architectures._recompute_paired_review_inventory",
+        lambda _root, _attempt: raw_inventory,
+    )
+    gate = _load_qualified_paired_review(
+        path,
+        review_execution_path=execution_path,
+        paired_results_root=tmp_path,
+        paired_attempt=8,
+        revision=revision,
+        wheel_sha256=wheel,
+        native_sha256=native,
+        scheduler_sha256=scheduler,
+        performance_profile_sha256=profile,
+    )
+    assert gate["axis_count"] == 360
+    assert gate["qualification_passed"] is True
+
+    tampered = dict(payload)
+    tampered["qualification_passed"] = False
+    rejected = tmp_path / "paired-review-rejected.json"
+    _write_signed_json(rejected, tampered)
+    with pytest.raises(RuntimeError, match="qualified 360/360"):
+        _load_qualified_paired_review(
+            rejected,
+            review_execution_path=execution_path,
+            paired_results_root=tmp_path,
+            paired_attempt=8,
+            revision=revision,
+            wheel_sha256=wheel,
+            native_sha256=native,
+            scheduler_sha256=scheduler,
+            performance_profile_sha256=profile,
+        )
+
+
+def test_campaign_gate_requires_signed_qualified_calibration_review(
+    tmp_path: Path,
+) -> None:
+    revision = "a" * 40
+    tree = "b" * 40
+    source = "c" * 64
+    wheel = "d" * 64
+    native = "e" * 64
+    scheduler = "f" * 64
+    profile_canonical = "1" * 64
+    calibration_run_label = "stage05.2_native_architecture_performance_calibration_attempt01"
+    calibration_dir = tmp_path / calibration_run_label
+    calibration_dir.mkdir()
+    calibration_receipt = calibration_dir / "calibration_receipt.json"
+    _write_signed_json(calibration_receipt, {"status": "calibrated"})
+    calibration_receipt_sha = hashlib.sha256(calibration_receipt.read_bytes()).hexdigest()
+    profile_path = calibration_dir / "frozen_performance_profile.json"
+    _write_signed_json(profile_path, {"canonical_sha256": profile_canonical})
+    profile_file_sha = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    review_path = calibration_dir / "review" / "calibration_review_receipt.json"
+    payload = {
+        "schema_version": ("stage05.2-native-architecture-performance-calibration-review-v1"),
+        "status": "qualified",
+        "qualification": "QUALIFIED_FOR_ATTEMPT08",
+        "calibration_run_label": calibration_run_label,
+        "storage_alias": "stage052-performance-calibration-run",
+        "calibration_receipt_relative_path": "calibration_receipt.json",
+        "calibration_receipt_sha256": calibration_receipt_sha,
+        "calibration_manifest_sha256": "2" * 64,
+        "profile_relative_path": "frozen_performance_profile.json",
+        "profile_sha256": profile_file_sha,
+        "profile_canonical_sha256": profile_canonical,
+        "rederived_profile_canonical_sha256": profile_canonical,
+        "repository_revision": revision,
+        "git_tree": tree,
+        "source_manifest_sha256": source,
+        "selected_build_profile": "portable-lto",
+        "wheel_sha256": wheel,
+        "native_sha256": native,
+        "scheduler_sha256": scheduler,
+        "observation_count": 30,
+        "raw_axis_replay_count": 360,
+        "resource_summary_replay_count": 60,
+        "memory_rejection_replay_count": 2,
+        "fixed_work_semantics_identical": True,
+        "validator_objective_replay_passed": True,
+        "queue_full_count": 0,
+        "rejected_count": 0,
+        "swap_used": False,
+        "selector_recomputation_passed": True,
+        "reviewer_source_sha256": "3" * 64,
+        "review_seconds": 1.0,
+        "formal_started": False,
+        "cuda_started": False,
+        "attempt08_started": False,
+    }
+    _write_signed_json(review_path, payload)
+    review_execution_path = calibration_dir / "review" / "review_execution.json"
+    _write_signed_json(
+        review_execution_path,
+        {
+            "schema_version": "experiment-review-execution-v1",
+            "run_label": calibration_run_label,
+            "status": "completed",
+            "finalized": True,
+            "exit_code": 0,
+            "reviewer_module_name": ("evrptw.experiments.stage052_performance_calibration_review"),
+            "reviewer_installed_distribution_digest": "3" * 64,
+            "raw_manifest_sha256_before": "2" * 64,
+            "raw_manifest_sha256_after": "2" * 64,
+            "raw_manifest_unchanged": True,
+            "review_manifest_sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+            "command": [
+                "/usr/bin/python",
+                "-m",
+                "evrptw.experiments.stage052_performance_calibration_review",
+            ],
+        },
+    )
+
+    gate = _load_qualified_calibration_review(
+        review_path,
+        review_execution_path=review_execution_path,
+        calibration_run_label=calibration_run_label,
+        revision=revision,
+        git_tree=tree,
+        source_manifest_sha256=source,
+        wheel_sha256=wheel,
+        native_sha256=native,
+        scheduler_sha256=scheduler,
+        performance_profile_path=profile_path,
+        performance_profile_file_sha256=profile_file_sha,
+        performance_profile_sha256=profile_canonical,
+        selected_build_profile="portable-lto",
+    )
+    assert gate["qualification"] == "QUALIFIED_FOR_ATTEMPT08"
+    assert gate["raw_axis_replay_count"] == 360
+
+    rejected = dict(payload)
+    rejected["selector_recomputation_passed"] = False
+    rejected_path = calibration_dir / "review" / "rejected.json"
+    _write_signed_json(rejected_path, rejected)
+    with pytest.raises(RuntimeError, match="qualified independent replay"):
+        _load_qualified_calibration_review(
+            rejected_path,
+            review_execution_path=review_execution_path,
+            calibration_run_label=calibration_run_label,
+            revision=revision,
+            git_tree=tree,
+            source_manifest_sha256=source,
+            wheel_sha256=wheel,
+            native_sha256=native,
+            scheduler_sha256=scheduler,
+            performance_profile_path=profile_path,
+            performance_profile_file_sha256=profile_file_sha,
+            performance_profile_sha256=profile_canonical,
+            selected_build_profile="portable-lto",
+        )
 
 
 def _review_fixture_records(root: Path, evidence_root: Path) -> tuple[ReviewRecord, ...]:
@@ -1714,7 +2859,7 @@ def test_v5_reviewer_rejects_scheduler_overlap_outside_host_wave(
     _write_signed_json(
         run_dir / "run_manifest.json",
         {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PREVIOUS_COMPARISON_SCHEMA_VERSION,
             "revision": revision,
             "git_tree": git_tree,
             "wheel_sha256": "b" * 64,
@@ -1799,6 +2944,7 @@ def test_reviewer_rejects_dirty_or_mismatched_build_attestation() -> None:
         },
     }
     manifest: dict[str, object] = {
+        "schema_version": PREVIOUS_COMPARISON_SCHEMA_VERSION,
         "revision": revision,
         "git_tree": git_tree,
         "wheel_sha256": "b" * 64,
@@ -2229,7 +3375,13 @@ def test_physical_screening_replay_rejects_self_consistent_decision_corruption()
     }
     payload = {
         "canonical_semantic_streams": {"screening": [event]},
-        "screening_statistics": {"screening_calls": 1},
+        "screening_statistics": {
+            "screening_calls": 1,
+            "screening_passes": int(replayed.accepted),
+            "screening_rejections": int(not replayed.accepted),
+            "screening_cache_hits": 0,
+            "screening_exact_call_blocked": int(not replayed.accepted),
+        },
     }
     assert _replay_physical_screening(payload, instance) is None
 
@@ -2256,19 +3408,21 @@ def test_physical_screening_replay_rejects_self_consistent_decision_corruption()
     )
     event["distance_increment_lower_bound"] = None
 
+    original_status = event["status"]
     event["status"] = "rejected" if replayed.accepted else "pass"
     assert _replay_physical_screening(payload, instance) == (
         "physical screening row 0 decision replay mismatch"
     )
+    event["status"] = original_status
 
-    payload["screening_statistics"] = {"screening_calls": 2}
+    statistics = payload["screening_statistics"]
+    assert isinstance(statistics, dict)
+    statistics["screening_calls"] = 2
     assert _replay_physical_screening(payload, instance) == (
-        "physical screening stream count mismatch"
+        "physical screening statistics do not conserve calls"
     )
     payload["canonical_semantic_streams"] = {"screening": []}
-    assert _replay_physical_screening(payload, instance) == (
-        "physical screening stream is empty"
-    )
+    assert _replay_physical_screening(payload, instance) == ("physical screening stream is empty")
 
 
 def test_canonical_semantic_events_require_explicit_contiguous_causal_sequence() -> None:
@@ -2490,8 +3644,35 @@ def test_cuda_condition_does_not_reuse_exact_backend_occupancy(
     assert condition == {
         "available": False,
         "condition_met": False,
+        "sample_count": 0,
+        "median": None,
+        "p95": None,
         "maximum": None,
         "reason": "native candidate-screening occupancy is not recorded",
+    }
+
+
+def test_cuda_condition_uses_median_candidate_screening_occupancy(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    records = list(_review_fixture_records(root, tmp_path))
+    host = next(record for record in records if record.mode.value == "host_scheduler")
+    assert isinstance(host.payload, dict)
+    host.payload["native_execution_statistics"] = {
+        "candidate_screening_occupancies": [1, 1, 64],
+    }
+
+    condition = _scheduler_screening_occupancy((host,))
+
+    assert condition == {
+        "available": True,
+        "condition_met": False,
+        "sample_count": 3,
+        "median": 1.0,
+        "p95": 64,
+        "maximum": 64,
+        "reason": "native candidate-screening median occupancy replayed",
     }
 
 
@@ -2514,6 +3695,7 @@ def test_review_writer_emits_hash_bound_review_manifest(tmp_path: Path) -> None:
     review = {
         "schema_version": "test-review-v1",
         "scope": "paired",
+        "attempt": 1,
         "review_status": "NOT_READY",
         "reviewer_provenance": {
             "repository_revision": "a" * 40,
@@ -2542,6 +3724,14 @@ def test_review_writer_emits_hash_bound_review_manifest(tmp_path: Path) -> None:
         },
         "axis_replay_passed": False,
         "axis_count": 0,
+        "raw_axis_inventory": {
+            "axis_count": 0,
+            "json_bytes": 0,
+            "sidecar_bytes": 0,
+            "tree_sha256": "0" * 64,
+            "algorithm": "test inventory",
+            "by_mode": {},
+        },
     }
 
     write_review(review, output_json=output_json, output_markdown=output_markdown)
@@ -2556,6 +3746,16 @@ def test_review_writer_emits_hash_bound_review_manifest(tmp_path: Path) -> None:
         manifest["files"][output_markdown.name]
         == hashlib.sha256(output_markdown.read_bytes()).hexdigest()
     )
+    manifest_path = tmp_path / "paired_review_manifest.json"
+    assert manifest_path.with_suffix(".json.sha256").is_file()
+    execution_path = tmp_path / "paired_review_execution.json"
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    assert execution["raw_manifest_unchanged"] is True
+    assert (
+        execution["review_manifest_sha256"]
+        == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    )
+    assert execution_path.with_suffix(".json.sha256").is_file()
 
 
 def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
@@ -2583,11 +3783,14 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
         ),
     )
 
-    with NativeHostScheduler(endpoint):
-        written = _run_group(task)
+    with NativeHostScheduler(endpoint) as scheduler:
+        written = _run_group(replace(task, scheduler_process_id=scheduler.process_id))
 
     assert len(written) == len(MODES)
-    payloads = [json.loads(Path(path).read_bytes()) for path in written]
+    payloads = [
+        _axis_payload_with_persistence(Path(path), json.loads(Path(path).read_bytes()))
+        for path in written
+    ]
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
     assert {payload["scheduler_sha256"] for payload in payloads} == {"f" * 64}
     status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
@@ -2595,15 +3798,67 @@ def test_one_wall_clock_group_runs_all_five_modes_with_one_scheduler(
         "current_stage052": "completed",
         "python_candidate_control": "completed",
         "per_solve_runtime": "completed",
-        "full_native_alns": "failed",
-        "host_scheduler": "failed",
+        "full_native_alns": "completed",
+        "host_scheduler": "completed",
     }
-    for payload in payloads:
-        if payload["mode"] in {
-            "full_native_alns",
-            "host_scheduler",
-        }:
-            assert payload["error"]
+    for raw_path, payload in zip(written, payloads, strict=True):
+        axis_path = Path(raw_path)
+        if payload["status"] != "completed":
+            assert "canonical_semantic_journal" not in payload
+            continue
+        assert "canonical_semantic_events" not in payload
+        assert "canonical_semantic_streams" not in payload
+        descriptor = payload["canonical_semantic_journal"]
+        journal_bundle = axis_path.parent / descriptor["path"]
+        journal_path = journal_bundle / descriptor["event_path"]
+        journal_sidecar = journal_bundle / descriptor["sidecar_path"]
+        axis_sidecar = axis_path.with_suffix(axis_path.suffix + ".sha256")
+        persistence_receipt = axis_path.with_suffix(axis_path.suffix + ".persistence")
+        persistence_receipt_sidecar = persistence_receipt.with_suffix(
+            persistence_receipt.suffix + ".sha256"
+        )
+        task_receipt = axis_path.with_suffix(axis_path.suffix + ".native-work-tasks.jsonl")
+        task_receipt_files = (
+            (
+                task_receipt,
+                task_receipt.with_suffix(task_receipt.suffix + ".sha256"),
+            )
+            if task_receipt.is_file()
+            else ()
+        )
+        assert journal_bundle.is_dir()
+        assert journal_path.is_file() and journal_sidecar.is_file()
+        assert descriptor["physical_telemetry"]["schema_version"].startswith(
+            "stage05.2-physical-telemetry-"
+        )
+        if payload["mode"] in {"full_native_alns", "host_scheduler"}:
+            control_rows = tuple(iter_verified_native_control_events(axis_path, descriptor))
+            assert control_rows
+            assert control_rows[-1]["event_type"] == "candidate_cache_transaction"
+            assert (
+                descriptor["native_control_events"]["native_source_sha256"]
+                == payload["native_execution_statistics"]["control_journal_sha256"]
+            )
+        else:
+            assert descriptor["native_control_events"] is None
+        assert payload["artifact_bytes"] == sum(
+            selected.stat().st_size
+            for selected in (
+                axis_path,
+                axis_sidecar,
+                persistence_receipt,
+                persistence_receipt_sidecar,
+                *journal_bundle.iterdir(),
+                *task_receipt_files,
+            )
+        )
+        assert payload["artifact_bytes"] < 8 * 1024 * 1024
+        replayed = _replay_record(
+            ReviewRecord(axis_path, payload),
+            root / "data" / "schneider",
+        )
+        assert replayed["valid"] is True, replayed
+    assert all(not payload.get("error") for payload in payloads)
     assert all(payload["persistence_seconds"] > 0.0 for payload in payloads)
     assert not tuple(tmp_path.rglob("*.persistence-probe-*"))
 
@@ -2631,10 +3886,13 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
         ),
     )
 
-    with NativeHostScheduler(endpoint):
-        written = _run_group(task)
+    with NativeHostScheduler(endpoint) as scheduler:
+        written = _run_group(replace(task, scheduler_process_id=scheduler.process_id))
 
-    payloads = [json.loads(Path(path).read_bytes()) for path in written]
+    payloads = [
+        _axis_payload_with_persistence(Path(path), json.loads(Path(path).read_bytes()))
+        for path in written
+    ]
     assert len(payloads) == len(MODES)
     assert {payload["mode"] for payload in payloads} == {mode.value for mode in MODES}
     status_by_mode = {payload["mode"]: payload["status"] for payload in payloads}
@@ -2642,6 +3900,48 @@ def test_one_fixed_work_group_retains_every_mode_axis(tmp_path: Path) -> None:
         "current_stage052": "completed",
         "python_candidate_control": "completed",
         "per_solve_runtime": "completed",
-        "full_native_alns": "failed",
-        "host_scheduler": "failed",
+        "full_native_alns": "completed",
+        "host_scheduler": "completed",
     }
+    for raw_path, payload in zip(written, payloads, strict=True):
+        axis_path = Path(raw_path)
+        if payload["status"] != "completed":
+            assert "canonical_semantic_journal" not in payload
+            continue
+        assert "canonical_semantic_events" not in payload
+        assert "canonical_semantic_streams" not in payload
+        descriptor = payload["canonical_semantic_journal"]
+        journal_bundle = axis_path.parent / descriptor["path"]
+        journal_path = journal_bundle / descriptor["event_path"]
+        journal_sidecar = journal_bundle / descriptor["sidecar_path"]
+        axis_sidecar = axis_path.with_suffix(axis_path.suffix + ".sha256")
+        persistence_receipt = axis_path.with_suffix(axis_path.suffix + ".persistence")
+        persistence_receipt_sidecar = persistence_receipt.with_suffix(
+            persistence_receipt.suffix + ".sha256"
+        )
+        task_receipt = axis_path.with_suffix(axis_path.suffix + ".native-work-tasks.jsonl")
+        task_receipt_files = (
+            (
+                task_receipt,
+                task_receipt.with_suffix(task_receipt.suffix + ".sha256"),
+            )
+            if task_receipt.is_file()
+            else ()
+        )
+        assert journal_bundle.is_dir()
+        assert journal_path.is_file() and journal_sidecar.is_file()
+        assert descriptor["physical_telemetry"]["schema_version"].startswith(
+            "stage05.2-physical-telemetry-"
+        )
+        assert payload["artifact_bytes"] == sum(
+            selected.stat().st_size
+            for selected in (
+                axis_path,
+                axis_sidecar,
+                persistence_receipt,
+                persistence_receipt_sidecar,
+                *journal_bundle.iterdir(),
+                *task_receipt_files,
+            )
+        )
+        assert payload["artifact_bytes"] < 8 * 1024 * 1024

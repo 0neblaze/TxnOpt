@@ -58,9 +58,7 @@ def test_native_build_attestation_reads_bytes_despite_assume_unchanged(
     assert clean["tracked_file_count"] == committed["tracked_file_count"]
 
     _git(root, "update-index", "--assume-unchanged", "cpp/producer.cpp")
-    (root / "cpp" / "producer.cpp").write_text(
-        "int value = 2;\n", encoding="utf-8"
-    )
+    (root / "cpp" / "producer.cpp").write_text("int value = 2;\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="producer.cpp"):
         inspect_source(root, development_override=False)
@@ -82,9 +80,7 @@ def test_native_cpp_snapshot_uses_committed_blobs_and_detects_tampering(
     assert snapshotted_source.read_text(encoding="utf-8") == "int value = 1;\n"
     verify_committed_cpp(root, "HEAD", snapshot)
 
-    (root / "cpp" / "producer.cpp").write_text(
-        "int value = 2;\n", encoding="utf-8"
-    )
+    (root / "cpp" / "producer.cpp").write_text("int value = 2;\n", encoding="utf-8")
     verify_committed_cpp(root, "HEAD", snapshot)
 
     snapshotted_source.write_text("int value = 3;\n", encoding="utf-8")
@@ -137,3 +133,50 @@ def test_scheduler_build_attestation_rejects_json_type_confusion() -> None:
                 source_manifest_sha256="c" * 64,
                 tracked_file_count=919,
             )
+
+
+def test_scheduler_build_attestation_binds_performance_profile() -> None:
+    expected: dict[str, object] = {
+        "schema_version": 2,
+        "revision": "a" * 40,
+        "git_tree": "b" * 40,
+        "source_manifest_sha256": "c" * 64,
+        "tracked_file_count": 919,
+        "source_dirty": False,
+        "development_override": False,
+        "cpp_source_kind": "git_blob_snapshot",
+        "performance_profile": "host-native-lto",
+        "compiler_id": "GNU",
+        "compiler_version": "14.2.0",
+        "interprocedural_optimization": True,
+        "host_native": True,
+    }
+    validate_scheduler_build_attestation(
+        expected,
+        revision="a" * 40,
+        git_tree="b" * 40,
+        source_manifest_sha256="c" * 64,
+        tracked_file_count=919,
+        performance_profile="host-native-lto",
+        compiler_id="GNU",
+        compiler_version="14.2.0",
+        interprocedural_optimization=True,
+        host_native=True,
+    )
+    with pytest.raises(RuntimeError, match="contradict"):
+        validate_scheduler_build_attestation(
+            {**expected, "interprocedural_optimization": False},
+            revision="a" * 40,
+            git_tree="b" * 40,
+            source_manifest_sha256="c" * 64,
+            tracked_file_count=919,
+        )
+    with pytest.raises(RuntimeError, match="does not reconcile"):
+        validate_scheduler_build_attestation(
+            expected,
+            revision="a" * 40,
+            git_tree="b" * 40,
+            source_manifest_sha256="c" * 64,
+            tracked_file_count=919,
+            performance_profile="portable-lto",
+        )

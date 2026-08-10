@@ -146,12 +146,8 @@ def test_negative_screening_evidence_token_survives_equivalent_lru_recompute() -
     assert first_token == _negative_screening_evidence_token(route_key, recomputed)
     assert first_token != _negative_screening_evidence_token(route_key, different)
     first_signature = _negative_screening_evidence_signature(route_key, first)
-    assert first_signature == _negative_screening_evidence_signature(
-        route_key, recomputed
-    )
-    assert first_signature != _negative_screening_evidence_signature(
-        route_key, different
-    )
+    assert first_signature == _negative_screening_evidence_signature(route_key, recomputed)
+    assert first_signature != _negative_screening_evidence_signature(route_key, different)
     assert 0 < first_token < 2**63
 
 
@@ -162,9 +158,7 @@ def test_bounded_lru_recompute_emits_one_stable_streaming_evidence_token() -> No
 
         @staticmethod
         def register_route(sequence: tuple[str, ...]) -> str:
-            return "route:" + "|".join(
-                f"{len(customer)}:{customer}" for customer in sequence
-            )
+            return "route:" + "|".join(f"{len(customer)}:{customer}" for customer in sequence)
 
         @staticmethod
         def _offset(value: float) -> float:
@@ -303,8 +297,7 @@ def test_evaluator_rescreens_an_evicted_safe_rejection_without_exact_work() -> N
     }
     assert cache.statistics() == expected_statistics
     assert (
-        evaluator.screening_statistics()["negative_screening_result_cache"]
-        == expected_statistics
+        evaluator.screening_statistics()["negative_screening_result_cache"] == expected_statistics
     )
 
 
@@ -493,9 +486,7 @@ def test_native_candidate_screening_rejects_hashed_semantic_inconsistency(
         else "repeated candidate lacks its first duplicate identity"
     )
     candidates = (
-        (("C1",), ("C2",))
-        if tampered_semantics == "counter_status"
-        else (("C1",), ("C1",))
+        (("C1",), ("C2",)) if tampered_semantics == "counter_status" else (("C1",), ("C1",))
     )
     with pytest.raises(RuntimeError, match=expected):
         native_screen_candidate_batch(
@@ -548,8 +539,8 @@ def test_route_cache_commit_restores_exact_and_negative_state_on_store_failure(
         route_cache=route_cache,
         negative_screening_sequences={("C2",): "capacity_prefilter"},
     )
-    evaluator.pending_candidate_cache[("new-1",)] = result
-    evaluator.pending_candidate_cache[("new-2",)] = result
+    evaluator._stage_pending_candidate_cache(("new-1",), result)
+    evaluator._stage_pending_candidate_cache(("new-2",), result)
     evaluator.pending_negative_screening_sequences[("reject",)] = "capacity_prefilter"
     original_store = route_cache.store
     calls = 0
@@ -594,9 +585,12 @@ def test_route_cache_commit_reconciles_equivalent_late_shared_cache_entry() -> N
         measurement_trace=trace,
         route_cache=route_cache,
     )
-    evaluator.pending_candidate_cache[("C1",)] = replace(
-        result,
-        runtime_seconds=result.runtime_seconds + 1.0,
+    evaluator._stage_pending_candidate_cache(
+        ("C1",),
+        replace(
+            result,
+            runtime_seconds=result.runtime_seconds + 1.0,
+        ),
     )
 
     evaluator._commit_pending_candidate_cache()
@@ -606,18 +600,13 @@ def test_route_cache_commit_reconciles_equivalent_late_shared_cache_entry() -> N
     reconciliation = [
         event
         for event in trace.events
-        if event.get("event_type") == "cache_event"
-        and event.get("operation") == "reconcile"
+        if event.get("event_type") == "cache_event" and event.get("operation") == "reconcile"
     ]
     assert len(reconciliation) == 1
     assert reconciliation[0]["reason"] == "equivalent_existing"
-    assert reconciliation[0]["pending_result_digest"] == reconciliation[0][
-        "existing_result_digest"
-    ]
+    assert reconciliation[0]["pending_result_digest"] == reconciliation[0]["existing_result_digest"]
     commit = [
-        event
-        for event in trace.events
-        if event.get("event_type") == "candidate_cache_commit"
+        event for event in trace.events if event.get("event_type") == "candidate_cache_commit"
     ]
     assert len(commit) == 1
     assert commit[0]["stored_entries"] == 0
@@ -640,7 +629,7 @@ def test_route_cache_conflict_preserves_original_error_with_bounded_negative_cac
         route_cache=route_cache,
         negative_screening_sequences=negative_cache,
     )
-    evaluator.pending_candidate_cache[("C1",)] = replace(result, distance=3.0)
+    evaluator._stage_pending_candidate_cache(("C1",), replace(result, distance=3.0))
     evaluator.pending_negative_screening_sequences[("reject",)] = "capacity_prefilter"
 
     with pytest.raises(RuntimeError, match="semantic conflict") as caught:
@@ -664,9 +653,7 @@ def test_route_cache_commit_rolls_back_exact_entries_when_negative_commit_fails(
     result = _feasible_result()
     route_cache.store(("C1",), result)
     before_statistics = route_cache.statistics_dict()
-    transaction_runtime = NativeCandidateTransactionRuntime(
-        NativeCandidateTransactionConfig()
-    )
+    transaction_runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
     evaluator = _Evaluator(
         instance,
         deadline=time.perf_counter() + 10.0,
@@ -675,7 +662,7 @@ def test_route_cache_commit_rolls_back_exact_entries_when_negative_commit_fails(
         candidate_transaction_runtime=transaction_runtime,
         negative_screening_sequences={("C2",): "capacity_prefilter"},
     )
-    evaluator.pending_candidate_cache[("new-1",)] = result
+    evaluator._stage_pending_candidate_cache(("new-1",), result)
     evaluator.pending_negative_screening_sequences[("reject",)] = "capacity_prefilter"
 
     def fail_negative_commit(*_args: object, **_kwargs: object) -> None:
@@ -730,9 +717,7 @@ def test_worker_failure_rolls_back_staged_negative_cache(
 def test_candidate_transaction_rescreens_after_bounded_negative_sequence_rollover() -> None:
     instance = _fixture_instance("bounded_negative_sequence_integration")
     native_runtime = NativeKernelRuntime.build(instance, NativeKernelConfig())
-    transaction_runtime = NativeCandidateTransactionRuntime(
-        NativeCandidateTransactionConfig()
-    )
+    transaction_runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
     negative_cache = BoundedNegativeSequenceCache(capacity=1)
     evaluator = _Evaluator(
         instance,

@@ -126,12 +126,13 @@ inline void record_telemetry(
     if (!std::isfinite(values[0]) || values[0] < 0.0
         || !std::isfinite(values[1]) || values[1] < 1.0
         || values[1] != static_cast<double>(static_cast<std::size_t>(values[1]))
-        || !std::isfinite(values[2]) || values[2] < 1.0 || values[2] > 24.0
+        || !std::isfinite(values[2]) || values[2] < 1.0 || values[2] > 256.0
         || values[2] != static_cast<double>(static_cast<std::size_t>(values[2]))
-        || values[3] != 24.0
-        || !std::isfinite(values[4]) || values[4] < 1.0 || values[4] > 6.0
+        || !std::isfinite(values[3]) || values[3] < 1.0 || values[3] > 256.0
+        || values[3] != static_cast<double>(static_cast<std::size_t>(values[3]))
+        || !std::isfinite(values[4]) || values[4] < 1.0 || values[4] > 64.0
         || values[4] != static_cast<double>(static_cast<std::size_t>(values[4]))
-        || !std::isfinite(values[5]) || values[5] < 1.0 || values[5] > 6.0
+        || !std::isfinite(values[5]) || values[5] < 1.0 || values[5] > 64.0
         || values[5] != static_cast<double>(static_cast<std::size_t>(values[5]))
         || !std::isfinite(values[6]) || values[6] <= 0.0
         || values[6] != static_cast<double>(static_cast<std::int64_t>(values[6]))
@@ -989,7 +990,7 @@ inline kernels::ExactBatchOutput exact_charging(
         socket_path, builder.finish(), output_mapping, response, socket);
     if (output.header().operation != protocol::KernelOperation::exact_charging
         || output.header().request_id != response.request_id
-        || output.header().array_count != 9) {
+        || output.header().array_count != 11) {
         throw std::runtime_error("native exact output schema is invalid");
     }
     const auto one_dimensional = [&](const std::size_t index,
@@ -1035,7 +1036,16 @@ inline kernels::ExactBatchOutput exact_charging(
         || output.descriptor(7).shape[0] != output.descriptor(7).count
         || output.descriptor(7).shape[1] != 0
         || output.descriptor(7).count > route_count
-        || !one_dimensional(8, protocol::NumericType::float64, 7)) {
+        || output.descriptor(8).type != protocol::NumericType::int64
+        || output.descriptor(8).dimensions != 1
+        || output.descriptor(8).shape[0] != output.descriptor(8).count
+        || output.descriptor(8).shape[1] != 0
+        || output.descriptor(8).count > route_count
+        || output.descriptor(9).type != protocol::NumericType::int64
+        || output.descriptor(9).dimensions != 2
+        || output.descriptor(9).shape[1] != 7
+        || output.descriptor(9).count != output.descriptor(9).shape[0] * 7
+        || !one_dimensional(10, protocol::NumericType::float64, 7)) {
         throw std::runtime_error("native exact output schema is invalid");
     }
     kernels::ExactBatchOutput result;
@@ -1058,6 +1068,8 @@ inline kernels::ExactBatchOutput exact_charging(
     result.label_counters = copy_int64(5);
     result.batch_counters = copy_int64(6);
     result.completion_order = copy_int64(7);
+    result.physical_completion_order = copy_int64(8);
+    result.physical_task_receipts = copy_int64(9);
     std::int64_t depot = -1;
     for (std::size_t node = 0; node < node_count; ++node) {
         if (node_kinds[node] == kernels::depot_kind) {
@@ -1072,7 +1084,7 @@ inline kernels::ExactBatchOutput exact_charging(
         result, node_kinds, order_offsets, order_indices, node_count,
         route_count, order_count, depot, batch_size);
     acknowledge(socket, response);
-    record_telemetry(output, 8);
+    record_telemetry(output, 10);
     return result;
 }
 

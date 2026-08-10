@@ -113,6 +113,17 @@ struct ExactBatchOutput {
     // This is telemetry, so the historical seven-array Python projection stays
     // unchanged while typed candidate transactions can bind real completion.
     std::vector<std::int64_t> completion_order;
+    // Search-loop round for each route, used by a parallel host scheduler to
+    // reconstruct the same deterministic backend completion order after
+    // independent route chunks finish. Interrupted routes retain -1.
+    std::vector<std::int64_t> completion_rounds;
+    // Timing-dependent route completion and task execution receipts.  These
+    // never participate in semantic hashes or deterministic merge order.
+    std::vector<std::int64_t> physical_completion_order;
+    // Rows: task ordinal, worker index, first route, last route (exclusive),
+    // submitted ns, started ns, completed ns.  Times are relative to the
+    // exact-batch dispatch boundary.
+    std::vector<std::int64_t> physical_task_receipts;
 };
 
 bool exact_dominates(const ExactLabel& left, const ExactLabel& right) {
@@ -179,6 +190,7 @@ ExactBatchOutput run_exact_charging_batch(
     output.metrics.assign(route_count * 4, 0.0);
     output.label_counters.assign(route_count * 3, 0);
     output.batch_counters.assign(10, 0);
+    output.completion_rounds.assign(route_count, -1);
     output.batch_counters[0] = static_cast<std::int64_t>(route_count);
     output.batch_counters[1] = static_cast<std::int64_t>(route_count);
     output.batch_counters[4] = route_count == 0 ? 0 : 1;
@@ -230,7 +242,9 @@ ExactBatchOutput run_exact_charging_batch(
     }
 
     bool deadline_hit = deadline_expired();
+    std::int64_t search_round = 0;
     while (!deadline_hit) {
+        ++search_round;
         std::vector<ExactRequest> requests;
         bool progressed = false;
         for (std::size_t route = 0; route < route_count; ++route) {
@@ -251,6 +265,7 @@ ExactBatchOutput run_exact_charging_batch(
                 state.completed = true;
                 output.completion_order.push_back(
                     static_cast<std::int64_t>(route));
+                output.completion_rounds[route] = search_round;
                 completion_recorded[route] = true;
                 continue;
             }
@@ -416,6 +431,7 @@ ExactBatchOutput run_exact_charging_batch(
         }
         if (!completion_recorded[route]) {
             output.completion_order.push_back(static_cast<std::int64_t>(route));
+            output.completion_rounds[route] = search_round + 1;
             completion_recorded[route] = true;
         }
         ++output.batch_counters[2];
@@ -506,6 +522,72 @@ inline void validate_exact_batch_output(
         if (completion_seen[route]
             != (output.statuses[route] != interrupted_status)) {
             invalid("completion order and route status diverge");
+        }
+    }
+    if (!output.completion_rounds.empty()) {
+        if (output.completion_rounds.size() != route_count) {
+            invalid("completion round extent is inconsistent");
+        }
+        std::vector<std::size_t> expected_order;
+        expected_order.reserve(output.completion_order.size());
+        for (std::size_t route = 0; route < route_count; ++route) {
+            const auto round = output.completion_rounds[route];
+            if ((output.statuses[route] == interrupted_status && round != -1)
+                || (output.statuses[route] != interrupted_status && round <= 0)) {
+                invalid("completion round and route status diverge");
+            }
+            if (round > 0) {
+                expected_order.push_back(route);
+            }
+        }
+        std::stable_sort(
+            expected_order.begin(), expected_order.end(),
+            [&](const auto left, const auto right) {
+                return std::tie(output.completion_rounds[left], left)
+                    < std::tie(output.completion_rounds[right], right);
+            });
+        if (!std::equal(
+                expected_order.begin(), expected_order.end(),
+                output.completion_order.begin(), output.completion_order.end(),
+                [](const auto expected, const auto observed) {
+                    return static_cast<std::int64_t>(expected) == observed;
+                })) {
+            invalid("completion order is inconsistent with search rounds");
+        }
+    }
+    if (!output.physical_completion_order.empty()
+        || !output.physical_task_receipts.empty()) {
+        if (output.physical_completion_order.size()
+                != output.completion_order.size()
+            || output.physical_task_receipts.empty()
+            || output.physical_task_receipts.size() % 7 != 0) {
+            invalid("physical task receipt extents are inconsistent");
+        }
+        std::vector<bool> physical_seen(route_count, false);
+        for (const auto ordinal : output.physical_completion_order) {
+            if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= route_count
+                || physical_seen[static_cast<std::size_t>(ordinal)]
+                || output.statuses[static_cast<std::size_t>(ordinal)]
+                    == interrupted_status) {
+                invalid("physical completion order identity is inconsistent");
+            }
+            physical_seen[static_cast<std::size_t>(ordinal)] = true;
+        }
+        std::size_t expected_first = 0;
+        const auto task_count = output.physical_task_receipts.size() / 7;
+        for (std::size_t task = 0; task < task_count; ++task) {
+            const auto* row = output.physical_task_receipts.data() + task * 7;
+            if (row[0] != static_cast<std::int64_t>(task)
+                || row[1] < -1 || row[2] < 0 || row[3] <= row[2]
+                || static_cast<std::size_t>(row[2]) != expected_first
+                || static_cast<std::size_t>(row[3]) > route_count
+                || row[4] < 0 || row[5] < row[4] || row[6] < row[5]) {
+                invalid("physical task receipt values are inconsistent");
+            }
+            expected_first = static_cast<std::size_t>(row[3]);
+        }
+        if (expected_first != route_count) {
+            invalid("physical task receipt route coverage is incomplete");
         }
     }
     std::int64_t completed = 0;

@@ -794,7 +794,9 @@ inline std::string candidate_plan_transaction_sha256_v2(
     append_f64(state.objective_float, {plan_count, 2});
     append_i64(state.route_resolutions, {state.route_resolutions.size()});
     append_i64(state.exact_route_rows, {state.exact_route_rows.size()});
-    append_i64(state.completion_order, {state.completion_order.size()});
+    // Physical completion order is timing-dependent telemetry.  Its shape and
+    // permutation are validated and the wire transport remains integrity
+    // protected, but it must not perturb the canonical semantic transaction.
     append_i64(state.counters, {state.counters.size()});
     append_i64(state.cache_statistics, {state.cache_statistics.size()});
     append_candidate_evidence_vector_v2<std::uint8_t>(
@@ -2964,6 +2966,9 @@ struct RouteMergeCandidatePoolV2 final {
     std::vector<std::int64_t> candidate_indices;
     std::vector<std::int64_t> metadata;
     std::array<std::int64_t, 2> pruning{};
+    std::vector<std::int64_t> pruned_pair_metadata;
+    // Parallel reason codes: 2=capacity, 3=optimistic time-window.
+    std::vector<std::int64_t> pruned_pair_reason_codes;
     std::int64_t input_route_count = 0;
 
     [[nodiscard]] std::size_t candidate_count() const noexcept {
@@ -2981,9 +2986,34 @@ struct RouteMergeCandidatePoolV2 final {
             || metadata.size() % 5 != 0
             || metadata.size() / 5 != candidate_count()
             || pruning[0] < 0 || pruning[1] < 0
+            || pruned_pair_metadata.size() % 3 != 0
+            || pruned_pair_metadata.size() / 3
+                != static_cast<std::size_t>(pruning[0])
+            || pruned_pair_reason_codes.size()
+                != static_cast<std::size_t>(pruning[0])
             || input_route_count < 2) {
             throw std::logic_error(
                 "native route-merge candidate pool is inconsistent");
+        }
+        std::int64_t pruned_candidates = 0;
+        for (std::size_t pair = 0; pair < pruned_pair_metadata.size() / 3; ++pair) {
+            const auto left = pruned_pair_metadata[pair * 3];
+            const auto right = pruned_pair_metadata[pair * 3 + 1];
+            const auto skipped = pruned_pair_metadata[pair * 3 + 2];
+            const auto reason = pruned_pair_reason_codes[pair];
+            if (left < 0 || right <= left || right >= input_route_count
+                || skipped <= 0
+                || (reason != 2 && reason != 3)
+                || pruned_candidates
+                    > std::numeric_limits<std::int64_t>::max() - skipped) {
+                throw std::logic_error(
+                    "native route-merge pruned-pair metadata is invalid");
+            }
+            pruned_candidates += skipped;
+        }
+        if (pruned_candidates != pruning[1]) {
+            throw std::logic_error(
+                "native route-merge pruned-candidate total is inconsistent");
         }
         for (std::size_t candidate = 0; candidate < candidate_count(); ++candidate) {
             if (candidate_offsets[candidate] < 0

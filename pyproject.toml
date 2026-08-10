@@ -39,6 +39,11 @@ experiment-historical-review = "evrptw.experiments.lifecycle_historical_review:m
 experiment-legacy-review = "evrptw.experiments.lifecycle_legacy_review:main"
 stage052-native-architectures = "evrptw.experiments.stage052_native_architectures:main"
 stage052-native-architecture-review = "evrptw.experiments.stage052_native_architecture_review:main"
+stage052-performance-build = "evrptw.experiments.stage052_performance_build:main"
+stage052-performance-calibration = "evrptw.experiments.stage052_performance_calibration:main"
+stage052-performance-observation = "evrptw.experiments.stage052_performance_observation:main"
+stage052-performance-calibration-review = "evrptw.experiments.stage052_performance_calibration_review:main"
+stage052-telemetry-overhead = "evrptw.experiments.stage052_telemetry_overhead:main"
 
 [dependency-groups]
 dev = [

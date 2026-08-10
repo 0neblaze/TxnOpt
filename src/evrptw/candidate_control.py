@@ -35,6 +35,7 @@ class CandidateControlConfig:
     proposal_top_k: int = 1
     max_exact_calls_per_round: int = 1
     worker_count: int = 1
+    stage052_calibrated_workers: bool = False
     executor_model: ExecutorModel = "process_spawn"
     ranking_policy: str = "vehicle_distance_changed_routes_route_key_ordinal"
     merge_policy: str = "submission_order"
@@ -50,7 +51,12 @@ class CandidateControlConfig:
             raise ValueError("proposal_top_k must be positive")
         if self.max_exact_calls_per_round <= 0:
             raise ValueError("max_exact_calls_per_round must be positive")
-        if self.worker_count not in {1, 4}:
+        if not isinstance(self.stage052_calibrated_workers, bool):
+            raise ValueError("stage052_calibrated_workers must be boolean")
+        if self.stage052_calibrated_workers:
+            if self.worker_count not in {1, 2, 3, 4}:
+                raise ValueError("Stage 5.2 calibrated worker_count must be in 1..4")
+        elif self.worker_count not in {1, 4}:
             raise ValueError("Stage 3.4 worker_count must be 1 or 4")
         if self.executor_model != "process_spawn":
             raise ValueError("Stage 3.4 requires executor_model=process_spawn")

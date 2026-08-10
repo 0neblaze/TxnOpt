@@ -54,6 +54,21 @@ def changed_candidate_pool_v1(
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
 ]: ...
+def route_merge_candidate_pool_v2(
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    route_objective_metrics: npt.NDArray[np.float64],
+    demand: npt.NDArray[np.float64],
+    load_capacity: float,
+    epsilon: float,
+    pair_pruning: bool,
+    preserve_duplicates: bool,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
 def assemble_changed_candidate_plans_v1(
     current_route_offsets: npt.NDArray[np.int64],
     current_route_indices: npt.NDArray[np.int64],
@@ -207,7 +222,9 @@ class NativeRouteCacheV2:
     ]: ...
     def commit_store_batch(self) -> npt.NDArray[np.int64]: ...
     def rollback_store_batch(self) -> npt.NDArray[np.int64]: ...
-    def snapshot(self) -> tuple[
+    def snapshot(
+        self,
+    ) -> tuple[
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],
         npt.NDArray[np.uint8],
@@ -234,7 +251,9 @@ class NativeNegativeRouteCacheV2:
     ) -> npt.NDArray[np.int64]: ...
     def commit_store_batch(self) -> npt.NDArray[np.int64]: ...
     def rollback_store_batch(self) -> npt.NDArray[np.int64]: ...
-    def snapshot(self) -> tuple[
+    def snapshot(
+        self,
+    ) -> tuple[
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],
@@ -245,18 +264,14 @@ class NativeBudgetStateV2:
     def __init__(self, exact_budget: int, round_budget: int) -> None: ...
     def begin_round(self, lane_id: int, iteration: int) -> npt.NDArray[np.int64]: ...
     def finish_round(self) -> npt.NDArray[np.int64]: ...
-    def reserve_round(
-        self, requested: int, atomic: bool
-    ) -> npt.NDArray[np.int64]: ...
+    def reserve_round(self, requested: int, atomic: bool) -> npt.NDArray[np.int64]: ...
     def reserve_exact(self, requested: int) -> npt.NDArray[np.int64]: ...
     def exact_remaining(self) -> int: ...
     def candidate_round_remaining(self) -> int: ...
     def complete_exact(self, count: int) -> npt.NDArray[np.int64]: ...
     def interrupt_exact(self, count: int) -> npt.NDArray[np.int64]: ...
     def snapshot(self) -> npt.NDArray[np.int64]: ...
-    def restore(
-        self, snapshot: npt.NDArray[np.int64]
-    ) -> npt.NDArray[np.int64]: ...
+    def restore(self, snapshot: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]: ...
     def state(self) -> npt.NDArray[np.int64]: ...
 
 class NativeAttemptedPlanSetV2:
@@ -698,6 +713,11 @@ __build_source_dirty__: bool
 __build_development_override__: bool
 __build_cpp_source_kind__: str
 __build_source_attestation_version__: int
+__build_performance_profile__: str
+__build_compiler_id__: str
+__build_compiler_version__: str
+__build_interprocedural_optimization__: bool
+__build_host_native__: bool
 
 def stage052_native_architecture_capabilities_v2() -> npt.NDArray[np.int64]: ...
 
@@ -814,6 +834,50 @@ def exact_charging_batch_numeric(
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
 ]: ...
+def _test_exact_completion_order_v2(
+    node_kind: npt.NDArray[np.int64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    order_offsets: npt.NDArray[np.int64],
+    order_indices: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    batch_size: npt.NDArray[np.int64],
+    scheduler_endpoint: str = "",
+) -> npt.NDArray[np.int64]: ...
+def _test_exact_physical_receipt_v2(
+    node_kind: npt.NDArray[np.int64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    order_offsets: npt.NDArray[np.int64],
+    order_indices: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    batch_size: npt.NDArray[np.int64],
+    scheduler_endpoint: str,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+]: ...
+def _test_exact_payload_hash_v2(
+    node_kind: npt.NDArray[np.int64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    vehicle: npt.NDArray[np.float64],
+    order_offsets: npt.NDArray[np.int64],
+    order_indices: npt.NDArray[np.int64],
+    deadline_remaining: npt.NDArray[np.float64],
+    batch_size: npt.NDArray[np.int64],
+    scheduler_endpoint: str = "",
+) -> str: ...
+def _test_initial_completion_hash_v2() -> tuple[str, str, str, str]: ...
 def exact_charging_batch_host_v2(
     socket_path: str,
     node_kind: npt.NDArray[np.int64],
@@ -924,6 +988,37 @@ def screen_route_batch_transaction_v2(
     npt.NDArray[np.float64],
     npt.NDArray[np.int64],
     str,
+]: ...
+def route_merge_candidate_pool_screened_v3(
+    node_kind: npt.NDArray[np.int64],
+    demand: npt.NDArray[np.float64],
+    ready_time: npt.NDArray[np.float64],
+    due_date: npt.NDArray[np.float64],
+    service_time: npt.NDArray[np.float64],
+    distance: npt.NDArray[np.float64],
+    reachable: npt.NDArray[np.uint8],
+    vehicle: npt.NDArray[np.float64],
+    route_offsets: npt.NDArray[np.int64],
+    route_indices: npt.NDArray[np.int64],
+    route_objective_metrics: npt.NDArray[np.float64],
+    epsilon: float,
+    worker_count: int = 1,
+) -> tuple[
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    npt.NDArray[np.int64],
+    tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        str,
+    ],
+    npt.NDArray[np.float64],
 ]: ...
 def candidate_round_transaction_v1(
     node_kind: npt.NDArray[np.int64],
@@ -1039,6 +1134,38 @@ def candidate_round_transaction_v2(
     npt.NDArray[np.int64],
     npt.NDArray[np.float64],
 ]: ...
+
+class NativeCandidateRoundRuntimeV2:
+    def __init__(self, worker_count: int, task_receipt_path: str = "") -> None: ...
+    def execute(self, *arguments: object) -> tuple[object, ...]: ...
+    def execute_screening(self, *arguments: object) -> tuple[object, ...]: ...
+    def execute_route_merge_pool_screened(self, *arguments: object) -> tuple[object, ...]: ...
+    def statistics(self) -> dict[str, object]: ...
+
+class NativeRouteMergeProfileCacheV1:
+    def __init__(self) -> None: ...
+    def plan(
+        self,
+        route_offsets: npt.NDArray[np.int64],
+        route_indices: npt.NDArray[np.int64],
+        available_flags: npt.NDArray[np.int64],
+    ) -> tuple[
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+        npt.NDArray[np.int64],
+    ]: ...
+    def commit(
+        self,
+        miss_indices: npt.NDArray[np.int64],
+        feasible_flags: npt.NDArray[np.int64],
+        objective_metrics: npt.NDArray[np.float64],
+        charging_counts: npt.NDArray[np.int64],
+    ) -> None: ...
+    def rollback(self) -> None: ...
+
 def full_native_alns_v1(
     node_kind: npt.NDArray[np.int64],
     demand: npt.NDArray[np.float64],
@@ -1153,6 +1280,7 @@ def full_native_alns_v2(
     stage04_float: npt.NDArray[np.float64],
     operator_integer: npt.NDArray[np.int64],
     operator_float: npt.NDArray[np.float64],
+    task_receipt_path: str = "",
 ) -> tuple[
     npt.NDArray[np.int64],
     npt.NDArray[np.int64],
@@ -1202,6 +1330,7 @@ def full_native_alns_v2(
         str,
     ],
     tuple[npt.NDArray[np.int64], str, str, str, str, object],
+    dict[str, object],
 ]: ...
 def native_search_request_host_receipt_v2(
     socket_path: str,
@@ -1338,7 +1467,6 @@ def full_native_alns_host_v2(
     operator_integer: npt.NDArray[np.int64],
     operator_float: npt.NDArray[np.float64],
 ) -> tuple[object, ...]: ...
-
 def _test_native_kernel_fault_v2(socket_path: str, fault: str) -> None: ...
 def _test_native_kernel_telemetry_v2(reset: bool = False) -> dict[str, int]: ...
 def _test_candidate_session_execute_ack_loss_v2(

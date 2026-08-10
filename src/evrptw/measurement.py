@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from evrptw.candidate_control import CandidateControlConfig
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.objective import ObjectiveComparison, SolutionObjective, compare_objectives
+from evrptw.stage052_event_spool import Stage052EventSpool
+from evrptw.stage052_writer_pipeline import validate_pipeline_receipt
 
 if TYPE_CHECKING:
     from evrptw.models import Instance
@@ -60,6 +63,11 @@ class MeasurementConfig:
     # from the historical Stage 3 measurement surface.  Keeping this false
     # preserves both the old artifact schema and its wall-clock cost.
     record_runtime_semantic_events: bool = False
+    externalize_runtime_semantic_events: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
     stream_sink: MeasurementTraceSink | None = field(
         default=None,
         repr=False,
@@ -72,6 +80,8 @@ class MeasurementConfig:
                 f"unsupported Stage 3.0 trace schema {self.schema_version}; "
                 f"expected {TRACE_SCHEMA_VERSION}"
             )
+        if self.externalize_runtime_semantic_events and not self.record_runtime_semantic_events:
+            raise ValueError("external runtime semantic storage requires semantic recording")
 
 
 def _measurement_config_payload(config: MeasurementConfig) -> dict[str, object]:
@@ -244,6 +254,37 @@ class _ExternalizedTraceList[T](list[T]):
         )
 
 
+class _RuntimeSemanticEventView(Sequence[dict[str, object]]):
+    """Replayable view over externally owned runtime semantic rows."""
+
+    def __init__(self, spool: Stage052EventSpool) -> None:
+        self._spool = spool
+
+    def __len__(self) -> int:
+        return len(self._spool)
+
+    @overload
+    def __getitem__(self, index: int) -> dict[str, object]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[dict[str, object]]: ...
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> dict[str, object] | Sequence[dict[str, object]]:
+        selected = self._spool[index]
+        if isinstance(index, slice):
+            assert isinstance(selected, list)
+            return [event for _stream, event in selected]
+        assert isinstance(selected, tuple)
+        return selected[1]
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        for _stream, event in self._spool:
+            yield event
+
+
 class _MeasuredResult(Protocol):
     @property
     def charging_subproblem_calls(self) -> int: ...
@@ -348,6 +389,21 @@ class Stage03Trace:
         init=False,
         repr=False,
     )
+    _runtime_semantic_spool: Stage052EventSpool | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _runtime_semantic_spool_receipt: dict[str, object] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _runtime_semantic_pipeline_evidence: list[tuple[dict[str, object], Path]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
     _runtime_semantic_terminal_imported: bool = field(
         default=False,
         init=False,
@@ -355,12 +411,87 @@ class Stage03Trace:
     )
 
     @property
-    def runtime_semantic_events(self) -> tuple[dict[str, object], ...]:
+    def runtime_semantic_events(self) -> Sequence[dict[str, object]]:
+        if self._runtime_semantic_spool is not None:
+            return _RuntimeSemanticEventView(self._runtime_semantic_spool)
         return tuple(self._runtime_semantic_events)
 
     @property
     def runtime_semantic_enabled(self) -> bool:
         return self.config.record_runtime_semantic_events
+
+    @property
+    def runtime_semantic_pipeline_receipts(self) -> tuple[dict[str, object], ...]:
+        """Return finalized physical spool receipts in lifecycle order."""
+
+        return tuple(
+            dict(receipt) for receipt, _audit_path in self._runtime_semantic_pipeline_evidence
+        )
+
+    @property
+    def runtime_semantic_pipeline_evidence(
+        self,
+    ) -> tuple[tuple[dict[str, object], Path], ...]:
+        """Return finalized receipts and private attempted-frame audit paths."""
+
+        return tuple(
+            (dict(receipt), audit_path)
+            for receipt, audit_path in self._runtime_semantic_pipeline_evidence
+        )
+
+    def register_runtime_semantic_pipeline_evidence(
+        self,
+        receipt: Mapping[str, object],
+        audit_path: Path,
+    ) -> None:
+        """Retain one externally owned spool receipt and immutable audit."""
+
+        validate_pipeline_receipt(receipt, require_finalized=True)
+        if audit_path.is_symlink() or not audit_path.is_file():
+            raise ValueError("runtime semantic attempted audit is not a regular file")
+        self._runtime_semantic_pipeline_evidence.append((dict(receipt), audit_path))
+
+    def seal_runtime_semantic_storage(self) -> dict[str, object] | None:
+        """Stop the sole active spool writer while retaining readable frames."""
+
+        if self._runtime_semantic_spool is None:
+            return None
+        if self._runtime_semantic_spool_receipt is None:
+            receipt, audit_path = self._runtime_semantic_spool.detach_pipeline_evidence()
+            try:
+                self.register_runtime_semantic_pipeline_evidence(receipt, audit_path)
+            except BaseException:
+                audit_path.unlink(missing_ok=True)
+                raise
+            self._runtime_semantic_spool_receipt = dict(receipt)
+        return dict(self._runtime_semantic_spool_receipt)
+
+    def release_runtime_semantic_storage(self) -> None:
+        """Release a temporary runtime-semantic spool after final persistence."""
+
+        cleanup_errors: list[BaseException] = []
+        if self._runtime_semantic_spool is not None:
+            try:
+                self.seal_runtime_semantic_storage()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            try:
+                self._runtime_semantic_spool.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            self._runtime_semantic_spool = None
+            self._runtime_semantic_spool_receipt = None
+        for _receipt, audit_path in self._runtime_semantic_pipeline_evidence:
+            try:
+                audit_path.unlink(missing_ok=True)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        self._runtime_semantic_pipeline_evidence.clear()
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "runtime semantic storage cleanup failed",
+                cleanup_errors,
+            )
 
     def record_runtime_semantic_event(
         self,
@@ -373,21 +504,23 @@ class Stage03Trace:
             raise ValueError("runtime semantic stream name cannot be empty")
         if self._runtime_semantic_terminal_imported:
             raise RuntimeError("runtime semantic journal is already terminated")
-        event_id = len(self._runtime_semantic_events) + 1
+        event_id = len(self.runtime_semantic_events) + 1
         if (
             "semantic_event_id" in event
             or "runtime_causal_event_id" in event
             or "semantic_stream" in event
         ):
             raise ValueError("runtime semantic identity is owned by Stage03Trace")
-        self._runtime_semantic_events.append(
-            {
-                **dict(event),
-                "semantic_stream": semantic_stream,
-                "semantic_event_id": event_id,
-                "runtime_causal_event_id": event_id,
-            }
-        )
+        owned_event = {
+            **dict(event),
+            "semantic_stream": semantic_stream,
+            "semantic_event_id": event_id,
+            "runtime_causal_event_id": event_id,
+        }
+        if self._runtime_semantic_spool is None:
+            self._runtime_semantic_events.append(owned_event)
+        else:
+            self._runtime_semantic_spool.append((semantic_stream, owned_event))
         if semantic_stream == "termination":
             self._runtime_semantic_terminal_imported = True
         return event_id
@@ -395,20 +528,20 @@ class Stage03Trace:
     def snapshot_runtime_semantic_journal(self) -> int:
         """Return an O(1) rollback boundary for one atomic candidate transaction."""
 
-        return len(self._runtime_semantic_events)
+        return len(self.runtime_semantic_events)
 
     def rollback_runtime_semantic_journal(self, checkpoint: int) -> None:
         """Discard every semantic event emitted after an uncommitted boundary."""
 
-        if isinstance(checkpoint, bool) or not 0 <= checkpoint <= len(
-            self._runtime_semantic_events
-        ):
+        if isinstance(checkpoint, bool) or not 0 <= checkpoint <= len(self.runtime_semantic_events):
             raise ValueError("runtime semantic journal checkpoint is invalid")
-        del self._runtime_semantic_events[checkpoint:]
+        if self._runtime_semantic_spool is None:
+            del self._runtime_semantic_events[checkpoint:]
+        else:
+            self._runtime_semantic_spool.truncate(checkpoint)
+        runtime_events = self.runtime_semantic_events
         self._runtime_semantic_terminal_imported = bool(
-            self._runtime_semantic_events
-            and self._runtime_semantic_events[-1].get("semantic_stream")
-            == "termination"
+            runtime_events and runtime_events[-1].get("semantic_stream") == "termination"
         )
 
     def replace_runtime_semantic_journal(
@@ -420,70 +553,130 @@ class Stage03Trace:
         replacement = tuple(events)
         if not self.runtime_semantic_enabled:
             if replacement:
-                raise ValueError(
-                    "runtime semantic replacement requires enabled recording"
-                )
+                raise ValueError("runtime semantic replacement requires enabled recording")
             return
-        self._runtime_semantic_events.clear()
-        self._runtime_semantic_terminal_imported = False
-        try:
-            for stream, event in replacement:
-                self.record_runtime_semantic_event(stream, event)
-        except Exception:
-            self._runtime_semantic_events.clear()
-            self._runtime_semantic_terminal_imported = False
-            raise
+        self.import_runtime_semantic_journal(
+            (
+                (event_id, stream, event)
+                for event_id, (stream, event) in enumerate(replacement, start=1)
+            )
+        )
 
     def import_runtime_semantic_journal(
         self,
         events: Iterable[tuple[int, str, Mapping[str, object]]],
+        *,
+        take_ownership: bool = False,
     ) -> None:
-        """Atomically import an already ordered external causal journal."""
+        """Atomically import an already ordered external causal journal.
 
-        replacement = tuple(events)
+        ``take_ownership`` lets a producer transfer mutable event dictionaries
+        after it has completed all independent validation.  The trace then
+        adds its owned identities in place instead of retaining a second full
+        copy of a large native journal.
+        """
+
         if not self.runtime_semantic_enabled:
-            if replacement:
-                raise ValueError(
-                    "runtime semantic import requires enabled recording"
-                )
+            if next(iter(events), None) is not None:
+                raise ValueError("runtime semantic import requires enabled recording")
             return
         imported: list[dict[str, object]] = []
+        previous_spool = self._runtime_semantic_spool
+        if previous_spool is not None:
+            self.seal_runtime_semantic_storage()
+        imported_spool = (
+            Stage052EventSpool(prefix="stage052-runtime-semantic-")
+            if previous_spool is not None
+            else None
+        )
         terminal_seen = False
-        for expected_id, row in enumerate(replacement, start=1):
-            causal_id, semantic_stream, event = row
-            if (
-                isinstance(causal_id, bool)
-                or not isinstance(causal_id, int)
-                or causal_id != expected_id
-            ):
-                raise ValueError(
-                    "runtime semantic causal IDs must be unique and contiguous"
-                )
+        try:
+            for expected_id, row in enumerate(events, start=1):
+                causal_id, semantic_stream, event = row
+                if (
+                    isinstance(causal_id, bool)
+                    or not isinstance(causal_id, int)
+                    or causal_id != expected_id
+                ):
+                    raise ValueError("runtime semantic causal IDs must be unique and contiguous")
+                if not semantic_stream:
+                    raise ValueError("runtime semantic stream name cannot be empty")
+                if terminal_seen:
+                    raise ValueError(
+                        "runtime semantic journal cannot contain events after termination"
+                    )
+                if (
+                    "semantic_event_id" in event
+                    or "runtime_causal_event_id" in event
+                    or "semantic_stream" in event
+                ):
+                    raise ValueError("runtime semantic identity is owned by Stage03Trace")
+                owned_event = event if take_ownership and isinstance(event, dict) else dict(event)
+                owned_event["semantic_stream"] = semantic_stream
+                owned_event["semantic_event_id"] = causal_id
+                owned_event["runtime_causal_event_id"] = causal_id
+                if imported_spool is None:
+                    imported.append(owned_event)
+                else:
+                    imported_spool.append((semantic_stream, owned_event))
+                terminal_seen = semantic_stream == "termination"
+        except BaseException:
+            if imported_spool is not None:
+                imported_spool.close()
+            raise
+        self._runtime_semantic_events = imported
+        self._runtime_semantic_spool = imported_spool
+        self._runtime_semantic_spool_receipt = None
+        self._runtime_semantic_terminal_imported = terminal_seen
+        if previous_spool is not None:
+            previous_spool.close()
+
+    def adopt_runtime_semantic_spool(self, spool: Stage052EventSpool) -> None:
+        """Adopt one fully validated terminal spool without re-encoding it.
+
+        Full-native execution builds its canonical projection in a dedicated
+        bounded writer after the solver spool has stopped.  Once the native
+        SoA journal and the rich projection reconcile, ownership can move to
+        the trace directly.  Re-importing every row into a second spool would
+        repeat JSON decoding, encoding, compression, and durable temporary I/O.
+        """
+
+        if not self.runtime_semantic_enabled:
+            raise ValueError("runtime semantic spool adoption requires enabled recording")
+        if not isinstance(spool, Stage052EventSpool):
+            raise TypeError("runtime semantic spool adoption requires Stage052EventSpool")
+        if spool is self._runtime_semantic_spool:
+            raise ValueError("runtime semantic spool is already owned by this trace")
+
+        spool.seal()
+        terminal_seen = False
+        row_count = 0
+        for expected_id, (semantic_stream, event) in enumerate(spool, start=1):
             if not semantic_stream:
                 raise ValueError("runtime semantic stream name cannot be empty")
             if terminal_seen:
-                raise ValueError(
-                    "runtime semantic journal cannot contain events after termination"
-                )
+                raise ValueError("runtime semantic journal cannot contain events after termination")
             if (
-                "semantic_event_id" in event
-                or "runtime_causal_event_id" in event
-                or "semantic_stream" in event
+                event.get("semantic_stream") != semantic_stream
+                or event.get("semantic_event_id") != expected_id
+                or event.get("runtime_causal_event_id") != expected_id
             ):
                 raise ValueError(
-                    "runtime semantic identity is owned by Stage03Trace"
+                    "adopted runtime semantic identities must be unique and contiguous"
                 )
-            imported.append(
-                {
-                    **dict(event),
-                    "semantic_stream": semantic_stream,
-                    "semantic_event_id": causal_id,
-                    "runtime_causal_event_id": causal_id,
-                }
-            )
             terminal_seen = semantic_stream == "termination"
-        self._runtime_semantic_events = imported
-        self._runtime_semantic_terminal_imported = terminal_seen
+            row_count = expected_id
+        if row_count == 0 or not terminal_seen:
+            raise ValueError("adopted runtime semantic spool must end with termination")
+
+        previous_spool = self._runtime_semantic_spool
+        if previous_spool is not None:
+            self.seal_runtime_semantic_storage()
+            previous_spool.close()
+        self._runtime_semantic_events = []
+        self._runtime_semantic_spool = spool
+        self._runtime_semantic_spool_receipt = None
+        self._runtime_semantic_terminal_imported = True
 
     def __post_init__(self) -> None:
         self._validate_screening_route_dictionary()
@@ -500,6 +693,8 @@ class Stage03Trace:
             self.trace_schema_version = EXACT_DEADLINE_TRACE_SCHEMA_VERSION
         if self.candidate_control_config is not None:
             self.trace_schema_version = CANDIDATE_CONTROL_TRACE_SCHEMA_VERSION
+        if self.config.externalize_runtime_semantic_events:
+            self._runtime_semantic_spool = Stage052EventSpool(prefix="stage052-runtime-semantic-")
         if self.config.stream_sink is not None:
             if any(
                 (
@@ -875,6 +1070,74 @@ class Stage03Trace:
                 self._aggregate_screening_reason_counts.get(reason, 0) + count
             )
         self.events.append(dict(event))
+        if self.runtime_semantic_enabled:
+            self.record_runtime_semantic_event(
+                "screening",
+                {
+                    "event_type": "candidate_screening_aggregate",
+                    "physical_event_type": event.get("event_type"),
+                    "status": event.get("status"),
+                    "lane": event.get("lane"),
+                    "iteration": event.get("iteration"),
+                    "operator": event.get("operator"),
+                    "calls": calls,
+                    "passes": passes,
+                    "rejections": rejections,
+                    "cache_hits": cache_hits,
+                    "exact_call_blocked": exact_call_blocked,
+                    "reason_counts": dict(sorted(reason_counts.items())),
+                    "candidate_pool_hash": event.get("candidate_pool_hash"),
+                    "screening_pool_hash": event.get("screening_pool_hash"),
+                    "screening_integrity_evidence": event.get("screening_integrity_evidence"),
+                },
+            )
+
+    def import_screening_statistics(
+        self,
+        statistics: Mapping[str, object],
+    ) -> None:
+        """Import validated native screening totals without per-row objects.
+
+        Full-native execution returns the independently hash-bound physical
+        decision journal as typed SoA arrays.  The historical measurement
+        reconciliation needs only its five totals and reason histogram; the
+        canonical journal separately retains and replays every physical row.
+        """
+
+        if self.screening_decisions or self._aggregate_screening_calls:
+            raise RuntimeError("screening statistics can only be imported once")
+        fields = (
+            "screening_calls",
+            "screening_passes",
+            "screening_rejections",
+            "screening_cache_hits",
+            "screening_exact_call_blocked",
+        )
+        values = tuple(statistics.get(field) for field in fields)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values
+        ):
+            raise ValueError("imported screening counters are invalid")
+        reason_counts = statistics.get("screening_reason_counts")
+        if not isinstance(reason_counts, dict) or any(
+            not isinstance(reason, str)
+            or not reason
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count <= 0
+            for reason, count in reason_counts.items()
+        ):
+            raise ValueError("imported screening reason counts are invalid")
+        (
+            self._aggregate_screening_calls,
+            self._aggregate_screening_passes,
+            self._aggregate_screening_rejections,
+            self._aggregate_screening_cache_hits,
+            self._aggregate_screening_exact_call_blocked,
+        ) = cast(tuple[int, int, int, int, int], values)
+        self._aggregate_screening_reason_counts = {
+            str(reason): int(count) for reason, count in reason_counts.items()
+        }
 
     def record_deadline_boundary(
         self,
@@ -1019,9 +1282,7 @@ class Stage03Trace:
         """
 
         key = (
-            self.register_route(sequence)
-            if registered_route_key is None
-            else registered_route_key
+            self.register_route(sequence) if registered_route_key is None else registered_route_key
         )
         started = self._offset() if started_at is None else started_at
         completed = self._offset() if completed_at is None else completed_at
@@ -1060,9 +1321,7 @@ class Stage03Trace:
         fast_append = self._typed_screening_append
         if fast_append is not None:
             summary = self._stream_summary
-            if summary is None or not isinstance(
-                self.screening_decisions, _ExternalizedTraceList
-            ):
+            if summary is None or not isinstance(self.screening_decisions, _ExternalizedTraceList):
                 raise RuntimeError("typed screening stream is unavailable")
             summary.counts["screening_decisions"] += 1
             self._typed_screening_passes += status == "pass"
@@ -1163,13 +1422,8 @@ class Stage03Trace:
                 self.result_summary["candidate_transaction_statistics"] = cast(
                     Any, result
                 ).candidate_transaction_statistics
-            if (
-                self.runtime_semantic_enabled
-                and not self._runtime_semantic_terminal_imported
-            ):
-                termination_status = str(
-                    getattr(result, "termination_reason", "unknown")
-                )
+            if self.runtime_semantic_enabled and not self._runtime_semantic_terminal_imported:
+                termination_status = str(getattr(result, "termination_reason", "unknown"))
                 if termination_status != "iteration_limit":
                     boundary_event_type = (
                         "exact_budget_boundary"
@@ -1187,15 +1441,9 @@ class Stage03Trace:
                             "lane": "all",
                             "iteration": getattr(result, "iterations", 0),
                             "operator": "termination",
-                            "started_calls": getattr(
-                                result, "exact_started_calls", 0
-                            ),
-                            "completed_calls": getattr(
-                                result, "exact_completed_calls", 0
-                            ),
-                            "interrupted_calls": getattr(
-                                result, "exact_interrupted_calls", 0
-                            ),
+                            "started_calls": getattr(result, "exact_started_calls", 0),
+                            "completed_calls": getattr(result, "exact_completed_calls", 0),
+                            "interrupted_calls": getattr(result, "exact_interrupted_calls", 0),
                         },
                     )
                 objective = getattr(result, "objective", None)
@@ -1206,18 +1454,10 @@ class Stage03Trace:
                         "event_type": "termination",
                         "status": termination_status,
                         "iterations": getattr(result, "iterations", 0),
-                        "effective_iterations": getattr(
-                            result, "effective_iterations", 0
-                        ),
-                        "exact_started_calls": getattr(
-                            result, "exact_started_calls", 0
-                        ),
-                        "exact_completed_calls": getattr(
-                            result, "exact_completed_calls", 0
-                        ),
-                        "exact_interrupted_calls": getattr(
-                            result, "exact_interrupted_calls", 0
-                        ),
+                        "effective_iterations": getattr(result, "effective_iterations", 0),
+                        "exact_started_calls": getattr(result, "exact_started_calls", 0),
+                        "exact_completed_calls": getattr(result, "exact_completed_calls", 0),
+                        "exact_interrupted_calls": getattr(result, "exact_interrupted_calls", 0),
                         "objective_key": list(objective_key),
                     },
                 )
@@ -1278,19 +1518,16 @@ class Stage03Trace:
                 reasons.update(aggregate_reasons)
                 return {
                     "screening_calls": (
-                        int(summary.counts["screening_decisions"])
-                        + self._aggregate_screening_calls
+                        int(summary.counts["screening_decisions"]) + self._aggregate_screening_calls
                     ),
                     "screening_passes": (
                         self._typed_screening_passes + self._aggregate_screening_passes
                     ),
                     "screening_rejections": (
-                        self._typed_screening_rejections
-                        + self._aggregate_screening_rejections
+                        self._typed_screening_rejections + self._aggregate_screening_rejections
                     ),
                     "screening_cache_hits": (
-                        self._typed_screening_cache_hits
-                        + self._aggregate_screening_cache_hits
+                        self._typed_screening_cache_hits + self._aggregate_screening_cache_hits
                     ),
                     "screening_exact_call_blocked": (
                         self._typed_screening_exact_call_blocked
@@ -1302,12 +1539,10 @@ class Stage03Trace:
             reasons.update(aggregate_reasons)
             return {
                 "screening_calls": (
-                    int(summary.counts["screening_decisions"])
-                    + self._aggregate_screening_calls
+                    int(summary.counts["screening_decisions"]) + self._aggregate_screening_calls
                 ),
                 "screening_passes": (
-                    int(summary.counts["screening_status:pass"])
-                    + self._aggregate_screening_passes
+                    int(summary.counts["screening_status:pass"]) + self._aggregate_screening_passes
                 ),
                 "screening_rejections": (
                     int(summary.counts["screening_status:rejected"])
@@ -1619,10 +1854,10 @@ class Stage03Trace:
         }
 
     def to_dict(self) -> dict[str, object]:
-        if self._stream_summary is not None:
+        if self._stream_summary is not None or self._runtime_semantic_spool is not None:
             raise RuntimeError(
                 "full trace rows were externalized during solve; use to_index_dict() and "
-                "the persisted Parquet stream"
+                "the persisted event stream"
             )
         return {
             "schema_version": self.config.schema_version,
@@ -1633,7 +1868,7 @@ class Stage03Trace:
             "route_evaluations": [asdict(record) for record in self.route_evaluations],
             "events": list(self.events),
             **(
-                {"runtime_semantic_events": list(self._runtime_semantic_events)}
+                {"runtime_semantic_events": list(self.runtime_semantic_events)}
                 if self.runtime_semantic_enabled
                 else {}
             ),
@@ -1752,47 +1987,28 @@ class Stage03Trace:
         ]
         trace.events = [dict(event) for event in payload.get("events", [])]
         runtime_semantic_payload = payload.get("runtime_semantic_events", [])
-        if (
-            runtime_semantic_payload
-            and not config.record_runtime_semantic_events
-        ):
-            raise ValueError(
-                "runtime semantic events require their explicit measurement flag"
-            )
-        trace._runtime_semantic_events = [
-            dict(event) for event in runtime_semantic_payload
-        ]
+        if runtime_semantic_payload and not config.record_runtime_semantic_events:
+            raise ValueError("runtime semantic events require their explicit measurement flag")
+        trace._runtime_semantic_events = [dict(event) for event in runtime_semantic_payload]
         termination_rows = [
             index
             for index, event in enumerate(trace._runtime_semantic_events)
             if event.get("semantic_stream") == "termination"
         ]
-        if termination_rows and termination_rows != [
-            len(trace._runtime_semantic_events) - 1
-        ]:
-            raise ValueError(
-                "runtime semantic termination must be the final event"
-            )
+        if termination_rows and termination_rows != [len(trace._runtime_semantic_events) - 1]:
+            raise ValueError("runtime semantic termination must be the final event")
         trace._runtime_semantic_terminal_imported = bool(termination_rows)
         causal_ids = [
-            event.get("runtime_causal_event_id")
-            for event in trace._runtime_semantic_events
+            event.get("runtime_causal_event_id") for event in trace._runtime_semantic_events
         ]
         if any(causal_id is not None for causal_id in causal_ids):
-            expected_ids = list(
-                range(1, len(trace._runtime_semantic_events) + 1)
-            )
+            expected_ids = list(range(1, len(trace._runtime_semantic_events) + 1))
             if (
                 causal_ids != expected_ids
-                or [
-                    event.get("semantic_event_id")
-                    for event in trace._runtime_semantic_events
-                ]
+                or [event.get("semantic_event_id") for event in trace._runtime_semantic_events]
                 != expected_ids
             ):
-                raise ValueError(
-                    "runtime semantic causal IDs must be unique and contiguous"
-                )
+                raise ValueError("runtime semantic causal IDs must be unique and contiguous")
         trace.finished_at = (
             None if payload.get("finished_at") is None else float(payload["finished_at"])
         )

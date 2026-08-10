@@ -8,25 +8,51 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <sys/socket.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <pthread.h>
 #include <thread>
+#include <tuple>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
+#ifndef EVRPTW_BUILD_PERFORMANCE_PROFILE
+#define EVRPTW_BUILD_PERFORMANCE_PROFILE "unknown"
+#endif
+#ifndef EVRPTW_BUILD_COMPILER_ID
+#define EVRPTW_BUILD_COMPILER_ID "unknown"
+#endif
+#ifndef EVRPTW_BUILD_COMPILER_VERSION
+#define EVRPTW_BUILD_COMPILER_VERSION "unknown"
+#endif
+#ifndef EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION
+#define EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION 0
+#endif
+#ifndef EVRPTW_BUILD_HOST_NATIVE
+#define EVRPTW_BUILD_HOST_NATIVE 0
+#endif
+
 #include "native_concurrency.hpp"
+#include "native_exact_parallel.hpp"
 #include "native_candidate_transaction_executor.hpp"
 #include "native_kernel_protocol.hpp"
 #include "native_search_core.hpp"
 #include "native_sha256.hpp"
 #include "native_solver_kernels.hpp"
+#include "native_task_receipt_spool.hpp"
 
 namespace protocol = evrptw::native_protocol;
 namespace kernels = evrptw::native_kernels;
@@ -37,6 +63,76 @@ std::atomic<std::uint64_t> segment_counter{0};
 std::string scheduler_run_nonce;
 std::string production_fault;
 std::atomic<bool> production_fault_consumed{false};
+
+void set_thread_name(const char* name) noexcept {
+#ifdef __linux__
+    ::pthread_setname_np(::pthread_self(), name);
+#else
+    static_cast<void>(name);
+#endif
+}
+
+void apply_cpu_affinity(const std::string_view specification) {
+    if (specification.empty()) {
+        throw std::invalid_argument(
+            "native scheduler CPU affinity cannot be empty");
+    }
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    std::size_t start = 0;
+    std::size_t count = 0;
+    while (start <= specification.size()) {
+        const auto comma = specification.find(',', start);
+        const auto token = specification.substr(
+            start, comma == std::string_view::npos
+                ? specification.size() - start
+                : comma - start);
+        if (token.empty()) {
+            throw std::invalid_argument(
+                "native scheduler CPU affinity contains an empty CPU id");
+        }
+        std::size_t consumed = 0;
+        const auto cpu = std::stoll(std::string(token), &consumed, 10);
+        if (consumed != token.size() || cpu < 0 || cpu >= CPU_SETSIZE) {
+            throw std::invalid_argument(
+                "native scheduler CPU affinity contains an invalid CPU id");
+        }
+        const auto cpu_id = static_cast<int>(cpu);
+        if (CPU_ISSET(cpu_id, &requested)) {
+            throw std::invalid_argument(
+                "native scheduler CPU affinity contains a duplicate CPU id");
+        }
+        CPU_SET(cpu_id, &requested);
+        ++count;
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (count == 0) {
+        throw std::invalid_argument(
+            "native scheduler CPU affinity must contain at least one CPU");
+    }
+    if (::sched_setaffinity(0, sizeof(requested), &requested) != 0) {
+        throw std::system_error(
+            errno, std::generic_category(),
+            "native scheduler sched_setaffinity failed");
+    }
+    cpu_set_t actual;
+    CPU_ZERO(&actual);
+    if (::sched_getaffinity(0, sizeof(actual), &actual) != 0
+        || CPU_COUNT(&actual) == 0) {
+        throw std::system_error(
+            errno == 0 ? EINVAL : errno, std::generic_category(),
+            "native scheduler sched_getaffinity failed after apply");
+    }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &requested) != CPU_ISSET(cpu, &actual)) {
+            throw std::runtime_error(
+                "native scheduler CPU affinity was not applied exactly");
+        }
+    }
+}
 
 class CandidateSessionRegistry final {
 public:
@@ -154,9 +250,13 @@ public:
             throw std::runtime_error(
                 "native candidate session close identity mismatch");
         }
-        std::lock_guard session_lock(found->second->mutex);
-        if (found->second->pending_budget_snapshot.has_value()) {
-            found->second->rollback_pending();
+        // Retain the session until after the guard unlocks its mutex.  Erasing
+        // the map's last shared_ptr while the guard still referenced the
+        // session-owned mutex destroyed the mutex before unlock.
+        auto session = found->second;
+        std::lock_guard session_lock(session->mutex);
+        if (session->pending_budget_snapshot.has_value()) {
+            session->rollback_pending();
         }
         sessions_.erase(found);
     }
@@ -245,9 +345,47 @@ public:
         const evrptw::native_search::RouteBatchViewV2 routes,
         const double deadline_remaining,
         const std::int64_t batch_size) override {
-        evrptw::native_search::LocalCandidateTransactionKernelsV2 local;
-        return local.exact(
-            problem, routes, deadline_remaining, batch_size);
+        routes.validate("scheduler candidate transaction exact");
+        const evrptw::native_search::ExactProblemViewV2 exact_problem{
+            problem.node_kind,
+            problem.ready_time,
+            problem.due_date,
+            problem.service_time,
+            problem.distance,
+            problem.vehicle,
+        };
+        const auto run_batch = [&](const std::int64_t* offsets,
+                                   const std::int64_t* indices,
+                                   const std::size_t route_count,
+                                   const double remaining) {
+            return evrptw::native_search::run_local_exact_batch_v2(
+                exact_problem,
+                {
+                    std::span<const std::int64_t>(offsets, route_count + 1),
+                    std::span<const std::int64_t>(
+                        indices,
+                        static_cast<std::size_t>(offsets[route_count])),
+                },
+                remaining, batch_size);
+        };
+        auto output = evrptw::native_parallel::run_exact_charging_parallel(
+            pool_, routes.offsets.data(), routes.indices.data(),
+            routes.route_count(), deadline_remaining, run_batch);
+        const auto depot = std::find(
+            problem.node_kind.begin(), problem.node_kind.end(),
+            kernels::depot_kind);
+        if (depot == problem.node_kind.end()) {
+            throw std::logic_error(
+                "scheduler candidate exact depot is unavailable");
+        }
+        kernels::validate_exact_batch_output(
+            output, problem.node_kind.data(), routes.offsets.data(),
+            routes.indices.data(), problem.node_count(), routes.route_count(),
+            routes.indices.size(),
+            static_cast<std::int64_t>(
+                std::distance(problem.node_kind.begin(), depot)),
+            batch_size);
+        return output;
     }
 
 private:
@@ -355,7 +493,8 @@ void validate_control(const protocol::ControlFrame& frame) {
 std::vector<std::uint8_t> run_exact(
     const protocol::PayloadView& input,
     double queue_wait_seconds,
-    std::size_t queue_depth) {
+    std::size_t queue_depth,
+    NativeWorkPool& pool) {
     if (input.header().array_count != 10) {
         throw std::runtime_error("native scheduler exact request shape is invalid");
     }
@@ -482,15 +621,26 @@ std::vector<std::uint8_t> run_exact(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count())
         : deadline_absolute;
-    const auto output = kernels::run_exact_charging_batch(
-        kinds,
-        input.data<double>(1, protocol::NumericType::float64),
-        input.data<double>(2, protocol::NumericType::float64),
-        input.data<double>(3, protocol::NumericType::float64),
-        input.data<double>(4, protocol::NumericType::float64),
-        input.data<double>(5, protocol::NumericType::float64),
-        offsets, indices, node_count, route_count, depot, stations,
-        execution_deadline, batch_size);
+    kernels::ExactBatchOutput output;
+    const auto run_batch = [&](const std::int64_t* batch_offsets,
+                               const std::int64_t* batch_indices,
+                               const std::size_t batch_route_count,
+                               const double batch_deadline) {
+        return kernels::run_exact_charging_batch(
+            kinds,
+            input.data<double>(1, protocol::NumericType::float64),
+            input.data<double>(2, protocol::NumericType::float64),
+            input.data<double>(3, protocol::NumericType::float64),
+            input.data<double>(4, protocol::NumericType::float64),
+            input.data<double>(5, protocol::NumericType::float64),
+            batch_offsets, batch_indices, node_count, batch_route_count,
+            depot, stations, batch_deadline, batch_size);
+    };
+    output = evrptw::native_parallel::run_exact_charging_parallel(
+        pool, offsets, indices, route_count, execution_deadline, run_batch);
+    kernels::validate_exact_batch_output(
+        output, kinds, offsets, indices, node_count, route_count,
+        index_shape.count, depot, batch_size);
     protocol::PayloadBuilder builder(
         protocol::KernelOperation::exact_charging, input.header().request_id);
     builder.add(protocol::NumericType::int64, output.path_offsets.data(),
@@ -509,6 +659,14 @@ std::vector<std::uint8_t> run_exact(
         output.batch_counters.size(), output.batch_counters.size());
     builder.add(protocol::NumericType::int64, output.completion_order.data(),
         output.completion_order.size(), output.completion_order.size());
+    builder.add(protocol::NumericType::int64,
+        output.physical_completion_order.data(),
+        output.physical_completion_order.size(),
+        output.physical_completion_order.size());
+    builder.add(protocol::NumericType::int64,
+        output.physical_task_receipts.data(),
+        output.physical_task_receipts.size(),
+        output.physical_task_receipts.size() / 7, 7);
     const std::array<double, 7> telemetry{
         queue_wait_seconds, static_cast<double>(queue_depth), 0.0, 24.0,
         0.0, 0.0, 0.0};
@@ -778,7 +936,7 @@ std::vector<std::uint8_t> execute(
     std::optional<std::string>& pending_commit_session) {
     switch (input.header().operation) {
     case protocol::KernelOperation::exact_charging:
-        return run_exact(input, queue_wait_seconds, queue_depth);
+        return run_exact(input, queue_wait_seconds, queue_depth, pool);
     case protocol::KernelOperation::screen_route:
         return run_screen(input, queue_wait_seconds, queue_depth);
     case protocol::KernelOperation::screen_routes:
@@ -1269,21 +1427,20 @@ void handle_connection(
                     input_view, queue_wait_seconds, queue_depth, pool,
                     request_peak_active_tasks);
             } else {
-                const auto pool_submitted_at = std::chrono::steady_clock::now();
-                pool.parallel_for(1, [&](std::size_t) {
-                    const auto pool_wait_seconds = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now()
-                        - pool_submitted_at).count();
-                    request_peak_active_tasks = pool.active_task_count();
-                    output_bytes = execute(
-                        input_view, queue_wait_seconds + pool_wait_seconds,
-                        queue_depth, peer_credentials.pid,
-                        candidate_sessions, pool, pending_candidate_transaction,
-                        pending_commit_session);
-                    request_peak_active_tasks = std::max(
-                        request_peak_active_tasks, pool.active_task_count());
-                });
+                request_peak_active_tasks = pool.active_task_count();
+                output_bytes = execute(
+                    input_view, queue_wait_seconds, queue_depth,
+                    peer_credentials.pid, candidate_sessions, pool,
+                    pending_candidate_transaction, pending_commit_session);
+                request_peak_active_tasks = std::max(
+                    request_peak_active_tasks, pool.peak_active_task_count());
             }
+            // A request thread remains active while executing even when the
+            // operation itself has no compute-pool work (for example control
+            // transactions).  Keep this lower bound explicit for consumers
+            // that use the metric as a liveness/ownership check.
+            request_peak_active_tasks = std::max(
+                request_peak_active_tasks, std::size_t{1});
         }
         if (injected_fault == "candidate_execute_output_failure") {
             throw std::runtime_error(
@@ -1434,12 +1591,113 @@ int make_listener(const std::string& socket_path) {
     return descriptor;
 }
 
+template <typename Values>
+void write_json_array(const Values& values) {
+    std::cout << '[';
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) {
+            std::cout << ',';
+        }
+        std::cout << values[index];
+    }
+    std::cout << ']';
+}
+
+
+using TaskReceiptFileDescriptor =
+    evrptw::native_telemetry::TaskReceiptFileDescriptor;
+using TaskReceiptSpool = evrptw::native_telemetry::TaskReceiptSpool;
+
+void emit_runtime_statistics(
+    const NativeWorkPool::Statistics& work,
+    const NativeRequestQueue::Statistics& request,
+    const SchedulerConcurrencySnapshot concurrency,
+    const std::int64_t worker_threads,
+    const std::int64_t request_threads,
+    const TaskReceiptFileDescriptor& task_receipts) {
+    std::cout << std::setprecision(17)
+        << "{\"schema_version\":\"stage05.2-native-scheduler-runtime-v3\""
+        << ",\"worker_threads\":" << worker_threads
+        << ",\"request_threads\":" << request_threads
+        << ",\"receipt_writer_threads\":1"
+        << ",\"peak_active_requests\":" << concurrency.peak_active_requests
+        << ",\"peak_distinct_client_pids\":"
+        << concurrency.peak_distinct_client_pids
+        << ",\"request_queue\":{\"pending\":" << request.pending_requests
+        << ",\"peak_pending\":" << request.peak_pending_requests
+        << ",\"queue_full_count\":" << request.queue_full_count
+        << ",\"rejected_count\":" << request.rejected_count
+        << ",\"completed\":" << request.completed_requests
+        << ",\"total_wait_seconds\":" << request.total_wait_seconds
+        << ",\"maximum_wait_seconds\":" << request.maximum_wait_seconds
+        << ",\"total_service_seconds\":" << request.total_service_seconds
+        << ",\"maximum_service_seconds\":" << request.maximum_service_seconds
+        << ",\"wait_histogram\":";
+    write_json_array(request.wait_histogram);
+    std::cout << ",\"service_histogram\":";
+    write_json_array(request.service_histogram);
+    std::cout << "},\"work_queue\":{\"pending\":" << work.pending_tasks
+        << ",\"active\":" << work.active_tasks
+        << ",\"peak_pending\":" << work.peak_pending_tasks
+        << ",\"peak_active\":" << work.peak_active_tasks
+        << ",\"queue_full_count\":" << work.queue_full_count
+        << ",\"rejected_count\":" << work.rejected_count
+        << ",\"completed\":" << work.completed_tasks
+        << ",\"total_wait_seconds\":" << work.total_wait_seconds
+        << ",\"maximum_wait_seconds\":" << work.maximum_wait_seconds
+        << ",\"total_service_seconds\":" << work.total_service_seconds
+        << ",\"maximum_service_seconds\":" << work.maximum_service_seconds
+        << ",\"wait_histogram\":";
+    write_json_array(work.wait_histogram);
+    std::cout << ",\"service_histogram\":";
+    write_json_array(work.service_histogram);
+    std::cout << "},\"task_receipts\":{\"schema_version\":"
+        << "\"stage05.2-native-work-task-receipts-v3\""
+        << ",\"path\":\"" << task_receipts.path << "\""
+        << ",\"sha256\":\"" << task_receipts.sha256 << "\""
+        << ",\"bytes\":" << task_receipts.bytes
+        << ",\"count\":" << task_receipts.count
+        << ",\"storage_model\":\"bounded_async_fifo_stream\""
+        << ",\"receipt_batch_capacity\":"
+        << task_receipts.receipt_batch_capacity
+        << ",\"queue_bound_batches\":"
+        << task_receipts.queue_bound_batches
+        << ",\"peak_queued_batches\":"
+        << task_receipts.peak_queued_batches
+        << ",\"submitted_batches\":"
+        << task_receipts.submitted_batches
+        << ",\"completed_batches\":"
+        << task_receipts.completed_batches
+        << ",\"dropped_count\":" << task_receipts.dropped_count
+        << ",\"producer_wait_seconds\":"
+        << task_receipts.producer_wait_seconds
+        << ",\"writer_wall_seconds\":"
+        << task_receipts.writer_wall_seconds
+        << ",\"writer_cpu_seconds\":"
+        << task_receipts.writer_cpu_seconds
+        << ",\"serialization_seconds\":"
+        << task_receipts.serialization_seconds
+        << ",\"write_seconds\":" << task_receipts.write_seconds
+        << ",\"file_fsync_seconds\":"
+        << task_receipts.file_fsync_seconds
+        << ",\"atomic_publish_seconds\":"
+        << task_receipts.atomic_publish_seconds
+        << ",\"parent_fsync_seconds\":"
+        << task_receipts.parent_fsync_seconds
+        << "}}\n";
+    std::cout.flush();
+    if (!std::cout) {
+        throw std::runtime_error(
+            "native scheduler runtime statistics could not be written");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--build-attestation") {
         std::cout
-            << "{\"schema_version\":1,\"revision\":\""
+            << "{\"schema_version\":2,\"revision\":\""
             << EVRPTW_BUILD_GIT_REVISION
             << "\",\"git_tree\":\"" << EVRPTW_BUILD_GIT_TREE
             << "\",\"source_manifest_sha256\":\""
@@ -1452,19 +1710,46 @@ int main(int argc, char** argv) {
             << (EVRPTW_BUILD_DEVELOPMENT_OVERRIDE ? "true" : "false")
             << ",\"cpp_source_kind\":\"" << EVRPTW_BUILD_CPP_SOURCE_KIND
             << "\""
+            << ",\"performance_profile\":\""
+            << EVRPTW_BUILD_PERFORMANCE_PROFILE
+            << "\",\"compiler_id\":\"" << EVRPTW_BUILD_COMPILER_ID
+            << "\",\"compiler_version\":\""
+            << EVRPTW_BUILD_COMPILER_VERSION
+            << "\",\"interprocedural_optimization\":"
+            << (EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION ? "true" : "false")
+            << ",\"host_native\":"
+            << (EVRPTW_BUILD_HOST_NATIVE ? "true" : "false")
             << "}\n";
         return 0;
     }
-    if (argc < 4 || argc > 6) {
+    if (argc < 4 || argc > 12) {
         std::cerr << "usage: evrptw_native_scheduler SOCKET WORKER_THREADS "
-                     "RUN_NONCE [--enable-fault-injection]\n";
+                     "[REQUEST_THREADS] RUN_NONCE [--cpu-affinity=CPU[,CPU...]] "
+                     "[--task-receipts=PATH] "
+                     "[--enable-fault-injection]\n";
         return 2;
     }
     const std::string socket_path(argv[1]);
     int listener = -1;
     try {
         const auto worker_threads = std::stoll(argv[2]);
-        scheduler_run_nonce = argv[3];
+        std::int64_t request_thread_count = 6;
+        std::size_t option_index = 4;
+        const auto looks_like_nonce = [](const std::string_view value) {
+            return value.size() == 16
+                && value.find_first_not_of("0123456789abcdef")
+                    == std::string::npos;
+        };
+        // The explicit form has the nonce in argv[4]; keying off that
+        // position keeps legacy invocations unambiguous even when a caller
+        // passes a request-thread value that happens to look like a nonce.
+        if (argc >= 5 && looks_like_nonce(argv[4])) {
+            request_thread_count = std::stoll(argv[3]);
+            scheduler_run_nonce = argv[4];
+            option_index = 5;
+        } else {
+            scheduler_run_nonce = argv[3];
+        }
         const bool valid_nonce = scheduler_run_nonce.size() == 16
             && scheduler_run_nonce.find_first_not_of("0123456789abcdef")
                 == std::string::npos;
@@ -1472,13 +1757,35 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("native scheduler run nonce is invalid");
         }
         bool allow_fault_injection = false;
-        for (int index = 4; index < argc; ++index) {
+        std::optional<std::string> cpu_affinity_spec;
+        std::optional<std::filesystem::path> task_receipt_path;
+        for (std::size_t index = option_index;
+             index < static_cast<std::size_t>(argc); ++index) {
             const std::string_view option(argv[index]);
             if (option == "--enable-fault-injection") {
                 allow_fault_injection = true;
             } else if (option.starts_with("--production-fault=")) {
                 production_fault = option.substr(
                     std::string_view("--production-fault=").size());
+            } else if (option.starts_with("--cpu-affinity=")) {
+                if (cpu_affinity_spec.has_value()) {
+                    throw std::invalid_argument(
+                        "native scheduler CPU affinity was specified twice");
+                }
+                cpu_affinity_spec = std::string(option.substr(
+                    std::string_view("--cpu-affinity=").size()));
+            } else if (option.starts_with("--task-receipts=")) {
+                if (task_receipt_path.has_value()) {
+                    throw std::invalid_argument(
+                        "native scheduler task receipts were specified twice");
+                }
+                const auto value = option.substr(
+                    std::string_view("--task-receipts=").size());
+                if (value.empty()) {
+                    throw std::invalid_argument(
+                        "native scheduler task-receipt path is empty");
+                }
+                task_receipt_path = std::filesystem::path(value);
             } else {
                 throw std::invalid_argument("native scheduler option is invalid");
             }
@@ -1502,11 +1809,32 @@ int main(int argc, char** argv) {
             throw std::invalid_argument(
                 "native scheduler production fault is invalid");
         }
-        if (worker_threads != 24) {
+        if (worker_threads <= 0 || worker_threads > 1024) {
             throw std::invalid_argument(
-                "native scheduler requires exactly 24 compute threads");
+                "native scheduler compute thread count must be in [1, 1024]");
         }
-        NativeWorkPool pool(worker_threads);
+        if (request_thread_count <= 0 || request_thread_count > 64) {
+            throw std::invalid_argument(
+                "native scheduler request thread count must be in [1, 64]");
+        }
+        if (cpu_affinity_spec.has_value()) {
+            apply_cpu_affinity(*cpu_affinity_spec);
+        }
+        if (!task_receipt_path.has_value()) {
+            task_receipt_path = std::filesystem::path(
+                socket_path + ".task-receipts.jsonl");
+        }
+        TaskReceiptSpool task_receipt_spool(*task_receipt_path);
+        NativeWorkPool pool(
+            worker_threads,
+            static_cast<std::size_t>(worker_threads)
+                * static_cast<std::size_t>(request_thread_count),
+            [&task_receipt_spool](const NativeWorkPool::TaskReceipt& receipt) {
+                task_receipt_spool.record(receipt);
+            },
+            [&task_receipt_spool]() {
+                task_receipt_spool.flush();
+            });
         NativeRequestQueue queue;
         SchedulerConcurrencyTelemetry concurrency_telemetry;
         CandidateSessionRegistry candidate_sessions;
@@ -1526,10 +1854,13 @@ int main(int argc, char** argv) {
                 }
             }
         } request_thread_guard{queue, request_threads};
-        request_threads.reserve(6);
-        for (std::size_t index = 0; index < 6; ++index) {
+        request_threads.reserve(static_cast<std::size_t>(request_thread_count));
+        for (std::int64_t index = 0;
+             index < request_thread_count; ++index) {
             request_threads.emplace_back([&]() {
+                set_thread_name("s52-request");
                 while (const auto request = queue.take()) {
+                    const auto service_started = std::chrono::steady_clock::now();
                     const auto queue_wait_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - request->submitted_at).count();
                     handle_connection(
@@ -1537,6 +1868,8 @@ int main(int argc, char** argv) {
                         queue_wait_seconds, request->queue_depth_on_submit,
                         allow_fault_injection, concurrency_telemetry,
                         candidate_sessions);
+                    queue.record_service(
+                        std::chrono::steady_clock::now() - service_started);
                 }
             });
         }
@@ -1567,6 +1900,21 @@ int main(int argc, char** argv) {
                 ::close(connection);
             }
         }
+        queue.stop();
+        for (auto& request_thread : request_threads) {
+            if (request_thread.joinable()) {
+                request_thread.join();
+            }
+        }
+        pool.wait_until_idle();
+        const auto work_statistics = pool.statistics();
+        const auto task_receipts = task_receipt_spool.finalize(
+            work_statistics.completed_tasks,
+            work_statistics.task_receipt_dropped_count);
+        emit_runtime_statistics(
+            work_statistics, queue.statistics(),
+            concurrency_telemetry.snapshot(), worker_threads,
+            request_thread_count, task_receipts);
         ::close(listener);
         listener = -1;
         ::unlink(socket_path.c_str());

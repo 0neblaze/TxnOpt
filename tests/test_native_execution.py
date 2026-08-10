@@ -9,6 +9,8 @@ import socket
 import stat
 import struct
 import subprocess
+import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
@@ -26,6 +28,7 @@ from evrptw.alns import (
     _Evaluator,
     _full_native_operator_statistics,
     _IncumbentRouteLedger,
+    _TimeLimitReached,
     solve_alns,
 )
 from evrptw.cache_incremental import (
@@ -45,6 +48,7 @@ from evrptw.candidate_transaction import (
 from evrptw.charging import solve_exact_charging
 from evrptw.exact_deadline import ExactCallController, ExactDeadlineConfig
 from evrptw.experiments.stage052_native_architecture_review import (
+    _NATIVE_CANONICAL_TELEMETRY_FIELDS,
     _canonical_semantic_events,
     _describe_first_divergence,
 )
@@ -86,6 +90,9 @@ from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.objective import SolutionObjective, accept_annealing_move
 from evrptw.parser import parse_schneider
 from evrptw.stage04 import Stage04Config
+from evrptw.stage052_physical_telemetry import (
+    validate_native_work_task_receipt_stream,
+)
 from evrptw.warm_start import (
     WarmStartValidationConfig,
     canonical_customer_sequences_sha256,
@@ -511,6 +518,61 @@ def test_explicit_native_protocol_is_the_only_guard_bypass() -> None:
     assert result.native_execution_statistics["mode"] == "per_solve_runtime"
     assert result.native_execution_statistics["worker_protocol"] == "candidate_round_soa_v2"
     assert result.native_execution_statistics["fallback_count"] == 0
+    work_pool = result.candidate_transaction_statistics["native_candidate_work_pool"]
+    assert isinstance(work_pool, dict)
+    assert work_pool["enabled"] is True
+    assert work_pool["thread_count"] == 4
+    assert work_pool["pending_tasks"] == 0
+    assert work_pool["active_tasks"] == 0
+    assert work_pool["queue_full_count"] == 0
+    assert work_pool["rejected_count"] == 0
+    assert work_pool["completed_tasks"] == (
+        len(work_pool["task_receipts"]) + work_pool["task_receipt_dropped_count"]
+    )
+    assert all(
+        0 <= row[1] < work_pool["thread_count"] and row[4] <= row[5] <= row[6]
+        for row in work_pool["task_receipts"]
+    )
+
+
+@pytest.mark.parametrize("mode", ["per_solve_runtime", "full_native_alns"])
+def test_local_native_modes_publish_validated_v3_work_task_streams(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    receipt_path = tmp_path / f"{mode}-work-tasks.jsonl"
+    config = replace(
+        _native_config(mode),
+        task_receipt_path=str(receipt_path),
+    )
+    solve_kwargs: dict[str, object] = {
+        "screening_config": CheapScreeningConfig(),
+    }
+    if mode == "full_native_alns":
+        solve_kwargs.update(_full_native_solve_kwargs())
+    result = solve_alns(
+        _fixture_instance(),
+        seed=2014,
+        max_iterations=1,
+        time_limit_seconds=2.0,
+        native_execution_config=config,
+        **solve_kwargs,
+    )
+
+    if mode == "per_solve_runtime":
+        receipt = result.candidate_transaction_statistics["native_candidate_work_pool"]
+    else:
+        receipt = result.native_execution_statistics["work_pool_statistics"]
+    assert isinstance(receipt, dict)
+    assert receipt["schema_version"].endswith("work-pool-v3")
+    assert receipt["task_receipt_dropped_count"] == 0
+    descriptor = receipt["task_receipts"]
+    assert isinstance(descriptor, dict)
+    assert descriptor["schema_version"] == "stage05.2-native-work-task-receipts-v3"
+    assert descriptor["storage_model"] == "bounded_async_fifo_stream"
+    assert descriptor["dropped_count"] == 0
+    assert receipt_path.is_file()
+    assert receipt_path.with_suffix(receipt_path.suffix + ".sha256").is_file()
 
 
 def test_explicit_warm_start_validation_does_not_enable_candidate_control(
@@ -744,9 +806,15 @@ def test_native_candidate_round_owned_plan_covers_ties_duplicates_and_budget_edg
     )
     candidate_ids = np.asarray([41, 17, 99], dtype=np.int64)
 
-    def run(exact_budget: int) -> tuple[object, ...]:
+    def run(
+        exact_budget: int,
+        runtime: Any | None = None,
+    ) -> tuple[object, ...]:
         receipt = np.asarray([2, 0, 0, 0, 0, 0], dtype=np.int64)
-        return native_core.candidate_round_transaction_v2(
+        entrypoint = (
+            native_core.candidate_round_transaction_v2 if runtime is None else runtime.execute
+        )
+        return entrypoint(
             context.node_kind,
             context.demand,
             context.ready_time,
@@ -769,7 +837,7 @@ def test_native_candidate_round_owned_plan_covers_ties_duplicates_and_budget_edg
             np.asarray([], dtype=np.int64),
             np.asarray([], dtype=np.int64),
             np.zeros(3, dtype=np.int64),
-            np.asarray([2, exact_budget, 1], dtype=np.int64),
+            np.asarray([2, exact_budget, 1 if runtime is None else 2], dtype=np.int64),
             np.asarray([10.0], dtype=np.float64),
             np.asarray([128], dtype=np.int64),
             np.asarray([7, 11, 13], dtype=np.int64),
@@ -782,12 +850,32 @@ def test_native_candidate_round_owned_plan_covers_ties_duplicates_and_budget_edg
     assert exact[4].tolist() == [17, 41]
     assert exact[7].tolist() == [3, 2, 2, 0, 0, 0, 2, 0, 1, 0]
 
+    persistent_runtime = native_core.NativeCandidateRoundRuntimeV2(2)
+    persistent = run(2, persistent_runtime)
+    assert persistent[1].tolist() == exact[1].tolist()
+    assert persistent[2].tolist() == exact[2].tolist()
+    assert persistent[4].tolist() == exact[4].tolist()
+    assert persistent[7].tolist() == exact[7].tolist()
+    assert persistent[9] == exact[9]
+    first_pool_statistics = persistent_runtime.statistics()
+    assert first_pool_statistics["thread_count"] == 2
+    assert first_pool_statistics["completed_tasks"] > 0
+    assert first_pool_statistics["queue_full_count"] == 0
+    assert first_pool_statistics["rejected_count"] == 0
+
     one_short = run(1)
     assert one_short[1].tolist() == [4, 4, 4]
     assert one_short[2].tolist() == [-1, -1, 17]
     assert one_short[4].tolist() == []
     assert one_short[3][:, 1].tolist() == [3, 3, 6]
     assert one_short[7].tolist() == [3, 2, 2, 0, 0, 0, 0, 2, 1, 0]
+    persistent_one_short = run(1, persistent_runtime)
+    assert persistent_one_short[1].tolist() == one_short[1].tolist()
+    assert persistent_one_short[7].tolist() == one_short[7].tolist()
+    second_pool_statistics = persistent_runtime.statistics()
+    assert second_pool_statistics["completed_tasks"] > (first_pool_statistics["completed_tasks"])
+    assert second_pool_statistics["pending_tasks"] == 0
+    assert second_pool_statistics["active_tasks"] == 0
 
 
 def test_native_candidate_round_thread_launch_failure_joins_and_preserves_receipt() -> None:
@@ -1851,6 +1939,7 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
         [[result.distance, result.charging_time] for result in results],
         dtype=np.float64,
     )
+    transaction_runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
 
     def execute(
         preserve_duplicates: bool,
@@ -1858,7 +1947,7 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
         *,
         pair_pruning: bool = True,
     ) -> tuple[object, ...]:
-        return native_core.route_merge_candidate_pool_v2(
+        result = transaction_runtime.execute_route_merge_candidate_pool(
             offsets,
             indices,
             metrics,
@@ -1868,6 +1957,8 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
             pair_pruning,
             preserve_duplicates,
         )
+        assert isinstance(result, tuple)
+        return result
 
     candidate_offsets, candidate_indices, metadata, pruning = execute(
         False,
@@ -1909,6 +2000,26 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
     )
     assert len(unpruned_offsets) - 1 == len(unpruned_metadata) == 4
     assert unpruned_counts.tolist() == [0, 0]
+    pool_statistics = transaction_runtime.statistics()["native_route_merge_candidate_pool"]
+    assert pool_statistics == {
+        "invocations": 4,
+        "completions": 4,
+        "failures": 0,
+        "seconds": pytest.approx(pool_statistics["seconds"]),
+        "input_routes": 8,
+        "output_candidates": 10,
+        "pruned_pairs": 1,
+        "pruned_candidates": 4,
+        "screening_invocations": 0,
+        "screening_failures": 0,
+        "screening_seconds": 0.0,
+        "screened_candidates": 0,
+        "screening_rejections": 0,
+        "profile_cache_hits": 0,
+        "profile_cache_misses": 0,
+        "profile_cache_invalidations": 0,
+    }
+    assert float(pool_statistics["seconds"]) >= 0.0
 
     with pytest.raises(ValueError, match="route-merge routes must be non-empty"):
         native_core.route_merge_candidate_pool_v2(
@@ -1939,6 +2050,232 @@ def test_native_route_merge_pool_preserves_python_order_and_duplicate_policy() -
                 True,
                 False,
             )
+
+
+def test_native_route_merge_pool_and_screening_share_one_persistent_dispatch() -> None:
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    sequences = (("C1",), ("C2",))
+    offsets = np.asarray([0, 1, 2], dtype=np.int64)
+    indices = np.asarray(
+        [context.name_to_index[name] for route in sequences for name in route],
+        dtype=np.int64,
+    )
+    exact_results = tuple(solve_exact_charging(instance, route) for route in sequences)
+    metrics = np.asarray(
+        [[result.distance, result.charging_time] for result in exact_results],
+        dtype=np.float64,
+    )
+    runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig(),
+        persistent_worker_threads=2,
+    )
+
+    raw = runtime.execute_route_merge_candidate_pool_screened(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        context.due_date,
+        context.service_time,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        offsets,
+        indices,
+        metrics,
+        1e-9,
+    )
+
+    (
+        candidate_offsets,
+        candidate_indices,
+        metadata,
+        pruning,
+        pruned_pair_metadata,
+        screening,
+        timings,
+    ) = raw
+    assert candidate_offsets.tolist() == [0, 2, 4]
+    assert candidate_indices.tolist() == [
+        context.name_to_index["C1"],
+        context.name_to_index["C2"],
+        context.name_to_index["C2"],
+        context.name_to_index["C1"],
+    ]
+    assert metadata.tolist() == [[0, 1, 0, 1, 0], [0, 1, 0, 1, 1]]
+    assert pruning.tolist() == [0, 0]
+    assert pruned_pair_metadata.shape == (0, 4)
+    assert timings.shape == (2,)
+    assert np.all(np.isfinite(timings))
+    assert np.all(timings >= 0.0)
+    candidate_ids, _statuses, _duplicate_of, _codes, _metrics, counters, digest = screening
+    assert candidate_ids.tolist() == [0, 1]
+    assert counters.tolist() == [2, 2, 0, 0, 2]
+    assert isinstance(digest, str) and len(digest) == 64
+
+    statistics = runtime.statistics()["native_route_merge_candidate_pool"]
+    assert statistics["invocations"] == statistics["completions"] == 1
+    assert statistics["failures"] == 0
+    assert statistics["screening_invocations"] == 1
+    assert statistics["screening_failures"] == 0
+    assert statistics["input_routes"] == 2
+    assert statistics["output_candidates"] == 2
+    work_pool = runtime.native_work_pool_statistics()
+    assert work_pool["enabled"] is True
+    assert work_pool["queue_full_count"] == 0
+    assert work_pool["rejected_count"] == 0
+
+
+def test_native_route_merge_prunes_pair_with_safe_service_time_window_bound() -> None:
+    instance = _fixture_instance()
+    context = NativeKernelRuntime.build(instance, NativeKernelConfig()).context
+    customer_indices = np.asarray(
+        [context.name_to_index["C1"], context.name_to_index["C2"]],
+        dtype=np.int64,
+    )
+    offsets = np.asarray([0, 1, 2], dtype=np.int64)
+    metrics = np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float64)
+    due = np.asarray(context.due_date, dtype=np.float64).copy()
+    service = np.asarray(context.service_time, dtype=np.float64).copy()
+    due[customer_indices] = 10.0
+    service[customer_indices] = 11.0
+    runtime = NativeCandidateTransactionRuntime(
+        NativeCandidateTransactionConfig(),
+        persistent_worker_threads=2,
+    )
+
+    raw = runtime.execute_route_merge_candidate_pool_screened(
+        context.node_kind,
+        context.demand,
+        context.ready_time,
+        due,
+        service,
+        context.distance,
+        context.reachable,
+        context.vehicle,
+        offsets,
+        customer_indices,
+        metrics,
+        1e-9,
+    )
+
+    candidate_offsets, candidate_indices, metadata, pruning, pruned, screening, _timings = raw
+    assert candidate_offsets.tolist() == [0]
+    assert candidate_indices.size == 0
+    assert metadata.shape == (0, 5)
+    assert pruning.tolist() == [1, 4]
+    assert pruned.tolist() == [[0, 1, 4, 3]]
+    assert screening[0].size == 0
+
+
+def test_route_merge_profile_cache_reuses_unchanged_routes_and_invalidates_changes() -> None:
+    instance = _fixture_instance()
+    runtime = NativeCandidateTransactionRuntime(NativeCandidateTransactionConfig())
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        backend="cpu_batch",
+        candidate_transaction_runtime=runtime,
+        native_runtime=NativeKernelRuntime.build(instance, NativeKernelConfig()),
+    )
+
+    first = evaluator.route_merge_profile_metrics((("C1",), ("C2",)))
+    first_calls = evaluator.calls
+    second = evaluator.route_merge_profile_metrics((("C1",), ("C2",)))
+    second_calls = evaluator.calls
+    changed = evaluator.route_merge_profile_metrics((("C1",), ("C1", "C2")))
+
+    assert tuple(metrics[:-1] for metrics in first) == tuple(metrics[:-1] for metrics in second)
+    assert tuple(metrics[-1] for metrics in first) == (1, 1)
+    assert tuple(metrics[-1] for metrics in second) == (0, 0)
+    assert first_calls == second_calls == 2
+    assert evaluator.calls == 3
+    assert changed[0][:-1] == first[0][:-1]
+    assert evaluator.route_merge_profile_cache == {}
+    statistics = runtime.statistics()["native_route_merge_candidate_pool"]
+    assert statistics["profile_cache_hits"] == 3
+    assert statistics["profile_cache_misses"] == 3
+    assert statistics["profile_cache_invalidations"] == 1
+
+
+def test_route_merge_profile_hit_replays_incumbent_event_and_deadline_boundary() -> None:
+    instance = _fixture_instance()
+    sequences = (("C1",), ("C2",))
+    ledger = _IncumbentRouteLedger(
+        {"legacy": {sequence: solve_exact_charging(instance, sequence) for sequence in sequences}}
+    )
+    trace = Stage03Trace(MeasurementConfig())
+    evaluator = _Evaluator(
+        instance,
+        deadline=time.perf_counter() + 10.0,
+        measurement_trace=trace,
+        backend="cpu_batch",
+        candidate_transaction_runtime=NativeCandidateTransactionRuntime(
+            NativeCandidateTransactionConfig()
+        ),
+        incumbent_route_ledger=ledger,
+        native_runtime=NativeKernelRuntime.build(instance, NativeKernelConfig()),
+    )
+
+    evaluator.route_merge_profile_metrics(sequences)
+    first_events = [row for row in trace.route_evaluations if row.kind == "precomputed_route"]
+    evaluator.route_merge_profile_metrics(sequences)
+    second_events = [row for row in trace.route_evaluations if row.kind == "precomputed_route"]
+
+    assert len(first_events) == 2
+    assert len(second_events) == 4
+    assert [row.route_key for row in second_events[:2]] == [
+        row.route_key for row in second_events[2:]
+    ]
+
+    evaluator.deadline = 0.0
+    with pytest.raises(_TimeLimitReached):
+        evaluator.route_merge_profile_metrics(sequences)
+    assert trace.events[-1]["event_type"] == "deadline_boundary"
+    assert trace.events[-1]["boundary"] == "before_precomputed_route"
+
+    evaluator.deadline = time.perf_counter() + 10.0
+    recovered = evaluator.route_merge_profile_metrics(sequences)
+    assert tuple(metrics[-1] for metrics in recovered) == (0, 0)
+
+
+def test_native_route_merge_profile_cache_rolls_back_generation_invalidation() -> None:
+    from evrptw import _core as native_core
+
+    cache = native_core.NativeRouteMergeProfileCacheV1()
+    initial = cache.plan(
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([1, 1], dtype=np.int64),
+    )
+    cache.commit(
+        initial[4],
+        np.asarray([1, 1], dtype=np.int64),
+        np.asarray([[3.0, 0.0], [4.0, 0.0]], dtype=np.float64),
+        np.asarray([0, 0], dtype=np.int64),
+    )
+
+    changed = cache.plan(
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([1, 3], dtype=np.int64),
+        np.asarray([1, 0], dtype=np.int64),
+    )
+    assert changed[5].tolist() == [1, 1, 1]
+    cache.rollback()
+
+    restored = cache.plan(
+        np.asarray([0, 1, 2], dtype=np.int64),
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([1, 1], dtype=np.int64),
+    )
+    assert restored[0].tolist() == [1, 1]
+    assert restored[5].tolist() == [2, 0, 0]
+    cache.commit(
+        restored[4],
+        np.empty(0, dtype=np.int64),
+        np.empty((0, 2), dtype=np.float64),
+        np.empty(0, dtype=np.int64),
+    )
 
 
 def test_full_native_initialization_matches_python_exact_objective_and_budget() -> None:
@@ -2787,15 +3124,13 @@ def test_native_candidate_plan_preparation_and_decision_are_typed_and_atomic() -
     assert combined.tolist() == [0, 1, 1, 1]
     assert eligible.flags.c_contiguous and combined.flags.c_contiguous
 
-    vehicle_increase_eligible, vehicle_increase_combined = (
-        native_core.decide_candidate_plans_v2(
-            plan_offsets,
-            prepared[1],
-            np.ones(8, dtype=np.int64),
-            np.zeros(4, dtype=np.int64),
-            2,
-            True,
-        )
+    vehicle_increase_eligible, vehicle_increase_combined = native_core.decide_candidate_plans_v2(
+        plan_offsets,
+        prepared[1],
+        np.ones(8, dtype=np.int64),
+        np.zeros(4, dtype=np.int64),
+        2,
+        True,
     )
     assert vehicle_increase_eligible.tolist() == [1, 0, 0, 1]
     assert vehicle_increase_combined.tolist() == [0, 1, 1, 0]
@@ -3291,6 +3626,7 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
     )
     assert native_first[10].tolist()[5:8] == [3, 3, 0]
     assert native_first[11].tolist() == [1]
+    assert sorted(native_first[6].tolist()) == sorted(native_first[5].tolist())
 
     python_control.begin_round(8, lane="constraint")
     python_evaluator.set_measurement_context(lane="constraint", iteration=8, operator="relocate")
@@ -3322,10 +3658,12 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
     )
     assert native_second[10].tolist()[5:8] == [5, 5, 0]
     assert native_second[11].tolist() == [0]
+    assert sorted(native_second[6].tolist()) == sorted(native_second[5].tolist())
     receipt = tuple(
         item.tobytes() if isinstance(item, np.ndarray) else item.encode("ascii")
         for payload in (native_first, native_second)
-        for item in payload
+        for item_index, item in enumerate(payload)
+        if item_index != 6
     )
     if native_plan_transaction_receipts:
         assert receipt == next(iter(native_plan_transaction_receipts.values()))
@@ -3850,7 +4188,7 @@ def test_native_search_engine_hash_binds_context_for_already_attempted_plan() ->
         np.asarray([1, 2], dtype=np.int64),
     )
     assert initial_context[12] == (
-        "6648b4554252317a411e7384ec3bb9d8c4da2e48f5ab996dbedb23a32a29cf63"
+        "d11088189d1d4608ecf935f300ed647cd2df68d585a381c62fcdfc87b461fb62"
     )
     first_context = engine.evaluate_plans(
         *arguments,
@@ -9080,6 +9418,31 @@ def test_full_native_v2_one_call_matches_python_first_iteration(
     assert instrumentation["work_pool_peak_active_tasks"] >= 1
     assert instrumentation["work_pool_active_tasks_at_return"] == 0
     assert instrumentation["queue_depth_on_submit"] == 0
+    work_pool_statistics = instrumentation["work_pool_statistics"]
+    assert isinstance(work_pool_statistics, dict)
+    assert work_pool_statistics["schema_version"] == "stage05.2-full-native-work-pool-v2"
+    assert work_pool_statistics["thread_count"] == 4
+    assert work_pool_statistics["maximum_pending_tasks"] >= 4
+    assert work_pool_statistics["pending_tasks"] == 0
+    assert work_pool_statistics["active_tasks"] == 0
+    assert work_pool_statistics["peak_active_tasks"] >= 1
+    assert work_pool_statistics["queue_full_count"] == 0
+    assert work_pool_statistics["rejected_count"] == 0
+    assert work_pool_statistics["completed_tasks"] >= 1
+    assert work_pool_statistics["task_receipt_capacity"] == 65_536
+    assert work_pool_statistics["completed_tasks"] == (
+        len(work_pool_statistics["task_receipts"])
+        + work_pool_statistics["task_receipt_dropped_count"]
+    )
+    assert work_pool_statistics["task_receipts"]
+    assert all(
+        0 <= row[1] < work_pool_statistics["thread_count"]
+        and row[2] < row[3]
+        and row[4] <= row[5] <= row[6]
+        for row in work_pool_statistics["task_receipts"]
+    )
+    assert len(work_pool_statistics["wait_histogram"]) == 32
+    assert len(work_pool_statistics["service_histogram"]) == 32
     assert instrumentation["candidate_screening_occupancies"]
     assert instrumentation["maximum_candidate_screening_occupancy"] >= 1
     cache_fields = (
@@ -9116,26 +9479,29 @@ def test_full_native_v2_owns_and_hashes_the_complete_request(
     receipts: list[tuple[np.ndarray[Any, np.dtype[np.int64]], str]] = []
 
     def inspect_request(*args: object) -> object:
-        receipt = native_core.native_search_request_receipt_v2(*args)
+        assert len(args) == 22
+        assert isinstance(args[-1], str)
+        request_args = args[:-1]
+        receipt = native_core.native_search_request_receipt_v2(*request_args)
         assert isinstance(receipt, tuple) and len(receipt) == 2
         counts, request_sha256 = receipt
         assert isinstance(counts, np.ndarray)
         assert counts.dtype == np.dtype(np.int64)
         assert counts.shape == (8,)
         assert isinstance(request_sha256, str) and len(request_sha256) == 64
-        duplicate_indices = list(args)
+        duplicate_indices = list(request_args)
         invalid_indices = np.array(duplicate_indices[12], copy=True)
         invalid_indices[-1] = invalid_indices[0]
         duplicate_indices[12] = invalid_indices
         with pytest.raises(ValueError, match="warm start"):
             native_core.native_search_request_receipt_v2(*duplicate_indices)
-        mutated_distance = list(args)
+        mutated_distance = list(request_args)
         changed_distance = np.array(mutated_distance[5], copy=True)
         changed_distance[0, 1] += 0.25
         mutated_distance[5] = changed_distance
         changed_receipt = native_core.native_search_request_receipt_v2(*mutated_distance)
         assert changed_receipt[1] != request_sha256
-        initial_state = native_core.native_search_initial_state_v2(*args)
+        initial_state = native_core.native_search_initial_state_v2(*request_args)
         assert isinstance(initial_state, tuple) and len(initial_state) == 6
         (
             exact,
@@ -9312,16 +9678,21 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
     )
 
     assert len(captured) == 1
-    local_counts, local_sha256 = native_core.native_search_request_receipt_v2(*captured[0])
-    local_state = native_core.native_search_initial_state_v2(*captured[0])
+    assert len(captured[0]) == 22
+    assert isinstance(captured[0][-1], str)
+    semantic_request = captured[0][:-1]
+    local_counts, local_sha256 = native_core.native_search_request_receipt_v2(*semantic_request)
+    local_state = native_core.native_search_initial_state_v2(*semantic_request)
     endpoint = tmp_path / "native-search-request.sock"
     with NativeHostScheduler(endpoint, worker_threads=24):
         host_counts, host_sha256 = native_core.native_search_request_host_receipt_v2(
-            str(endpoint), *captured[0]
+            str(endpoint), *semantic_request
         )
-        host_state = native_core.native_search_initial_state_host_v2(str(endpoint), *captured[0])
+        host_state = native_core.native_search_initial_state_host_v2(
+            str(endpoint), *semantic_request
+        )
         session_state, session_token = native_core.candidate_session_open_host_v2(
-            str(endpoint), *captured[0]
+            str(endpoint), *semantic_request
         )
         assert len(session_token) == 64
         initial_route_offsets = np.asarray(captured[0][11], dtype=np.int64)
@@ -9463,7 +9834,9 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
             assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
         for actual, expected in zip(repeated_shared_wire, repeated_local_wire, strict=True):
             assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
-        _, rollback_token = native_core.candidate_session_open_host_v2(str(endpoint), *captured[0])
+        _, rollback_token = native_core.candidate_session_open_host_v2(
+            str(endpoint), *semantic_request
+        )
         deferred_flags = np.asarray([0, 0, 1, 0, 1], dtype=np.int64)
         deferred_wire = native_core.candidate_session_execute_host_v2(
             str(endpoint),
@@ -9514,7 +9887,9 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
         native_core.candidate_session_finish_transaction_host_v2(
             str(endpoint), rollback_token, True, 30.0
         )
-        _, ack_loss_token = native_core.candidate_session_open_host_v2(str(endpoint), *captured[0])
+        _, ack_loss_token = native_core.candidate_session_open_host_v2(
+            str(endpoint), *semantic_request
+        )
         with pytest.raises(RuntimeError, match="acknowledgement loss without fallback"):
             native_core._test_candidate_session_execute_ack_loss_v2(
                 str(endpoint),
@@ -9556,14 +9931,14 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
         native_core.candidate_session_close_host_v2(str(endpoint), session_token, 30.0)
         with pytest.raises(RuntimeError, match="close identity mismatch"):
             native_core.candidate_session_close_host_v2(str(endpoint), session_token, 30.0)
-        insufficient_budget = list(captured[0])
+        insufficient_budget = list(semantic_request)
         budget_control = np.array(insufficient_budget[13], copy=True)
         budget_control[4] = 0
         insufficient_budget[13] = budget_control
         with pytest.raises(RuntimeError, match="does not fit the exact-call budget"):
             native_core.native_search_initial_state_host_v2(str(endpoint), *insufficient_budget)
         recovered_counts, recovered_sha256 = native_core.native_search_request_host_receipt_v2(
-            str(endpoint), *captured[0]
+            str(endpoint), *semantic_request
         )
 
     serialization_endpoint = tmp_path / "candidate-output-failure.sock"
@@ -9573,7 +9948,7 @@ def test_full_native_v2_complete_request_crosses_host_binary_protocol(
         production_fault="candidate_execute_output_failure",
     ):
         _, serialization_token = native_core.candidate_session_open_host_v2(
-            str(serialization_endpoint), *captured[0]
+            str(serialization_endpoint), *semantic_request
         )
         execute_arguments = (
             str(serialization_endpoint),
@@ -9639,6 +10014,9 @@ def test_host_initial_state_rejects_self_hashed_invalid_path_before_ack(
         native_execution_config=_native_config("full_native_alns"),
     )
     assert len(captured) == 1
+    assert len(captured[0]) == 22
+    assert isinstance(captured[0][-1], str)
+    semantic_request = captured[0][:-1]
 
     before = _stage052_shared_memory_names()
     endpoint = tmp_path / "native-search-corruption.sock"
@@ -9648,9 +10026,11 @@ def test_host_initial_state_rejects_self_hashed_invalid_path_before_ack(
         production_fault="initial_state_path_offset_oob",
     ):
         with pytest.raises(RuntimeError, match="typed schema is invalid"):
-            native_core.native_search_initial_state_host_v2(str(endpoint), *captured[0])
-        recovered = native_core.native_search_request_host_receipt_v2(str(endpoint), *captured[0])
-        assert recovered[1] == native_core.native_search_request_receipt_v2(*captured[0])[1]
+            native_core.native_search_initial_state_host_v2(str(endpoint), *semantic_request)
+        recovered = native_core.native_search_request_host_receipt_v2(
+            str(endpoint), *semantic_request
+        )
+        assert recovered[1] == native_core.native_search_request_receipt_v2(*semantic_request)[1]
 
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -9723,7 +10103,9 @@ def test_host_initial_state_ipc_obeys_absolute_deadline_without_ack(
         native_execution_config=_native_config("full_native_alns"),
     )
     assert len(captured) == 1
-    deadline_args = list(captured[0])
+    assert len(captured[0]) == 22
+    assert isinstance(captured[0][-1], str)
+    deadline_args = list(captured[0][:-1])
     deadline_args[14] = np.ascontiguousarray([0.05], dtype=np.float64)
 
     before = _stage052_shared_memory_names()
@@ -9830,6 +10212,21 @@ def test_full_native_v2_causal_journal_differential_matches_python_control() -> 
 
     def reviewed_events(mode: str, result: ALNSResult) -> list[dict[str, object]]:
         streams = _canonical_semantic_streams(result)
+        if mode == "full_native_alns":
+            trace = result.measurement_trace
+            assert trace is not None
+            native_by_runtime_id = {
+                event["semantic_event_id"]: {
+                    field: event[field] for field in _NATIVE_CANONICAL_TELEMETRY_FIELDS
+                }
+                for event in trace.runtime_semantic_events
+                if all(field in event for field in _NATIVE_CANONICAL_TELEMETRY_FIELDS)
+            }
+            for rows in streams.values():
+                for row in rows:
+                    native = native_by_runtime_id.get(row["runtime_event_id"])
+                    if native is not None:
+                        row["native_telemetry"] = native
         events = _canonical_semantic_event_sequence(streams)
         reviewed = _canonical_semantic_events(
             {
@@ -9840,6 +10237,7 @@ def test_full_native_v2_causal_journal_differential_matches_python_control() -> 
                 "termination_reason": result.termination_reason,
                 "canonical_semantic_streams": streams,
                 "canonical_semantic_events": events,
+                "native_execution_statistics": result.native_execution_statistics,
             }
         )
         required = {
@@ -9856,6 +10254,8 @@ def test_full_native_v2_causal_journal_differential_matches_python_control() -> 
         assert [event["semantic_event_id"] for event in reviewed] == list(
             range(1, len(reviewed) + 1)
         )
+        for event in reviewed:
+            event.pop("native_telemetry", None)
         return reviewed
 
     python_events = reviewed_events("python_candidate_control", python_result)
@@ -9929,7 +10329,7 @@ def test_full_native_runtime_semantic_events_keep_native_causal_identity(
     monkeypatch: pytest.MonkeyPatch,
     max_iterations: int,
 ) -> None:
-    """Every rich canonical row must retain its one-to-one native source ID."""
+    """Native-backed rows keep source IDs; signed control rows remain distinct."""
 
     import evrptw.alns as alns_module
 
@@ -9977,10 +10377,24 @@ def test_full_native_runtime_semantic_events_keep_native_causal_identity(
     assert trace is not None
     runtime_events = trace.runtime_semantic_events
     native_journal = captured["result"].canonical_event_journal
-    assert len(runtime_events) == len(native_journal.event_ids)
-    assert [event.get("runtime_causal_event_id") for event in runtime_events] == [
+    native_backed = [event for event in runtime_events if "runtime_native_event_id" in event]
+    control_derived = [event for event in runtime_events if "runtime_native_event_id" not in event]
+    assert [event["runtime_native_event_id"] for event in native_backed] == [
         int(event_id) for event_id in native_journal.event_ids
     ]
+    assert len(native_backed) == len(native_journal.event_ids)
+    assert control_derived
+    assert any(
+        event.get("semantic_stream") == "cache"
+        and event.get("operation") in {"store", "evict", "reconcile", "oversize_not_cached"}
+        for event in control_derived
+    )
+    assert all(
+        not any(key.startswith("runtime_native_") for key in event) for event in control_derived
+    )
+    assert [event.get("runtime_causal_event_id") for event in runtime_events] == list(
+        range(1, len(runtime_events) + 1)
+    )
 
 
 def test_full_native_stage04_segment_events_have_native_source_rows() -> None:
@@ -10104,8 +10518,11 @@ def test_full_native_fixed_work_boundary_keeps_one_native_terminal_identity(
     assert trace is not None
     events = trace.runtime_semantic_events
     journal = captured["result"].canonical_event_journal
-    assert len(events) == len(journal.event_ids)
-    assert [event["runtime_causal_event_id"] for event in events] == [
+    native_backed_events = [
+        event for event in events if event.get("runtime_native_event_id") is not None
+    ]
+    assert len(native_backed_events) == len(journal.event_ids)
+    assert [event["runtime_native_event_id"] for event in native_backed_events] == [
         int(event_id) for event_id in journal.event_ids
     ]
     assert [event["semantic_stream"] for event in events].count("deadline") == 1
@@ -10243,11 +10660,13 @@ def test_full_native_restart_and_intensification_end_have_native_source_rows() -
 
 def test_full_native_runtime_projection_length_mismatch_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """A missing native row must report a canonical mismatch, never IndexError."""
 
     import evrptw.alns as alns_module
 
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     original = alns_module.execute_full_native_alns
 
     def truncate(*args: object, **kwargs: object) -> FullNativeALNSResult:
@@ -10292,6 +10711,10 @@ def test_full_native_runtime_projection_length_mismatch_is_bounded(
             **_full_native_solve_kwargs(),
             native_execution_config=_native_config("full_native_alns"),
         )
+    assert not any(
+        thread.name == "s52-event-write" and thread.is_alive() for thread in threading.enumerate()
+    )
+    assert not tuple(tmp_path.glob("stage052-native-projection-*"))
 
 
 def test_full_native_rejects_same_context_exact_result_reordering(
@@ -10489,7 +10912,14 @@ def test_full_native_v2_raw_causal_payload_has_ordered_stream_counts(
 
     payload = captured["payload"]
     assert isinstance(payload, tuple)
-    assert len(payload) == 14
+    assert len(payload) == 15
+    work_pool = payload[14]
+    assert isinstance(work_pool, dict)
+    assert work_pool["schema_version"] == "stage05.2-full-native-work-pool-v2"
+    assert work_pool["pending_tasks"] == 0
+    assert work_pool["active_tasks"] == 0
+    assert work_pool["queue_full_count"] == 0
+    assert work_pool["rejected_count"] == 0
     causal = payload[11]
     assert isinstance(causal, tuple)
     assert len(causal) == 12
@@ -10545,7 +10975,14 @@ def test_full_native_v2_raw_causal_payload_marks_fixed_work_boundary(
     )
 
     payload = captured["payload"]
-    assert isinstance(payload, tuple) and len(payload) == 14
+    assert isinstance(payload, tuple) and len(payload) == 15
+    work_pool = payload[14]
+    assert isinstance(work_pool, dict)
+    assert work_pool["schema_version"] == "stage05.2-full-native-work-pool-v2"
+    assert work_pool["pending_tasks"] == 0
+    assert work_pool["active_tasks"] == 0
+    assert work_pool["queue_full_count"] == 0
+    assert work_pool["rejected_count"] == 0
     causal = payload[11]
     assert isinstance(causal, tuple) and len(causal) == 12
     stream_counts = causal[10]
@@ -10912,8 +11349,301 @@ def test_host_scheduler_v2_owns_one_shared_24_thread_pool(tmp_path: Path) -> Non
         # One service main thread, six request/control threads, and exactly one
         # shared 24-thread compute pool. Per-request 24-thread pools would make
         # this count grow with connected shards.
-        assert scheduler.observed_thread_count() == 31
+        assert scheduler.observed_thread_count() == 32
+        assert scheduler.observed_task_receipt_writer_thread_count() == 1
         assert stat.S_IMODE(endpoint.stat().st_mode) == 0o600
+
+
+def test_host_scheduler_request_thread_count_is_explicit_and_observable(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "native-scheduler-request-threads.sock"
+
+    with NativeHostScheduler(
+        endpoint,
+        worker_threads=24,
+        request_threads=2,
+    ) as scheduler:
+        assert scheduler.request_thread_count == 2
+        assert scheduler.observed_request_thread_count() == 2
+        assert scheduler.observed_thread_count() == 28
+        assert scheduler.observed_task_receipt_writer_thread_count() == 1
+
+
+def test_host_scheduler_emits_bounded_drained_runtime_statistics(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "native-scheduler-runtime-statistics.sock"
+    scheduler = NativeHostScheduler(
+        endpoint,
+        worker_threads=2,
+        request_threads=2,
+    )
+    with scheduler:
+        assert scheduler.observed_thread_count() == 6
+        assert scheduler.observed_task_receipt_writer_thread_count() == 1
+
+    statistics = scheduler.runtime_statistics
+    assert statistics["schema_version"] == ("stage05.2-native-scheduler-runtime-v3")
+    assert statistics["worker_threads"] == 2
+    assert statistics["request_threads"] == 2
+    assert statistics["receipt_writer_threads"] == 1
+    for queue_name in ("request_queue", "work_queue"):
+        queue = statistics[queue_name]
+        assert isinstance(queue, dict)
+        assert queue["pending"] == 0
+        assert queue["queue_full_count"] == 0
+        assert queue["rejected_count"] == 0
+        assert len(queue["wait_histogram"]) == 32
+        assert len(queue["service_histogram"]) == 32
+    work_queue = statistics["work_queue"]
+    assert isinstance(work_queue, dict)
+    assert work_queue["active"] == 0
+    task_receipts = statistics["task_receipts"]
+    assert isinstance(task_receipts, dict)
+    assert task_receipts["schema_version"] == "stage05.2-native-work-task-receipts-v3"
+    assert task_receipts["count"] == work_queue["completed"] == 0
+    assert task_receipts["storage_model"] == "bounded_async_fifo_stream"
+    assert task_receipts["receipt_batch_capacity"] == 4_096
+    assert task_receipts["queue_bound_batches"] == 1
+    assert task_receipts["peak_queued_batches"] == 0
+    assert task_receipts["submitted_batches"] == 0
+    assert task_receipts["completed_batches"] == 0
+    assert task_receipts["dropped_count"] == 0
+    for field in (
+        "producer_wait_seconds",
+        "writer_wall_seconds",
+        "writer_cpu_seconds",
+        "serialization_seconds",
+        "write_seconds",
+        "file_fsync_seconds",
+        "atomic_publish_seconds",
+        "parent_fsync_seconds",
+    ):
+        assert task_receipts[field] >= 0.0
+    receipt_path = tmp_path / str(task_receipts["path"])
+    sidecar_path = tmp_path / str(task_receipts["sidecar_path"])
+    assert receipt_path.is_file() and sidecar_path.is_file()
+    assert hashlib.sha256(receipt_path.read_bytes()).hexdigest() == task_receipts["sha256"]
+    assert hashlib.sha256(sidecar_path.read_bytes()).hexdigest() == task_receipts["sidecar_sha256"]
+
+
+@pytest.mark.parametrize("queue_name", ("request_queue", "work_queue"))
+@pytest.mark.parametrize("counter_name", ("queue_full_count", "rejected_count"))
+def test_host_scheduler_rejects_queue_gate_before_accepting_runtime_statistics(
+    tmp_path: Path,
+    queue_name: str,
+    counter_name: str,
+) -> None:
+    scheduler = NativeHostScheduler(
+        tmp_path / "native-scheduler-queue-gate.sock",
+        worker_threads=1,
+        request_threads=1,
+    )
+    common_queue: dict[str, object] = {
+        "pending": 0,
+        "peak_pending": 1,
+        "queue_full_count": 0,
+        "rejected_count": 0,
+        "completed": 0,
+        "total_wait_seconds": 0.0,
+        "maximum_wait_seconds": 0.0,
+        "total_service_seconds": 0.0,
+        "maximum_service_seconds": 0.0,
+        "wait_histogram": [0] * 32,
+        "service_histogram": [0] * 32,
+    }
+    request_queue = dict(common_queue)
+    work_queue = {**common_queue, "active": 0, "peak_active": 0}
+    selected = request_queue if queue_name == "request_queue" else work_queue
+    selected[counter_name] = 1
+    payload = {
+        "schema_version": "stage05.2-native-scheduler-runtime-v3",
+        "worker_threads": 1,
+        "request_threads": 1,
+        "receipt_writer_threads": 1,
+        "peak_active_requests": 0,
+        "peak_distinct_client_pids": 0,
+        "request_queue": request_queue,
+        "work_queue": work_queue,
+        "task_receipts": {},
+    }
+
+    with pytest.raises(RuntimeError, match="queue overflowed or rejected"):
+        scheduler._parse_runtime_statistics(json.dumps(payload))
+
+
+def _native_work_task_descriptor(
+    path: Path,
+    *,
+    worker_index: int = 0,
+    batch_sha256: str | None = None,
+) -> dict[str, object]:
+    task = {
+        "kind": "task",
+        "task_sequence": 0,
+        "worker_index": worker_index,
+        "first_index": 0,
+        "last_index": 1,
+        "submitted_nanoseconds": 1,
+        "started_nanoseconds": 2,
+        "completed_nanoseconds": 3,
+    }
+    task_line = (json.dumps(task, separators=(",", ":")) + "\n").encode("ascii")
+    batch = {
+        "kind": "batch",
+        "batch_ordinal": 0,
+        "row_count": 1,
+        "first_task_sequence": 0,
+        "last_task_sequence": 0,
+        "sha256": batch_sha256 or hashlib.sha256(task_line).hexdigest(),
+    }
+    trailer = {
+        "kind": "trailer",
+        "schema_version": "stage05.2-native-work-task-receipts-v3",
+        "storage_model": "bounded_async_fifo_stream",
+        "receipt_batch_capacity": 4_096,
+        "queue_bound_batches": 1,
+        "submitted_batches": 1,
+        "completed_batches": 1,
+        "task_receipt_dropped_count": 0,
+        "completed_tasks": 1,
+        "receipt_count": 1,
+    }
+    data = task_line + (
+        json.dumps(batch, separators=(",", ":"))
+        + "\n"
+        + json.dumps(trailer, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    path.write_bytes(data)
+    return {
+        "schema_version": "stage05.2-native-work-task-receipts-v3",
+        "path": path.name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data),
+        "count": 1,
+        "storage_model": "bounded_async_fifo_stream",
+        "receipt_batch_capacity": 4_096,
+        "queue_bound_batches": 1,
+        "peak_queued_batches": 1,
+        "submitted_batches": 1,
+        "completed_batches": 1,
+        "dropped_count": 0,
+        "producer_wait_seconds": 0.0,
+        "writer_wall_seconds": 0.0,
+        "writer_cpu_seconds": 0.0,
+        "serialization_seconds": 0.0,
+        "write_seconds": 0.0,
+        "file_fsync_seconds": 0.0,
+        "atomic_publish_seconds": 0.0,
+        "parent_fsync_seconds": 0.0,
+    }
+
+
+def test_native_work_task_stream_rejects_batch_ledger_tamper(tmp_path: Path) -> None:
+    path = tmp_path / "tampered-batch.jsonl"
+    descriptor = _native_work_task_descriptor(path, batch_sha256="0" * 64)
+
+    with pytest.raises(RuntimeError, match="batch ledger is invalid"):
+        validate_native_work_task_receipt_stream(
+            descriptor,
+            expected_path=path,
+            completed_tasks=1,
+            worker_threads=1,
+        )
+
+
+def test_native_work_task_stream_rejects_unowned_worker(tmp_path: Path) -> None:
+    path = tmp_path / "unowned-worker.jsonl"
+    descriptor = _native_work_task_descriptor(path, worker_index=-1)
+
+    with pytest.raises(RuntimeError, match="worker index is invalid"):
+        validate_native_work_task_receipt_stream(
+            descriptor,
+            expected_path=path,
+            completed_tasks=1,
+            worker_threads=1,
+        )
+
+
+def test_host_scheduler_task_receipt_publish_is_no_replace(tmp_path: Path) -> None:
+    endpoint = tmp_path / "native-scheduler-no-replace.sock"
+    receipt_path = tmp_path / "scheduler-task-receipts.jsonl"
+    scheduler = NativeHostScheduler(
+        endpoint,
+        worker_threads=2,
+        request_threads=1,
+        task_receipt_path=receipt_path,
+    )
+    scheduler.start()
+    receipt_path.write_bytes(b"preserve-existing-evidence")
+
+    with pytest.raises(RuntimeError, match="graceful shutdown failed"):
+        scheduler.close()
+
+    assert receipt_path.read_bytes() == b"preserve-existing-evidence"
+
+
+def test_host_scheduler_explicit_cpu_affinity_is_inherited(
+    tmp_path: Path,
+) -> None:
+    allowed = tuple(sorted(os.sched_getaffinity(0)))
+    if not allowed:
+        pytest.skip("host exposes no schedulable CPUs")
+    selected = allowed[: min(2, len(allowed))]
+    endpoint = tmp_path / "native-scheduler-cpu-affinity.sock"
+    with NativeHostScheduler(
+        endpoint,
+        worker_threads=24,
+        cpu_affinity=selected,
+    ) as scheduler:
+        assert scheduler.observed_cpu_affinity() == selected
+        process_status = Path("/proc") / str(scheduler.process_id) / "status"
+        expected_line = next(
+            line
+            for line in process_status.read_text(encoding="utf-8").splitlines()
+            if line.startswith("Cpus_allowed_list:")
+        )
+        for task in (Path("/proc") / str(scheduler.process_id) / "task").iterdir():
+            status = task / "status"
+            if not status.is_file():
+                continue
+            actual_line = next(
+                line
+                for line in status.read_text(encoding="utf-8").splitlines()
+                if line.startswith("Cpus_allowed_list:")
+            )
+            assert actual_line == expected_line
+
+
+def test_host_scheduler_cpu_affinity_partitions_are_isolated(
+    tmp_path: Path,
+) -> None:
+    allowed = tuple(sorted(os.sched_getaffinity(0)))
+    if len(allowed) < 2:
+        pytest.skip("requires at least two schedulable CPUs")
+    first_endpoint = tmp_path / "native-scheduler-cpu-partition-a.sock"
+    second_endpoint = tmp_path / "native-scheduler-cpu-partition-b.sock"
+    with (
+        NativeHostScheduler(first_endpoint, cpu_affinity=(allowed[0],)) as first,
+        NativeHostScheduler(second_endpoint, cpu_affinity=(allowed[1],)) as second,
+    ):
+        assert first.observed_cpu_affinity() == (allowed[0],)
+        assert second.observed_cpu_affinity() == (allowed[1],)
+
+
+@pytest.mark.parametrize("cpu_affinity", [(), (0, 0), (-1,)])
+def test_host_scheduler_rejects_invalid_cpu_affinity(
+    tmp_path: Path,
+    cpu_affinity: tuple[int, ...],
+) -> None:
+    scheduler = NativeHostScheduler(
+        tmp_path / "native-scheduler-invalid-cpu-affinity.sock",
+        cpu_affinity=cpu_affinity,
+    )
+    with pytest.raises(ValueError, match="cpu_affinity"):
+        scheduler.start()
 
 
 @pytest.mark.parametrize("reported_count", [0.0, 2.0])
@@ -11068,7 +11798,8 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
             futures = tuple(clients.submit(solve_one) for _ in range(client_count))
             results = tuple(future.result() for future in futures)
 
-        assert scheduler.observed_thread_count() == 31
+        assert scheduler.observed_thread_count() == 32
+        assert scheduler.observed_task_receipt_writer_thread_count() == 1
 
     reference = results[0]
     for result in results:
@@ -11096,6 +11827,30 @@ def test_host_scheduler_v2_six_clients_share_pool_and_isolate_state(
         assert result.native_execution_statistics["screening_batch_request_count"] < sum(
             result.native_execution_statistics["candidate_screening_occupancies"]
         )
+    runtime_statistics = scheduler.runtime_statistics
+    work_queue = runtime_statistics["work_queue"]
+    task_receipts = runtime_statistics["task_receipts"]
+    assert isinstance(work_queue, dict) and isinstance(task_receipts, dict)
+    assert task_receipts["count"] == work_queue["completed"]
+    assert int(task_receipts["count"]) > 0
+    assert task_receipts["dropped_count"] == 0
+    receipt_path = tmp_path / str(task_receipts["path"])
+    rows = [json.loads(line) for line in receipt_path.read_text(encoding="ascii").splitlines()]
+    task_rows = [row for row in rows if row["kind"] == "task"]
+    batch_rows = [row for row in rows if row["kind"] == "batch"]
+    trailers = [row for row in rows if row["kind"] == "trailer"]
+    assert len(task_rows) == int(task_receipts["count"])
+    assert len(batch_rows) == int(task_receipts["completed_batches"])
+    assert len(trailers) == 1
+    assert all(
+        row["submitted_nanoseconds"] <= row["started_nanoseconds"] <= row["completed_nanoseconds"]
+        and 0 <= row["worker_index"] < 24
+        and row["first_index"] < row["last_index"]
+        for row in task_rows
+    )
+    assert [row["batch_ordinal"] for row in batch_rows] == list(range(len(batch_rows)))
+    assert sum(int(row["row_count"]) for row in batch_rows) == len(task_rows)
+    assert rows[-1]["kind"] == "trailer"
 
 
 def test_host_scheduler_v2_six_os_processes_share_one_24_thread_pool(
@@ -11153,7 +11908,8 @@ def test_host_scheduler_v2_six_os_processes_share_one_24_thread_pool(
                         )
                 time.sleep(0.001)
             records = tuple(future.result(timeout=1.0) for future in futures)
-            assert scheduler.observed_thread_count() == 31
+            assert scheduler.observed_thread_count() == 32
+            assert scheduler.observed_task_receipt_writer_thread_count() == 1
             assert os.sched_getaffinity(scheduler.process_id) == selected_affinity
     finally:
         os.sched_setaffinity(0, original_affinity)
@@ -11346,9 +12102,7 @@ def test_host_scheduler_graceful_close_uses_v3_shutdown_without_terminate(
     assert process.returncode == 0
     assert not endpoint.exists()
     owned_prefix = f"evrptw-s52-kernel-{process.pid}-{run_nonce}-"
-    assert not any(
-        path.name.startswith(owned_prefix) for path in Path("/dev/shm").iterdir()
-    )
+    assert not any(path.name.startswith(owned_prefix) for path in Path("/dev/shm").iterdir())
 
 
 @pytest.mark.parametrize("receipt", [b"partial", b"invalid"])
@@ -11429,9 +12183,7 @@ def test_host_scheduler_shutdown_failure_cleans_then_fails_without_fallback(
     assert scheduler._run_nonce is None
     assert not endpoint.exists()
     owned_prefix = f"evrptw-s52-kernel-{process.pid}-shutdownfailure-"
-    assert not any(
-        path.name.startswith(owned_prefix) for path in Path("/dev/shm").iterdir()
-    )
+    assert not any(path.name.startswith(owned_prefix) for path in Path("/dev/shm").iterdir())
 
 
 @pytest.mark.parametrize("wait_timeouts", [1, 2])
@@ -11579,7 +12331,9 @@ def _candidate_session_fault_arguments(
         native_execution_config=_native_config("full_native_alns"),
     )
     assert len(captured) == 1
-    request = captured[0]
+    assert len(captured[0]) == 22
+    assert isinstance(captured[0][-1], str)
+    request = captured[0][:-1]
     initial_route_offsets = np.asarray(request[11], dtype=np.int64)
     initial_route_indices = np.asarray(request[12], dtype=np.int64)
     candidate_indices = np.ascontiguousarray(initial_route_indices[::-1], dtype=np.int64)
@@ -11627,11 +12381,13 @@ def test_candidate_session_commit_preapply_crash_requires_pending_commit(
 ) -> None:
     native_core, request, execute = _candidate_session_fault_arguments(monkeypatch)
     endpoint = tmp_path / "production-commit-preapply-crash.sock"
-    with NativeHostScheduler(
+    scheduler = NativeHostScheduler(
         endpoint,
         enable_fault_injection=True,
         production_fault="candidate_commit_before_apply_crash",
-    ) as scheduler:
+    )
+    scheduler.start()
+    try:
         _, token = native_core.candidate_session_open_host_v2(str(endpoint), *request)
         native_core.candidate_session_execute_host_v2(str(endpoint), token, *execute)
         with pytest.raises(RuntimeError):
@@ -11639,6 +12395,8 @@ def test_candidate_session_commit_preapply_crash_requires_pending_commit(
                 str(endpoint), token, True, 30.0
             )
         assert not scheduler.is_running
+    finally:
+        scheduler.close(force=True)
 
 
 def test_full_native_screen_response_crash_fails_before_local_apply(
@@ -11656,11 +12414,13 @@ def test_full_native_screen_response_crash_fails_before_local_apply(
         ),
         scheduler_socket_path=str(endpoint),
     )
-    with NativeHostScheduler(
+    scheduler = NativeHostScheduler(
         endpoint,
         enable_fault_injection=True,
         production_fault="screen_response_before_local_apply_crash",
-    ) as scheduler:
+    )
+    scheduler.start()
+    try:
         native_core._test_native_kernel_telemetry_v2(reset=True)
         with pytest.raises(RuntimeError, match="IPC failed without fallback"):
             solve_alns(
@@ -11674,6 +12434,8 @@ def test_full_native_screen_response_crash_fails_before_local_apply(
         telemetry = native_core._test_native_kernel_telemetry_v2()
         assert telemetry["screening_batch_request_count"] == 0
         assert not scheduler.is_running
+    finally:
+        scheduler.close(force=True)
 
 
 def test_host_worker_error_containing_deadline_text_is_not_deadline(
@@ -12017,11 +12779,15 @@ def test_host_scheduler_lingering_partial_frame_times_out_and_recovers(
         assert result.native_execution_statistics["fallback_count"] == 0
 
 
-def test_host_scheduler_start_failure_cleans_process_state(tmp_path: Path) -> None:
+@pytest.mark.parametrize("worker_threads", (0, 1025))
+def test_host_scheduler_rejects_invalid_worker_count_before_start(
+    tmp_path: Path,
+    worker_threads: int,
+) -> None:
     endpoint = tmp_path / "native-scheduler.sock"
-    scheduler = NativeHostScheduler(endpoint, worker_threads=23)
+    scheduler = NativeHostScheduler(endpoint, worker_threads=worker_threads)
 
-    with pytest.raises(RuntimeError, match="exited before becoming ready"):
+    with pytest.raises(ValueError, match=r"worker_threads must be in \[1, 1024\]"):
         scheduler.start()
 
     assert not scheduler.is_running

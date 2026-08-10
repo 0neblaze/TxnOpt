@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import plistlib
 import subprocess
+import zlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +83,49 @@ def _sha256_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+_STAGE052_SUCCESSOR_FIXTURE_MANIFEST = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "stage052_campaign_successor_e7"
+    / "manifest.json"
+)
+
+
+def _load_stage052_successor_fixture() -> tuple[str, dict[str, bytes]]:
+    manifest = json.loads(_STAGE052_SUCCESSOR_FIXTURE_MANIFEST.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == "stage052-campaign-successor-fixture-v1"
+    assert manifest["encoding"] == {
+        "compression": "zlib",
+        "transport": "base64",
+        "chunk_size": 16000,
+    }
+    source_revision = manifest["source_revision"]
+    assert isinstance(source_revision, str)
+    entries = manifest["files"]
+    assert isinstance(entries, list)
+    decoded: dict[str, bytes] = {}
+    for entry in entries:
+        assert isinstance(entry, dict)
+        relative = entry["path"]
+        assert isinstance(relative, str)
+        encoded_chunks = entry["content_zlib_base64_chunks"]
+        assert isinstance(encoded_chunks, list)
+        encoded = "".join(encoded_chunks)
+        content = zlib.decompress(base64.b64decode(encoded, validate=True))
+        assert len(content) == entry["byte_count"]
+        assert hashlib.sha256(content).hexdigest() == entry["sha256"]
+        blob_header = f"blob {len(content)}\0".encode("ascii")
+        assert hashlib.sha1(blob_header + content).hexdigest() == entry["git_blob_sha1"]
+        decoded[relative] = content
+
+    assert len(decoded) == len(entries)
+    pinned = campaign_runner._CAMPAIGN_SUCCESSOR_PINNED_PRODUCER_FIXES
+    assert frozenset(decoded) == frozenset(pinned)
+    for relative, content in decoded.items():
+        assert hashlib.sha256(content).hexdigest() == pinned[relative]
+    return source_revision, decoded
 
 
 def test_formal_execution_lock_requires_signed_recalibration_for_memory_drift() -> None:
@@ -165,9 +210,7 @@ def test_formal_execution_lock_requires_signed_recalibration_for_memory_drift() 
             changed_topology,
             formal_recalibration=replace(
                 evidence,
-                replacement_contract_sha256=_sha256_json(
-                    changed_topology.to_dict()
-                ),
+                replacement_contract_sha256=_sha256_json(changed_topology.to_dict()),
             ),
         )
 
@@ -340,10 +383,7 @@ def test_parallel_shards_recycle_worker_after_each_task(
     for options in executor_options:
         assert options["max_workers"] == 2
         assert options["max_tasks_per_child"] == 1
-        assert (
-            options["initializer"]
-            is stage052_performance._warm_v2_worker_artifact_runtime
-        )
+        assert options["initializer"] is stage052_performance._warm_v2_worker_artifact_runtime
 
 
 def test_parallel_shards_abort_active_wave_on_resource_violation(
@@ -414,10 +454,7 @@ def test_parallel_shards_abort_active_wave_on_resource_violation(
 
 
 def test_parallel_shards_use_a_fresh_spawned_pid_per_task() -> None:
-    tasks = [
-        SimpleNamespace(instance_name="c101C5", seed=seed)
-        for seed in range(2014, 2020)
-    ]
+    tasks = [SimpleNamespace(instance_name="c101C5", seed=seed) for seed in range(2014, 2020)]
 
     rows = _run_v2_tasks(
         tasks,  # type: ignore[arg-type]
@@ -605,9 +642,7 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
         "optimization_profile": "native",
         "worker_count": 2,
         "native_kernel_config": native,
-        "candidate_transaction_config": (
-            NativeCandidateTransactionConfig().to_dict()
-        ),
+        "candidate_transaction_config": (NativeCandidateTransactionConfig().to_dict()),
         "repository_revision": "a" * 40,
         "runtime_identity": runtime,
         "configuration_sha256": "4" * 64,
@@ -627,9 +662,7 @@ def _accepted_f02_payloads() -> tuple[dict[str, object], dict[str, object], str]
         "selected_exact_backend": "cpu_batch",
         "selected_workers": 2,
         "native_configuration": native,
-        "candidate_transaction_configuration": (
-            NativeCandidateTransactionConfig().to_dict()
-        ),
+        "candidate_transaction_configuration": (NativeCandidateTransactionConfig().to_dict()),
     }
     return metadata, review, raw_manifest_sha
 
@@ -906,9 +939,7 @@ def test_execution_lock_accepts_only_verified_archive_configuration_relocation()
         "repository_revision": lock.repository_revision,
         "configuration_sha256": current_selection,
         "configuration_selection_sha256": current_selection,
-        "predecessor_configuration_selection_sha256": (
-            lock.configuration_selection_sha256
-        ),
+        "predecessor_configuration_selection_sha256": (lock.configuration_selection_sha256),
         "runtime_identity": metadata["runtime_identity"],
         "input_provenance": metadata["performance_provenance"],
         "native_kernel_config": metadata["native_kernel_config"],
@@ -972,9 +1003,7 @@ def test_execution_lock_ignores_only_same_revision_runtime_telemetry_and_paths()
         "machine_load_telemetry": {"temperature_c": 91.0},
     }
 
-    assert campaign_runtime_contract_sha256(current) == (
-        campaign_runtime_contract_sha256(runtime)
-    )
+    assert campaign_runtime_contract_sha256(current) == (campaign_runtime_contract_sha256(runtime))
     lock.verify_current_execution(
         selected_backend="native_cpu",
         selected_exact_backend="cpu_batch",
@@ -1238,9 +1267,7 @@ def test_calibration_successor_attestation_recomputes_git_and_review_bindings(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    monkeypatch.setattr(
-        campaign_runner, "_CALIBRATION_SUCCESSOR_PREDECESSOR", predecessor
-    )
+    monkeypatch.setattr(campaign_runner, "_CALIBRATION_SUCCESSOR_PREDECESSOR", predecessor)
     monkeypatch.setattr(campaign_runner, "_CALIBRATION_PINNED_RECOVERY_BLOBS", {})
     monkeypatch.setattr(
         campaign_runner,
@@ -1259,9 +1286,7 @@ def test_calibration_successor_attestation_recomputes_git_and_review_bindings(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    contract_path, _ = atomic_write_signed_json(
-        tmp_path / "contract.json", {"selected_workers": 6}
-    )
+    contract_path, _ = atomic_write_signed_json(tmp_path / "contract.json", {"selected_workers": 6})
     report_path, _ = atomic_write_signed_json(
         tmp_path / "report.json",
         {"run_label": "stage05.2_resource_calibration_attempt23"},
@@ -1273,12 +1298,8 @@ def test_calibration_successor_attestation_recomputes_git_and_review_bindings(
             "schema_version": "stage05.2-resource-calibration-review-v1",
             "run_label": "stage05.2_resource_calibration_attempt23",
             "status": "ACCEPTED",
-            "calibration_report_sha256": hashlib.sha256(
-                report_path.read_bytes()
-            ).hexdigest(),
-            "resource_contract_sha256": hashlib.sha256(
-                contract_path.read_bytes()
-            ).hexdigest(),
+            "calibration_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            "resource_contract_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
             "gates": {
                 gate: {"passed": True}
                 for gate in campaign_runner._CALIBRATION_REQUIRED_REVIEW_GATES
@@ -1307,9 +1328,7 @@ def test_calibration_successor_attestation_recomputes_git_and_review_bindings(
 
     assert verified.inheritance_scope == "resource_contract_only"
     assert verified.formal_batch_geometry_contribution == 0
-    assert set(verified.changed_blob_sha256_by_path) == {
-        "docs/stage052_change_log.md"
-    }
+    assert set(verified.changed_blob_sha256_by_path) == {"docs/stage052_change_log.md"}
     report_path.write_bytes(report_path.read_bytes() + b" ")
     with pytest.raises(RuntimeError, match="not signed"):
         verify_calibration_successor_attestation(
@@ -1336,7 +1355,9 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         ("git", "-C", str(repository), "config", "user.name", "Stage 5.2 test"),
         check=True,
     )
-    source_repository = Path(__file__).resolve().parents[1]
+    approved_revision, approved_files = _load_stage052_successor_fixture()
+    assert approved_revision == "e7e48912ea68f48562b39ee8bd67189170096249"
+
     pinned_paths = (
         "src/evrptw/alns.py",
         "tests/test_alns_wall_clock_only.py",
@@ -1352,14 +1373,11 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
         "tests/test_stage033_exact_deadline.py",
         "tests/test_stage052_streaming_trace.py",
     )
+    assert frozenset(pinned_paths) == frozenset(approved_files)
     for index, relative in enumerate(pinned_paths):
         destination = repository / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(
-            (source_repository / relative).read_bytes()
-            if index < 2
-            else b"pre-fix\n"
-        )
+        destination.write_bytes(approved_files[relative] if index < 2 else b"pre-fix\n")
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
     subprocess.run(
         ("git", "-C", str(repository), "commit", "-qm", "base"),
@@ -1373,7 +1391,7 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
     ).stdout.strip()
 
     for relative in pinned_paths:
-        (repository / relative).write_bytes((source_repository / relative).read_bytes())
+        (repository / relative).write_bytes(approved_files[relative])
     subprocess.run(("git", "-C", str(repository), "commit", "-qam", "producer fix"), check=True)
     successor = subprocess.run(
         ("git", "-C", str(repository), "rev-parse", "HEAD"),
@@ -1400,6 +1418,106 @@ def test_campaign_successor_revision_accepts_only_exact_pinned_producer_fix(
     with pytest.raises(RuntimeError, match="pinned producer-fix content"):
         verify_campaign_successor_revision(
             repository,
+            predecessor_revision=predecessor,
+            current_revision=drifted,
+        )
+
+
+def test_campaign_successor_fixture_survives_shallow_source_without_e7_object(
+    tmp_path: Path,
+) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(("git", "-C", str(origin), "init", "-q", "-b", "main"), check=True)
+    subprocess.run(
+        ("git", "-C", str(origin), "config", "user.email", "test@example.com"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(origin), "config", "user.name", "Stage 5.2 test"),
+        check=True,
+    )
+    (origin / "README").write_text("shallow source\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(origin), "add", "."), check=True)
+    subprocess.run(("git", "-C", str(origin), "commit", "-qm", "source"), check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ("git", "clone", "-q", "--depth=1", f"file://{origin}", str(shallow)),
+        check=True,
+    )
+    assert (
+        subprocess.run(
+            ("git", "-C", str(shallow), "rev-parse", "--is-shallow-repository"),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "true"
+    )
+    missing = subprocess.run(
+        (
+            "git",
+            "-C",
+            str(shallow),
+            "cat-file",
+            "-e",
+            "e7e48912ea68f48562b39ee8bd67189170096249^{commit}",
+        ),
+        check=False,
+        capture_output=True,
+    )
+    assert missing.returncode != 0
+
+    source_revision, approved_files = _load_stage052_successor_fixture()
+    assert source_revision == "e7e48912ea68f48562b39ee8bd67189170096249"
+    subprocess.run(
+        ("git", "-C", str(shallow), "config", "user.email", "test@example.com"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(shallow), "config", "user.name", "Stage 5.2 test"),
+        check=True,
+    )
+    pinned_paths = tuple(sorted(approved_files))
+    for index, relative in enumerate(pinned_paths):
+        destination = shallow / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(approved_files[relative] if index < 2 else b"pre-fix\n")
+    subprocess.run(("git", "-C", str(shallow), "add", "."), check=True)
+    subprocess.run(("git", "-C", str(shallow), "commit", "-qm", "base"), check=True)
+    predecessor = subprocess.run(
+        ("git", "-C", str(shallow), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    for relative in pinned_paths:
+        (shallow / relative).write_bytes(approved_files[relative])
+    subprocess.run(("git", "-C", str(shallow), "commit", "-qam", "producer fix"), check=True)
+    successor = subprocess.run(
+        ("git", "-C", str(shallow), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert verify_campaign_successor_revision(
+        shallow,
+        predecessor_revision=predecessor,
+        current_revision=successor,
+    ) == tuple(sorted(pinned_paths[2:]))
+
+    with (shallow / pinned_paths[0]).open("ab") as stream:
+        stream.write(b"# unapproved change\n")
+    subprocess.run(("git", "-C", str(shallow), "commit", "-qam", "drift"), check=True)
+    drifted = subprocess.run(
+        ("git", "-C", str(shallow), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    with pytest.raises(RuntimeError, match="pinned producer-fix content"):
+        verify_campaign_successor_revision(
+            shallow,
             predecessor_revision=predecessor,
             current_revision=drifted,
         )
@@ -1576,9 +1694,7 @@ def test_campaign_root_location_drift_is_rejected_before_writes(tmp_path: Path) 
     d_drive = VolumeIdentity("d-nvme", "9p")
     locator = StorageRootLocator(
         {
-            "wsl_staging": StorageRoot(
-                "wsl_staging", Path("/mnt/d/wrong-staging"), ext4
-            ),
+            "wsl_staging": StorageRoot("wsl_staging", Path("/mnt/d/wrong-staging"), ext4),
             "d_archive": StorageRoot(
                 "d_archive", Path("/mnt/d/FURP-2026-Yiyang-GUO-EVRP-TW-results"), d_drive
             ),
@@ -1690,11 +1806,7 @@ def test_wsl_volume_probe_records_d_nvme_identity(
             assert arguments[:2] == ("findmnt", "--json")
             return SimpleNamespace(
                 stdout=json.dumps(
-                    {
-                        "filesystems": [
-                            {"source": "D:\\", "fstype": "9p", "uuid": None}
-                        ]
-                    }
+                    {"filesystems": [{"source": "D:\\", "fstype": "9p", "uuid": None}]}
                 )
             )
         return SimpleNamespace(
@@ -1727,11 +1839,7 @@ def test_wsl_volume_probe_records_e_usb_identity(
         if calls == 1:
             return SimpleNamespace(
                 stdout=json.dumps(
-                    {
-                        "filesystems": [
-                            {"source": "E:\\", "fstype": "9p", "uuid": None}
-                        ]
-                    }
+                    {"filesystems": [{"source": "E:\\", "fstype": "9p", "uuid": None}]}
                 )
             )
         return SimpleNamespace(
@@ -1764,11 +1872,7 @@ def test_wsl_volume_probe_rejects_non_ntfs_windows_backing_filesystem(
         if calls == 1:
             return SimpleNamespace(
                 stdout=json.dumps(
-                    {
-                        "filesystems": [
-                            {"source": "E:\\", "fstype": "9p", "uuid": None}
-                        ]
-                    }
+                    {"filesystems": [{"source": "E:\\", "fstype": "9p", "uuid": None}]}
                 )
             )
         return SimpleNamespace(
@@ -2881,9 +2985,7 @@ def _fake_batch_result(
         batch=verified,
         base_attribution=attribution,
         verified_manifest_sha256="c" * 64,
-        verified_manifest_write_interval=PersistenceInterval(
-            "verified_batch_manifest_write", 1, 2
-        ),
+        verified_manifest_write_interval=PersistenceInterval("verified_batch_manifest_write", 1, 2),
     )
 
 
@@ -2900,10 +3002,7 @@ def _run_patched_pilot(
     attribution_precommit_status: list[str] | None = None,
 ) -> tuple[Path, list[str], list[str]]:
     stage051_manifest = (
-        tmp_path
-        / "experiments"
-        / "manifests"
-        / "stage05.1_best_known_artifact_manifest.json"
+        tmp_path / "experiments" / "manifests" / "stage05.1_best_known_artifact_manifest.json"
     )
     stage051_manifest.parent.mkdir(parents=True)
     stage051_manifest.write_text("{}\n", encoding="utf-8")
@@ -2916,9 +3015,7 @@ def _run_patched_pilot(
         "test_plan": True,
     }
     lifecycle_plan = SimpleNamespace(
-        plan_sha256=stage052_performance._canonical_mapping_sha256(
-            lifecycle_payload
-        ),
+        plan_sha256=stage052_performance._canonical_mapping_sha256(lifecycle_payload),
         to_dict=lambda: lifecycle_payload,
     )
     monkeypatch.setattr(
@@ -2991,9 +3088,7 @@ def _run_patched_pilot(
         return ArchivedBatchEvidence(
             batch=archived,
             manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            state_write_interval=PersistenceInterval(
-                "archived_batch_manifest_write", 3, 4
-            ),
+            state_write_interval=PersistenceInterval("archived_batch_manifest_write", 3, 4),
             manifest_path=manifest_path,
         )
 
@@ -3084,9 +3179,7 @@ def _run_patched_pilot(
             if path.name == "stage05.2_benchmark_attempt01_persistence_attribution.json":
                 if attribution_precommit_status is not None:
                     attribution_precommit_status.append(
-                        load_campaign_manifest(
-                            path.parent.parent / "campaign_manifest.json"
-                        ).status
+                        load_campaign_manifest(path.parent.parent / "campaign_manifest.json").status
                     )
                 raise OSError("injected campaign attribution failure")
             return real_atomic_write(path, payload, **kwargs)
@@ -3161,8 +3254,7 @@ def test_g01_dispatcher_archives_all_batches_and_completes_campaign(
     standard = ArtifactReader(output_dir)
     assert standard.manifest["status"] == "complete"
     assert not any(
-        item["artifact_type"] == "campaign_manifest"
-        for item in standard.manifest["artifacts"]
+        item["artifact_type"] == "campaign_manifest" for item in standard.manifest["artifacts"]
     )
     assert batch_calls == [batch.batch_id for batch in manifest.batches]
     assert preflight_calls == ["preflight"]
@@ -3172,10 +3264,9 @@ def test_g01_dispatcher_archives_all_batches_and_completes_campaign(
     aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
     assert aggregate["row_count"] == 144
     failure_summary = json.loads(
-        (
-            output_dir
-            / "control/stage05.2_benchmark_attempt01_failure_state_drill.json"
-        ).read_text(encoding="utf-8")
+        (output_dir / "control/stage05.2_benchmark_attempt01_failure_state_drill.json").read_text(
+            encoding="utf-8"
+        )
     )
     failed_batch = load_batch_manifest(
         output_dir / str(failure_summary["failed_batch_relative_path"])
@@ -3185,18 +3276,15 @@ def test_g01_dispatcher_archives_all_batches_and_completes_campaign(
     )
     assert failed_batch.status == "failed"
     assert failed_campaign.status == "failed"
-    worker_manifest_path = output_dir / str(
-        failure_summary["worker_manifest_relative_path"]
-    )
+    worker_manifest_path = output_dir / str(failure_summary["worker_manifest_relative_path"])
     worker_manifest = json.loads(worker_manifest_path.read_text(encoding="utf-8"))
     assert worker_manifest["evidence_completeness"] == "partial"
     assert worker_manifest["worker_identity"] == "failure-recorder"
-    assert worker_manifest_path.with_suffix(".sha256").read_text(
-        encoding="utf-8"
-    ).strip() == hashlib.sha256(worker_manifest_path.read_bytes()).hexdigest()
-    archive_manifest_path = output_dir / str(
-        failure_summary["archive_manifest_relative_path"]
+    assert (
+        worker_manifest_path.with_suffix(".sha256").read_text(encoding="utf-8").strip()
+        == hashlib.sha256(worker_manifest_path.read_bytes()).hexdigest()
     )
+    archive_manifest_path = output_dir / str(failure_summary["archive_manifest_relative_path"])
     archive_drill = load_batch_manifest(archive_manifest_path)
     assert archive_drill.status == "archived"
     assert archive_drill.transfer_mode == "same_volume_atomic_rename"
@@ -3249,9 +3337,7 @@ def test_rolling_capacity_journal_survives_summary_write_interruption(
         fail_rolling_summary_once=True,
     )
 
-    journals = sorted(
-        (output_dir / "control/rolling_capacity_observations").glob("*.json")
-    )
+    journals = sorted((output_dir / "control/rolling_capacity_observations").glob("*.json"))
     assert len(journals) == 1
     assert journals[0].with_suffix(".sha256").read_text(encoding="utf-8").strip() == (
         hashlib.sha256(journals[0].read_bytes()).hexdigest()
@@ -3270,9 +3356,7 @@ def test_rolling_capacity_deficit_is_signed_before_campaign_aborts(
         fail_capacity_deficit=True,
     )
 
-    journals = sorted(
-        (output_dir / "control/rolling_capacity_observations").glob("*.json")
-    )
+    journals = sorted((output_dir / "control/rolling_capacity_observations").glob("*.json"))
     assert len(journals) == 1
     journal = json.loads(journals[0].read_text(encoding="utf-8"))
     assert journal["passed"] is False
@@ -3281,10 +3365,9 @@ def test_rolling_capacity_deficit_is_signed_before_campaign_aborts(
         hashlib.sha256(journals[0].read_bytes()).hexdigest()
     )
     summary = json.loads(
-        (
-            output_dir
-            / "control/stage05.2_benchmark_attempt01_rolling_capacity.json"
-        ).read_text(encoding="utf-8")
+        (output_dir / "control/stage05.2_benchmark_attempt01_rolling_capacity.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert summary["status"] == "failed"
     assert summary["passed"] is False
@@ -3431,10 +3514,7 @@ def test_campaign_startup_failure_is_sealed_as_partial_evidence(
     campaign = load_campaign_manifest(output_dir / "campaign_manifest.json")
     assert reader.manifest["evidence_completeness"] == "partial"
     assert campaign.status == "failed"
-    assert any(
-        item["artifact_type"] == "startup_failure"
-        for item in reader.manifest["artifacts"]
-    )
+    assert any(item["artifact_type"] == "startup_failure" for item in reader.manifest["artifacts"])
     assert batch_calls == []
 
 
@@ -3460,7 +3540,4 @@ def test_nested_corrupt_manifest_cannot_suppress_top_level_failure_seal(
     reader = ArtifactReader(output_dir)
     assert reader.result.manifest_path == output_dir / "control" / f"{run_label}_manifest.json"
     assert reader.manifest["status"] == "partial"
-    assert any(
-        item["artifact_type"] == "startup_failure"
-        for item in reader.manifest["artifacts"]
-    )
+    assert any(item["artifact_type"] == "startup_failure" for item in reader.manifest["artifacts"])
