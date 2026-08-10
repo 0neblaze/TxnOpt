@@ -17,7 +17,7 @@ import subprocess
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +35,35 @@ _RUN_LABEL: Final = re.compile(
     r"(?:attempt|rerun)[0-9]{2}$"
 )
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
+
+
+def _artifact_storage_lifecycle_caps(
+    sections: Iterable[Mapping[str, object]],
+) -> tuple[int, int]:
+    """Return distinct batch and run caps for lifecycle admission."""
+
+    per_batch_caps: list[int] = []
+    per_run_caps: list[int] = []
+    for section in sections:
+        run_value = section.get("per_run_max_bytes")
+        if isinstance(run_value, bool) or not isinstance(run_value, int) or run_value <= 0:
+            raise ValueError("experiment artifact storage run hard cap is missing")
+        batch_value = section.get(
+            "per_batch_max_bytes",
+            section.get("per_instance_seed_max_bytes", run_value),
+        )
+        if (
+            isinstance(batch_value, bool)
+            or not isinstance(batch_value, int)
+            or batch_value <= 0
+            or batch_value > run_value
+        ):
+            raise ValueError("experiment artifact storage batch hard cap is invalid")
+        per_batch_caps.append(batch_value)
+        per_run_caps.append(run_value)
+    if not per_run_caps:
+        raise ValueError("experiment plan does not declare an artifact storage hard cap")
+    return max(per_batch_caps), max(per_run_caps)
 
 
 class StorageGovernanceError(RuntimeError):
@@ -1375,20 +1404,19 @@ def preflight_cli_attempt(
             reason=reason,
         )
         raise StorageGovernanceError(reason)
-    per_run_caps: list[int] = []
-    for section in storage_sections:
-        value = section.get("per_run_max_bytes")
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            reason = "experiment artifact storage run hard cap is missing"
-            _persist_cli_plan_rejection(
-                config_path=resolved_config,
-                output_dir=resolved_output,
-                run_label=selected_label,
-                reason=reason,
-            )
-            raise StorageGovernanceError(reason)
-        per_run_caps.append(value)
-    planned_archive_bytes = max(per_run_caps)
+    try:
+        planned_batch_bytes, planned_archive_bytes = (
+            _artifact_storage_lifecycle_caps(storage_sections)
+        )
+    except ValueError as error:
+        reason = str(error)
+        _persist_cli_plan_rejection(
+            config_path=resolved_config,
+            output_dir=resolved_output,
+            run_label=selected_label,
+            reason=reason,
+        )
+        raise StorageGovernanceError(reason) from error
     prerequisite_sha256_by_contract: dict[str, str] = {}
     if stage_id == "stage05.2":
         stage052 = config_payload.get("stage05_2")
@@ -1499,6 +1527,8 @@ def preflight_cli_attempt(
         run_label=selected_label,
         run_dir=resolved_output,
         planned_archive_bytes=planned_archive_bytes,
+        max_batch_bytes=planned_batch_bytes,
+        max_run_bytes=planned_archive_bytes,
         max_workspace_bytes=planned_archive_bytes,
         workers=workers,
         threads=threads,

@@ -158,6 +158,38 @@ def test_missing_experiment_plan_cap_persists_rejection_without_run_directory(
     assert observations[0].with_suffix(".json.sha256").is_file()
 
 
+def test_cli_lifecycle_caps_keep_batch_and_run_budgets_distinct() -> None:
+    assert storage_governance_module._artifact_storage_lifecycle_caps(
+        (
+            {
+                "per_instance_seed_max_bytes": 1 * GIB,
+                "per_run_max_bytes": 16 * GIB,
+            },
+        )
+    ) == (1 * GIB, 16 * GIB)
+    assert storage_governance_module._artifact_storage_lifecycle_caps(
+        (
+            {
+                "per_batch_max_bytes": 2 * GIB,
+                "per_instance_seed_max_bytes": 1 * GIB,
+                "per_run_max_bytes": 16 * GIB,
+            },
+        )
+    ) == (2 * GIB, 16 * GIB)
+
+
+def test_cli_lifecycle_caps_reject_batch_above_run_budget() -> None:
+    with pytest.raises(ValueError, match="batch hard cap is invalid"):
+        storage_governance_module._artifact_storage_lifecycle_caps(
+            (
+                {
+                    "per_instance_seed_max_bytes": 17 * GIB,
+                    "per_run_max_bytes": 16 * GIB,
+                },
+            )
+        )
+
+
 def test_preflight_capacity_failure_is_observable_without_creating_run(
     tmp_path: Path,
 ) -> None:
