@@ -1552,6 +1552,69 @@ def test_duplicate_failure_reduction_requires_signed_adjudication(tmp_path: Path
         )
 
 
+def test_native_performance_failure_rejects_generic_retention_replay(
+    tmp_path: Path,
+) -> None:
+    locator = _locator(tmp_path)
+    for alias in locator.aliases:
+        locator.resolve(alias).absolute_path.mkdir()
+    label = "stage05.2_native_architecture_performance_calibration_attempt90"
+    source = (tmp_path / "source" / label).resolve()
+    (source / "control").mkdir(parents=True)
+    (source / "review").mkdir()
+    (source / "control" / f"{label}_failure_lifecycle_manifest.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (source / "review" / "review_manifest.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    adjudication_path = (tmp_path / "adjudication.json").resolve()
+    adjudication = write_adjudication_record(
+        adjudication_path,
+        run_label=label,
+        root_cause_id="dynamic-memory-identity-self-race-v1",
+        canonical_representative_run_label=label,
+        failure_location="failure_summary.json",
+        evidence_references=("failure_summary.json",),
+    )
+    governance = ExperimentStorageGovernance(
+        policy=GovernancePolicy(),
+        locator=locator,
+        state_root=tmp_path / "state",
+        free_space=lambda _path: 500 * GIB,
+        volume_probe=lambda path: next(
+            root.volume
+            for root in (locator.resolve(alias) for alias in locator.aliases)
+            if root.absolute_path == path
+        ),
+    )
+
+    with pytest.raises(
+        StorageGovernanceError,
+        match="independent retention replay failed",
+    ):
+        governance.retain_run(
+            RetentionRequest(
+                run_label=label,
+                generation=1,
+                retention_class=RetentionClass.UNIQUE_FAILURE_FULL,
+                root_cause_id="dynamic-memory-identity-self-race-v1",
+                adjudication=adjudication,
+                adjudication_path=adjudication_path,
+                archive_root_alias="e_archive",
+                archive_relative_path=f"stage05.2/runs/{label}/generation-0001",
+                segments=(RetentionSegment("run", source, "."),),
+                replay_verifier=_replay_writer(
+                    tmp_path,
+                    run_label=label,
+                    generation=1,
+                ),
+            )
+        )
+
+
 def test_duplicate_failure_retains_auditable_projection_and_trigger_shard(
     tmp_path: Path,
 ) -> None:

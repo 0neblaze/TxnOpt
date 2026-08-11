@@ -199,6 +199,70 @@ def test_lifecycle_failure_capsule_review_rejects_artifact_drift(
         )
 
 
+def test_lifecycle_failure_retention_replay_recomputes_tree(
+    tmp_path: Path,
+) -> None:
+    label = "stage05.2_native_architecture_performance_calibration_attempt09"
+    run_dir = tmp_path / label
+    run_dir.mkdir()
+    partial = run_dir / "partial.log"
+    partial.write_text("started\n", encoding="utf-8")
+    atomic_write_signed_json(
+        run_dir / "failure_summary.json",
+        {
+            "schema_version": "experiment-cli-failure-summary-v1",
+            "run_label": label,
+            "status": "failed",
+            "failure_code": "runner_failure",
+            "error_type": "RuntimeError",
+            "error_message": (
+                "selected producer peak plus operating headroom exceeds "
+                "available memory"
+            ),
+        },
+    )
+    raw_manifest = build_cli_failure_manifest(
+        output_dir=run_dir,
+        run_label=label,
+    )
+    review_lifecycle_failure_capsule(
+        raw_manifest_path=raw_manifest,
+        review_manifest_path=run_dir / "review" / "review_manifest.json",
+    )
+    archive_path = tmp_path / "archive" / label / "generation-0001"
+    shutil.copytree(run_dir, archive_path)
+    archived_partial = archive_path / "partial.log"
+    archived_stat = archived_partial.stat()
+    os.utime(
+        archived_partial,
+        ns=(archived_stat.st_atime_ns, archived_stat.st_mtime_ns + 1_000_000),
+    )
+    replay_path = tmp_path / "retention" / "replay.json"
+
+    result = campaign_review_module.write_lifecycle_failure_retention_replay(
+        archive_path=archive_path,
+        run_label=label,
+        generation=1,
+        output_path=replay_path,
+    )
+
+    replay = json.loads(result.read_text(encoding="utf-8"))
+    assert replay["status"] == "passed"
+    assert replay["archive_tree_sha256"] == compute_tree_sha256(archive_path)
+    assert replay["raw_review_replay_passed"] is True
+    assert replay["replay_kind"] == "lifecycle_failure_capsule"
+    assert replay["raw_manifest_sha256"] == hashlib.sha256(
+        (
+            archive_path
+            / "control"
+            / f"{label}_failure_lifecycle_manifest.json"
+        ).read_bytes()
+    ).hexdigest()
+    assert replay["review_manifest_sha256"] == hashlib.sha256(
+        (archive_path / "review" / "review_manifest.json").read_bytes()
+    ).hexdigest()
+
+
 def _resource_calibration_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

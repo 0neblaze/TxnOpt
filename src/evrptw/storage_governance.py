@@ -31,6 +31,11 @@ from evrptw.stage052_campaign import StorageRoot, StorageRootLocator, VolumeIden
 
 GIB: Final = 1024**3
 POLICY_SCHEMA_VERSION: Final = "experiment-storage-governance-v1"
+LIFECYCLE_FAILURE_REPLAY_KIND: Final = "lifecycle_failure_capsule"
+_NATIVE_PERFORMANCE_CALIBRATION_LABEL: Final = re.compile(
+    r"stage05\.2_native_architecture_performance_calibration_"
+    r"(?:attempt|rerun)[0-9]{2}"
+)
 LIFECYCLE_ADJUDICATION_SCHEMA_VERSION: Final = (
     "experiment-lifecycle-root-cause-adjudication-v1"
 )
@@ -953,6 +958,9 @@ def write_retention_replay_receipt(
     validator_replay_passed: bool,
     objective_replay_passed: bool,
     raw_review_replay_passed: bool,
+    replay_kind: str = "",
+    raw_manifest_sha256: str = "",
+    review_manifest_sha256: str = "",
 ) -> str:
     """Seal the independently produced full-retention replay result."""
 
@@ -964,6 +972,17 @@ def write_retention_replay_receipt(
         or _SHA256.fullmatch(verifier_identity_sha256) is None
     ):
         raise ValueError("retention replay identity is invalid")
+    replay_identity = (
+        replay_kind,
+        raw_manifest_sha256,
+        review_manifest_sha256,
+    )
+    if any(replay_identity) and (
+        re.fullmatch(r"[a-z][a-z0-9_]*", replay_kind) is None
+        or _SHA256.fullmatch(raw_manifest_sha256) is None
+        or _SHA256.fullmatch(review_manifest_sha256) is None
+    ):
+        raise ValueError("retention replay semantic identity is invalid")
     checks = {
         "validator_replay_passed": validator_replay_passed,
         "objective_replay_passed": objective_replay_passed,
@@ -974,6 +993,15 @@ def write_retention_replay_receipt(
             f"full-retention replay did not pass every check: {run_label}"
         )
     file_count, byte_count, tree_sha256 = _tree_identity(archive_path)
+    semantic_identity = (
+        {
+            "replay_kind": replay_kind,
+            "raw_manifest_sha256": raw_manifest_sha256,
+            "review_manifest_sha256": review_manifest_sha256,
+        }
+        if replay_kind
+        else {}
+    )
     return _write_signed_json(
         path,
         {
@@ -985,6 +1013,7 @@ def write_retention_replay_receipt(
             "archive_file_count": file_count,
             "archive_byte_count": byte_count,
             "verifier_identity_sha256": verifier_identity_sha256,
+            **semantic_identity,
             **checks,
             "status": "passed",
         },
@@ -5302,6 +5331,29 @@ class ExperimentStorageGovernance:
                     "raw_review_replay_passed": True,
                     "status": "passed",
                 }
+                if (
+                    request.retention_class == RetentionClass.UNIQUE_FAILURE_FULL
+                    and _NATIVE_PERFORMANCE_CALIBRATION_LABEL.fullmatch(
+                        request.run_label
+                    )
+                    is not None
+                ):
+                    expected_replay.update(
+                        {
+                            "replay_kind": LIFECYCLE_FAILURE_REPLAY_KIND,
+                            "raw_manifest_sha256": _file_sha256(
+                                destination
+                                / "control"
+                                / (
+                                    f"{request.run_label}_"
+                                    "failure_lifecycle_manifest.json"
+                                )
+                            ),
+                            "review_manifest_sha256": _file_sha256(
+                                destination / "review" / "review_manifest.json"
+                            ),
+                        }
+                    )
                 if any(
                     replay_receipt.get(field) != value
                     for field, value in expected_replay.items()

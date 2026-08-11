@@ -47,6 +47,9 @@ UNBOUND_CALIBRATION_REVIEW_SCHEMA_VERSION: Final = (
 UNBOUND_CALIBRATION_FAILURE_CODE: Final = "invalid_manifest"
 UNBOUND_CALIBRATION_FAILURE_COMPONENT: Final = "stage052_calibration"
 UNBOUND_CALIBRATION_FAILURE_CHECK: Final = "resource_contract_not_bound_at_seal"
+_FULL_TREE_FAILURE_EXPERIMENT_IDS: Final = frozenset(
+    {"stage052_native_architecture_performance_calibration"}
+)
 _SHA256: Final = re.compile(r"[0-9a-f]{64}")
 _RUN_LABEL: Final = re.compile(
     r"stage0[0-8](?:\.[0-9]+)?_[a-z0-9_]+_(?:attempt|rerun)[0-9]{2}"
@@ -4623,6 +4626,14 @@ class ExperimentLifecycleController:
             raise LifecycleError("root-cause adjudication has no bound review manifest")
         from evrptw.storage_governance import load_adjudication_record
 
+        if (
+            record.experiment_id in _FULL_TREE_FAILURE_EXPERIMENT_IDS
+            and canonical_representative != run_label
+        ):
+            raise LifecycleError(
+                "performance calibration failures require self-adjudication"
+            )
+
         adjudication_sha256 = _sha256_file(adjudication_path)
         shared_adjudication = load_adjudication_record(
             adjudication_path,
@@ -4786,6 +4797,15 @@ class ExperimentLifecycleController:
         ):
             selected = RetentionClassV3.UNIQUE_FAILURE_FULL
             reason = "known_unbound_calibration_full"
+        elif (
+            status == ReviewerStatus.FAILED_KNOWN
+            and record.experiment_id in _FULL_TREE_FAILURE_EXPERIMENT_IDS
+            and record.root_cause_id
+            and record.adjudication_sha256
+            and record.canonical_representative == run_label
+        ):
+            selected = RetentionClassV3.UNIQUE_FAILURE_FULL
+            reason = "known_performance_calibration_failure_full"
         elif (
             status == ReviewerStatus.FAILED_KNOWN
             and record.root_cause_id
@@ -5172,6 +5192,26 @@ class ExperimentLifecycleController:
             or replay.get("status") != "passed"
         ):
             raise LifecycleError("retention replay receipt differs")
+        if (
+            record.experiment_id in _FULL_TREE_FAILURE_EXPERIMENT_IDS
+            and record.retention_class == RetentionClassV3.UNIQUE_FAILURE_FULL
+        ):
+            from evrptw.storage_governance import LIFECYCLE_FAILURE_REPLAY_KIND
+
+            raw_manifest_path = archive_path.joinpath(
+                *PurePosixPath(record.sealed_manifest_relative_path).parts
+            )
+            review_manifest_path = archive_path / "review" / "review_manifest.json"
+            if (
+                replay.get("replay_kind") != LIFECYCLE_FAILURE_REPLAY_KIND
+                or replay.get("raw_manifest_sha256")
+                != _sha256_file(raw_manifest_path)
+                or replay.get("review_manifest_sha256")
+                != _sha256_file(review_manifest_path)
+            ):
+                raise LifecycleError(
+                    "performance calibration failure replay identity differs"
+                )
         performance = receipt.get("close_performance")
         if not isinstance(performance, dict):
             raise LifecycleError("retention receipt close performance is missing")

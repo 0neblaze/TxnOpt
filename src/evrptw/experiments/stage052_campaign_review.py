@@ -134,6 +134,7 @@ from evrptw.stage052_storage_migration import (
     verify_successor_storage_migration_evidence,
 )
 from evrptw.storage_governance import (
+    LIFECYCLE_FAILURE_REPLAY_KIND,
     POLICY_SCHEMA_VERSION,
     GovernancePolicy,
     StorageGovernanceError,
@@ -6863,30 +6864,28 @@ def review_stage052_campaign(
     )
 
 
-def review_lifecycle_failure_capsule(
-    *,
+def _lifecycle_failure_review_payload(
     raw_manifest_path: Path,
-    review_manifest_path: Path,
-) -> dict[str, object]:
-    """Independently classify a sealed CLI failure without trusting its summary."""
+    *,
+    expected_run_label: str | None = None,
+) -> tuple[Path, dict[str, object]]:
+    """Recompute one sealed CLI-failure review without publishing it."""
 
     raw_manifest_path = raw_manifest_path.resolve(strict=True)
     run_dir = raw_manifest_path.parent.parent
+    run_label = expected_run_label or run_dir.name
     if (
         raw_manifest_path.parent.name != "control"
         or raw_manifest_path.name
-        != f"{run_dir.name}_failure_lifecycle_manifest.json"
+        != f"{run_label}_failure_lifecycle_manifest.json"
     ):
         raise ArtifactIntegrityError("CLI failure manifest location is invalid")
-    expected_review_path = run_dir / "review" / "review_manifest.json"
-    if review_manifest_path.resolve() != expected_review_path.resolve():
-        raise ArtifactIntegrityError("CLI failure review output location is invalid")
     _verify_manifest_sidecar(raw_manifest_path)
     raw = _json_object(raw_manifest_path)
     artifacts = raw.get("artifacts")
     if (
         raw.get("schema_version") != "experiment-cli-failure-manifest-v1"
-        or raw.get("run_label") != run_dir.name
+        or raw.get("run_label") != run_label
         or raw.get("status") != "failed"
         or raw.get("evidence_completeness") != "partial"
         or raw.get("artifact_trust") != "untrusted_failure_capsule"
@@ -6926,7 +6925,7 @@ def review_lifecycle_failure_capsule(
         stat = path.stat()
         if (
             stat.st_size != byte_size
-            or stat.st_mtime_ns != modified_time_ns
+            or (expected_run_label is None and stat.st_mtime_ns != modified_time_ns)
             or _sha256(path) != checksum
         ):
             raise ArtifactIntegrityError("CLI failure artifact content differs")
@@ -6954,7 +6953,7 @@ def review_lifecycle_failure_capsule(
     summary = _json_object(summary_path)
     if (
         summary.get("schema_version") != "experiment-cli-failure-summary-v1"
-        or summary.get("run_label") != run_dir.name
+        or summary.get("run_label") != run_label
         or summary.get("status") != "failed"
         or summary.get("failure_code") != "runner_failure"
         or not isinstance(summary.get("error_type"), str)
@@ -6974,7 +6973,7 @@ def review_lifecycle_failure_capsule(
     )
     manifest: dict[str, object] = {
         "schema_version": "experiment-lifecycle-failure-review-v1",
-        "run_label": run_dir.name,
+        "run_label": run_label,
         "status": lifecycle_status,
         "lifecycle_status": lifecycle_status,
         "failure_identity": {
@@ -6994,9 +6993,81 @@ def review_lifecycle_failure_capsule(
         },
         "files": {},
     }
+    return run_dir, manifest
+
+
+def review_lifecycle_failure_capsule(
+    *,
+    raw_manifest_path: Path,
+    review_manifest_path: Path,
+) -> dict[str, object]:
+    """Independently classify a sealed CLI failure without trusting its summary."""
+
+    run_dir, manifest = _lifecycle_failure_review_payload(raw_manifest_path)
+    expected_review_path = run_dir / "review" / "review_manifest.json"
+    if review_manifest_path.resolve() != expected_review_path.resolve():
+        raise ArtifactIntegrityError("CLI failure review output location is invalid")
     review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
     atomic_write_signed_json(review_manifest_path, manifest)
     return manifest
+
+
+def write_lifecycle_failure_retention_replay(
+    *,
+    archive_path: Path,
+    run_label: str,
+    generation: int,
+    output_path: Path,
+) -> Path:
+    """Replay an archived CLI-failure capsule before full retention closes."""
+
+    archive_path = archive_path.resolve(strict=True)
+    if (
+        not archive_path.is_dir()
+        or re.fullmatch(r"[a-z0-9][a-z0-9._-]*", run_label) is None
+        or isinstance(generation, bool)
+        or generation <= 0
+    ):
+        raise ArtifactIntegrityError("failure retention replay identity is invalid")
+    output_path = output_path.resolve()
+    if output_path.exists() or output_path.is_relative_to(archive_path):
+        raise ArtifactIntegrityError("failure retention replay output is unsafe")
+    raw_manifest_path = (
+        archive_path
+        / "control"
+        / f"{run_label}_failure_lifecycle_manifest.json"
+    )
+    run_dir, expected_review = _lifecycle_failure_review_payload(
+        raw_manifest_path,
+        expected_run_label=run_label,
+    )
+    if run_dir != archive_path or expected_review.get("run_label") != run_label:
+        raise ArtifactIntegrityError("archived failure run identity differs")
+    review_path = archive_path / "review" / "review_manifest.json"
+    _verify_manifest_sidecar(review_path)
+    if _json_object(review_path) != expected_review:
+        raise ArtifactIntegrityError("archived failure review replay differs")
+    tree_sha256 = compute_tree_sha256(archive_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_retention_replay_receipt(
+        output_path,
+        run_label=run_label,
+        generation=generation,
+        archive_path=archive_path,
+        verifier_identity_sha256=_sha256(Path(__file__)),
+        validator_replay_passed=True,
+        objective_replay_passed=True,
+        raw_review_replay_passed=True,
+        replay_kind=LIFECYCLE_FAILURE_REPLAY_KIND,
+        raw_manifest_sha256=_sha256(raw_manifest_path),
+        review_manifest_sha256=_sha256(review_path),
+    )
+    if (
+        _json_object(output_path).get("archive_tree_sha256") != tree_sha256
+        or compute_tree_sha256(archive_path) != tree_sha256
+    ):
+        raise ArtifactIntegrityError("failure retention tree changed during replay")
+    return output_path
 
 
 def _verify_stage052_memory_release(payload: object) -> None:

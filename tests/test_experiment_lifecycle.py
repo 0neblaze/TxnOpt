@@ -2848,6 +2848,116 @@ def test_signed_adjudication_unblocks_unknown_failure(tmp_path: Path) -> None:
     assert controller.records()[0].state == LifecycleState.CLASSIFIED
 
 
+def test_native_performance_calibration_known_failure_keeps_full_tree(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    label = "stage05.2_native_architecture_performance_calibration_attempt91"
+    _start(controller, tmp_path, label)
+    _seal_and_review(
+        controller,
+        tmp_path,
+        label,
+        reviewer_status=ReviewerStatus.FAILED_UNKNOWN,
+        failure_code="runner_failure",
+    )
+    reviewed = next(
+        item for item in controller.records() if item.run_label == label
+    )
+    adjudication_path = tmp_path / "performance-calibration-adjudication.json"
+    write_lifecycle_adjudication_record(
+        adjudication_path,
+        run_label=label,
+        review_manifest_sha256=reviewed.review_manifest_sha256,
+        root_cause_id="dynamic-memory-identity-self-race-v1",
+        canonical_representative_run_label=label,
+        canonical_representative_record_sha256=hashlib.sha256(
+            controller._record_path(label).read_bytes()
+        ).hexdigest(),
+        failure_code="runner_failure",
+        failing_component="runner",
+        invariant_or_check="manifest_integrity",
+        failure_location="control/manifest.json",
+    )
+    controller.adjudicate(
+        label,
+        root_cause_id="dynamic-memory-identity-self-race-v1",
+        canonical_representative=label,
+        adjudication_path=adjudication_path,
+    )
+
+    decision = controller.classify(
+        label,
+        classification_context_path=_classification_context(
+            controller,
+            tmp_path,
+            label,
+            publication_state="none",
+        ),
+    )
+
+    assert decision.retention_class == RetentionClassV3.UNIQUE_FAILURE_FULL
+    assert decision.retention_class.preserves_full_tree
+    assert decision.reason_code == "known_performance_calibration_failure_full"
+
+
+def test_native_performance_calibration_rejects_duplicate_adjudication(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    label = "stage05.2_native_architecture_performance_calibration_attempt92"
+    representative = (
+        "stage05.2_native_architecture_performance_calibration_attempt90"
+    )
+    _start(controller, tmp_path, label)
+    _seal_and_review(
+        controller,
+        tmp_path,
+        label,
+        reviewer_status=ReviewerStatus.FAILED_UNKNOWN,
+        failure_code="runner_failure",
+    )
+    reviewed = next(
+        item for item in controller.records() if item.run_label == label
+    )
+    adjudication_path = tmp_path / "duplicate-performance-adjudication.json"
+    write_lifecycle_adjudication_record(
+        adjudication_path,
+        run_label=label,
+        review_manifest_sha256=reviewed.review_manifest_sha256,
+        root_cause_id="dynamic-memory-identity-self-race-v1",
+        canonical_representative_run_label=representative,
+        canonical_representative_record_sha256="1" * 64,
+        failure_code="runner_failure",
+        failing_component="runner",
+        invariant_or_check="manifest_integrity",
+        failure_location="control/manifest.json",
+    )
+
+    with pytest.raises(
+        LifecycleError,
+        match="performance calibration failures require self-adjudication",
+    ):
+        controller.adjudicate(
+            label,
+            root_cause_id="dynamic-memory-identity-self-race-v1",
+            canonical_representative=representative,
+            adjudication_path=adjudication_path,
+        )
+
+    decision = controller.classify(
+        label,
+        classification_context_path=_classification_context(
+            controller,
+            tmp_path,
+            label,
+            publication_state="none",
+        ),
+    )
+    assert decision.retention_class == RetentionClassV3.UNKNOWN_FULL
+    assert decision.blocked is True
+
+
 def test_unbound_calibration_review_infers_failure_and_keeps_full_tree(
     tmp_path: Path,
 ) -> None:

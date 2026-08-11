@@ -687,6 +687,11 @@ this repository or one of its subdirectories.
   attestation. Its canonical unique failure retains the complete source tree
   through `unique_failure_full` retention so close never deletes or compacts
   the evidence. A new calibration uses a new immutable attempt label.
+- Native-architecture performance calibration failures follow the same
+  no-cleanup boundary. After independent failure-capsule replay and signed
+  root-cause adjudication, a self-representative known failure uses
+  `unique_failure_full`; closing it must preserve the complete source tree and
+  independently replay the archived failure inventory and review receipt.
 - Every Stage 5.2 calibration CLI invocation must pass the clean ext4 checkout
   explicitly through `--repository-root`. Service working-directory state is
   not a source-identity input and may not be relied on implicitly. A missing
