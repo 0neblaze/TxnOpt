@@ -4520,18 +4520,77 @@ class ExperimentLifecycleController:
         except ValueError as error:
             raise LifecycleError("review output is outside the governed review root") from error
         receipt_path = review_root / "review_execution.json"
-        if (
-            review_manifest_path.exists()
-            or any(
-                candidate.exists()
-                for candidate in (
+        execution_binding_path = (
+            self.state_root / "review-executions" / f"{run_label}.json"
+        )
+        receipt_sidecars = tuple(
+            dict.fromkeys(
+                (
+                    receipt_path.with_suffix(receipt_path.suffix + ".sha256"),
+                    receipt_path.with_suffix(".sha256"),
+                )
+            )
+        )
+        execution_binding_sidecars = tuple(
+            dict.fromkeys(
+                (
+                    execution_binding_path.with_suffix(
+                        execution_binding_path.suffix + ".sha256"
+                    ),
+                    execution_binding_path.with_suffix(".sha256"),
+                )
+            )
+        )
+        review_sidecars = tuple(
+            dict.fromkeys(
+                (
                     review_manifest_path.with_suffix(
                         review_manifest_path.suffix + ".sha256"
                     ),
                     review_manifest_path.with_suffix(".sha256"),
-                    receipt_path,
-                    receipt_path.with_suffix(receipt_path.suffix + ".sha256"),
                 )
+            )
+        )
+        def _unique_flag_path(flag: str) -> Path | None:
+            positions = tuple(
+                index for index, part in enumerate(command_parts) if part == flag
+            )
+            if len(positions) != 1 or positions[0] + 1 >= len(command_parts):
+                return None
+            return Path(command_parts[positions[0] + 1]).resolve()
+
+        failure_review_recovery = bool(record.failure_code) and (
+            review_manifest_path.resolve()
+            == (review_root / "review_manifest.json").resolve()
+            and _unique_flag_path("--lifecycle-failure-manifest") == expected_raw
+            and _unique_flag_path("--failure-review-manifest")
+            == review_manifest_path.resolve()
+        )
+        preexisting_review_sha256: str | None = None
+        preexisting_review_sidecars: dict[Path, bytes] | None = None
+        if review_manifest_path.is_file():
+            if (
+                not failure_review_recovery
+                or receipt_path.exists()
+                or any(sidecar.exists() for sidecar in receipt_sidecars)
+                or execution_binding_path.exists()
+                or any(sidecar.exists() for sidecar in execution_binding_sidecars)
+            ):
+                raise LifecycleError("independent review output already exists")
+            _load_external_signed_json(review_manifest_path)
+            preexisting_review_sha256 = _sha256_file(review_manifest_path)
+            preexisting_review_sidecars = {
+                sidecar: sidecar.read_bytes()
+                for sidecar in _external_sidecars(review_manifest_path)
+            }
+        elif any(
+            candidate.exists()
+            for candidate in (
+                *review_sidecars,
+                receipt_path,
+                *receipt_sidecars,
+                execution_binding_path,
+                *execution_binding_sidecars,
             )
         ):
             raise LifecycleError("independent review output already exists")
@@ -4546,6 +4605,22 @@ class ExperimentLifecycleController:
             )
         if after != before:
             raise LifecycleError("independent reviewer modified the raw manifest")
+        if (
+            preexisting_review_sha256 is not None
+            and _sha256_file(review_manifest_path) != preexisting_review_sha256
+        ):
+            raise LifecycleError("independent reviewer modified the existing review")
+        if preexisting_review_sidecars is not None:
+            observed_sidecars = {
+                sidecar for sidecar in review_sidecars if sidecar.is_file()
+            }
+            if observed_sidecars != set(preexisting_review_sidecars) or any(
+                sidecar.read_bytes() != original
+                for sidecar, original in preexisting_review_sidecars.items()
+            ):
+                raise LifecycleError(
+                    "independent reviewer modified the existing review sidecar"
+                )
         if _sha256_file(module_path) != module_digest_before:
             raise LifecycleError("catalog reviewer module changed during execution")
         raw_payload = _load_external_signed_json(expected_raw)
@@ -4591,7 +4666,7 @@ class ExperimentLifecycleController:
             },
         )
         _write_signed_json(
-            self.state_root / "review-executions" / f"{run_label}.json",
+            execution_binding_path,
             {
                 "schema_version": "experiment-review-execution-binding-v1",
                 "run_label": run_label,

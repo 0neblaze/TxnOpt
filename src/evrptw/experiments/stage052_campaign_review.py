@@ -7007,6 +7007,30 @@ def review_lifecycle_failure_capsule(
     expected_review_path = run_dir / "review" / "review_manifest.json"
     if review_manifest_path.resolve() != expected_review_path.resolve():
         raise ArtifactIntegrityError("CLI failure review output location is invalid")
+    review_sidecars = tuple(
+        dict.fromkeys(
+            (
+                review_manifest_path.with_suffix(
+                    review_manifest_path.suffix + ".sha256"
+                ),
+                review_manifest_path.with_suffix(".sha256"),
+            )
+        )
+    )
+    existing_review_sidecars = tuple(
+        sidecar for sidecar in review_sidecars if sidecar.is_file()
+    )
+    if review_manifest_path.exists():
+        if not existing_review_sidecars or any(
+            not signed_sidecar_matches(review_manifest_path, sidecar)
+            for sidecar in existing_review_sidecars
+        ):
+            raise ArtifactIntegrityError("CLI failure review sidecar differs")
+        if _json_object(review_manifest_path) != manifest:
+            raise ArtifactIntegrityError("existing CLI failure review differs")
+        return manifest
+    if existing_review_sidecars:
+        raise ArtifactIntegrityError("CLI failure review sidecar is orphaned")
     review_manifest_path.parent.mkdir(parents=True, exist_ok=False)
     atomic_write_signed_json(review_manifest_path, manifest)
     return manifest

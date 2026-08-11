@@ -35,6 +35,7 @@ from evrptw.experiments.stage052_campaign_review import (
     CampaignGeometryRecord,
     _publish_review,
     _read_bounded_compact_trace,
+    _sidecar_for,
     _validate_batch_metadata,
     _verify_review_storage_migration,
     audit_campaign_planning,
@@ -165,6 +166,29 @@ def test_lifecycle_failure_capsule_review_recomputes_known_failure(
     }
     assert review["verified_artifact_count"] == 3
     assert review_manifest.is_file()
+
+    original = review_manifest.read_bytes()
+    original_sidecar = _sidecar_for(review_manifest).read_bytes()
+    assert (
+        review_lifecycle_failure_capsule(
+            raw_manifest_path=raw_manifest,
+            review_manifest_path=review_manifest,
+        )
+        == review
+    )
+    assert review_manifest.read_bytes() == original
+    assert _sidecar_for(review_manifest).read_bytes() == original_sidecar
+    alternate_sidecar = review_manifest.with_suffix(".sha256")
+    alternate_sidecar.write_bytes(original_sidecar)
+    original_sidecar_path = review_manifest.with_suffix(
+        review_manifest.suffix + ".sha256"
+    )
+    original_sidecar_path.write_text(f"{'0' * 64}\n", encoding="utf-8")
+    with pytest.raises(ArtifactIntegrityError, match="sidecar differs"):
+        review_lifecycle_failure_capsule(
+            raw_manifest_path=raw_manifest,
+            review_manifest_path=review_manifest,
+        )
 
 
 def test_lifecycle_failure_capsule_review_rejects_artifact_drift(

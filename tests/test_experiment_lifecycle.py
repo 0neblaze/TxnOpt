@@ -54,6 +54,7 @@ from evrptw.stage052_campaign import (
 )
 from evrptw.storage_governance import (
     StorageGovernanceError,
+    build_cli_failure_manifest,
     build_cli_terminal_manifest,
     write_lifecycle_adjudication_record,
 )
@@ -2069,6 +2070,123 @@ def test_execute_reviewer_writes_uniform_receipt_and_allows_review(
 
     assert receipt == plan.run_dir / "review" / "review_execution.json"
     assert controller.review(label, review_manifest_path=review).state == (LifecycleState.REVIEWED)
+
+
+@pytest.mark.parametrize("mutate_sidecar", (False, True))
+def test_execute_reviewer_recovers_preexisting_failure_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mutate_sidecar: bool,
+) -> None:
+    controller = _controller(tmp_path)
+    label = "stage05.2_native_architecture_performance_calibration_attempt09"
+    plan = _start(controller, tmp_path, label)
+    summary = plan.run_dir / "failure_summary.json"
+    _write_signed_json(
+        summary,
+        {
+            "schema_version": "experiment-cli-failure-summary-v1",
+            "run_label": label,
+            "status": "failed",
+            "failure_code": "runner_failure",
+            "error_type": "RuntimeError",
+            "error_message": "diagnostic failure",
+        },
+    )
+    manifest = build_cli_failure_manifest(output_dir=plan.run_dir, run_label=label)
+    controller.seal(label, manifest_path=manifest, failure_code="runner_failure")
+    review = plan.run_dir / "review" / "review_manifest.json"
+    _write_signed_json(
+        review,
+        {"run_label": label, "status": "FAILED_UNKNOWN", "files": {}},
+    )
+    original = review.read_bytes()
+    review_sidecar = review.with_suffix(review.suffix + ".sha256")
+    original_sidecar = review_sidecar.read_bytes()
+
+    def fake_run(command: tuple[str, ...], *, check: bool) -> subprocess.CompletedProcess[str]:
+        assert check is False
+        assert review.read_bytes() == original
+        if mutate_sidecar:
+            review_sidecar.write_text(
+                f"{hashlib.sha256(original).hexdigest()}  alternate.json\n",
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    spec = controller.catalog.for_run_label(label)
+    with pytest.raises(LifecycleError, match="output already exists"):
+        controller.execute_reviewer(
+            label,
+            raw_manifest_path=manifest,
+            review_manifest_path=review,
+            command=(
+                sys.executable,
+                "-m",
+                spec.reviewer_module,
+                "--lifecycle-failure-manifest",
+                str(manifest),
+                "--failure-review-manifest",
+                str(review.with_name("different.json")),
+            ),
+        )
+    receipt_orphan = plan.run_dir / "review" / "review_execution.sha256"
+    receipt_orphan.write_text("orphan\n", encoding="utf-8")
+    with pytest.raises(LifecycleError, match="output already exists"):
+        controller.execute_reviewer(
+            label,
+            raw_manifest_path=manifest,
+            review_manifest_path=review,
+            command=(
+                sys.executable,
+                "-m",
+                spec.reviewer_module,
+                "--lifecycle-failure-manifest",
+                str(manifest),
+                "--failure-review-manifest",
+                str(review),
+            ),
+        )
+    receipt_orphan.unlink()
+    if mutate_sidecar:
+        with pytest.raises(LifecycleError, match="modified the existing review sidecar"):
+            controller.execute_reviewer(
+                label,
+                raw_manifest_path=manifest,
+                review_manifest_path=review,
+                command=(
+                    sys.executable,
+                    "-m",
+                    spec.reviewer_module,
+                    "--lifecycle-failure-manifest",
+                    str(manifest),
+                    "--failure-review-manifest",
+                    str(review),
+                ),
+            )
+        assert review.read_bytes() == original
+        assert review_sidecar.read_bytes() != original_sidecar
+        return
+    receipt = controller.execute_reviewer(
+        label,
+        raw_manifest_path=manifest,
+        review_manifest_path=review,
+        command=(
+            sys.executable,
+            "-m",
+            spec.reviewer_module,
+            "--lifecycle-failure-manifest",
+            str(manifest),
+            "--failure-review-manifest",
+            str(review),
+        ),
+    )
+
+    assert receipt == plan.run_dir / "review" / "review_execution.json"
+    assert review.read_bytes() == original
+    assert review_sidecar.read_bytes() == original_sidecar
 
 
 def test_execute_reviewer_rejects_a_decorative_module_argument(
