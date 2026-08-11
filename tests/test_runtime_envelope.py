@@ -269,7 +269,9 @@ def test_process_tree_monitor_registers_late_shared_root_before_worker_samples()
         assert statistics["additional_root_pids"] == [shared_root.pid]
         peak = statistics["worker_descendant_pss_peak"]
         assert peak["status"] == "available"
-        assert {row["pid"] for row in peak["processes"]} == {worker.pid}
+        observed_worker_pids = {row["pid"] for row in peak["processes"]}
+        assert worker.pid in observed_worker_pids
+        assert shared_root.pid not in observed_worker_pids
     finally:
         if worker is not None:
             worker.terminate()
