@@ -38,7 +38,6 @@ from evrptw.experiments.stage052_native_architectures import (
     _run_mode,
     _runtime_cgroup_snapshot,
     _scheduler_runtime_summary,
-    _solve_mode,
     load_warm_start_bundle,
     workload_class_for_instance,
 )
@@ -2106,6 +2105,7 @@ def _candidate_payload_receipt_matches(
 def produce_representative_telemetry_sample(
     *,
     enabled: bool,
+    sample_index: int,
     wheel_receipt_path: Path,
     warm_start_bundle_path: Path,
     benchmark_dir: Path,
@@ -2121,6 +2121,13 @@ def produce_representative_telemetry_sample(
 ) -> dict[str, object]:
     """Run one representative current-stage fixed-work axis with telemetry on/off."""
 
+    if (
+        isinstance(sample_index, bool)
+        or sample_index < -2
+        or (sample_index == -2 and enabled)
+        or (sample_index == -1 and not enabled)
+    ):
+        raise ValueError("representative telemetry sample index is invalid")
     if output_path.exists() or raw_output_root.exists():
         raise FileExistsError("representative telemetry sample namespace already exists")
     parent = parent_run_dir.resolve()
@@ -2194,106 +2201,51 @@ def produce_representative_telemetry_sample(
     started = time.perf_counter()
     raw_inventory: list[Mapping[str, object]] = []
     replay_seconds = 0.0
-    minimal_replay_receipt: dict[str, object] | None = None
-    telemetry_off_result: ALNSResult | None = None
-    telemetry_on_payload: Mapping[str, object] | None = None
-    if enabled:
-        axis_path = Path(
-            _run_mode(
-                task,
-                ArchitectureMode.CURRENT_STAGE052,
-                resource_telemetry_enabled=True,
-            )
-        )
-        payload, inventory = _signed_axis(
-            axis_path,
-            role="representative-telemetry-on",
-            storage_root=parent,
-        )
-        from evrptw.experiments.stage052_native_architecture_review import (
-            ReviewRecord,
-            _replay_record,
-        )
-
-        replay_started = time.perf_counter()
-        replay = _replay_record(ReviewRecord(axis_path, payload), benchmark_dir)
-        replay_seconds = time.perf_counter() - replay_started
-        if replay.get("valid") is not True or replay.get("semantics_complete") is not True:
-            raise PerformanceObservationError("representative telemetry replay failed")
-        journal = payload.get("canonical_semantic_journal")
-        physical = journal.get("physical_telemetry") if isinstance(journal, Mapping) else None
-        measurement = payload.get("measurement_evidence")
-        persistence = payload.get("persistence_breakdown")
-        if not (
-            isinstance(measurement, Mapping)
-            and measurement.get("present") is True
-            and isinstance(physical, Mapping)
-            and isinstance(persistence, Mapping)
-        ):
-            raise PerformanceObservationError("representative telemetry surface is incomplete")
-        telemetry_on_payload = payload
-        resource_summary = payload.get("topology")
-        raw_inventory.append(inventory)
-    else:
-        result, _solver_seconds, resource_summary = _solve_mode(
-            ArchitectureMode.CURRENT_STAGE052,
+    axis_path = Path(
+        _run_mode(
             task,
-            telemetry_enabled=False,
-            resource_telemetry_enabled=False,
-            task_receipt_path=None,
+            ArchitectureMode.CURRENT_STAGE052,
+            resource_telemetry_enabled=enabled,
         )
-        telemetry_off_result = result
+    )
+    payload, inventory = _signed_axis(
+        axis_path,
+        role=(
+            "representative-resource-telemetry-on"
+            if enabled
+            else "representative-resource-telemetry-off"
+        ),
+        storage_root=parent,
+    )
+    from evrptw.experiments.stage052_native_architecture_review import (
+        ReviewRecord,
+        _replay_record,
+    )
+
+    replay_started = time.perf_counter()
+    replay = _replay_record(
+        ReviewRecord(axis_path, payload),
+        benchmark_dir,
+        expected_resource_telemetry=enabled,
+    )
+    replay_seconds = time.perf_counter() - replay_started
+    if replay.get("valid") is not True or replay.get("semantics_complete") is not True:
+        raise PerformanceObservationError("representative telemetry replay failed")
+    journal = payload.get("canonical_semantic_journal")
+    physical = journal.get("physical_telemetry") if isinstance(journal, Mapping) else None
+    measurement = payload.get("measurement_evidence")
+    persistence = payload.get("persistence_breakdown")
+    if not (
+        isinstance(measurement, Mapping)
+        and measurement.get("present") is True
+        and isinstance(physical, Mapping)
+        and isinstance(persistence, Mapping)
+    ):
+        raise PerformanceObservationError("representative telemetry surface is incomplete")
+    resource_summary = payload.get("topology")
+    raw_inventory.append(inventory)
     measured_elapsed_seconds = time.perf_counter() - started
-    trajectory_rows: dict[str, tuple[object, ...]] | None = None
-    if enabled:
-        if telemetry_on_payload is None:
-            raise PerformanceObservationError("telemetry-on axis payload is missing")
-        fingerprint_payload = _representative_fingerprint_payload_from_axis(telemetry_on_payload)
-    else:
-        if telemetry_off_result is None:
-            raise PerformanceObservationError("telemetry-off solver result is missing")
-        trajectory_rows = _representative_trajectory_rows(telemetry_off_result)
-        fingerprint_payload = _representative_fingerprint_payload_from_result(
-            telemetry_off_result,
-            trajectory_rows,
-        )
-        candidate_work_events = tuple(
-            dict(event) for event in telemetry_off_result.candidate_work_events
-        )
-        route_result_events = tuple(
-            dict(event) for event in telemetry_off_result.route_result_events
-        )
-        if (
-            len(candidate_work_events) > CALIBRATION_MAX_ITERATIONS
-            or len(route_result_events) > CALIBRATION_EXACT_CALLS
-            or not _candidate_payload_receipt_matches(
-                candidate_work_events,
-                telemetry_off_result.candidate_work_hash,
-            )
-            or not _candidate_payload_receipt_matches(
-                route_result_events,
-                telemetry_off_result.route_result_hash,
-            )
-        ):
-            raise PerformanceObservationError(
-                "representative telemetry-off transaction receipt is invalid"
-            )
-        minimal_replay_receipt = {
-            "schema_version": "stage05.2-telemetry-off-minimal-replay-v1",
-            "instance": instance_name,
-            "seed": seed,
-            "routes": [list(route) for route in telemetry_off_result.routes],
-            "objective": (
-                list(telemetry_off_result.objective.key)
-                if telemetry_off_result.objective is not None
-                else None
-            ),
-            "candidate_work_events": candidate_work_events,
-            "route_result_events": route_result_events,
-            "candidate_work_hash": telemetry_off_result.candidate_work_hash,
-            "route_result_hash": telemetry_off_result.route_result_hash,
-            "trajectory_rows": trajectory_rows,
-        }
+    fingerprint_payload = _representative_fingerprint_payload_from_axis(payload)
     fingerprint = _representative_fingerprint(fingerprint_payload)
     evidence = {
         "kind": "representative-fixed-work-axis",
@@ -2304,10 +2256,11 @@ def produce_representative_telemetry_sample(
         "exact_calls": CALIBRATION_EXACT_CALLS,
         "iterations": CALIBRATION_MAX_ITERATIONS,
         "batch_size": CALIBRATION_BATCH_SIZE,
-        "semantic_telemetry": enabled,
-        "physical_telemetry": enabled,
-        "persistence": enabled,
-        "independent_replay": enabled,
+        "semantic_telemetry": True,
+        "physical_telemetry": True,
+        "persistence": True,
+        "independent_replay": True,
+        "resource_telemetry": enabled,
         "minimal_validator_replay": True,
         "fingerprints_identical": True,
     }
@@ -2316,6 +2269,7 @@ def produce_representative_telemetry_sample(
     sample = {
         "schema_version": TELEMETRY_SAMPLE_SCHEMA_VERSION,
         "enabled": enabled,
+        "sample_index": sample_index,
         "fingerprint": fingerprint,
         "fingerprint_payload": fingerprint_payload,
         "elapsed_seconds": measured_elapsed_seconds,
@@ -2323,7 +2277,6 @@ def produce_representative_telemetry_sample(
         "resource_summary": dict(resource_summary),
         "workload_evidence": evidence,
         "raw_axis_inventory": raw_inventory,
-        "minimal_replay_receipt": minimal_replay_receipt,
     }
     _atomic_signed_json(output_path, sample)
     return sample
@@ -2351,6 +2304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Explicit clean ext4 Git worktree used for source identity",
     )
     parser.add_argument("--telemetry-sample", choices=("on", "off"))
+    parser.add_argument("--telemetry-sample-index", type=int)
     arguments = parser.parse_args(argv)
     resolved_repository = require_clean_repository_root(arguments.repository_root)
     try:
@@ -2372,8 +2326,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repository_root_path=resolved_repository,
             )
         else:
+            if arguments.telemetry_sample_index is None:
+                raise ValueError("--telemetry-sample-index is required for telemetry samples")
             produce_representative_telemetry_sample(
                 enabled=arguments.telemetry_sample == "on",
+                sample_index=arguments.telemetry_sample_index,
                 wheel_receipt_path=arguments.wheel_receipt,
                 warm_start_bundle_path=arguments.warm_start_bundle,
                 benchmark_dir=arguments.benchmark_dir,

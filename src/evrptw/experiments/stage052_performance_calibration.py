@@ -2419,6 +2419,8 @@ def _representative_telemetry_runner(
             str(root),
             "--telemetry-sample",
             "on" if enabled else "off",
+            "--telemetry-sample-index",
+            str(sample_index),
         )
         completed = subprocess.run(
             command,
@@ -2436,6 +2438,7 @@ def _representative_telemetry_runner(
         if (
             payload.get("schema_version") != TELEMETRY_SAMPLE_SCHEMA_VERSION
             or payload.get("enabled") is not enabled
+            or payload.get("sample_index") != sample_index
         ):
             raise CalibrationError("representative telemetry sample identity mismatch")
         fingerprint = payload.get("fingerprint")

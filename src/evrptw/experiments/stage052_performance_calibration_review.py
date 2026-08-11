@@ -21,11 +21,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Final, cast
 
-from evrptw.candidate_control import stable_candidate_payload_hash
 from evrptw.experiments.stage052_native_architecture_review import (
+    ReviewRecord,
     _replay_canonical_journal,
     _replay_measurement_evidence,
     _replay_raw_native_control_journal,
+    _replay_record,
 )
 from evrptw.experiments.stage052_native_architectures import (
     AXIS_PERSISTENCE_RECEIPT_SCHEMA_VERSION,
@@ -43,7 +44,9 @@ from evrptw.experiments.stage052_performance_calibration import (
     load_fixed_work_observations,
     load_wheel_receipts,
 )
+from evrptw.experiments.stage052_performance_observation import FIXED_WORK_BUDGET
 from evrptw.experiments.stage052_telemetry_overhead import (
+    TELEMETRY_SAMPLE_SCHEMA_VERSION,
     load_telemetry_overhead_receipt,
 )
 from evrptw.objective import SolutionObjective
@@ -55,6 +58,8 @@ from evrptw.stage052_performance import (
     HostPerformanceEnvelope,
     RuntimeResourceSummaryV2,
     TelemetryOverheadReceipt,
+    execution_topology_id,
+    generate_mode_topology_candidates,
     require_clean_repository_root,
 )
 from evrptw.validation import validate_routes
@@ -147,34 +152,78 @@ _REPRESENTATIVE_TRAJECTORY_FIELDS = (
     "stage04_events",
     "candidate_transaction_events",
 )
-_REPRESENTATIVE_TRAJECTORY_MAX_ROWS = 200_000
-_REPRESENTATIVE_TRAJECTORY_MAX_BYTES = 64 * 1024 * 1024
+_REPRESENTATIVE_TOPOLOGY_CONTROL_FIELDS = (
+    "shard_processes",
+    "threads_per_shard",
+    "compute_thread_limit",
+    "axis_compute_thread_limit",
+    "scheduler_threads",
+    "effective_native_search_threads",
+    "performance_profile_sha256",
+    "performance_topology_key",
+    "configured_axis_cpu_ids",
+    "configured_scheduler_cpu_ids",
+    "scheduler_request_threads",
+    "allow_affinity_overlap",
+    "shared_native_work_pool",
+)
 
 
-def _representative_row_evidence(rows: Sequence[object]) -> tuple[dict[str, object], int]:
-    digest = hashlib.sha256(b"stage05.2-row-evidence-v1\0")
-    payload_bytes = 0
-    for row in rows:
-        encoded = _canonical(row)
-        payload_bytes += len(encoded)
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-    return {"count": len(rows), "sha256": digest.hexdigest()}, payload_bytes
+def _representative_axis_control_identity(
+    payload: Mapping[str, object],
+    *,
+    expected_topology: ExecutionTopology,
+    topology_id: str,
+) -> dict[str, object]:
+    """Project the A/B controls while excluding resource observations and timings."""
 
-
-def _candidate_payload_receipt_replays(
-    rows: Sequence[object],
-    declared_hash: object,
-) -> bool:
-    """Replay a present Candidate Control digest or its explicit absence."""
-
-    if declared_hash == "":
-        return not rows
-    return (
-        _is_sha256(declared_hash)
-        and all(isinstance(row, Mapping) for row in rows)
-        and stable_candidate_payload_hash(tuple(rows)) == declared_hash
+    topology = _mapping(payload.get("topology"), "telemetry raw topology")
+    if any(field not in topology for field in _REPRESENTATIVE_TOPOLOGY_CONTROL_FIELDS):
+        raise CalibrationReviewError("telemetry raw topology control identity is incomplete")
+    budget = _mapping(payload.get("fixed_work_budget"), "telemetry fixed-work budget")
+    if dict(budget) != FIXED_WORK_BUDGET:
+        raise CalibrationReviewError("telemetry fixed-work budget schema is invalid")
+    expected_shard_cpu_ids = expected_topology.shards[0]
+    expected_axis_cpu_ids = (
+        expected_topology.cpu_ids
+        if expected_topology.affinity_policy == "free_scheduler"
+        else expected_shard_cpu_ids
     )
+    expected_topology_fields: dict[str, object] = {
+        "shard_processes": expected_topology.shard_count,
+        "threads_per_shard": len(expected_shard_cpu_ids),
+        "compute_thread_limit": len(expected_topology.cpu_ids),
+        "axis_compute_thread_limit": len(expected_axis_cpu_ids),
+        "scheduler_threads": 0,
+        "effective_native_search_threads": len(expected_shard_cpu_ids),
+        "performance_topology_key": f"calibration:current_stage052:c5:{topology_id}",
+        "configured_axis_cpu_ids": list(expected_axis_cpu_ids),
+        "configured_scheduler_cpu_ids": [],
+        "scheduler_request_threads": expected_topology.request_threads,
+        "allow_affinity_overlap": expected_topology.allow_affinity_overlap,
+        "shared_native_work_pool": False,
+    }
+    if any(topology.get(field) != value for field, value in expected_topology_fields.items()):
+        raise CalibrationReviewError("telemetry raw topology differs from the host-derived control")
+    identity = {
+        "scope": payload.get("scope"),
+        "repeat": payload.get("repeat"),
+        "mode": payload.get("mode"),
+        "axis": payload.get("axis"),
+        "instance": payload.get("instance"),
+        "seed": payload.get("seed"),
+        "revision": payload.get("revision"),
+        "wheel_sha256": payload.get("wheel_sha256"),
+        "native_sha256": payload.get("native_sha256"),
+        "scheduler_sha256": payload.get("scheduler_sha256"),
+        "fixed_work_budget": dict(budget),
+        "topology_id": topology_id,
+        "topology": {
+            field: topology[field] for field in _REPRESENTATIVE_TOPOLOGY_CONTROL_FIELDS
+        },
+    }
+    _canonical(identity)
+    return identity
 
 
 def _thaw_json(value: object) -> object:
@@ -1786,6 +1835,7 @@ def _replay_telemetry_children(
     run_root: Path,
     benchmark_dir: Path,
     build_identity: Mapping[str, object],
+    frozen_host: HostPerformanceEnvelope,
 ) -> int:
     overhead.require_representative_fixed_work()
     run_root = run_root.resolve()
@@ -1800,6 +1850,7 @@ def _replay_telemetry_children(
         "persistence",
         "independent_replay",
     }
+    monitor_field = "resource_telemetry"
     base_evidence = {
         key: value
         for key, value in evidence.items()
@@ -1809,11 +1860,30 @@ def _replay_telemetry_children(
             "paired_sample_evidence",
             "unmonitored_telemetry_surface",
             "monitored_telemetry_surface",
+            monitor_field,
             *surface_fields,
         }
     }
     expected_fingerprint: str | None = None
+    expected_control_identity: dict[str, object] | None = None
+    seen_sample_paths: set[Path] = set()
+    seen_axis_paths: set[Path] = set()
     replayed_axes = 0
+    topology_candidates = generate_mode_topology_candidates(
+        frozen_host,
+        mode="current_stage052",
+        workload_class="c5",
+    )
+    target_shards = math.ceil(len(frozen_host.allowed_cpu_ids) / 4)
+    expected_topology = min(
+        topology_candidates,
+        key=lambda item: (
+            abs(item.shard_count - target_shards),
+            item.affinity_policy != "physical_core_first",
+            execution_topology_id(item),
+        ),
+    )
+    expected_topology_id = execution_topology_id(expected_topology)
 
     def resolve_relative(value: object, field: str) -> Path:
         relative = PurePosixPath(_text(value, field))
@@ -1833,11 +1903,12 @@ def _replay_telemetry_children(
         sample_index: int,
         expected_seconds: float | None,
     ) -> None:
-        nonlocal expected_fingerprint, replayed_axes
+        nonlocal expected_control_identity, expected_fingerprint, replayed_axes
         row = _mapping(sample, "telemetry sample evidence")
         expected_workload_evidence = {
             **base_evidence,
-            **{field: enabled for field in surface_fields},
+            **{field: True for field in surface_fields},
+            monitor_field: enabled,
         }
         if (
             row.get("enabled") is not enabled
@@ -1875,8 +1946,9 @@ def _replay_telemetry_children(
             or resources.get("sample_sidecar_sha256") != _sha256_file(sample_sidecar)
             or sample_sidecar != Path(f"{sample_path}.sha256")
             or sample_payload.get("schema_version")
-            != "stage05.2-representative-telemetry-sample-v3"
+            != TELEMETRY_SAMPLE_SCHEMA_VERSION
             or sample_payload.get("enabled") is not enabled
+            or sample_payload.get("sample_index") != sample_index
             or sample_payload.get("fingerprint") != fingerprint
             or not _json_equivalent(
                 sample_payload.get("workload_evidence"),
@@ -1888,6 +1960,9 @@ def _replay_telemetry_children(
             )
         ):
             raise CalibrationReviewError("telemetry sample receipt does not reconcile")
+        if sample_path in seen_sample_paths:
+            raise CalibrationReviewError("telemetry sample path is duplicated")
+        seen_sample_paths.add(sample_path)
         child_elapsed = _number(
             sample_payload.get("elapsed_seconds"),
             "telemetry child elapsed",
@@ -1896,8 +1971,7 @@ def _replay_telemetry_children(
         if resources.get("child_elapsed_seconds") != child_elapsed or elapsed < child_elapsed:
             raise CalibrationReviewError("telemetry parent/child timing is invalid")
         raw_inventory = _array(sample_payload.get("raw_axis_inventory"), "telemetry raw axes")
-        expected_axis_count = 1 if enabled else 0
-        if len(raw_inventory) != expected_axis_count:
+        if len(raw_inventory) != 1:
             raise CalibrationReviewError("telemetry on/off raw axis surface is invalid")
         fingerprint_payload = _mapping(
             sample_payload.get("fingerprint_payload"),
@@ -1927,107 +2001,19 @@ def _replay_telemetry_children(
         ).hexdigest()
         if replayed_fingerprint != fingerprint:
             raise CalibrationReviewError("telemetry minimal fingerprint does not replay")
-        if not enabled:
-            minimal = _mapping(
-                sample_payload.get("minimal_replay_receipt"),
-                "telemetry-off minimal replay receipt",
-            )
-            if (
-                set(minimal)
-                != {
-                    "schema_version",
-                    "instance",
-                    "seed",
-                    "routes",
-                    "objective",
-                    "candidate_work_events",
-                    "route_result_events",
-                    "candidate_work_hash",
-                    "route_result_hash",
-                    "trajectory_rows",
-                }
-                or minimal.get("schema_version") != "stage05.2-telemetry-off-minimal-replay-v1"
-                or minimal.get("instance") != base_evidence.get("instance")
-                or minimal.get("seed") != base_evidence.get("seed")
-            ):
-                raise CalibrationReviewError("telemetry-off minimal receipt identity differs")
-            instance_name = _text(minimal.get("instance"), "telemetry-off instance")
-            instance = parse_schneider(benchmark_dir / f"{instance_name}.txt")
-            routes = _routes(minimal)
-            report = validate_routes(instance, routes)
-            if not report.feasible:
-                raise CalibrationReviewError("telemetry-off validator replay failed")
-            objective = SolutionObjective.from_report(instance, report)
-            if list(objective.key) != minimal.get("objective"):
-                raise CalibrationReviewError("telemetry-off objective replay failed")
-            candidate_work = _array(
-                minimal.get("candidate_work_events"),
-                "telemetry-off candidate work",
-            )
-            route_results = _array(
-                minimal.get("route_result_events"),
-                "telemetry-off route results",
-            )
-            if (
-                not all(isinstance(row, Mapping) for row in candidate_work)
-                or not all(isinstance(row, Mapping) for row in route_results)
-                or not _candidate_payload_receipt_replays(
-                    candidate_work,
-                    minimal.get("candidate_work_hash"),
-                )
-                or not _candidate_payload_receipt_replays(
-                    route_results,
-                    minimal.get("route_result_hash"),
-                )
-                or any(
-                    minimal.get(field) != fingerprint_payload.get(field)
-                    for field in (
-                        "routes",
-                        "objective",
-                        "candidate_work_hash",
-                        "route_result_hash",
-                    )
-                )
-            ):
-                raise CalibrationReviewError("telemetry-off transaction hashes do not replay")
-            trajectory_rows = _mapping(
-                minimal.get("trajectory_rows"),
-                "telemetry-off trajectory rows",
-            )
-            if set(trajectory_rows) != set(_REPRESENTATIVE_TRAJECTORY_FIELDS):
-                raise CalibrationReviewError("telemetry-off trajectory surface is incomplete")
-            total_rows = 0
-            total_bytes = 0
-            for field in _REPRESENTATIVE_TRAJECTORY_FIELDS:
-                rows = _array(
-                    trajectory_rows.get(field),
-                    f"telemetry-off {field} rows",
-                )
-                receipt, payload_bytes = _representative_row_evidence(rows)
-                total_rows += len(rows)
-                total_bytes += payload_bytes
-                expected_receipt: Mapping[str, object]
-                if field == "semantic_trajectory":
-                    expected_receipt = {
-                        "schema_version": "stage05.2-external-semantic-trajectory-v1",
-                        "source": "canonical_semantic_journal:operator",
-                        **receipt,
-                    }
-                else:
-                    expected_receipt = receipt
-                if fingerprint_payload.get(field) != expected_receipt:
-                    raise CalibrationReviewError(f"telemetry-off {field} digest does not replay")
-            if (
-                total_rows > _REPRESENTATIVE_TRAJECTORY_MAX_ROWS
-                or total_bytes > _REPRESENTATIVE_TRAJECTORY_MAX_BYTES
-            ):
-                raise CalibrationReviewError("telemetry-off trajectory exceeds its bounded receipt")
-            return
-        if sample_payload.get("minimal_replay_receipt") is not None:
-            raise CalibrationReviewError("telemetry-on sample carries an off-only receipt")
+        if "minimal_replay_receipt" in sample_payload:
+            raise CalibrationReviewError("telemetry sample carries a legacy minimal receipt")
         item = _mapping(raw_inventory[0], "telemetry raw axis inventory")
         _review_axis_supporting_artifacts(item, run_root=run_root)
-        if item.get("storage_alias") != "stage052-performance-calibration-run":
+        expected_role = (
+            "representative-resource-telemetry-on"
+            if enabled
+            else "representative-resource-telemetry-off"
+        )
+        if (
+            item.get("storage_alias") != "stage052-performance-calibration-run"
+            or item.get("role") != expected_role
+        ):
             raise CalibrationReviewError("telemetry raw axis storage alias is invalid")
         axis_path = resolve_relative(item.get("relative_path"), "telemetry raw axis path")
         axis_sidecar = resolve_relative(
@@ -2040,14 +2026,46 @@ def _replay_telemetry_children(
             or axis_sidecar != Path(f"{axis_path}.sha256")
         ):
             raise CalibrationReviewError("telemetry raw axis inventory hash differs")
-        _review_raw_axis(
+        if axis_path in seen_axis_paths:
+            raise CalibrationReviewError("telemetry raw axis path is duplicated")
+        seen_axis_paths.add(axis_path)
+        _projection, mode, workload, topology_id = _review_raw_axis(
             axis_path,
             benchmark_dir=benchmark_dir,
             build_identity=build_identity,
         )
         axis_payload, _axis_digest = _load_signed_json(axis_path, "telemetry raw axis")
+        if (
+            mode != "current_stage052"
+            or workload != "c5"
+            or axis_payload.get("instance") != base_evidence.get("instance")
+            or axis_payload.get("seed") != base_evidence.get("seed")
+            or axis_payload.get("axis") != base_evidence.get("axis")
+        ):
+            raise CalibrationReviewError("telemetry raw axis control identity differs")
+        budget = _mapping(axis_payload.get("fixed_work_budget"), "telemetry fixed-work budget")
+        if dict(budget) != FIXED_WORK_BUDGET:
+            raise CalibrationReviewError("telemetry raw axis fixed-work budget differs")
+        if topology_id != expected_topology_id:
+            raise CalibrationReviewError("telemetry raw axis topology is not host-derived")
+        control_identity = _representative_axis_control_identity(
+            axis_payload,
+            expected_topology=expected_topology,
+            topology_id=topology_id,
+        )
+        if expected_control_identity is None:
+            expected_control_identity = control_identity
+        elif control_identity != expected_control_identity:
+            raise CalibrationReviewError("telemetry raw axis topology/config differs")
         if any(axis_payload.get(field) != value for field, value in fingerprint_payload.items()):
             raise CalibrationReviewError("telemetry raw axis fingerprint does not replay")
+        replay = _replay_record(
+            ReviewRecord(axis_path, axis_payload),
+            benchmark_dir,
+            expected_resource_telemetry=enabled,
+        )
+        if replay.get("valid") is not True or replay.get("semantics_complete") is not True:
+            raise CalibrationReviewError("telemetry raw axis independent replay failed")
         replayed_axes += 1
 
     replay_sample(warm[0], enabled=False, sample_index=-2, expected_seconds=None)
@@ -2164,6 +2182,7 @@ def derive_calibration_review(
         run_root=run_dir,
         benchmark_dir=benchmark_dir.resolve(),
         build_identity=telemetry_identity.to_dict(),
+        frozen_host=profile.host,
     )
     raw_count, resource_count, rejection_count = _replay_observation_children(
         observation_paths,

@@ -49,6 +49,7 @@ from evrptw.neighborhoods import screen_route_candidate
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
+from evrptw.runtime_envelope import PROCESS_TREE_STATISTICS_FIELDS
 from evrptw.stage052_performance import FrozenPerformanceProfile
 from evrptw.stage052_physical_telemetry import (
     iter_verified_physical_telemetry,
@@ -79,6 +80,35 @@ LEGACY_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v3"
 INLINE_SEMANTIC_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v6"
 EXTERNAL_SEMANTIC_COMPARISON_SCHEMA_VERSIONS = frozenset(
     {PREVIOUS_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}
+)
+_RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS = frozenset(
+    {
+        "shard_processes",
+        "threads_per_shard",
+        "compute_thread_limit",
+        "axis_compute_thread_limit",
+        "scheduler_threads",
+        "effective_native_search_threads",
+        "performance_profile_sha256",
+        "performance_topology_key",
+        "configured_axis_cpu_ids",
+        "configured_scheduler_cpu_ids",
+        "scheduler_request_threads",
+        "allow_affinity_overlap",
+        "shared_native_work_pool",
+        "process_id",
+        "scheduler_process_id",
+        "shared_scheduler_resource_attribution",
+        "threads_before",
+        "threads_after",
+        "rss_bytes",
+        "peak_rss_bytes",
+        "cpu_affinity",
+        "shared_scheduler_accounting",
+    }
+)
+_RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS = (
+    _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | {"telemetry_status"}
 )
 FULL_NATIVE_SEMANTIC_MODES = frozenset(
     {
@@ -118,6 +148,33 @@ class ReviewRecord:
             _string(self.payload, "instance"),
             _integer(self.payload, "seed"),
         )
+
+
+def _resource_telemetry_topology_error(
+    topology: Mapping[str, object],
+    *,
+    mode: ArchitectureMode,
+    expected_resource_telemetry: bool,
+    require_complete_schema: bool = True,
+) -> str | None:
+    if expected_resource_telemetry:
+        if "telemetry_status" in topology:
+            return "enabled process-tree telemetry has a disabled-status marker"
+        if require_complete_schema and set(topology) != (
+            _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS
+            | PROCESS_TREE_STATISTICS_FIELDS
+        ):
+            return "enabled process-tree telemetry schema is not exact"
+        return None
+    if not require_complete_schema:
+        return "disabled process-tree telemetry is unavailable for a historical schema"
+    if (
+        mode is not ArchitectureMode.CURRENT_STAGE052
+        or set(topology) != _RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS
+        or topology.get("telemetry_status") != "disabled"
+    ):
+        return "disabled process-tree telemetry is not an exact authorized control"
+    return None
 
 
 def _string(payload: Mapping[str, object], key: str) -> str:
@@ -3261,7 +3318,12 @@ def _replay_canonical_journal(
     return _replay_physical_telemetry(payload, axis_path=axis_path)
 
 
-def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, object]:
+def _replay_record(
+    record: ReviewRecord,
+    benchmark_dir: Path,
+    *,
+    expected_resource_telemetry: bool = True,
+) -> dict[str, object]:
     payload = _axis_payload_with_persistence(record.path, record.payload)
     comparison_schema = _string(payload, "schema_version")
     if comparison_schema not in {
@@ -3373,25 +3435,35 @@ def _replay_record(record: ReviewRecord, benchmark_dir: Path) -> dict[str, objec
         topology = payload.get("topology")
         if not isinstance(topology, dict):
             return {"valid": False, "reason": "process-tree topology is missing"}
-        for field in (
+        process_tree_fields = (
             "sample_count",
             "peak_concurrent_processes",
             "peak_aggregate_threads",
             "peak_aggregate_rss_bytes",
             "peak_aggregate_pss_bytes",
             "process_tree_cpu_seconds",
-        ):
-            value = topology.get(field)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int | float)
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-            ):
-                return {
-                    "valid": False,
-                    "reason": f"process-tree field is missing or invalid: {field}",
-                }
+        )
+        resource_error = _resource_telemetry_topology_error(
+            topology,
+            mode=record.mode,
+            expected_resource_telemetry=expected_resource_telemetry,
+            require_complete_schema=comparison_schema == SCHEMA_VERSION,
+        )
+        if resource_error is not None:
+            return {"valid": False, "reason": resource_error}
+        if expected_resource_telemetry:
+            for field in process_tree_fields:
+                value = topology.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int | float)
+                    or not math.isfinite(float(value))
+                    or float(value) < 0.0
+                ):
+                    return {
+                        "valid": False,
+                        "reason": f"process-tree field is missing or invalid: {field}",
+                    }
         persistence = payload.get("persistence_seconds")
         if (
             isinstance(persistence, bool)

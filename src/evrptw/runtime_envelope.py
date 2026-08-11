@@ -29,6 +29,83 @@ _UNAVAILABLE = "unavailable"
 _MAX_BOUNDED_SAMPLES = 256
 _MAX_CPU_STAT_CORES = 256
 _MAX_THREAD_OBSERVATIONS = 4096
+PROCESS_TREE_STATISTICS_FIELDS = frozenset(
+    {
+        "sample_interval_seconds",
+        "sample_count",
+        "observed_processes",
+        "observed_process_ids",
+        "peak_concurrent_processes",
+        "peak_aggregate_threads",
+        "peak_aggregate_rss_bytes",
+        "peak_aggregate_pss_bytes",
+        "peak_worker_descendant_pss_bytes",
+        "worker_descendant_pss_peak",
+        "process_tree_cpu_seconds",
+        "cpu_utilization_percent_of_one_core",
+        "cpu_utilization_percent_of_compute_limit",
+        "root_process_id",
+        "additional_root_pids",
+        "excluded_root_pids",
+        "monitor_elapsed_seconds",
+        "effective_elapsed_seconds",
+        "monitor_start_wall_time",
+        "monitor_start_monotonic",
+        "monitor_start_boot_time_ticks",
+        "monitor_end_monotonic",
+        "compute_thread_limit",
+        "process_tree_user_cpu_seconds",
+        "process_tree_system_cpu_seconds",
+        "process_tree_cpu_user_seconds",
+        "process_tree_cpu_system_seconds",
+        "cpu_limit_tolerance_seconds",
+        "cpu_normalized_within_limit",
+        "process_tree_voluntary_context_switches",
+        "process_tree_involuntary_context_switches",
+        "process_tree_context_switches",
+        "process_tree_minor_faults",
+        "process_tree_major_faults",
+        "process_tree_read_bytes",
+        "process_tree_write_bytes",
+        "process_tree_cpu_migrations",
+        "process_tree_migration_count",
+        "process_tree_schedstat",
+        "actual_affinity_union",
+        "actual_affinity_intersection",
+        "cpu_affinity_union",
+        "cpu_affinity_intersection",
+        "actual_affinity_union_count",
+        "actual_affinity_intersection_count",
+        "affinity_status",
+        "process_metrics",
+        "thread_tree_status",
+        "thread_tree",
+        "thread_metrics",
+        "thread_detail_interval_seconds",
+        "thread_detail_sample_count",
+        "thread_discovery_sample_count",
+        "thread_tree_user_cpu_seconds",
+        "thread_tree_system_cpu_seconds",
+        "thread_tree_context_switches",
+        "thread_tree_cpu_migrations",
+        "thread_tree_minor_faults",
+        "thread_tree_major_faults",
+        "thread_tree_schedstat",
+        "thread_affinity_union",
+        "thread_affinity_intersection",
+        "bounded_sample_capacity",
+        "bounded_samples",
+        "sample_quantiles",
+        "resource_samples",
+        "resource_quantiles",
+        "cpu_stat",
+        "cpu_stat_available",
+        "cpu_stat_per_cpu",
+        "cpu_stat_aggregate",
+        "pressure_stall_information",
+        "psi",
+    }
+)
 _PROCESS_ERRORS = (
     psutil.AccessDenied,
     psutil.NoSuchProcess,
@@ -945,7 +1022,7 @@ class ProcessTreeMonitor:
         thread_statistics = self._thread_statistics()
         thread_counters = thread_statistics["counters"]
         assert isinstance(thread_counters, dict)
-        return {
+        statistics: dict[str, object] = {
             # Existing fields remain stable for historical readers.
             "sample_interval_seconds": self.sample_interval_seconds,
             "sample_count": self._sample_count,
@@ -1054,6 +1131,9 @@ class ProcessTreeMonitor:
             "pressure_stall_information": pressure,
             "psi": pressure,
         }
+        if set(statistics) != PROCESS_TREE_STATISTICS_FIELDS:
+            raise AssertionError("process-tree statistics schema differs from its public field set")
+        return statistics
 
     def _run(self) -> None:
         while not self._stop.wait(self.sample_interval_seconds):
@@ -1569,4 +1649,4 @@ class ProcessTreeMonitor:
                 self._peak_worker_descendant_pss_processes = normalized
 
 
-__all__ = ("ProcessTreeMonitor",)
+__all__ = ("PROCESS_TREE_STATISTICS_FIELDS", "ProcessTreeMonitor")

@@ -21,7 +21,7 @@ from evrptw.stage052_atomic import publish_no_replace
 
 PERFORMANCE_PROFILE_SCHEMA_VERSION: Final = "stage05.2-performance-profile-v1"
 RUNTIME_RESOURCE_SCHEMA_VERSION: Final = "stage05.2-runtime-resource-v2"
-TELEMETRY_OVERHEAD_SCHEMA_VERSION: Final = "stage05.2-telemetry-overhead-v2"
+TELEMETRY_OVERHEAD_SCHEMA_VERSION: Final = "stage05.2-telemetry-overhead-v3"
 _BUILD_NAMES: Final = frozenset({"portable-o3", "portable-lto", "host-native-lto"})
 STAGE052_PERFORMANCE_MODES: Final = (
     "current_stage052",
@@ -1129,7 +1129,7 @@ def _median(values: Sequence[float]) -> float:
 
 @dataclass(frozen=True, slots=True)
 class TelemetryOverheadReceipt:
-    """Alternating paired A/B evidence for the complete telemetry surface."""
+    """Paired A/B evidence for resource monitoring on a complete evidence surface."""
 
     unmonitored_seconds: tuple[float, ...]
     monitored_seconds: tuple[float, ...]
@@ -1245,18 +1245,22 @@ class TelemetryOverheadReceipt:
         }
         if any(self.workload_evidence.get(key) != value for key, value in required.items()):
             raise ValueError("telemetry overhead evidence is not a representative fixed-work axis")
-        surface_fields = {
+        complete_surface_fields = {
             "semantic_telemetry",
             "physical_telemetry",
             "persistence",
             "independent_replay",
         }
+        surface_fields = {*complete_surface_fields, "resource_telemetry"}
         unmonitored_surface = self.workload_evidence.get("unmonitored_telemetry_surface")
         monitored_surface = self.workload_evidence.get("monitored_telemetry_surface")
         if (
             not isinstance(unmonitored_surface, Mapping)
             or set(unmonitored_surface) != surface_fields
-            or any(unmonitored_surface[field] is not False for field in surface_fields)
+            or any(
+                unmonitored_surface[field] is not True for field in complete_surface_fields
+            )
+            or unmonitored_surface["resource_telemetry"] is not False
             or not isinstance(monitored_surface, Mapping)
             or set(monitored_surface) != surface_fields
             or any(monitored_surface[field] is not True for field in surface_fields)

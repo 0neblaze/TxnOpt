@@ -118,16 +118,18 @@ def _representative_evidence(
         "minimal_validator_replay": True,
         "fingerprints_identical": True,
         "unmonitored_telemetry_surface": {
-            "semantic_telemetry": False,
-            "physical_telemetry": False,
-            "persistence": False,
-            "independent_replay": False,
+            "semantic_telemetry": True,
+            "physical_telemetry": True,
+            "persistence": True,
+            "independent_replay": True,
+            "resource_telemetry": False,
         },
         "monitored_telemetry_surface": {
             "semantic_telemetry": True,
             "physical_telemetry": True,
             "persistence": True,
             "independent_replay": True,
+            "resource_telemetry": True,
         },
     }
     sample_base = {
@@ -153,10 +155,11 @@ def _representative_evidence(
             "resource_summary": {},
             "workload_evidence": {
                 **sample_base,
-                "semantic_telemetry": enabled,
-                "physical_telemetry": enabled,
-                "persistence": enabled,
-                "independent_replay": enabled,
+                "semantic_telemetry": True,
+                "physical_telemetry": True,
+                "persistence": True,
+                "independent_replay": True,
+                "resource_telemetry": enabled,
             },
         }
 

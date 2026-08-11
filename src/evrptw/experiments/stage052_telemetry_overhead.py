@@ -21,7 +21,7 @@ from evrptw.stage052_performance import (
     require_clean_repository_root,
 )
 
-TELEMETRY_SAMPLE_SCHEMA_VERSION: Final = "stage05.2-representative-telemetry-sample-v3"
+TELEMETRY_SAMPLE_SCHEMA_VERSION: Final = "stage05.2-representative-telemetry-sample-v4"
 
 _CHILD_WORKLOAD: Final = """
 import hashlib
@@ -40,6 +40,7 @@ _REPRESENTATIVE_SURFACE_FIELDS: Final = (
     "persistence",
     "independent_replay",
 )
+_REPRESENTATIVE_MONITOR_FIELD: Final = "resource_telemetry"
 
 
 class TelemetryOverheadError(RuntimeError):
@@ -173,7 +174,7 @@ def measure_representative_telemetry_overhead(
     sample_interval_seconds: float = 0.05,
     minimum_unmonitored_seconds: float = 0.5,
 ) -> TelemetryOverheadReceipt:
-    """Measure full semantic/physical/persistence/replay overhead on one real axis."""
+    """Measure resource-monitor overhead on one complete, replayed real axis."""
 
     if (
         isinstance(repeat_count, bool)
@@ -195,7 +196,7 @@ def measure_representative_telemetry_overhead(
         return {
             key: value
             for key, value in sample.workload_evidence.items()
-            if key not in _REPRESENTATIVE_SURFACE_FIELDS
+            if key not in {*_REPRESENTATIVE_SURFACE_FIELDS, _REPRESENTATIVE_MONITOR_FIELD}
         }
 
     def timed(enabled: bool, sample_index: int) -> tuple[float, TelemetryWorkloadSample]:
@@ -206,9 +207,12 @@ def measure_representative_telemetry_overhead(
             byte not in b"0123456789abcdef" for byte in result.fingerprint
         ):
             raise TelemetryOverheadError("representative workload fingerprint is invalid")
-        if any(
-            result.workload_evidence.get(field) is not enabled
-            for field in _REPRESENTATIVE_SURFACE_FIELDS
+        if (
+            any(
+                result.workload_evidence.get(field) is not True
+                for field in _REPRESENTATIVE_SURFACE_FIELDS
+            )
+            or result.workload_evidence.get(_REPRESENTATIVE_MONITOR_FIELD) is not enabled
         ):
             raise TelemetryOverheadError("representative telemetry on/off surface is invalid")
         if result.workload_evidence.get("minimal_validator_replay") is not True:
@@ -300,10 +304,12 @@ def measure_representative_telemetry_overhead(
     first_evidence["fingerprints_identical"] = True
     first_evidence.update({field: True for field in _REPRESENTATIVE_SURFACE_FIELDS})
     first_evidence["unmonitored_telemetry_surface"] = {
-        field: False for field in _REPRESENTATIVE_SURFACE_FIELDS
+        **{field: True for field in _REPRESENTATIVE_SURFACE_FIELDS},
+        _REPRESENTATIVE_MONITOR_FIELD: False,
     }
     first_evidence["monitored_telemetry_surface"] = {
-        field: True for field in _REPRESENTATIVE_SURFACE_FIELDS
+        **{field: True for field in _REPRESENTATIVE_SURFACE_FIELDS},
+        _REPRESENTATIVE_MONITOR_FIELD: True,
     }
     first_evidence["warm_sample_evidence"] = warm_sample_evidence
     first_evidence["paired_sample_evidence"] = paired_sample_evidence

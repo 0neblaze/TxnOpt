@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from evrptw.experiments.stage052_native_architecture_review import (
+    _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS,
+    _RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS,
+    ReviewRecord,
+    _resource_telemetry_topology_error,
+)
+from evrptw.experiments.stage052_native_architectures import ArchitectureMode
 from evrptw.experiments.stage052_telemetry_overhead import (
+    TELEMETRY_SAMPLE_SCHEMA_VERSION,
     TelemetryWorkloadSample,
     load_telemetry_overhead_receipt,
     measure_representative_telemetry_overhead,
@@ -15,7 +23,13 @@ from evrptw.experiments.stage052_telemetry_overhead import (
 )
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
-from evrptw.stage052_performance import TelemetryOverheadReceipt
+from evrptw.runtime_envelope import PROCESS_TREE_STATISTICS_FIELDS
+from evrptw.stage052_performance import (
+    ExecutionTopology,
+    HostPerformanceEnvelope,
+    TelemetryOverheadReceipt,
+    execution_topology_id,
+)
 from evrptw.validation import validate_routes
 
 
@@ -145,10 +159,11 @@ def test_representative_telemetry_gate_covers_complete_fixed_work_surface(
             {"enabled": enabled, "sample_index": index},
             {
                 **evidence,
-                "semantic_telemetry": enabled,
-                "physical_telemetry": enabled,
-                "persistence": enabled,
-                "independent_replay": enabled,
+                "semantic_telemetry": True,
+                "physical_telemetry": True,
+                "persistence": True,
+                "independent_replay": True,
+                "resource_telemetry": enabled,
             },
         )
 
@@ -159,6 +174,20 @@ def test_representative_telemetry_gate_covers_complete_fixed_work_surface(
     receipt.require_representative_fixed_work()
     assert receipt.passed
     assert receipt.p95_overhead_fraction == pytest.approx(0.0)
+    assert receipt.workload_evidence["unmonitored_telemetry_surface"] == {
+        "semantic_telemetry": True,
+        "physical_telemetry": True,
+        "persistence": True,
+        "independent_replay": True,
+        "resource_telemetry": False,
+    }
+    assert receipt.workload_evidence["monitored_telemetry_surface"] == {
+        "semantic_telemetry": True,
+        "physical_telemetry": True,
+        "persistence": True,
+        "independent_replay": True,
+        "resource_telemetry": True,
+    }
 
 
 def test_independent_reviewer_replays_every_raw_telemetry_child(
@@ -179,8 +208,6 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
     report = validate_routes(instance, routes)
     assert report.feasible
     objective = list(SolutionObjective.from_report(instance, report).key)
-    candidate_work_events: tuple[dict[str, object], ...] = ()
-    route_result_events: tuple[dict[str, object], ...] = ()
     # current_stage052 has no Candidate Control runtime.  Empty rows plus an
     # empty hash are its explicit unavailable receipt, not the hash of [].
     candidate_work_hash = ""
@@ -214,36 +241,20 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
     fingerprint = hashlib.sha256(
         json.dumps(axis_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    axis_path = tmp_path / "raw-axis.json"
-    axis_sha256, axis_sidecar_sha256 = _write_signed_json(axis_path, axis_payload)
-    persistence_path = tmp_path / "raw-axis.persistence.json"
-    persistence_sha256, persistence_sidecar_sha256 = _write_signed_json(
-        persistence_path,
-        {"schema_version": "test-axis-persistence-v1"},
+    expected_topology = ExecutionTopology(
+        workload_class="c5",
+        shards=tuple(tuple(range(index * 4, index * 4 + 4)) for index in range(6)),
+        worker_count=6,
+        request_threads=6,
+        affinity_policy="physical_core_first",
     )
-    persistence_sidecar = Path(f"{persistence_path}.sha256")
-    axis_inventory = [
-        {
-            "storage_alias": "stage052-performance-calibration-run",
-            "relative_path": axis_path.relative_to(tmp_path).as_posix(),
-            "sha256": axis_sha256,
-            "relative_sidecar_path": Path(f"{axis_path}.sha256").relative_to(tmp_path).as_posix(),
-            "sidecar_sha256": axis_sidecar_sha256,
-            "role": "representative-telemetry-axis",
-            "supporting_artifacts": [
-                {
-                    "relative_path": persistence_path.relative_to(tmp_path).as_posix(),
-                    "sha256": persistence_sha256,
-                    "role": "axis-persistence-receipt",
-                },
-                {
-                    "relative_path": persistence_sidecar.relative_to(tmp_path).as_posix(),
-                    "sha256": persistence_sidecar_sha256,
-                    "role": "axis-persistence-receipt-sidecar",
-                },
-            ],
-        }
-    ]
+    topology_id = execution_topology_id(expected_topology)
+    frozen_host = HostPerformanceEnvelope(
+        allowed_cpu_ids=tuple(range(24)),
+        memory_total_bytes=16 * 1024**3,
+        memory_available_bytes=8 * 1024**3,
+        topology_source="provided",
+    )
     sample_base: dict[str, object] = {
         "kind": "representative-fixed-work-axis",
         "mode": "current_stage052",
@@ -259,45 +270,107 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
 
     def sample(enabled: bool, index: int, elapsed: float) -> dict[str, object]:
         sample_path = tmp_path / f"sample-{index}.json"
+        axis_path = tmp_path / f"raw-axis-{index}.json"
+        control_topology: dict[str, object] = {
+            "shard_processes": 6,
+            "threads_per_shard": 4,
+            "compute_thread_limit": 24,
+            "axis_compute_thread_limit": 4,
+            "scheduler_threads": 0,
+            "effective_native_search_threads": 4,
+            "performance_profile_sha256": "1" * 64,
+            "performance_topology_key": f"calibration:current_stage052:c5:{topology_id}",
+            "configured_axis_cpu_ids": [0, 1, 2, 3],
+            "configured_scheduler_cpu_ids": [],
+            "scheduler_request_threads": 6,
+            "allow_affinity_overlap": False,
+            "shared_native_work_pool": False,
+        }
+        resource_topology = (
+            {
+                "sample_count": 1,
+                "peak_concurrent_processes": 1,
+                "peak_aggregate_threads": 1,
+                "peak_aggregate_rss_bytes": 1,
+                "peak_aggregate_pss_bytes": 1,
+                "process_tree_cpu_seconds": 0.1,
+            }
+            if enabled
+            else {"telemetry_status": "disabled"}
+        )
+        raw_axis_payload = {
+            **axis_payload,
+            "scope": "performance_calibration",
+            "repeat": 0,
+            "mode": "current_stage052",
+            "axis": "fixed_work",
+            "instance": "c101C5",
+            "seed": 2014,
+            "revision": "2" * 40,
+            "wheel_sha256": "3" * 64,
+            "native_sha256": "4" * 64,
+            "scheduler_sha256": "5" * 64,
+            "fixed_work_budget": {
+                "axis": "fixed_work",
+                "batch_size": 128,
+                "exact_calls": 20,
+                "iterations": 200,
+                "watchdog_seconds": 30.0,
+            },
+            "topology": {**control_topology, **resource_topology},
+        }
+        axis_sha256, axis_sidecar_sha256 = _write_signed_json(axis_path, raw_axis_payload)
+        persistence_path = tmp_path / f"raw-axis-{index}.persistence.json"
+        persistence_sha256, persistence_sidecar_sha256 = _write_signed_json(
+            persistence_path,
+            {"schema_version": "test-axis-persistence-v1"},
+        )
+        persistence_sidecar = Path(f"{persistence_path}.sha256")
+        axis_inventory = [
+            {
+                "storage_alias": "stage052-performance-calibration-run",
+                "relative_path": axis_path.relative_to(tmp_path).as_posix(),
+                "sha256": axis_sha256,
+                "relative_sidecar_path": Path(f"{axis_path}.sha256")
+                .relative_to(tmp_path)
+                .as_posix(),
+                "sidecar_sha256": axis_sidecar_sha256,
+                "role": (
+                    "representative-resource-telemetry-on"
+                    if enabled
+                    else "representative-resource-telemetry-off"
+                ),
+                "supporting_artifacts": [
+                    {
+                        "relative_path": persistence_path.relative_to(tmp_path).as_posix(),
+                        "sha256": persistence_sha256,
+                        "role": "axis-persistence-receipt",
+                    },
+                    {
+                        "relative_path": persistence_sidecar.relative_to(tmp_path).as_posix(),
+                        "sha256": persistence_sidecar_sha256,
+                        "role": "axis-persistence-receipt-sidecar",
+                    },
+                ],
+            }
+        ]
         workload_evidence = {
             **sample_base,
-            "semantic_telemetry": enabled,
-            "physical_telemetry": enabled,
-            "persistence": enabled,
-            "independent_replay": enabled,
+            "semantic_telemetry": True,
+            "physical_telemetry": True,
+            "persistence": True,
+            "independent_replay": True,
+            "resource_telemetry": enabled,
         }
-        raw_inventory = axis_inventory if enabled else []
-        minimal_replay_receipt = (
-            None
-            if enabled
-            else {
-                "schema_version": "stage05.2-telemetry-off-minimal-replay-v1",
-                "instance": "c101C5",
-                "seed": 2014,
-                "routes": routes,
-                "objective": objective,
-                "candidate_work_events": candidate_work_events,
-                "route_result_events": route_result_events,
-                "candidate_work_hash": candidate_work_hash,
-                "route_result_hash": route_result_hash,
-                "trajectory_rows": {
-                    "semantic_trajectory": (),
-                    "trajectory": (),
-                    "stage04_events": (),
-                    "candidate_transaction_events": (),
-                },
-            }
-        )
         payload = {
-            "schema_version": "stage05.2-representative-telemetry-sample-v3",
+            "schema_version": TELEMETRY_SAMPLE_SCHEMA_VERSION,
             "enabled": enabled,
             "sample_index": index,
             "elapsed_seconds": elapsed,
             "fingerprint": fingerprint,
             "fingerprint_payload": axis_payload,
             "workload_evidence": workload_evidence,
-            "raw_axis_inventory": raw_inventory,
-            "minimal_replay_receipt": minimal_replay_receipt,
+            "raw_axis_inventory": axis_inventory,
         }
         sample_sha256, sample_sidecar_sha256 = _write_signed_json(sample_path, payload)
         return {
@@ -314,7 +387,7 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
                 "sample_sha256": sample_sha256,
                 "sample_sidecar_sha256": sample_sidecar_sha256,
                 "child_elapsed_seconds": elapsed,
-                "raw_axis_inventory": raw_inventory,
+                "raw_axis_inventory": axis_inventory,
             },
             "workload_evidence": workload_evidence,
         }
@@ -329,16 +402,18 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         "persistence": True,
         "independent_replay": True,
         "unmonitored_telemetry_surface": {
-            "semantic_telemetry": False,
-            "physical_telemetry": False,
-            "persistence": False,
-            "independent_replay": False,
+            "semantic_telemetry": True,
+            "physical_telemetry": True,
+            "persistence": True,
+            "independent_replay": True,
+            "resource_telemetry": False,
         },
         "monitored_telemetry_surface": {
             "semantic_telemetry": True,
             "physical_telemetry": True,
             "persistence": True,
             "independent_replay": True,
+            "resource_telemetry": True,
         },
     }
     evidence["warm_sample_evidence"] = (
@@ -371,26 +446,99 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
         workload_evidence=evidence,
     )
-    monkeypatch.setattr(review, "_review_raw_axis", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        review,
+        "_review_raw_axis",
+        lambda *_args, **_kwargs: ({}, "current_stage052", "c5", topology_id),
+    )
+    monkeypatch.setattr(
+        review,
+        "generate_mode_topology_candidates",
+        lambda *_args, **_kwargs: (expected_topology,),
+    )
+
+    def fake_replay_record(
+        record: ReviewRecord,
+        _benchmark_dir: Path,
+        *,
+        expected_resource_telemetry: bool,
+    ) -> dict[str, object]:
+        payload = record.payload
+        topology = payload["topology"]
+        observed_enabled = topology.get("telemetry_status") != "disabled"
+        return {
+            "valid": observed_enabled is expected_resource_telemetry,
+            "semantics_complete": True,
+        }
+
+    monkeypatch.setattr(review, "_replay_record", fake_replay_record)
 
     replayed = review._replay_telemetry_children(
         receipt,
         run_root=tmp_path,
         benchmark_dir=benchmark_dir,
         build_identity={},
+        frozen_host=frozen_host,
     )
 
-    assert replayed == 6
+    assert replayed == 12
 
     warm_samples = evidence["warm_sample_evidence"]
     assert isinstance(warm_samples, tuple)
     off_row = warm_samples[0]
     assert isinstance(off_row, dict)
+    paired_samples = evidence["paired_sample_evidence"]
+    assert isinstance(paired_samples, tuple)
+    first_pair = paired_samples[0]
+    assert isinstance(first_pair, dict)
+    duplicate_row = first_pair["unmonitored"]
+    assert isinstance(duplicate_row, dict)
+    duplicate_resources = duplicate_row["resource_summary"]
+    assert isinstance(duplicate_resources, dict)
+    duplicate_path = tmp_path / str(duplicate_resources["sample_relative_path"])
+    duplicate_payload = json.loads(duplicate_path.read_text(encoding="utf-8"))
+    original_inventory = duplicate_payload["raw_axis_inventory"]
+    off_resources = off_row["resource_summary"]
+    assert isinstance(off_resources, dict)
+    duplicate_payload["raw_axis_inventory"] = off_resources["raw_axis_inventory"]
+    duplicate_resources["raw_axis_inventory"] = off_resources["raw_axis_inventory"]
+    duplicate_sha256, duplicate_sidecar_sha256 = _write_signed_json(
+        duplicate_path,
+        duplicate_payload,
+    )
+    duplicate_resources["sample_sha256"] = duplicate_sha256
+    duplicate_resources["sample_sidecar_sha256"] = duplicate_sidecar_sha256
+    duplicate_receipt = TelemetryOverheadReceipt(
+        unmonitored_seconds=unmonitored,
+        monitored_seconds=monitored,
+        pair_orders=orders,
+        sample_interval_seconds=0.05,
+        workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
+        monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
+        workload_evidence=evidence,
+    )
+    with pytest.raises(review.CalibrationReviewError, match="raw axis path is duplicated"):
+        review._replay_telemetry_children(
+            duplicate_receipt,
+            run_root=tmp_path,
+            benchmark_dir=benchmark_dir,
+            build_identity={},
+            frozen_host=frozen_host,
+        )
+    duplicate_payload["raw_axis_inventory"] = original_inventory
+    duplicate_resources["raw_axis_inventory"] = original_inventory
+    duplicate_sha256, duplicate_sidecar_sha256 = _write_signed_json(
+        duplicate_path,
+        duplicate_payload,
+    )
+    duplicate_resources["sample_sha256"] = duplicate_sha256
+    duplicate_resources["sample_sidecar_sha256"] = duplicate_sidecar_sha256
+
     resources = off_row["resource_summary"]
     assert isinstance(resources, dict)
     off_path = tmp_path / str(resources["sample_relative_path"])
     off_payload = json.loads(off_path.read_text(encoding="utf-8"))
-    off_payload["minimal_replay_receipt"]["routes"] = []
+    off_payload["minimal_replay_receipt"] = {"legacy": True}
     sample_sha256, sidecar_sha256 = _write_signed_json(off_path, off_payload)
     resources["sample_sha256"] = sample_sha256
     resources["sample_sidecar_sha256"] = sidecar_sha256
@@ -403,37 +551,195 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
         workload_evidence=evidence,
     )
-    with pytest.raises(review.CalibrationReviewError, match="validator replay failed"):
+    with pytest.raises(review.CalibrationReviewError, match="legacy minimal receipt"):
         review._replay_telemetry_children(
             tampered_receipt,
             run_root=tmp_path,
             benchmark_dir=benchmark_dir,
             build_identity={},
+            frozen_host=frozen_host,
         )
 
-    off_payload["minimal_replay_receipt"]["routes"] = routes
-    off_payload["minimal_replay_receipt"]["trajectory_rows"]["candidate_transaction_events"] = [
-        {"status": "accepted"}
-    ]
-    sample_sha256, sidecar_sha256 = _write_signed_json(off_path, off_payload)
-    resources["sample_sha256"] = sample_sha256
-    resources["sample_sidecar_sha256"] = sidecar_sha256
-    trajectory_tampered_receipt = TelemetryOverheadReceipt(
-        unmonitored_seconds=unmonitored,
-        monitored_seconds=monitored,
-        pair_orders=orders,
-        sample_interval_seconds=0.05,
-        workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
-        workload_evidence=evidence,
+
+@pytest.mark.parametrize(
+    "residual_field",
+    ("process_metrics", "thread_tree", "bounded_samples", "cpu_stat", "psi"),
+)
+def test_disabled_resource_telemetry_rejects_any_monitor_residue(
+    residual_field: str,
+) -> None:
+    topology = {field: None for field in _RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS}
+    topology["telemetry_status"] = "disabled"
+    assert (
+        _resource_telemetry_topology_error(
+            topology,
+            mode=ArchitectureMode.CURRENT_STAGE052,
+            expected_resource_telemetry=False,
+        )
+        is None
     )
-    with pytest.raises(
-        review.CalibrationReviewError,
-        match="candidate_transaction_events digest does not replay",
-    ):
-        review._replay_telemetry_children(
-            trajectory_tampered_receipt,
-            run_root=tmp_path,
-            benchmark_dir=benchmark_dir,
-            build_identity={},
+    topology[residual_field] = {}
+    assert _resource_telemetry_topology_error(
+        topology,
+        mode=ArchitectureMode.CURRENT_STAGE052,
+        expected_resource_telemetry=False,
+    ) is not None
+
+
+def test_historical_enabled_resource_schema_remains_read_only_compatible() -> None:
+    legacy_topology = {
+        "sample_count": 1,
+        "peak_concurrent_processes": 1,
+        "peak_aggregate_threads": 1,
+        "peak_aggregate_rss_bytes": 1,
+        "peak_aggregate_pss_bytes": 1,
+        "process_tree_cpu_seconds": 0.1,
+    }
+    assert (
+        _resource_telemetry_topology_error(
+            legacy_topology,
+            mode=ArchitectureMode.CURRENT_STAGE052,
+            expected_resource_telemetry=True,
+            require_complete_schema=False,
+        )
+        is None
+    )
+
+
+def test_enabled_resource_telemetry_requires_exact_current_schema() -> None:
+    topology = {
+        field: None
+        for field in (
+            _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS
+            | PROCESS_TREE_STATISTICS_FIELDS
+        )
+    }
+    assert (
+        _resource_telemetry_topology_error(
+            topology,
+            mode=ArchitectureMode.CURRENT_STAGE052,
+            expected_resource_telemetry=True,
+        )
+        is None
+    )
+    topology["unknown_process_tree_field"] = 1
+    assert _resource_telemetry_topology_error(
+        topology,
+        mode=ArchitectureMode.CURRENT_STAGE052,
+        expected_resource_telemetry=True,
+    ) is not None
+
+
+def test_representative_control_rejects_stable_wrong_topology_or_watchdog() -> None:
+    from evrptw.experiments import stage052_performance_calibration_review as review
+
+    expected_topology = ExecutionTopology(
+        workload_class="c5",
+        shards=((0, 1, 2, 3), (4, 5, 6, 7)),
+        worker_count=2,
+        request_threads=2,
+        affinity_policy="physical_core_first",
+    )
+    topology_id = execution_topology_id(expected_topology)
+    payload: dict[str, object] = {
+        "scope": "performance_calibration",
+        "repeat": 0,
+        "mode": "current_stage052",
+        "axis": "fixed_work",
+        "instance": "c101C5",
+        "seed": 2014,
+        "revision": "1" * 40,
+        "wheel_sha256": "2" * 64,
+        "native_sha256": "3" * 64,
+        "scheduler_sha256": "4" * 64,
+        "fixed_work_budget": {
+            "axis": "fixed_work",
+            "batch_size": 128,
+            "exact_calls": 20,
+            "iterations": 200,
+            "watchdog_seconds": 30.0,
+        },
+        "topology": {
+            "shard_processes": 2,
+            "threads_per_shard": 4,
+            "compute_thread_limit": 8,
+            "axis_compute_thread_limit": 4,
+            "scheduler_threads": 0,
+            "effective_native_search_threads": 4,
+            "performance_profile_sha256": "5" * 64,
+            "performance_topology_key": f"calibration:current_stage052:c5:{topology_id}",
+            "configured_axis_cpu_ids": [0, 1, 2, 3],
+            "configured_scheduler_cpu_ids": [],
+            "scheduler_request_threads": 2,
+            "allow_affinity_overlap": False,
+            "shared_native_work_pool": False,
+        },
+    }
+    review._representative_axis_control_identity(  # noqa: SLF001
+        payload,
+        expected_topology=expected_topology,
+        topology_id=topology_id,
+    )
+
+    free_scheduler = ExecutionTopology(
+        workload_class="c5",
+        shards=((0, 1, 2, 3), (4, 5, 6, 7)),
+        worker_count=2,
+        request_threads=2,
+        affinity_policy="free_scheduler",
+    )
+    missing_topology_host = HostPerformanceEnvelope(
+        allowed_cpu_ids=tuple(range(8)),
+        memory_total_bytes=16 * 1024**3,
+        memory_available_bytes=8 * 1024**3,
+        topology_source="unavailable",
+    )
+    selected_without_physical_topology = min(
+        review.generate_mode_topology_candidates(
+            missing_topology_host,
+            mode="current_stage052",
+            workload_class="c5",
+        ),
+        key=lambda item: (
+            abs(item.shard_count - 2),
+            item.affinity_policy != "physical_core_first",
+            execution_topology_id(item),
+        ),
+    )
+    assert selected_without_physical_topology.to_dict() == free_scheduler.to_dict()
+    free_scheduler_id = execution_topology_id(free_scheduler)
+    free_scheduler_payload = json.loads(json.dumps(payload))
+    free_scheduler_payload["topology"].update(
+        {
+            "threads_per_shard": 4,
+            "axis_compute_thread_limit": 8,
+            "effective_native_search_threads": 4,
+            "performance_topology_key": (
+                f"calibration:current_stage052:c5:{free_scheduler_id}"
+            ),
+            "configured_axis_cpu_ids": list(range(8)),
+        }
+    )
+    review._representative_axis_control_identity(  # noqa: SLF001
+        free_scheduler_payload,
+        expected_topology=free_scheduler,
+        topology_id=free_scheduler_id,
+    )
+
+    wrong_watchdog = json.loads(json.dumps(payload))
+    wrong_watchdog["fixed_work_budget"]["watchdog_seconds"] = 29.0
+    with pytest.raises(review.CalibrationReviewError, match="fixed-work budget schema"):
+        review._representative_axis_control_identity(  # noqa: SLF001
+            wrong_watchdog,
+            expected_topology=expected_topology,
+            topology_id=topology_id,
+        )
+
+    wrong_topology = json.loads(json.dumps(payload))
+    wrong_topology["topology"]["configured_axis_cpu_ids"] = [0]
+    with pytest.raises(review.CalibrationReviewError, match="host-derived control"):
+        review._representative_axis_control_identity(  # noqa: SLF001
+            wrong_topology,
+            expected_topology=expected_topology,
+            topology_id=topology_id,
         )

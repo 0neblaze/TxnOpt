@@ -98,16 +98,18 @@ def _telemetry_evidence(
         "minimal_validator_replay": True,
         "fingerprints_identical": True,
         "unmonitored_telemetry_surface": {
-            "semantic_telemetry": False,
-            "physical_telemetry": False,
-            "persistence": False,
-            "independent_replay": False,
+            "semantic_telemetry": True,
+            "physical_telemetry": True,
+            "persistence": True,
+            "independent_replay": True,
+            "resource_telemetry": False,
         },
         "monitored_telemetry_surface": {
             "semantic_telemetry": True,
             "physical_telemetry": True,
             "persistence": True,
             "independent_replay": True,
+            "resource_telemetry": True,
         },
     }
     sample_base = {
@@ -133,10 +135,11 @@ def _telemetry_evidence(
             "resource_summary": {},
             "workload_evidence": {
                 **sample_base,
-                "semantic_telemetry": enabled,
-                "physical_telemetry": enabled,
-                "persistence": enabled,
-                "independent_replay": enabled,
+                "semantic_telemetry": True,
+                "physical_telemetry": True,
+                "persistence": True,
+                "independent_replay": True,
+                "resource_telemetry": enabled,
             },
         }
 
@@ -910,12 +913,14 @@ def test_representative_telemetry_parent_accepts_current_shared_schema(
     ) -> subprocess.CompletedProcess[str]:
         output = Path(command[command.index("--output") + 1])
         enabled = command[command.index("--telemetry-sample") + 1] == "on"
+        sample_index = int(command[command.index("--telemetry-sample-index") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
             json.dumps(
                 {
                     "schema_version": TELEMETRY_SAMPLE_SCHEMA_VERSION,
                     "enabled": enabled,
+                    "sample_index": sample_index,
                     "fingerprint": "f" * 64,
                     "resource_summary": {},
                     "workload_evidence": {},
