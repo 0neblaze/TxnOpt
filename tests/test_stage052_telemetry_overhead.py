@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from evrptw.candidate_control import stable_candidate_payload_hash
 from evrptw.experiments.stage052_telemetry_overhead import (
     TelemetryWorkloadSample,
     load_telemetry_overhead_receipt,
@@ -182,8 +181,10 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
     objective = list(SolutionObjective.from_report(instance, report).key)
     candidate_work_events: tuple[dict[str, object], ...] = ()
     route_result_events: tuple[dict[str, object], ...] = ()
-    candidate_work_hash = stable_candidate_payload_hash(candidate_work_events)
-    route_result_hash = stable_candidate_payload_hash(route_result_events)
+    # current_stage052 has no Candidate Control runtime.  Empty rows plus an
+    # empty hash are its explicit unavailable receipt, not the hash of [].
+    candidate_work_hash = ""
+    route_result_hash = ""
     empty_row_receipt = {
         "count": 0,
         "sha256": hashlib.sha256(b"stage05.2-row-evidence-v1\0").hexdigest(),

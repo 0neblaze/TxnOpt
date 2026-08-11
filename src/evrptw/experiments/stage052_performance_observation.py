@@ -2081,6 +2081,28 @@ def _representative_fingerprint(payload: Mapping[str, object]) -> str:
     ).hexdigest()
 
 
+def _candidate_payload_receipt_matches(
+    rows: Sequence[Mapping[str, object]],
+    declared_hash: object,
+) -> bool:
+    """Validate an optional Candidate Control receipt without inventing telemetry.
+
+    ``current_stage052`` does not construct a Candidate Control runtime.  Its
+    result therefore uses the historical unavailable representation: no rows
+    and an empty hash.  The telemetry-off control must preserve that absence;
+    hashing the empty tuple would fabricate a receipt that the solver did not
+    produce and would make the unmonitored control impossible to run.
+    """
+
+    if declared_hash == "":
+        return not rows
+    return (
+        isinstance(declared_hash, str)
+        and _SHA256_RE.fullmatch(declared_hash) is not None
+        and stable_candidate_payload_hash(rows) == declared_hash
+    )
+
+
 def produce_representative_telemetry_sample(
     *,
     enabled: bool,
@@ -2244,10 +2266,14 @@ def produce_representative_telemetry_sample(
         if (
             len(candidate_work_events) > CALIBRATION_MAX_ITERATIONS
             or len(route_result_events) > CALIBRATION_EXACT_CALLS
-            or stable_candidate_payload_hash(candidate_work_events)
-            != telemetry_off_result.candidate_work_hash
-            or stable_candidate_payload_hash(route_result_events)
-            != telemetry_off_result.route_result_hash
+            or not _candidate_payload_receipt_matches(
+                candidate_work_events,
+                telemetry_off_result.candidate_work_hash,
+            )
+            or not _candidate_payload_receipt_matches(
+                route_result_events,
+                telemetry_off_result.route_result_hash,
+            )
         ):
             raise PerformanceObservationError(
                 "representative telemetry-off transaction receipt is invalid"

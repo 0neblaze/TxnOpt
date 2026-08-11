@@ -18,6 +18,7 @@ from evrptw.experiments.stage052_performance_observation import (
     BlockExecution,
     PerformanceObservationError,
     _atomic_signed_json,
+    _candidate_payload_receipt_matches,
     _local_work_pool_receipt,
     _memory_admission,
     _parallel_diagnostics,
@@ -39,6 +40,16 @@ from evrptw.stage052_performance import (
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def test_optional_candidate_payload_receipt_preserves_unavailable_surface() -> None:
+    rows = ({"candidate": 1},)
+    digest = observation_module.stable_candidate_payload_hash(rows)
+
+    assert _candidate_payload_receipt_matches((), "")
+    assert not _candidate_payload_receipt_matches(rows, "")
+    assert _candidate_payload_receipt_matches(rows, digest)
+    assert not _candidate_payload_receipt_matches((), digest)
 
 
 def _topology(*, shards: int = 2) -> ExecutionTopology:

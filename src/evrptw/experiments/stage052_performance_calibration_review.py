@@ -162,6 +162,21 @@ def _representative_row_evidence(rows: Sequence[object]) -> tuple[dict[str, obje
     return {"count": len(rows), "sha256": digest.hexdigest()}, payload_bytes
 
 
+def _candidate_payload_receipt_replays(
+    rows: Sequence[object],
+    declared_hash: object,
+) -> bool:
+    """Replay a present Candidate Control digest or its explicit absence."""
+
+    if declared_hash == "":
+        return not rows
+    return (
+        _is_sha256(declared_hash)
+        and all(isinstance(row, Mapping) for row in rows)
+        and stable_candidate_payload_hash(tuple(rows)) == declared_hash
+    )
+
+
 def _thaw_json(value: object) -> object:
     """Project frozen containers back to their exact JSON representation."""
 
@@ -1956,10 +1971,14 @@ def _replay_telemetry_children(
             if (
                 not all(isinstance(row, Mapping) for row in candidate_work)
                 or not all(isinstance(row, Mapping) for row in route_results)
-                or stable_candidate_payload_hash(tuple(candidate_work))
-                != minimal.get("candidate_work_hash")
-                or stable_candidate_payload_hash(tuple(route_results))
-                != minimal.get("route_result_hash")
+                or not _candidate_payload_receipt_replays(
+                    candidate_work,
+                    minimal.get("candidate_work_hash"),
+                )
+                or not _candidate_payload_receipt_replays(
+                    route_results,
+                    minimal.get("route_result_hash"),
+                )
                 or any(
                     minimal.get(field) != fingerprint_payload.get(field)
                     for field in (
