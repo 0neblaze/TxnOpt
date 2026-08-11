@@ -28,6 +28,24 @@ def _statistics(
     )
 
 
+def test_worker_descendant_pss_peak_does_not_sum_sequential_generations() -> None:
+    monitor = ProcessTreeMonitor()
+    monitor._record_worker_descendant_pss_sample(  # noqa: SLF001
+        [(11, 2.0, 80)],
+        complete=True,
+    )
+    monitor._sample_count += 1  # noqa: SLF001
+    monitor._record_worker_descendant_pss_sample(  # noqa: SLF001
+        [(12, 3.0, 80)],
+        complete=True,
+    )
+
+    assert monitor._peak_worker_descendant_pss_bytes == 80  # noqa: SLF001
+    assert monitor._peak_worker_descendant_pss_processes == (  # noqa: SLF001
+        (11, 2.0, 80),
+    )
+
+
 def test_process_tree_monitor_records_complete_local_envelope() -> None:
     with ProcessTreeMonitor(sample_interval_seconds=0.005) as monitor:
         started = time.perf_counter()
@@ -231,6 +249,33 @@ def test_process_tree_monitor_rejects_invalid_external_root() -> None:
         assert "positive PIDs" in str(error)
     else:
         raise AssertionError("invalid external process root was accepted")
+
+
+def test_process_tree_monitor_registers_late_shared_root_before_worker_samples() -> None:
+    shared_root = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1.0)"])
+    worker: subprocess.Popen[bytes] | None = None
+    try:
+        with ProcessTreeMonitor(sample_interval_seconds=0.002) as monitor:
+            monitor.register_additional_root(shared_root.pid)
+            worker = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(1.0)"]
+            )
+            time.sleep(0.02)
+        statistics = _statistics(
+            monitor,
+            elapsed_seconds=0.02,
+            compute_thread_limit=24,
+        )
+        assert statistics["additional_root_pids"] == [shared_root.pid]
+        peak = statistics["worker_descendant_pss_peak"]
+        assert peak["status"] == "available"
+        assert {row["pid"] for row in peak["processes"]} == {worker.pid}
+    finally:
+        if worker is not None:
+            worker.terminate()
+            worker.wait(timeout=5.0)
+        shared_root.terminate()
+        shared_root.wait(timeout=5.0)
 
 
 def test_process_tree_monitor_rejects_invalid_thread_detail_interval() -> None:

@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -34,6 +35,7 @@ from evrptw.experiments.stage052_performance_calibration import (
     CALIBRATION_INPUT_DIRECTORY,
     CALIBRATION_INPUT_STORAGE_ALIAS,
     CALIBRATION_RECEIPT_SCHEMA_VERSION,
+    MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION,
     OBSERVATION_PRODUCER_SCHEMA_VERSION,
     AxisObservation,
     CalibrationError,
@@ -50,6 +52,7 @@ from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_performance import (
     ExecutionTopology,
     FrozenPerformanceProfile,
+    HostPerformanceEnvelope,
     RuntimeResourceSummaryV2,
     TelemetryOverheadReceipt,
     require_clean_repository_root,
@@ -652,7 +655,7 @@ def _derive_resource_summary(
     run_root: Path,
     inventory_roles: Mapping[str, str],
     scheduler_statistics: Mapping[str, object] | None,
-) -> tuple[RuntimeResourceSummaryV2, int, tuple[str, ...]]:
+) -> tuple[RuntimeResourceSummaryV2, int, int, int, tuple[str, ...]]:
     if evidence.get("schema_version") != "stage05.2-calibration-resource-evidence-v1":
         raise CalibrationReviewError("raw resource evidence schema is invalid")
     if (
@@ -795,18 +798,16 @@ def _derive_resource_summary(
         scheduler_statistics,
     )
     schedstat = _mapping(process_tree.get("thread_tree_schedstat"), "resource schedstat")
-    scheduler_pid = evidence.get("scheduler_process_id")
-    scheduler_pss = 0
-    if scheduler_pid is not None:
-        scheduler_pid_value = _integer(scheduler_pid, "resource scheduler PID")
-        values = [
-            row.get("maximum_pss_bytes")
-            for row in _array(process_tree.get("process_metrics"), "resource process metrics")
-            if isinstance(row, Mapping) and row.get("pid") == scheduler_pid_value
-        ]
-        if len(values) != 1:
-            raise CalibrationReviewError("resource scheduler PSS identity is ambiguous")
-        scheduler_pss = _integer(values[0], "resource scheduler PSS")
+    scheduler_pid_raw = evidence.get("scheduler_process_id")
+    scheduler_pid = (
+        None
+        if scheduler_pid_raw is None
+        else _integer(scheduler_pid_raw, "resource scheduler PID")
+    )
+    producer_pss, scheduler_pss, worker_descendant_pss = _resource_pss_components(
+        process_tree,
+        scheduler_process_id=scheduler_pid,
+    )
     summary = RuntimeResourceSummaryV2(
         elapsed_seconds=elapsed,
         effective_cores=cpu_seconds / elapsed,
@@ -865,7 +866,13 @@ def _derive_resource_summary(
         p99_end_to_end_seconds=_resource_percentile(worker_times, 0.99),
         max_end_to_end_seconds=max(worker_times),
     )
-    return summary, scheduler_pss, tuple(normalized_paths)
+    return (
+        summary,
+        scheduler_pss,
+        producer_pss,
+        worker_descendant_pss,
+        tuple(normalized_paths),
+    )
 
 
 def _validate_resource_evidence(
@@ -905,7 +912,13 @@ def _validate_resource_evidence(
                 else _mapping(scheduler_raw, "resource scheduler statistics")
             )
             raw_resource = _mapping(row.get("raw_resource_statistics"), "raw_resource_statistics")
-            derived, scheduler_pss, paths = _derive_resource_summary(
+            (
+                derived,
+                scheduler_pss,
+                producer_pss,
+                worker_descendant_pss,
+                paths,
+            ) = _derive_resource_summary(
                 raw_resource,
                 run_root=run_root,
                 inventory_roles=inventory_roles,
@@ -933,6 +946,9 @@ def _validate_resource_evidence(
                     "topology": raw_resource["topology"],
                     "axis_relative_paths": paths,
                     "scheduler_statistics": scheduler_statistics,
+                    "memory_admission": row.get("memory_admission"),
+                    "producer_pss_bytes": producer_pss,
+                    "worker_descendant_pss_bytes": worker_descendant_pss,
                 }
         if row.get("role") == "admitted-mode-block":
             diagnostics = _mapping(
@@ -1031,10 +1047,235 @@ def _validate_resource_evidence(
     return len(resources)
 
 
+def _resource_pss_components(
+    process_tree: Mapping[str, object],
+    *,
+    scheduler_process_id: int | None,
+) -> tuple[int, int, int]:
+    root_pid = _integer(process_tree.get("root_process_id"), "resource root process ID")
+    additional_root_pids = _array(
+        process_tree.get("additional_root_pids"),
+        "resource additional root PIDs",
+    )
+    excluded_pids = {root_pid}
+    for raw_pid in additional_root_pids:
+        excluded_pids.add(_integer(raw_pid, "resource additional root PID"))
+    if scheduler_process_id is not None and scheduler_process_id not in excluded_pids:
+        raise CalibrationReviewError("resource scheduler is not a monitored root")
+    metrics = _array(process_tree.get("process_metrics"), "resource process metrics")
+    producer_pss: int | None = None
+    scheduler_pss = 0
+    identities: set[tuple[int, object]] = set()
+    metric_pss: dict[tuple[int, object], int] = {}
+    for item in metrics:
+        row = _mapping(item, "resource process metric")
+        pid = _integer(row.get("pid"), "resource process metric PID")
+        create_time = row.get("create_time")
+        if (
+            isinstance(create_time, bool)
+            or not isinstance(create_time, int | float)
+            or not math.isfinite(float(create_time))
+        ):
+            raise CalibrationReviewError("resource process create time is invalid")
+        identity = (pid, create_time)
+        if identity in identities:
+            raise CalibrationReviewError("resource process PSS identity is duplicated")
+        identities.add(identity)
+        pss = _integer(row.get("maximum_pss_bytes"), "resource process PSS")
+        if pss <= 0:
+            raise CalibrationReviewError("resource process PSS is not positive")
+        metric_pss[identity] = pss
+        if pid == root_pid:
+            if producer_pss is not None:
+                raise CalibrationReviewError("resource producer PSS identity is ambiguous")
+            producer_pss = pss
+        elif scheduler_process_id is not None and pid == scheduler_process_id:
+            if scheduler_pss != 0:
+                raise CalibrationReviewError("resource scheduler PSS identity is ambiguous")
+            scheduler_pss = pss
+    if producer_pss is None:
+        raise CalibrationReviewError("resource producer PSS identity is unavailable")
+    if scheduler_process_id is not None and scheduler_pss == 0:
+        raise CalibrationReviewError("resource scheduler PSS identity is unavailable")
+    receipt = _mapping(
+        process_tree.get("worker_descendant_pss_peak"),
+        "resource worker descendant PSS peak",
+    )
+    if set(receipt) != {"status", "peak_bytes", "sample_index", "processes"}:
+        raise CalibrationReviewError("resource worker descendant PSS schema is invalid")
+    worker_descendant_pss = _integer(
+        receipt.get("peak_bytes"),
+        "resource worker descendant PSS peak bytes",
+    )
+    sample_index = _integer(
+        receipt.get("sample_index"),
+        "resource worker descendant PSS sample index",
+    )
+    sample_count = _integer(process_tree.get("sample_count"), "resource sample count")
+    process_rows = _array(
+        receipt.get("processes"),
+        "resource worker descendant PSS processes",
+    )
+    if (
+        receipt.get("status") != "available"
+        or worker_descendant_pss <= 0
+        or not 0 <= sample_index < sample_count
+        or not process_rows
+        or process_tree.get("peak_worker_descendant_pss_bytes")
+        != worker_descendant_pss
+    ):
+        raise CalibrationReviewError("resource worker descendant PSS peak is invalid")
+    observed_peak_identities: set[tuple[int, object]] = set()
+    reconstructed_peak = 0
+    for item in process_rows:
+        row = _mapping(item, "resource worker descendant PSS process")
+        if set(row) != {"pid", "create_time", "pss_bytes"}:
+            raise CalibrationReviewError("resource worker descendant process schema is invalid")
+        pid = _integer(row.get("pid"), "resource worker descendant PID")
+        create_time = row.get("create_time")
+        pss_bytes = _integer(
+            row.get("pss_bytes"),
+            "resource worker descendant process PSS",
+        )
+        if (
+            pid in excluded_pids
+            or isinstance(create_time, bool)
+            or not isinstance(create_time, int | float)
+            or not math.isfinite(float(create_time))
+            or pss_bytes <= 0
+        ):
+            raise CalibrationReviewError("resource worker descendant PSS value is invalid")
+        identity = (pid, create_time)
+        if identity in observed_peak_identities:
+            raise CalibrationReviewError("resource worker descendant identity is duplicated")
+        maximum = metric_pss.get(identity)
+        if maximum is None or pss_bytes > maximum:
+            raise CalibrationReviewError(
+                "resource worker descendant PSS exceeds process maximum"
+            )
+        observed_peak_identities.add(identity)
+        reconstructed_peak += pss_bytes
+    if reconstructed_peak != worker_descendant_pss:
+        raise CalibrationReviewError("resource worker descendant PSS peak does not replay")
+    return producer_pss, scheduler_pss, worker_descendant_pss
+
+
+def _validate_live_memory_admission(
+    value: object,
+    *,
+    frozen_host: HostPerformanceEnvelope,
+    topology: ExecutionTopology,
+    isolated_pss_bytes: int,
+    scheduler_pss_bytes: int,
+    producer_pss_bytes: int,
+    worker_descendant_pss_bytes: int,
+) -> bool:
+    evidence = _mapping(value, "live memory admission")
+    expected_fields = {
+        "schema_version",
+        "frozen_effective_memory_limit_bytes",
+        "live_host",
+        "resident_pss_bytes",
+        "isolated_producer_pss_bytes",
+        "isolated_worker_descendant_pss_bytes",
+        "projected_concurrent_pss_bytes",
+        "incremental_required_bytes",
+        "admission",
+    }
+    if (
+        set(evidence) != expected_fields
+        or evidence.get("schema_version") != MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION
+    ):
+        raise CalibrationReviewError("live memory admission schema is invalid")
+    try:
+        live_host = HostPerformanceEnvelope.from_dict(
+            _mapping(evidence.get("live_host"), "live memory host")
+        )
+    except ValueError as error:
+        raise CalibrationReviewError("live memory host is invalid") from error
+    stable_fields = (
+        "platform_name",
+        "architecture",
+        "allowed_cpu_ids",
+        "physical_core_groups",
+        "memory_total_bytes",
+        "memory_limit_bytes",
+        "swap_limit_bytes",
+        "cpu_features",
+    )
+    if any(
+        getattr(live_host, field) != getattr(frozen_host, field)
+        for field in stable_fields
+    ):
+        raise CalibrationReviewError("live memory host identity differs")
+    if live_host.swap_used_bytes != 0 or (
+        live_host.swap_current_bytes is not None and live_host.swap_current_bytes != 0
+    ):
+        raise CalibrationReviewError("live memory admission used swap")
+    resident = _integer(evidence.get("resident_pss_bytes"), "resident PSS")
+    if resident <= 0:
+        raise CalibrationReviewError("resident PSS is not positive")
+    if producer_pss_bytes <= 0 or worker_descendant_pss_bytes <= 0:
+        raise CalibrationReviewError("isolated PSS components are invalid")
+    projected = _integer(
+        evidence.get("projected_concurrent_pss_bytes"),
+        "projected concurrent PSS",
+    )
+    incremental = (
+        scheduler_pss_bytes + worker_descendant_pss_bytes * topology.shard_count
+    )
+    expected_projected = producer_pss_bytes + incremental
+    available = min(
+        frozen_host.effective_memory_limit_bytes,
+        live_host.effective_memory_limit_bytes,
+    )
+    headroom = math.ceil(incremental * 0.20)
+    passed = (
+        available >= incremental + headroom
+        and incremental <= math.floor(available * 0.80)
+    )
+    reason = (
+        "incremental projected PSS exceeds 80% of live effective memory"
+        if incremental > math.floor(available * 0.80)
+        else (
+            "live effective memory is below incremental PSS plus headroom"
+            if available < incremental + headroom
+            else "live memory and swap admission passed"
+        )
+    )
+    admission = _mapping(evidence.get("admission"), "live memory admission result")
+    expected_admission = {
+        "passed": passed,
+        "available_bytes": available,
+        "required_bytes": incremental,
+        "headroom_bytes": headroom,
+        "swap_total_bytes": live_host.swap_total_bytes,
+        "swap_used_bytes": live_host.swap_used_bytes,
+        "swap_current_bytes": (
+            0 if live_host.swap_current_bytes is None else live_host.swap_current_bytes
+        ),
+        "reason": reason,
+    }
+    if (
+        evidence.get("frozen_effective_memory_limit_bytes")
+        != frozen_host.effective_memory_limit_bytes
+        or projected != expected_projected
+        or evidence.get("isolated_producer_pss_bytes") != producer_pss_bytes
+        or evidence.get("isolated_worker_descendant_pss_bytes")
+        != worker_descendant_pss_bytes
+        or evidence.get("incremental_required_bytes") != incremental
+        or dict(admission) != expected_admission
+    ):
+        raise CalibrationReviewError("live memory admission does not replay")
+    return passed
+
+
 def _validate_observation_resource_bindings(
     observation_payload: Mapping[str, object],
     rows: Sequence[AxisObservation],
     resources: Mapping[tuple[str, str, str, str], Mapping[str, object]],
+    *,
+    frozen_host: HostPerformanceEnvelope,
 ) -> None:
     for row in rows:
         identity = (row.mode, row.workload_class, row.topology_id)
@@ -1057,8 +1298,22 @@ def _validate_observation_resource_bindings(
             != admitted_summary.elapsed_seconds + admitted_summary.replay_seconds
             or row.pss_bytes != isolated_summary.pss_bytes
             or row.scheduler_pss_bytes != isolated.get("scheduler_pss_bytes")
+            or row.producer_pss_bytes != isolated.get("producer_pss_bytes")
+            or row.worker_descendant_pss_bytes
+            != isolated.get("worker_descendant_pss_bytes")
         ):
             raise CalibrationReviewError("observation timing/PSS differs from raw resources")
+        for resource in (isolated, admitted):
+            if not _validate_live_memory_admission(
+                resource.get("memory_admission"),
+                frozen_host=frozen_host,
+                topology=row.topology,
+                isolated_pss_bytes=row.pss_bytes,
+                scheduler_pss_bytes=row.scheduler_pss_bytes,
+                producer_pss_bytes=row.producer_pss_bytes,
+                worker_descendant_pss_bytes=row.worker_descendant_pss_bytes,
+            ):
+                raise CalibrationReviewError("admitted topology failed live memory admission")
 
     build_profile = _text(observation_payload.get("build_profile"), "observation build profile")
     lifecycle_root = _mapping(
@@ -1096,6 +1351,31 @@ def _validate_observation_resource_bindings(
             if mode_block is None or any(row is None for row in per_wave_rows):
                 raise CalibrationReviewError("lifecycle resource rows are incomplete")
             selected_per_wave = cast(list[Mapping[str, object]], per_wave_rows)
+            matching_axes = [
+                row
+                for row in rows
+                if row.mode == "host_scheduler"
+                and row.workload_class == workload
+                and row.topology_id == topology_id
+            ]
+            if len(matching_axes) != 1:
+                raise CalibrationReviewError("lifecycle memory source axis is ambiguous")
+            source_axis = matching_axes[0]
+            for resource in (*selected_per_wave, mode_block):
+                if not _validate_live_memory_admission(
+                    resource.get("memory_admission"),
+                    frozen_host=frozen_host,
+                    topology=source_axis.topology,
+                    isolated_pss_bytes=source_axis.pss_bytes,
+                    scheduler_pss_bytes=source_axis.scheduler_pss_bytes,
+                    producer_pss_bytes=source_axis.producer_pss_bytes,
+                    worker_descendant_pss_bytes=(
+                        source_axis.worker_descendant_pss_bytes
+                    ),
+                ):
+                    raise CalibrationReviewError(
+                        "scheduler lifecycle failed live memory admission"
+                    )
             per_wave_summaries = [
                 cast(RuntimeResourceSummaryV2, item["summary"]) for item in selected_per_wave
             ]
@@ -1221,6 +1501,8 @@ def _validate_scheduler_task_receipt_evidence(
 
 def _validate_memory_rejections(
     observation_payload: Mapping[str, object],
+    *,
+    frozen_host: HostPerformanceEnvelope,
 ) -> int:
     rows = _array(observation_payload.get("memory_rejections"), "memory_rejections")
     for index, raw in enumerate(rows):
@@ -1233,6 +1515,11 @@ def _validate_memory_rejections(
             raise CalibrationReviewError("memory rejection topology is invalid") from error
         isolated = _integer(row.get("isolated_pss_bytes"), "isolated_pss_bytes")
         scheduler = _integer(row.get("scheduler_pss_bytes"), "scheduler_pss_bytes")
+        producer = _integer(row.get("producer_pss_bytes"), "producer_pss_bytes")
+        worker_descendant = _integer(
+            row.get("worker_descendant_pss_bytes"),
+            "worker_descendant_pss_bytes",
+        )
         projected = _integer(
             row.get("projected_concurrent_pss_bytes"),
             "projected_concurrent_pss_bytes",
@@ -1255,17 +1542,30 @@ def _validate_memory_rejections(
         )
         swap_used = _integer(row.get("swap_used_bytes"), "swap_used_bytes")
         swap_current = _integer(row.get("swap_current_bytes"), "swap_current_bytes")
-        expected = scheduler + (isolated - scheduler) * topology.shard_count
-        over_eighty = projected > math.floor(effective_limit * 0.80)
-        below_headroom = admission_available < admission_required + admission_headroom
-        swap_failure = swap_used > 0 or swap_current > 0
+        admission_passed = _validate_live_memory_admission(
+            row.get("memory_admission"),
+            frozen_host=frozen_host,
+            topology=topology,
+            isolated_pss_bytes=isolated,
+            scheduler_pss_bytes=scheduler,
+            producer_pss_bytes=producer,
+            worker_descendant_pss_bytes=worker_descendant,
+        )
+        evidence = _mapping(row.get("memory_admission"), "memory rejection evidence")
+        admission = _mapping(evidence.get("admission"), "memory rejection admission")
+        expected = producer + scheduler + worker_descendant * topology.shard_count
         if (
-            scheduler > isolated
+            producer <= 0
+            or worker_descendant <= 0
             or projected != expected
-            or admission_required != projected
-            or admission_available != effective_limit
-            or admission_headroom != math.ceil(projected * 0.20)
-            or not (over_eighty or below_headroom or swap_failure)
+            or admission_passed
+            or effective_limit != admission_available
+            or admission_available != admission.get("available_bytes")
+            or admission_required != admission.get("required_bytes")
+            or admission_headroom != admission.get("headroom_bytes")
+            or swap_used != admission.get("swap_used_bytes")
+            or swap_current != admission.get("swap_current_bytes")
+            or row.get("reason") != admission.get("reason")
         ):
             raise CalibrationReviewError("memory rejection does not independently reproduce")
     return len(rows)
@@ -1287,6 +1587,7 @@ def _replay_observation_children(
     observations: Sequence[AxisObservation],
     *,
     benchmark_dir: Path,
+    frozen_host: HostPerformanceEnvelope,
 ) -> tuple[int, int, int]:
     rows_by_source: dict[Path, list[AxisObservation]] = defaultdict(list)
     for row in observations:
@@ -1302,7 +1603,10 @@ def _replay_observation_children(
         provenance = _mapping(payload.get("producer_provenance"), "producer_provenance")
         if provenance.get("schema_version") != OBSERVATION_PRODUCER_SCHEMA_VERSION:
             raise CalibrationReviewError("observation producer schema is unsupported")
-        rejection_count += _validate_memory_rejections(payload)
+        rejection_count += _validate_memory_rejections(
+            payload,
+            frozen_host=frozen_host,
+        )
         build_identity = _mapping(payload.get("build_identity"), "observation build_identity")
         inventory = _array(provenance.get("raw_axis_inventory"), "raw_axis_inventory")
         parent_run_label = _text(provenance.get("parent_run_label"), "parent_run_label")
@@ -1384,7 +1688,12 @@ def _replay_observation_children(
         expected_rows = rows_by_source.get(observation_path.resolve(), [])
         if not expected_rows:
             raise CalibrationReviewError("signed observation produced no parsed axes")
-        _validate_observation_resource_bindings(payload, expected_rows, resource_replays)
+        _validate_observation_resource_bindings(
+            payload,
+            expected_rows,
+            resource_replays,
+            frozen_host=frozen_host,
+        )
         if set(admitted) != {
             (row.mode, row.workload_class, row.topology_id) for row in expected_rows
         }:
@@ -1841,6 +2150,7 @@ def derive_calibration_review(
         observation_paths,
         observations,
         benchmark_dir=benchmark_dir.resolve(),
+        frozen_host=profile.host,
     )
     identity = profile.selected_build.artifact_identity
     if identity is None:
@@ -1905,6 +2215,37 @@ def review_calibration(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--lifecycle-failure-manifest" in selected_argv:
+        failure_parser = argparse.ArgumentParser(description=__doc__)
+        failure_parser.add_argument(
+            "--lifecycle-failure-manifest",
+            type=Path,
+            required=True,
+        )
+        failure_parser.add_argument(
+            "--failure-review-manifest",
+            type=Path,
+            required=True,
+        )
+        failure_parser.add_argument(
+            "--repository-root",
+            type=Path,
+            required=True,
+        )
+        failure_arguments = failure_parser.parse_args(selected_argv)
+        require_clean_repository_root(failure_arguments.repository_root)
+        from evrptw.experiments.stage052_campaign_review import (
+            review_lifecycle_failure_capsule,
+        )
+
+        payload = review_lifecycle_failure_capsule(
+            raw_manifest_path=failure_arguments.lifecycle_failure_manifest,
+            review_manifest_path=failure_arguments.failure_review_manifest,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--calibration-run-dir", type=Path, required=True)
     parser.add_argument("--benchmark-dir", type=Path, required=True)
@@ -1915,7 +2256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Explicit clean ext4 Git worktree used for source identity",
     )
     parser.add_argument("--output", type=Path)
-    arguments = parser.parse_args(argv)
+    arguments = parser.parse_args(selected_argv)
     require_clean_repository_root(arguments.repository_root)
     destination = (
         arguments.calibration_run_dir.resolve() / "review" / "calibration_review_receipt.json"

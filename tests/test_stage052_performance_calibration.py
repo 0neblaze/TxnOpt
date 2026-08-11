@@ -13,6 +13,7 @@ import pytest
 
 from evrptw.experiment_lifecycle import ExperimentCatalog
 from evrptw.experiments.stage052_performance_calibration import (
+    MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION,
     MODE_NAMES,
     OBSERVATION_PRODUCER_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
@@ -30,6 +31,8 @@ from evrptw.experiments.stage052_performance_calibration import (
 )
 from evrptw.experiments.stage052_performance_calibration_review import (
     CalibrationReviewError,
+    _resource_pss_components,
+    _validate_live_memory_admission,
     _validate_resource_evidence,
 )
 from evrptw.experiments.stage052_telemetry_overhead import (
@@ -226,6 +229,84 @@ def test_calibration_reviewer_recomputes_parallel_diagnostics() -> None:
         _validate_resource_evidence(provenance)
 
 
+def test_calibration_reviewer_recomputes_live_memory_admission() -> None:
+    host = _host()
+    topology = ExecutionTopology(
+        workload_class="c5",
+        shards=((0,), (1,)),
+        worker_count=2,
+        request_threads=2,
+    )
+    evidence: dict[str, object] = {
+        "schema_version": MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION,
+        "frozen_effective_memory_limit_bytes": 1_000,
+        "live_host": host.to_dict(),
+        "resident_pss_bytes": 400,
+        "isolated_producer_pss_bytes": 100,
+        "isolated_worker_descendant_pss_bytes": 100,
+        "projected_concurrent_pss_bytes": 300,
+        "incremental_required_bytes": 200,
+        "admission": {
+            "passed": True,
+            "available_bytes": 1_000,
+            "required_bytes": 200,
+            "headroom_bytes": 40,
+            "swap_total_bytes": 0,
+            "swap_used_bytes": 0,
+            "swap_current_bytes": 0,
+            "reason": "live memory and swap admission passed",
+        },
+    }
+
+    assert _validate_live_memory_admission(
+        evidence,
+        frozen_host=host,
+        topology=topology,
+        isolated_pss_bytes=200,
+        scheduler_pss_bytes=0,
+        producer_pss_bytes=100,
+        worker_descendant_pss_bytes=100,
+    )
+    cast(dict[str, object], evidence["admission"])["available_bytes"] = 999
+    with pytest.raises(CalibrationReviewError, match="does not replay"):
+        _validate_live_memory_admission(
+            evidence,
+            frozen_host=host,
+            topology=topology,
+            isolated_pss_bytes=200,
+            scheduler_pss_bytes=0,
+            producer_pss_bytes=100,
+            worker_descendant_pss_bytes=100,
+        )
+
+
+def test_calibration_reviewer_uses_simultaneous_worker_peak_receipt() -> None:
+    process_tree: dict[str, object] = {
+        "root_process_id": 10,
+        "additional_root_pids": [20],
+        "sample_count": 2,
+        "peak_aggregate_pss_bytes": 100,
+        "peak_worker_descendant_pss_bytes": 80,
+        "worker_descendant_pss_peak": {
+            "status": "available",
+            "peak_bytes": 80,
+            "sample_index": 0,
+            "processes": [
+                {"pid": 30, "create_time": 3.0, "pss_bytes": 80},
+            ],
+        },
+        "process_metrics": [
+            {"pid": 10, "create_time": 1.0, "maximum_pss_bytes": 100},
+            {"pid": 20, "create_time": 2.0, "maximum_pss_bytes": 40},
+            {"pid": 30, "create_time": 3.0, "maximum_pss_bytes": 80},
+            {"pid": 31, "create_time": 4.0, "maximum_pss_bytes": 80},
+        ],
+    }
+
+    assert _resource_pss_components(
+        process_tree,
+        scheduler_process_id=20,
+    ) == (100, 40, 80)
 def _start_permit(
     tmp_path: Path,
     *,
@@ -365,6 +446,12 @@ def _axis(
         "end_to_end_seconds": seconds,
         "pss_bytes": pss_bytes,
         "scheduler_pss_bytes": pss_bytes // 10 if mode == "host_scheduler" else 0,
+        "producer_pss_bytes": pss_bytes // 5,
+        "worker_descendant_pss_bytes": (
+            pss_bytes
+            - pss_bytes // 5
+            - (pss_bytes // 10 if mode == "host_scheduler" else 0)
+        ),
         "objective": {"vehicle_count": 1, "distance": 10.0},
         "routes": [["depot", marker, "depot"]],
         "candidate_trajectory": ["candidate-0", marker],
@@ -1070,3 +1157,45 @@ def test_independent_review_rejects_tampered_calibration_receipt(
             calibration_run_dir=outputs["run_dir"],
             benchmark_dir=tmp_path / "benchmarks",
         )
+
+
+def test_calibration_reviewer_routes_sealed_failure_capsule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from evrptw.experiments import stage052_campaign_review as campaign_review
+    from evrptw.experiments import stage052_performance_calibration_review as review
+
+    raw_manifest = tmp_path / "control" / "failure.json"
+    review_manifest = tmp_path / "review" / "review_manifest.json"
+    repository = tmp_path / "repository"
+    calls: list[tuple[Path, Path]] = []
+
+    monkeypatch.setattr(review, "require_clean_repository_root", lambda _path: None)
+
+    def route_failure(*, raw_manifest_path: Path, review_manifest_path: Path) -> dict[str, object]:
+        calls.append((raw_manifest_path, review_manifest_path))
+        return {"status": "FAILED_UNKNOWN", "run_label": "attempt"}
+
+    monkeypatch.setattr(
+        campaign_review,
+        "review_lifecycle_failure_capsule",
+        route_failure,
+    )
+
+    assert (
+        review.main(
+            [
+                "--lifecycle-failure-manifest",
+                str(raw_manifest),
+                "--failure-review-manifest",
+                str(review_manifest),
+                "--repository-root",
+                str(repository),
+            ]
+        )
+        == 0
+    )
+    assert calls == [(raw_manifest, review_manifest)]
+    assert json.loads(capsys.readouterr().out)["status"] == "FAILED_UNKNOWN"

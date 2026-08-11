@@ -43,6 +43,7 @@ from evrptw.experiments.stage052_native_architectures import (
     workload_class_for_instance,
 )
 from evrptw.experiments.stage052_performance_calibration import (
+    MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION,
     OBSERVATION_PRODUCER_SCHEMA_VERSION,
     OBSERVATION_SCHEMA_VERSION,
     WORKLOAD_CLASSES,
@@ -110,6 +111,7 @@ class BlockExecution:
     scheduler_process_id: int | None
     scheduler_pss_bytes: int
     scheduler_task_receipt_inventory: tuple[Mapping[str, object], ...] = ()
+    memory_admission: Mapping[str, object] | None = None
 
     @property
     def end_to_end_seconds(self) -> float:
@@ -207,7 +209,9 @@ def _require_parent_permit(parent_run_dir: Path, permit_path: Path) -> str:
     return observed
 
 
-def _require_live_host_identity(frozen: HostPerformanceEnvelope) -> None:
+def _require_live_host_identity(
+    frozen: HostPerformanceEnvelope,
+) -> HostPerformanceEnvelope:
     observed = detect_host_performance()
     stable_fields = (
         "platform_name",
@@ -221,12 +225,172 @@ def _require_live_host_identity(frozen: HostPerformanceEnvelope) -> None:
     )
     if any(getattr(observed, field) != getattr(frozen, field) for field in stable_fields):
         raise PerformanceObservationError("live host identity differs from calibration envelope")
-    if observed.effective_memory_limit_bytes < frozen.effective_memory_limit_bytes:
-        raise PerformanceObservationError("live available memory fell below calibration envelope")
+    # MemAvailable and cgroup current usage are live resource snapshots, not
+    # stable host identity.  A child necessarily consumes some memory while it
+    # starts, so requiring its effective headroom to be at least the parent's
+    # frozen value makes every real calibration race its own startup.  The
+    # signed envelope remains the fixed admission denominator; isolated PSS
+    # calibration and the 20% headroom gate reject unsafe topologies later.
     if observed.swap_used_bytes != 0 or (
         observed.swap_current_bytes is not None and observed.swap_current_bytes != 0
     ):
         raise PerformanceObservationError("live calibration host already uses swap")
+    return observed
+
+
+def _current_process_pss_bytes(
+    path: Path = Path("/proc/self/smaps_rollup"),
+) -> int:
+    """Read the current producer PSS without treating it as future demand."""
+
+    try:
+        rows = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise PerformanceObservationError("current process PSS is unavailable") from error
+    for row in rows:
+        fields = row.split()
+        if len(fields) == 3 and fields[0] == "Pss:" and fields[2] == "kB":
+            try:
+                pss_bytes = int(fields[1]) * 1024
+            except ValueError as error:
+                raise PerformanceObservationError(
+                    "current process PSS is invalid"
+                ) from error
+            if pss_bytes <= 0:
+                raise PerformanceObservationError("current process PSS is not positive")
+            return pss_bytes
+    raise PerformanceObservationError("current process PSS is absent")
+
+
+def _producer_peak_pss_bytes(statistics: Mapping[str, object]) -> int:
+    root_pid = statistics.get("root_process_id")
+    metrics = statistics.get("process_metrics")
+    if (
+        isinstance(root_pid, bool)
+        or not isinstance(root_pid, int)
+        or not isinstance(metrics, list)
+    ):
+        raise PerformanceObservationError("producer PSS evidence is unavailable")
+    matching = [
+        item
+        for item in metrics
+        if isinstance(item, Mapping) and item.get("pid") == root_pid
+    ]
+    if len(matching) != 1:
+        raise PerformanceObservationError("producer PSS identity is ambiguous")
+    value = matching[0].get("maximum_pss_bytes")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PerformanceObservationError("producer peak PSS is unavailable")
+    return value
+
+
+def _worker_descendant_peak_pss_bytes(
+    statistics: Mapping[str, object],
+    *,
+    scheduler_process_id: int | None,
+) -> int:
+    """Validate and return the isolated sample's simultaneous descendant PSS peak."""
+
+    root_pid = statistics.get("root_process_id")
+    additional_root_pids = statistics.get("additional_root_pids")
+    metrics = statistics.get("process_metrics")
+    receipt = statistics.get("worker_descendant_pss_peak")
+    if (
+        isinstance(root_pid, bool)
+        or not isinstance(root_pid, int)
+        or not isinstance(additional_root_pids, list)
+        or not isinstance(metrics, list)
+        or not isinstance(receipt, Mapping)
+    ):
+        raise PerformanceObservationError("worker descendant PSS evidence is unavailable")
+    if any(
+        isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+        for pid in additional_root_pids
+    ):
+        raise PerformanceObservationError("additional process-root identity is invalid")
+    excluded_pids = {root_pid, *cast(list[int], additional_root_pids)}
+    if scheduler_process_id is not None:
+        if isinstance(scheduler_process_id, bool) or scheduler_process_id <= 0:
+            raise PerformanceObservationError("scheduler process identity is invalid")
+        if scheduler_process_id not in excluded_pids:
+            raise PerformanceObservationError("scheduler is not a monitored process root")
+    metric_pss: dict[tuple[int, object], int] = {}
+    for item in metrics:
+        if not isinstance(item, Mapping):
+            raise PerformanceObservationError("worker process PSS row is invalid")
+        pid = item.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise PerformanceObservationError("worker process identity is invalid")
+        create_time = item.get("create_time")
+        if (
+            isinstance(create_time, bool)
+            or not isinstance(create_time, int | float)
+            or not math.isfinite(float(create_time))
+        ):
+            raise PerformanceObservationError("worker process create time is invalid")
+        identity = (pid, create_time)
+        if identity in metric_pss:
+            raise PerformanceObservationError("worker process PSS identity is duplicated")
+        value = item.get("maximum_pss_bytes")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise PerformanceObservationError("process peak PSS is unavailable")
+        metric_pss[identity] = value
+    if receipt.get("status") != "available":
+        raise PerformanceObservationError("worker descendant PSS peak is unavailable")
+    peak = receipt.get("peak_bytes")
+    sample_index = receipt.get("sample_index")
+    process_rows = receipt.get("processes")
+    sample_count = statistics.get("sample_count")
+    if (
+        isinstance(peak, bool)
+        or not isinstance(peak, int)
+        or peak <= 0
+        or isinstance(sample_index, bool)
+        or not isinstance(sample_index, int)
+        or isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or not 0 <= sample_index < sample_count
+        or not isinstance(process_rows, list)
+        or not process_rows
+        or statistics.get("peak_worker_descendant_pss_bytes") != peak
+    ):
+        raise PerformanceObservationError("worker descendant PSS peak receipt is invalid")
+    total = 0
+    observed_identities: set[tuple[int, object]] = set()
+    for item in process_rows:
+        if not isinstance(item, Mapping) or set(item) != {
+            "pid",
+            "create_time",
+            "pss_bytes",
+        }:
+            raise PerformanceObservationError("worker descendant PSS process row is invalid")
+        pid = item.get("pid")
+        create_time = item.get("create_time")
+        pss_bytes = item.get("pss_bytes")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or pid in excluded_pids
+            or isinstance(create_time, bool)
+            or not isinstance(create_time, int | float)
+            or not math.isfinite(float(create_time))
+            or isinstance(pss_bytes, bool)
+            or not isinstance(pss_bytes, int)
+            or pss_bytes <= 0
+        ):
+            raise PerformanceObservationError("worker descendant PSS process value is invalid")
+        identity = (pid, create_time)
+        if identity in observed_identities:
+            raise PerformanceObservationError("worker descendant PSS process is duplicated")
+        maximum = metric_pss.get(identity)
+        if maximum is None or pss_bytes > maximum:
+            raise PerformanceObservationError("worker descendant PSS exceeds process maximum")
+        observed_identities.add(identity)
+        total += pss_bytes
+    if total != peak:
+        raise PerformanceObservationError("worker descendant PSS peak does not reconcile")
+    return peak
 
 
 def _atomic_signed_json(path: Path, payload: Mapping[str, object]) -> str:
@@ -766,6 +930,11 @@ def execute_mode_block(
     shard_count: int,
     archive_root: Path | None = None,
     wave_count: int = 1,
+    frozen_host: HostPerformanceEnvelope | None = None,
+    isolated_pss_bytes: int | None = None,
+    scheduler_pss_bytes: int | None = None,
+    producer_pss_bytes: int | None = None,
+    worker_descendant_pss_bytes: int | None = None,
 ) -> BlockExecution:
     """Execute one real solver block under a candidate topology."""
 
@@ -773,6 +942,34 @@ def execute_mode_block(
         raise ValueError("calibration block must be isolated or full-topology")
     if isinstance(wave_count, bool) or wave_count not in {1, 2}:
         raise ValueError("calibration block wave_count must be 1 or 2")
+    guard_values = (
+        frozen_host,
+        isolated_pss_bytes,
+        scheduler_pss_bytes,
+        producer_pss_bytes,
+        worker_descendant_pss_bytes,
+    )
+    if any(value is None for value in guard_values) != all(
+        value is None for value in guard_values
+    ):
+        raise ValueError("calibration live-memory guard is incomplete")
+    memory_admission_evidence: Mapping[str, object] | None = None
+    if frozen_host is not None:
+        live_host = _require_live_host_identity(frozen_host)
+        admission, _projected, memory_admission_evidence = _memory_admission_evidence(
+            frozen_host=frozen_host,
+            live_host=live_host,
+            topology=topology,
+            isolated_pss_bytes=cast(int, isolated_pss_bytes),
+            scheduler_pss_bytes=cast(int, scheduler_pss_bytes),
+            producer_pss_bytes=cast(int, producer_pss_bytes),
+            worker_descendant_pss_bytes=cast(int, worker_descendant_pss_bytes),
+            resident_pss_bytes=_current_process_pss_bytes(),
+        )
+        if not admission.passed:
+            raise PerformanceObservationError(
+                f"live memory admission failed before {role}: {admission.reason}"
+            )
     socket_hash = hashlib.sha256(
         f"{os.getpid()}:{receipt.build_profile}:{repeat}:{mode.value}:{topology_id}:{role}".encode()
     ).hexdigest()[:16]
@@ -804,6 +1001,7 @@ def execute_mode_block(
                 )
                 scheduler.start()
                 scheduler_pid = scheduler.process_id
+                monitor.register_additional_root(scheduler_pid)
             with ProcessPoolExecutor(
                 max_workers=shard_count,
                 mp_context=multiprocessing.get_context("spawn"),
@@ -959,6 +1157,7 @@ def execute_mode_block(
         scheduler_pid,
         scheduler_pss,
         scheduler_inventory,
+        memory_admission_evidence,
     )
 
 
@@ -1034,6 +1233,11 @@ def compare_host_scheduler_lifecycles(
     topology: ExecutionTopology,
     topology_id: str,
     archive_root: Path,
+    frozen_host: HostPerformanceEnvelope | None = None,
+    isolated_pss_bytes: int | None = None,
+    scheduler_pss_bytes: int | None = None,
+    producer_pss_bytes: int | None = None,
+    worker_descendant_pss_bytes: int | None = None,
 ) -> tuple[dict[str, object], tuple[BlockExecution, ...]]:
     """Compare two scheduler-per-wave runs with one scheduler reused for two waves."""
 
@@ -1053,6 +1257,11 @@ def compare_host_scheduler_lifecycles(
                 role=f"scheduler-per-wave-{wave_index + 1}",
                 shard_count=topology.shard_count,
                 archive_root=archive_root,
+                frozen_host=frozen_host,
+                isolated_pss_bytes=isolated_pss_bytes,
+                scheduler_pss_bytes=scheduler_pss_bytes,
+                producer_pss_bytes=producer_pss_bytes,
+                worker_descendant_pss_bytes=worker_descendant_pss_bytes,
             )
             for wave_index in range(2)
         )  # type: ignore[return-value]
@@ -1073,6 +1282,11 @@ def compare_host_scheduler_lifecycles(
             shard_count=topology.shard_count,
             archive_root=archive_root,
             wave_count=2,
+            frozen_host=frozen_host,
+            isolated_pss_bytes=isolated_pss_bytes,
+            scheduler_pss_bytes=scheduler_pss_bytes,
+            producer_pss_bytes=producer_pss_bytes,
+            worker_descendant_pss_bytes=worker_descendant_pss_bytes,
         )
 
     if repeat % 2 == 0:
@@ -1132,19 +1346,89 @@ def compare_host_scheduler_lifecycles(
 
 
 def _memory_admission(
-    host: HostPerformanceEnvelope,
+    frozen_host: HostPerformanceEnvelope,
     *,
     topology: ExecutionTopology,
     isolated_pss_bytes: int,
     scheduler_pss_bytes: int,
+    producer_pss_bytes: int,
+    worker_descendant_pss_bytes: int,
+    live_host: HostPerformanceEnvelope | None = None,
+    resident_pss_bytes: int = 0,
 ) -> tuple[MemoryAdmission, int]:
-    if scheduler_pss_bytes > isolated_pss_bytes:
-        raise PerformanceObservationError("scheduler PSS exceeds isolated process-tree PSS")
-    projected = (
-        scheduler_pss_bytes + (isolated_pss_bytes - scheduler_pss_bytes) * topology.shard_count
+    if (
+        isinstance(isolated_pss_bytes, bool)
+        or not isinstance(isolated_pss_bytes, int)
+        or isolated_pss_bytes <= 0
+        or isinstance(scheduler_pss_bytes, bool)
+        or not isinstance(scheduler_pss_bytes, int)
+        or scheduler_pss_bytes < 0
+        or isinstance(producer_pss_bytes, bool)
+        or not isinstance(producer_pss_bytes, int)
+        or producer_pss_bytes <= 0
+        or isinstance(worker_descendant_pss_bytes, bool)
+        or not isinstance(worker_descendant_pss_bytes, int)
+        or worker_descendant_pss_bytes <= 0
+    ):
+        raise PerformanceObservationError("isolated PSS components are invalid")
+    if (
+        isinstance(resident_pss_bytes, bool)
+        or not isinstance(resident_pss_bytes, int)
+        or resident_pss_bytes < 0
+    ):
+        raise ValueError("resident_pss_bytes must be a non-negative integer")
+    incremental_process_pss_bytes = (
+        scheduler_pss_bytes + worker_descendant_pss_bytes * topology.shard_count
     )
-    admission = check_memory_admission(host, projected, headroom_fraction=0.20)
-    if projected > math.floor(host.effective_memory_limit_bytes * 0.80):
+    projected = producer_pss_bytes + incremental_process_pss_bytes
+    if live_host is None:
+        admission = check_memory_admission(
+            frozen_host,
+            projected,
+            headroom_fraction=0.20,
+        )
+        effective_available = frozen_host.effective_memory_limit_bytes
+        incremental_required = projected
+    else:
+        effective_available = min(
+            frozen_host.effective_memory_limit_bytes,
+            live_host.effective_memory_limit_bytes,
+        )
+        incremental_required = incremental_process_pss_bytes
+        headroom = math.ceil(incremental_required * 0.20)
+        swap_failure = live_host.swap_used_bytes > 0 or (
+            live_host.swap_current_bytes is not None
+            and live_host.swap_current_bytes > 0
+        )
+        passed = (
+            not swap_failure
+            and effective_available >= incremental_required + headroom
+            and incremental_required <= math.floor(effective_available * 0.80)
+        )
+        reason = (
+            "live swap is non-zero"
+            if swap_failure
+            else (
+                "incremental projected PSS exceeds 80% of live effective memory"
+                if incremental_required > math.floor(effective_available * 0.80)
+                else (
+                    "live effective memory is below incremental PSS plus headroom"
+                    if effective_available < incremental_required + headroom
+                    else "live memory and swap admission passed"
+                )
+            )
+        )
+        admission = MemoryAdmission(
+            passed,
+            effective_available,
+            incremental_required,
+            headroom,
+            live_host.swap_total_bytes,
+            live_host.swap_used_bytes,
+            reason,
+            0 if live_host.swap_current_bytes is None else live_host.swap_current_bytes,
+        )
+    if incremental_required > math.floor(effective_available * 0.80):
         admission = MemoryAdmission(
             False,
             admission.available_bytes,
@@ -1152,10 +1436,54 @@ def _memory_admission(
             admission.headroom_bytes,
             admission.swap_total_bytes,
             admission.swap_used_bytes,
-            "projected PSS exceeds 80% of effective memory",
+            (
+                "projected PSS exceeds 80% of effective memory"
+                if live_host is None
+                else "incremental projected PSS exceeds 80% of effective memory"
+            ),
             admission.swap_current_bytes,
         )
     return admission, projected
+
+
+def _memory_admission_evidence(
+    *,
+    frozen_host: HostPerformanceEnvelope,
+    live_host: HostPerformanceEnvelope,
+    topology: ExecutionTopology,
+    isolated_pss_bytes: int,
+    scheduler_pss_bytes: int,
+    producer_pss_bytes: int,
+    worker_descendant_pss_bytes: int,
+    resident_pss_bytes: int,
+) -> tuple[MemoryAdmission, int, dict[str, object]]:
+    admission, projected = _memory_admission(
+        frozen_host,
+        topology=topology,
+        isolated_pss_bytes=isolated_pss_bytes,
+        scheduler_pss_bytes=scheduler_pss_bytes,
+        producer_pss_bytes=producer_pss_bytes,
+        worker_descendant_pss_bytes=worker_descendant_pss_bytes,
+        live_host=live_host,
+        resident_pss_bytes=resident_pss_bytes,
+    )
+    return (
+        admission,
+        projected,
+        {
+            "schema_version": MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION,
+            "frozen_effective_memory_limit_bytes": (
+                frozen_host.effective_memory_limit_bytes
+            ),
+            "live_host": live_host.to_dict(),
+            "resident_pss_bytes": resident_pss_bytes,
+            "isolated_producer_pss_bytes": producer_pss_bytes,
+            "isolated_worker_descendant_pss_bytes": worker_descendant_pss_bytes,
+            "projected_concurrent_pss_bytes": projected,
+            "incremental_required_bytes": admission.required_bytes,
+            "admission": admission.to_dict(),
+        },
+    )
 
 
 def _parallel_diagnostics(
@@ -1210,6 +1538,8 @@ def _axis_observation(
     seed: int,
     isolated_pss_bytes: int,
     scheduler_pss_bytes: int,
+    producer_pss_bytes: int,
+    worker_descendant_pss_bytes: int,
 ) -> dict[str, object]:
     semantic = _replay_identical(block.payloads)
     return {
@@ -1224,6 +1554,8 @@ def _axis_observation(
         "end_to_end_seconds": block.end_to_end_seconds,
         "pss_bytes": isolated_pss_bytes,
         "scheduler_pss_bytes": scheduler_pss_bytes,
+        "producer_pss_bytes": producer_pss_bytes,
+        "worker_descendant_pss_bytes": worker_descendant_pss_bytes,
         "objective": semantic["objective"],
         "routes": semantic["routes"],
         "candidate_trajectory": semantic["candidate_trajectory"],
@@ -1355,7 +1687,7 @@ def produce_fixed_work_observation(
     resources: list[dict[str, object]] = []
     host_topology_candidates: dict[
         str,
-        list[tuple[float, str, ExecutionTopology]],
+        list[tuple[float, str, ExecutionTopology, int, int, int, int]],
     ] = {workload: [] for workload in WORKLOAD_CLASSES}
     raw_output_root.mkdir(parents=True)
     for mode in ArchitectureMode:
@@ -1385,6 +1717,22 @@ def produce_fixed_work_observation(
                 )
                 inventory.extend(probe.raw_inventory)
                 scheduler_inventory.extend(probe.scheduler_task_receipt_inventory)
+                producer_pss = _producer_peak_pss_bytes(probe.resource_statistics)
+                worker_descendant_pss = _worker_descendant_peak_pss_bytes(
+                    probe.resource_statistics,
+                    scheduler_process_id=probe.scheduler_process_id,
+                )
+                live_host = _require_live_host_identity(detected_host)
+                admission, projected, admission_evidence = _memory_admission_evidence(
+                    frozen_host=detected_host,
+                    live_host=live_host,
+                    topology=topology,
+                    isolated_pss_bytes=probe.resource_summary.pss_bytes,
+                    scheduler_pss_bytes=probe.scheduler_pss_bytes,
+                    producer_pss_bytes=producer_pss,
+                    worker_descendant_pss_bytes=worker_descendant_pss,
+                    resident_pss_bytes=_current_process_pss_bytes(),
+                )
                 resources.append(
                     {
                         "mode": mode.value,
@@ -1393,13 +1741,8 @@ def produce_fixed_work_observation(
                         "role": "isolated-memory-probe",
                         "resource_summary": probe.resource_summary.to_dict(),
                         "raw_resource_statistics": dict(probe.resource_statistics),
+                        "memory_admission": admission_evidence,
                     }
-                )
-                admission, projected = _memory_admission(
-                    detected_host,
-                    topology=topology,
-                    isolated_pss_bytes=probe.resource_summary.pss_bytes,
-                    scheduler_pss_bytes=probe.scheduler_pss_bytes,
                 )
                 if not admission.passed:
                     memory_rejections.append(
@@ -1410,16 +1753,17 @@ def produce_fixed_work_observation(
                             "topology": topology.to_dict(),
                             "isolated_pss_bytes": probe.resource_summary.pss_bytes,
                             "scheduler_pss_bytes": probe.scheduler_pss_bytes,
+                            "producer_pss_bytes": producer_pss,
+                            "worker_descendant_pss_bytes": worker_descendant_pss,
                             "projected_concurrent_pss_bytes": projected,
-                            "effective_memory_limit_bytes": (
-                                detected_host.effective_memory_limit_bytes
-                            ),
+                            "effective_memory_limit_bytes": admission.available_bytes,
                             "admission_available_bytes": admission.available_bytes,
                             "admission_required_bytes": admission.required_bytes,
                             "admission_headroom_bytes": admission.headroom_bytes,
                             "swap_used_bytes": admission.swap_used_bytes,
                             "swap_current_bytes": admission.swap_current_bytes,
                             "reason": admission.reason,
+                            "memory_admission": admission_evidence,
                         }
                     )
                     continue
@@ -1437,7 +1781,16 @@ def produce_fixed_work_observation(
                     role="admitted-mode-block",
                     shard_count=topology.shard_count,
                     archive_root=parent,
+                    frozen_host=detected_host,
+                    isolated_pss_bytes=probe.resource_summary.pss_bytes,
+                    scheduler_pss_bytes=probe.scheduler_pss_bytes,
+                    producer_pss_bytes=producer_pss,
+                    worker_descendant_pss_bytes=worker_descendant_pss,
                 )
+                if block.memory_admission is None:
+                    raise PerformanceObservationError(
+                        "admitted block lacks live memory evidence"
+                    )
                 inventory.extend(block.raw_inventory)
                 scheduler_inventory.extend(block.scheduler_task_receipt_inventory)
                 resources.append(
@@ -1453,6 +1806,7 @@ def produce_fixed_work_observation(
                             topology=topology,
                         ),
                         "raw_resource_statistics": dict(block.resource_statistics),
+                        "memory_admission": dict(block.memory_admission),
                         "scheduler_statistics": (
                             None
                             if block.scheduler_statistics is None
@@ -1471,12 +1825,22 @@ def produce_fixed_work_observation(
                         seed=seed,
                         isolated_pss_bytes=probe.resource_summary.pss_bytes,
                         scheduler_pss_bytes=probe.scheduler_pss_bytes,
+                        producer_pss_bytes=producer_pss,
+                        worker_descendant_pss_bytes=worker_descendant_pss,
                     )
                 )
                 successful += 1
                 if mode is ArchitectureMode.HOST_SCHEDULER:
                     host_topology_candidates[workload_class].append(
-                        (block.end_to_end_seconds, topology_id, topology)
+                        (
+                            block.end_to_end_seconds,
+                            topology_id,
+                            topology,
+                            probe.resource_summary.pss_bytes,
+                            probe.scheduler_pss_bytes,
+                            producer_pss,
+                            worker_descendant_pss,
+                        )
                     )
             if successful == 0:
                 raise PerformanceObservationError(
@@ -1490,7 +1854,15 @@ def produce_fixed_work_observation(
             raise PerformanceObservationError("host scheduler lifecycle evidence is missing")
         instance_name = instances[workload_class]
         lifecycle[workload_class] = []
-        for _elapsed, topology_id, topology in sorted(
+        for (
+            _elapsed,
+            topology_id,
+            topology,
+            isolated_pss,
+            scheduler_pss,
+            producer_pss,
+            worker_descendant_pss,
+        ) in sorted(
             candidates,
             key=lambda item: item[1],
         ):
@@ -1505,9 +1877,18 @@ def produce_fixed_work_observation(
                 topology=topology,
                 topology_id=topology_id,
                 archive_root=parent,
+                frozen_host=detected_host,
+                isolated_pss_bytes=isolated_pss,
+                scheduler_pss_bytes=scheduler_pss,
+                producer_pss_bytes=producer_pss,
+                worker_descendant_pss_bytes=worker_descendant_pss,
             )
             lifecycle[workload_class].append(lifecycle_receipt)
             for index, block in enumerate(lifecycle_blocks):
+                if block.memory_admission is None:
+                    raise PerformanceObservationError(
+                        "scheduler lifecycle block lacks live memory evidence"
+                    )
                 inventory.extend(block.raw_inventory)
                 scheduler_inventory.extend(block.scheduler_task_receipt_inventory)
                 resources.append(
@@ -1522,6 +1903,7 @@ def produce_fixed_work_observation(
                         ),
                         "resource_summary": block.resource_summary.to_dict(),
                         "raw_resource_statistics": dict(block.resource_statistics),
+                        "memory_admission": dict(block.memory_admission),
                         "scheduler_statistics": (
                             None
                             if block.scheduler_statistics is None

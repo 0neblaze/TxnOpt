@@ -56,8 +56,11 @@ from evrptw.storage_governance import (
 
 CALIBRATION_SCHEMA_VERSION: Final = "stage05.2-native-architecture-performance-calibration-v1"
 WHEEL_RECEIPT_SCHEMA_VERSION: Final = "stage05.2-native-architecture-wheel-receipt-v2"
-OBSERVATION_SCHEMA_VERSION: Final = "stage05.2-native-architecture-fixed-work-observation-v3"
-OBSERVATION_PRODUCER_SCHEMA_VERSION: Final = "stage05.2-native-architecture-observation-producer-v3"
+OBSERVATION_SCHEMA_VERSION: Final = "stage05.2-native-architecture-fixed-work-observation-v5"
+OBSERVATION_PRODUCER_SCHEMA_VERSION: Final = "stage05.2-native-architecture-observation-producer-v5"
+MEMORY_ADMISSION_EVIDENCE_SCHEMA_VERSION: Final = (
+    "stage05.2-calibration-live-memory-admission-v2"
+)
 CALIBRATION_RECEIPT_SCHEMA_VERSION: Final = "stage05.2-native-architecture-calibration-receipt-v1"
 REQUIRED_BUILD_PROFILES: Final = ("portable-o3", "portable-lto")
 OPTIONAL_BUILD_PROFILES: Final = ("host-native-lto",)
@@ -555,12 +558,19 @@ class AxisObservation:
     producer_end_to_end_seconds: float
     independent_replay_seconds: float
     end_to_end_seconds: float
-    # PSS of one isolated client axis. The selector projects this value over
-    # the frozen shard count before memory admission.
+    # Synchronous aggregate peak PSS of one isolated probe, retained as a
+    # diagnostic and raw-resource cross-check rather than used by subtraction.
     pss_bytes: int
     # Shared scheduler PSS included in pss_bytes for host-scheduler axes.
     # It is counted once rather than once per client.
     scheduler_pss_bytes: int
+    # Producer PSS included in pss_bytes. It is counted exactly once when the
+    # isolated client component is projected over the shard count.
+    producer_pss_bytes: int
+    # Conservative sum of each non-producer, non-shared-scheduler descendant's
+    # independently observed peak PSS. This avoids subtracting non-simultaneous
+    # maxima and is multiplied by the frozen shard count.
+    worker_descendant_pss_bytes: int
     objective: object
     routes: object
     candidate_trajectory: object
@@ -603,6 +613,8 @@ class AxisObservation:
             raise CalibrationError("axis end-to-end timing does not reconcile")
         _positive(self.pss_bytes, "pss_bytes")
         _nonnegative(self.scheduler_pss_bytes, "scheduler_pss_bytes")
+        _positive(self.producer_pss_bytes, "producer_pss_bytes")
+        _positive(self.worker_descendant_pss_bytes, "worker_descendant_pss_bytes")
         if self.scheduler_pss_bytes > self.pss_bytes:
             raise CalibrationError("scheduler_pss_bytes exceeds isolated axis PSS")
         if self.mode != "host_scheduler" and self.scheduler_pss_bytes != 0:
@@ -674,6 +686,8 @@ class AxisObservation:
             "end_to_end_seconds": self.end_to_end_seconds,
             "pss_bytes": self.pss_bytes,
             "scheduler_pss_bytes": self.scheduler_pss_bytes,
+            "producer_pss_bytes": self.producer_pss_bytes,
+            "worker_descendant_pss_bytes": self.worker_descendant_pss_bytes,
             "objective": self.objective,
             "routes": self.routes,
             "candidate_trajectory": self.candidate_trajectory,
@@ -711,6 +725,8 @@ class AxisObservation:
             "end_to_end_seconds",
             "pss_bytes",
             "scheduler_pss_bytes",
+            "producer_pss_bytes",
+            "worker_descendant_pss_bytes",
             "objective",
             "routes",
             "candidate_trajectory",
@@ -771,6 +787,14 @@ class AxisObservation:
             scheduler_pss_bytes=_nonnegative(
                 payload["scheduler_pss_bytes"],
                 "scheduler_pss_bytes",
+            ),
+            producer_pss_bytes=_positive(
+                payload["producer_pss_bytes"],
+                "producer_pss_bytes",
+            ),
+            worker_descendant_pss_bytes=_positive(
+                payload["worker_descendant_pss_bytes"],
+                "worker_descendant_pss_bytes",
             ),
             objective=payload["objective"],
             routes=payload["routes"],
@@ -1254,9 +1278,12 @@ def _stats(
                 topology = values[0].topology
                 if any(item.topology.to_dict() != topology.to_dict() for item in values):
                     raise CalibrationError("build-selection topology identity changed")
-                peak = max(item.pss_bytes for item in values)
-                scheduler_peak = max(item.scheduler_pss_bytes for item in values)
-                projected = scheduler_peak + (peak - scheduler_peak) * topology.shard_count
+                projected = max(
+                    item.producer_pss_bytes
+                    + item.scheduler_pss_bytes
+                    + item.worker_descendant_pss_bytes * topology.shard_count
+                    for item in values
+                )
                 admission = check_memory_admission(host, projected, headroom_fraction=0.20)
                 if not admission.passed or projected > math.floor(
                     host.effective_memory_limit_bytes * 0.80
@@ -1431,8 +1458,16 @@ def _select_topologies(
                 continue
             peak = max(item.pss_bytes for item in values)
             scheduler_peak = max(item.scheduler_pss_bytes for item in values)
-            client_peak = peak - scheduler_peak
-            projected_peak = scheduler_peak + client_peak * topology.shard_count
+            producer_peak = max(item.producer_pss_bytes for item in values)
+            worker_descendant_peak = max(
+                item.worker_descendant_pss_bytes for item in values
+            )
+            projected_peak = max(
+                item.producer_pss_bytes
+                + item.scheduler_pss_bytes
+                + item.worker_descendant_pss_bytes * topology.shard_count
+                for item in values
+            )
             admission = check_memory_admission(
                 host,
                 projected_peak,
@@ -1466,6 +1501,8 @@ def _select_topologies(
             candidate_detail[topology_id] = {
                 "pss_peak_bytes": peak,
                 "scheduler_pss_peak_bytes": scheduler_peak,
+                "producer_pss_peak_bytes": producer_peak,
+                "worker_descendant_pss_peak_bytes": worker_descendant_peak,
                 "projected_concurrent_pss_bytes": projected_peak,
                 "projection_shard_count": topology.shard_count,
                 "median_end_to_end_seconds": median,

@@ -583,6 +583,9 @@ class ProcessTreeMonitor:
     _MAX_BOUNDED_SAMPLES: ClassVar[int] = _MAX_BOUNDED_SAMPLES
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
+    _root_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _registered_additional_root_pids: set[int] = field(default_factory=set, init=False)
+    _worker_descendant_classification_epoch: int = field(default=0, init=False)
     _observations: dict[tuple[int, float], _ProcessObservation] = field(
         default_factory=dict,
         init=False,
@@ -617,6 +620,13 @@ class ProcessTreeMonitor:
     _thread_affinity_intersection: set[int] | None = field(default=None, init=False)
     _peak_aggregate_rss_bytes: int = field(default=0, init=False)
     _peak_aggregate_pss_bytes: int | None = field(default=0, init=False)
+    _peak_worker_descendant_pss_bytes: int = field(default=0, init=False)
+    _peak_worker_descendant_pss_sample_index: int | None = field(default=None, init=False)
+    _peak_worker_descendant_pss_processes: tuple[tuple[int, float, int], ...] = field(
+        default=(),
+        init=False,
+    )
+    _worker_descendant_pss_available: bool = field(default=True, init=False)
     _peak_processes: int = field(default=0, init=False)
     _peak_threads: int = field(default=0, init=False)
     _sample_count: int = field(default=0, init=False)
@@ -660,6 +670,7 @@ class ProcessTreeMonitor:
             for name in (
                 "aggregate_rss_bytes",
                 "aggregate_pss_bytes",
+                "worker_descendant_pss_bytes",
                 "aggregate_user_cpu_seconds",
                 "aggregate_system_cpu_seconds",
                 "aggregate_processes",
@@ -680,6 +691,7 @@ class ProcessTreeMonitor:
             raise ValueError("excluded process-tree roots must be positive PIDs")
         if set(self.additional_root_pids) & set(self.excluded_root_pids):
             raise ValueError("a process-tree root cannot be both included and excluded")
+        self._registered_additional_root_pids.update(self.additional_root_pids)
 
     def __enter__(self) -> ProcessTreeMonitor:
         if self._thread is not None:
@@ -710,6 +722,36 @@ class ProcessTreeMonitor:
             raise RuntimeError("process-tree monitor did not stop")
         self._sample(force_thread_details=True)
         self._monitor_end_monotonic = time.monotonic()
+
+    def register_additional_root(self, pid: int) -> None:
+        """Classify a newly started child as a shared root before worker launch."""
+
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ValueError("additional process-tree root must be a positive PID")
+        if pid == os.getpid() or pid in self.excluded_root_pids:
+            raise ValueError("additional process-tree root conflicts with another root role")
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            raise RuntimeError("additional process-tree roots require a running monitor")
+        try:
+            process = psutil.Process(pid)
+        except _PROCESS_ERRORS as error:
+            raise RuntimeError("additional process-tree root is not observable") from error
+        if _process_identity(process) is None:
+            raise RuntimeError("additional process-tree root identity is unavailable")
+        with self._root_lock:
+            if pid in self._registered_additional_root_pids:
+                return
+            self._registered_additional_root_pids.add(pid)
+            self._worker_descendant_classification_epoch += 1
+            # Samples recorded before this root existed used a different role
+            # partition.  No worker has been submitted yet at the calibration
+            # call site, so discard that incompatible descendant peak.
+            self._peak_worker_descendant_pss_bytes = 0
+            self._peak_worker_descendant_pss_sample_index = None
+            self._peak_worker_descendant_pss_processes = ()
+            self._worker_descendant_pss_available = True
+            self._bounded_samples["worker_descendant_pss_bytes"].clear()
 
     def statistics(
         self,
@@ -845,6 +887,35 @@ class ProcessTreeMonitor:
             if self._pss_available and self._peak_aggregate_pss_bytes is not None
             else _UNAVAILABLE
         )
+        worker_descendant_pss_peak: dict[str, object]
+        if (
+            self._worker_descendant_pss_available
+            and self._peak_worker_descendant_pss_bytes > 0
+            and self._peak_worker_descendant_pss_sample_index is not None
+            and self._peak_worker_descendant_pss_processes
+        ):
+            worker_descendant_pss_peak = {
+                "status": "available",
+                "peak_bytes": self._peak_worker_descendant_pss_bytes,
+                "sample_index": self._peak_worker_descendant_pss_sample_index,
+                "processes": [
+                    {
+                        "pid": pid,
+                        "create_time": create_time,
+                        "pss_bytes": process_pss_bytes,
+                    }
+                    for pid, create_time, process_pss_bytes in (
+                        self._peak_worker_descendant_pss_processes
+                    )
+                ],
+            }
+        else:
+            worker_descendant_pss_peak = {
+                "status": _UNAVAILABLE,
+                "peak_bytes": _UNAVAILABLE,
+                "sample_index": _UNAVAILABLE,
+                "processes": _UNAVAILABLE,
+            }
         threads_peak: int | str = self._peak_threads if self._threads_available else _UNAVAILABLE
         affinity_union: list[int] | str = (
             sorted(self._affinity_union) if self._affinity_available else _UNAVAILABLE
@@ -884,11 +955,15 @@ class ProcessTreeMonitor:
             "peak_aggregate_threads": threads_peak,
             "peak_aggregate_rss_bytes": self._peak_aggregate_rss_bytes,
             "peak_aggregate_pss_bytes": pss_peak,
+            "peak_worker_descendant_pss_bytes": worker_descendant_pss_peak[
+                "peak_bytes"
+            ],
+            "worker_descendant_pss_peak": worker_descendant_pss_peak,
             "process_tree_cpu_seconds": cpu_seconds,
             "cpu_utilization_percent_of_one_core": utilization_of_one_core,
             "cpu_utilization_percent_of_compute_limit": utilization_of_limit,
             "root_process_id": os.getpid(),
-            "additional_root_pids": list(self.additional_root_pids),
+            "additional_root_pids": sorted(self._registered_additional_root_pids),
             "excluded_root_pids": list(self.excluded_root_pids),
             # Extended trustworthy resource envelope.
             "monitor_elapsed_seconds": monitor_elapsed or effective_elapsed,
@@ -1305,6 +1380,9 @@ class ProcessTreeMonitor:
             self._thread_discovery_sample_count += 1
         self._update_cpu_stat()
         self._update_pressure()
+        with self._root_lock:
+            additional_root_pids = tuple(sorted(self._registered_additional_root_pids))
+            classification_epoch = self._worker_descendant_classification_epoch
         processes: dict[tuple[int, float], psutil.Process] = {}
         excluded: set[tuple[int, float]] = set()
         for pid in self.excluded_root_pids:
@@ -1317,7 +1395,7 @@ class ProcessTreeMonitor:
                 identity = _process_identity(process)
                 if identity is not None:
                     excluded.add(identity)
-        for pid in (os.getpid(), *self.additional_root_pids):
+        for pid in (os.getpid(), *additional_root_pids):
             try:
                 root = psutil.Process(pid)
                 candidates = (root, *root.children(recursive=True))
@@ -1336,9 +1414,21 @@ class ProcessTreeMonitor:
         aggregate_user_cpu = 0.0
         aggregate_system_cpu = 0.0
         aggregate_processes = 0
+        process_root_pids = {os.getpid(), *additional_root_pids}
+        worker_descendant_pss_complete = True
+        worker_descendant_pss_processes: list[tuple[int, float, int]] = []
         for identity, process in processes.items():
             sample = _read_process_sample(process)
             if sample is None:
+                # A short-lived spawn worker may exit between recursive
+                # discovery and the per-process read.  It is no longer part of
+                # this simultaneous sample; only a still-identical live
+                # process makes the sample incomplete.
+                if (
+                    identity[0] not in process_root_pids
+                    and _process_identity(process) == identity
+                ):
+                    worker_descendant_pss_complete = False
                 continue
             aggregate_processes += 1
             aggregate_rss += sample.rss_bytes
@@ -1348,6 +1438,13 @@ class ProcessTreeMonitor:
                 aggregate_pss_complete = False
             else:
                 aggregate_pss += sample.pss_bytes
+            if identity[0] not in process_root_pids:
+                if sample.pss_bytes is None:
+                    worker_descendant_pss_complete = False
+                else:
+                    worker_descendant_pss_processes.append(
+                        (identity[0], identity[1], sample.pss_bytes)
+                    )
             if sample.thread_count is None:
                 aggregate_threads_complete = False
             else:
@@ -1416,6 +1513,11 @@ class ProcessTreeMonitor:
             aggregate_threads_complete = False
             self._affinity_available = False
         self._pss_available = self._pss_available and aggregate_pss_complete
+        self._record_worker_descendant_pss_sample(
+            worker_descendant_pss_processes,
+            complete=worker_descendant_pss_complete,
+            classification_epoch=classification_epoch,
+        )
         self._threads_available = self._threads_available and aggregate_threads_complete
         if aggregate_pss_complete:
             self._peak_aggregate_pss_bytes = max(
@@ -1438,6 +1540,33 @@ class ProcessTreeMonitor:
         if aggregate_threads_complete:
             self._bounded_samples["aggregate_threads"].append(float(aggregate_threads))
         self._sample_count += 1
+
+    def _record_worker_descendant_pss_sample(
+        self,
+        processes: list[tuple[int, float, int]],
+        *,
+        complete: bool,
+        classification_epoch: int | None = None,
+    ) -> None:
+        with self._root_lock:
+            if (
+                classification_epoch is not None
+                and classification_epoch != self._worker_descendant_classification_epoch
+            ):
+                return
+            if not complete:
+                self._worker_descendant_pss_available = False
+                return
+            normalized = tuple(sorted(processes))
+            if any(pss_bytes <= 0 for _pid, _create_time, pss_bytes in normalized):
+                self._worker_descendant_pss_available = False
+                return
+            aggregate = sum(pss_bytes for _pid, _create_time, pss_bytes in normalized)
+            self._bounded_samples["worker_descendant_pss_bytes"].append(float(aggregate))
+            if aggregate > self._peak_worker_descendant_pss_bytes:
+                self._peak_worker_descendant_pss_bytes = aggregate
+                self._peak_worker_descendant_pss_sample_index = self._sample_count
+                self._peak_worker_descendant_pss_processes = normalized
 
 
 __all__ = ("ProcessTreeMonitor",)

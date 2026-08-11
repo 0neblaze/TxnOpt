@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
+import evrptw.experiments.stage052_performance_observation as observation_module
 from evrptw.experiments.stage052_performance_observation import (
     BlockExecution,
     PerformanceObservationError,
@@ -16,10 +20,14 @@ from evrptw.experiments.stage052_performance_observation import (
     _memory_admission,
     _parallel_diagnostics,
     _replay_identical,
+    _require_live_host_identity,
     _resource_summary,
     _signed_axis,
+    _worker_descendant_peak_pss_bytes,
     compare_host_scheduler_lifecycles,
 )
+from evrptw.native_scheduler import NativeHostScheduler
+from evrptw.runtime_envelope import ProcessTreeMonitor
 from evrptw.stage052_performance import (
     ExecutionTopology,
     HostPerformanceEnvelope,
@@ -48,6 +56,199 @@ def _host(*, available: int = 10_000) -> HostPerformanceEnvelope:
         memory_available_bytes=available,
         topology_source="provided",
     )
+
+
+def test_live_host_identity_allows_dynamic_available_memory_to_decrease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = _host()
+    observed = replace(
+        frozen,
+        memory_available_bytes=frozen.memory_available_bytes - 1,
+        memory_current_bytes=1,
+    )
+    monkeypatch.setattr(observation_module, "detect_host_performance", lambda: observed)
+
+    _require_live_host_identity(frozen)
+
+
+def test_live_host_identity_rejects_stable_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = _host()
+    observed = replace(frozen, memory_total_bytes=frozen.memory_total_bytes + 1)
+    monkeypatch.setattr(observation_module, "detect_host_performance", lambda: observed)
+
+    with pytest.raises(PerformanceObservationError, match="live host identity differs"):
+        _require_live_host_identity(frozen)
+
+
+def test_live_host_identity_rejects_actual_swap_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = _host()
+    observed = replace(
+        frozen,
+        swap_total_bytes=1,
+        swap_used_bytes=1,
+        swap_current_bytes=1,
+    )
+    monkeypatch.setattr(observation_module, "detect_host_performance", lambda: observed)
+
+    with pytest.raises(PerformanceObservationError, match="already uses swap"):
+        _require_live_host_identity(frozen)
+
+
+def test_live_memory_admission_uses_incremental_pss_without_startup_self_race() -> None:
+    frozen = _host()
+    live = replace(frozen, memory_available_bytes=frozen.memory_available_bytes - 1)
+
+    admission, projected = _memory_admission(
+        frozen,
+        topology=_topology(shards=4),
+        isolated_pss_bytes=1_500,
+        scheduler_pss_bytes=500,
+        producer_pss_bytes=1_000,
+        worker_descendant_pss_bytes=100,
+        live_host=live,
+        resident_pss_bytes=1_000,
+    )
+
+    assert projected == 1_900
+    assert admission.required_bytes == 900
+    assert admission.available_bytes == 9_999
+    assert admission.passed
+
+
+def test_live_memory_admission_rejects_large_available_memory_drop() -> None:
+    frozen = _host()
+    live = replace(frozen, memory_available_bytes=2_000)
+
+    admission, projected = _memory_admission(
+        frozen,
+        topology=_topology(shards=4),
+        isolated_pss_bytes=2_500,
+        scheduler_pss_bytes=500,
+        producer_pss_bytes=1_000,
+        worker_descendant_pss_bytes=1_000,
+        live_host=live,
+        resident_pss_bytes=1_000,
+    )
+
+    assert projected == 5_500
+    assert admission.required_bytes == 4_500
+    assert admission.available_bytes == 2_000
+    assert not admission.passed
+
+
+def test_live_memory_admission_rejects_increased_cgroup_current() -> None:
+    frozen = replace(_host(), memory_limit_bytes=10_000, memory_current_bytes=0)
+    live = replace(frozen, memory_current_bytes=9_000)
+
+    admission, _projected = _memory_admission(
+        frozen,
+        topology=_topology(shards=4),
+        isolated_pss_bytes=2_500,
+        scheduler_pss_bytes=500,
+        producer_pss_bytes=1_000,
+        worker_descendant_pss_bytes=1_000,
+        live_host=live,
+        resident_pss_bytes=1_000,
+    )
+
+    assert admission.available_bytes == 1_000
+    assert not admission.passed
+
+
+def test_live_memory_admission_never_erases_descendant_demand() -> None:
+    frozen = _host(available=1_000)
+    live = replace(frozen, memory_available_bytes=150)
+
+    admission, projected = _memory_admission(
+        frozen,
+        topology=_topology(shards=2),
+        isolated_pss_bytes=200,
+        scheduler_pss_bytes=0,
+        producer_pss_bytes=100,
+        worker_descendant_pss_bytes=100,
+        live_host=live,
+        resident_pss_bytes=400,
+    )
+
+    assert projected == 300
+    assert admission.required_bytes == 200
+    assert not admission.passed
+
+
+def test_worker_descendant_projection_uses_simultaneous_peak_not_lifetime_pids() -> None:
+    statistics: dict[str, object] = {
+        "root_process_id": 10,
+        "additional_root_pids": [],
+        "sample_count": 2,
+        "peak_aggregate_pss_bytes": 100,
+        "peak_worker_descendant_pss_bytes": 80,
+        "worker_descendant_pss_peak": {
+            "status": "available",
+            "peak_bytes": 80,
+            "sample_index": 0,
+            "processes": [
+                {"pid": 11, "create_time": 2.0, "pss_bytes": 80},
+            ],
+        },
+        "process_metrics": [
+            {
+                "pid": 10,
+                "create_time": 1.0,
+                "maximum_pss_bytes": 100,
+            },
+            {
+                "pid": 11,
+                "create_time": 2.0,
+                "maximum_pss_bytes": 80,
+            },
+            {
+                "pid": 12,
+                "create_time": 3.0,
+                "maximum_pss_bytes": 80,
+            },
+        ],
+    }
+
+    assert (
+        _worker_descendant_peak_pss_bytes(
+            statistics,
+            scheduler_process_id=None,
+        )
+        == 80
+    )
+
+
+def test_real_host_scheduler_is_registered_before_worker_classification(
+    tmp_path: Path,
+) -> None:
+    endpoint = tmp_path / "scheduler.sock"
+    scheduler = NativeHostScheduler(
+        endpoint,
+        worker_threads=1,
+        request_threads=1,
+        cpu_affinity=(min(os.sched_getaffinity(0)),),
+        task_receipt_path=tmp_path / "task-receipts.jsonl",
+    )
+    started = time.perf_counter()
+    scheduler_pid: int | None = None
+    with ProcessTreeMonitor(sample_interval_seconds=0.002) as monitor:
+        try:
+            scheduler.start()
+            scheduler_pid = scheduler.process_id
+            monitor.register_additional_root(scheduler_pid)
+            time.sleep(0.02)
+        finally:
+            scheduler.close()
+    elapsed = time.perf_counter() - started
+    statistics = monitor.statistics(elapsed_seconds=elapsed, compute_thread_limit=1)
+
+    assert scheduler_pid in statistics["additional_root_pids"]
+    assert statistics["worker_descendant_pss_peak"]["status"] == "unavailable"
 
 
 def _axis_payload(
@@ -175,17 +376,21 @@ def test_memory_projection_counts_shared_scheduler_once_and_applies_80_percent()
         topology=topology,
         isolated_pss_bytes=1_500,
         scheduler_pss_bytes=500,
+        producer_pss_bytes=500,
+        worker_descendant_pss_bytes=500,
     )
-    assert projected == 4_500
+    assert projected == 3_000
     assert admitted.passed
 
     rejected, projected = _memory_admission(
         _host(),
         topology=topology,
-        isolated_pss_bytes=2_500,
+        isolated_pss_bytes=3_000,
         scheduler_pss_bytes=500,
+        producer_pss_bytes=500,
+        worker_descendant_pss_bytes=2_000,
     )
-    assert projected == 8_500
+    assert projected == 9_000
     assert not rejected.passed
     assert rejected.reason == "projected PSS exceeds 80% of effective memory"
 
@@ -353,7 +558,7 @@ def test_scheduler_lifecycle_compares_two_per_wave_starts_with_two_wave_reuse(
 
     def execute(**kwargs: object) -> BlockExecution:
         role = str(kwargs["role"])
-        wave_count = int(kwargs.get("wave_count", 1))
+        wave_count = cast(int, kwargs.get("wave_count", 1))
         calls.append((role, wave_count))
         elapsed = 3.0 if wave_count == 2 else 2.0
         payload_count = 4 if wave_count == 2 else 2
