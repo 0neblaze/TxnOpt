@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 
+from evrptw.experiment_lifecycle import ExperimentCatalog
 from evrptw.experiments.stage052_performance_calibration import (
     MODE_NAMES,
     OBSERVATION_PRODUCER_SCHEMA_VERSION,
@@ -44,6 +45,26 @@ from evrptw.stage052_performance import (
     generate_execution_topologies,
 )
 from evrptw.storage_governance import StartPermit
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_performance_calibration_catalog_declares_stage052_prerequisites() -> None:
+    catalog = ExperimentCatalog.from_toml(ROOT / "configs/experiment_catalog.toml")
+    spec = catalog.for_run_label(
+        "stage05.2_native_architecture_performance_calibration_attempt99"
+    )
+
+    assert spec.prerequisite_contracts == (
+        "stage051_readiness",
+        "historical_migration",
+        "campaign_geometry",
+    )
+    assert spec.prerequisite_paths == {
+        "stage051_readiness": (
+            "experiments/manifests/stage05.1_best_known_artifact_manifest.json"
+        )
+    }
 
 
 def _sha(value: bytes) -> str:
