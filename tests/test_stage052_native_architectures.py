@@ -23,6 +23,7 @@ from evrptw.alns import ALNSResult
 from evrptw.cache_incremental import RouteCacheKey, canonical_instance_hash
 from evrptw.charging import solve_exact_charging
 from evrptw.experiments.stage052_native_architecture_review import (
+    REVIEW_SCHEMA_VERSION,
     ReviewRecord,
     _axis_end_to_end_seconds,
     _axis_payload_with_persistence,
@@ -33,6 +34,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _describe_first_divergence,
     _external_semantic_trajectory,
     _load_axis_record,
+    _mode_wave_metrics,
     _NativeCanonicalProjectionHasher,
     _raw_axis_inventory,
     _relative_time_improvement,
@@ -54,9 +56,11 @@ from evrptw.experiments.stage052_native_architecture_review import (
     write_review,
 )
 from evrptw.experiments.stage052_native_architectures import (
+    CALIBRATION_REVIEW_SCHEMA_VERSION,
     MODES,
     PAIRED_INSTANCES,
     PREVIOUS_COMPARISON_SCHEMA_VERSION,
+    PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SEEDS,
     WARM_START_SCHEMA_VERSION,
@@ -78,6 +82,7 @@ from evrptw.experiments.stage052_native_architectures import (
     _require_native_architecture_capabilities,
     _run_group,
     _runtime_cgroup_snapshot,
+    _runtime_io_accounting,
     _semantic_candidate_trajectory,
     _solve_mode,
     _validate_native_build_attestation,
@@ -91,6 +96,9 @@ from evrptw.experiments.stage052_native_architectures import (
     rotated_modes,
     run_experiment,
     run_labels_for_scope,
+)
+from evrptw.experiments.stage052_performance_calibration_review import (
+    CALIBRATION_REVIEW_SCHEMA_VERSION as PRODUCER_CALIBRATION_REVIEW_SCHEMA_VERSION,
 )
 from evrptw.measurement import canonical_route_key
 from evrptw.native_scheduler import NativeHostScheduler
@@ -487,6 +495,25 @@ def test_runtime_cgroup_snapshot_marks_missing_membership_unavailable(
     }
 
 
+def test_runtime_io_accounting_uses_process_tree_when_cgroup_io_is_unavailable() -> None:
+    assert _runtime_io_accounting(
+        {"io": "unavailable"},
+        {"io": "unavailable"},
+        {"process_tree_read_bytes": 123, "process_tree_write_bytes": 456},
+    ) == {
+        "source": "process_tree_proc_io",
+        "read_bytes": 123,
+        "write_bytes": 456,
+    }
+
+    with pytest.raises(RuntimeError, match="cgroup I/O accounting is invalid"):
+        _runtime_io_accounting(
+            {"io": {"read_bytes": 1}},
+            {"io": "unavailable"},
+            {"process_tree_read_bytes": 123, "process_tree_write_bytes": 456},
+        )
+
+
 def test_free_scheduler_topology_keeps_thread_budget_but_exposes_all_cpus() -> None:
     task = ArchitectureAxisTask(
         scope="paired",
@@ -676,7 +703,8 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
             "io": io_after,
         },
         "cgroup_memory_event_deltas": {"oom": 0, "oom_kill": 0},
-        "cgroup_io_deltas": {
+        "io_accounting": {
+            "source": "cgroup_v2_io_stat",
             "read_bytes": 5,
             "write_bytes": 10,
             "read_operations": 1,
@@ -756,6 +784,25 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "thread_tree_major_faults": 0,
     }
     _review_mode_wave_resources(wave)
+    prior_wave = copy.deepcopy(wave)
+    prior_io = cast(dict[str, object], prior_wave.pop("io_accounting"))
+    prior_io.pop("source")
+    prior_wave["cgroup_io_deltas"] = prior_io
+    _review_mode_wave_resources(
+        prior_wave,
+        comparison_schema=PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+    )
+    prior_metrics = _mode_wave_metrics(
+        (
+            ReviewRecord(
+                Path("prior-axis.json"),
+                {"schema_version": PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION},
+                prior_wave,
+            ),
+        )
+    )
+    assert cast(dict[str, object], prior_metrics["io_read_bytes"])["median"] == 5.0
+    assert prior_metrics["io_accounting_sources"] == ["cgroup_v2_io_stat"]
 
     thread_tree = cast(dict[str, object], wave["thread_tree"])
     counters = cast(dict[str, int], thread_tree["counters"])
@@ -768,6 +815,37 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
     assert isinstance(after, dict)
     after["memory_swap_peak_bytes"] = 1
     with pytest.raises(RuntimeError, match="swap gate"):
+        _review_mode_wave_resources(wave)
+    after["memory_swap_peak_bytes"] = 0
+
+    before = cast(dict[str, object], wave["cgroup_before"])
+    before["io"] = "unavailable"
+    after["io"] = "unavailable"
+    wave["io_accounting"] = {
+        "source": "process_tree_proc_io",
+        "read_bytes": 7,
+        "write_bytes": 11,
+    }
+    wave["process_tree_read_bytes"] = 7
+    wave["process_tree_write_bytes"] = 11
+    wave["process_metrics"] = [
+        {
+            "pid": 1,
+            "create_time": 1.0,
+            "counters": {"read_bytes": 7, "write_bytes": 11},
+        }
+    ]
+    _review_mode_wave_resources(wave)
+    process_io = cast(dict[str, object], wave["io_accounting"])
+    process_io["write_bytes"] = 12
+    wave["process_tree_write_bytes"] = 12
+    with pytest.raises(RuntimeError, match="aggregate does not replay"):
+        _review_mode_wave_resources(wave)
+    process_io["write_bytes"] = 11
+    wave["process_tree_write_bytes"] = 11
+    before["io"] = io_before
+    after["io"] = io_after
+    with pytest.raises(RuntimeError, match="did not prefer cgroup"):
         _review_mode_wave_resources(wave)
 
 
@@ -2481,7 +2559,7 @@ def test_pilot_gate_requires_signed_qualified_paired_review(
         "by_mode": {},
     }
     payload = {
-        "schema_version": "stage05.2-native-architecture-review-v9",
+        "schema_version": REVIEW_SCHEMA_VERSION,
         "scope": "paired",
         "attempt": 8,
         "axis_count": 360,
@@ -2580,8 +2658,9 @@ def test_campaign_gate_requires_signed_qualified_calibration_review(
     _write_signed_json(profile_path, {"canonical_sha256": profile_canonical})
     profile_file_sha = hashlib.sha256(profile_path.read_bytes()).hexdigest()
     review_path = calibration_dir / "review" / "calibration_review_receipt.json"
+    assert PRODUCER_CALIBRATION_REVIEW_SCHEMA_VERSION == CALIBRATION_REVIEW_SCHEMA_VERSION
     payload = {
-        "schema_version": ("stage05.2-native-architecture-performance-calibration-review-v1"),
+        "schema_version": PRODUCER_CALIBRATION_REVIEW_SCHEMA_VERSION,
         "status": "qualified",
         "qualification": "QUALIFIED_FOR_ATTEMPT08",
         "calibration_run_label": calibration_run_label,
@@ -2657,6 +2736,29 @@ def test_campaign_gate_requires_signed_qualified_calibration_review(
     )
     assert gate["qualification"] == "QUALIFIED_FOR_ATTEMPT08"
     assert gate["raw_axis_replay_count"] == 360
+
+    legacy = dict(payload)
+    legacy["schema_version"] = (
+        "stage05.2-native-architecture-performance-calibration-review-v1"
+    )
+    legacy_path = calibration_dir / "review" / "legacy-v1.json"
+    _write_signed_json(legacy_path, legacy)
+    with pytest.raises(RuntimeError, match="qualified independent replay"):
+        _load_qualified_calibration_review(
+            legacy_path,
+            review_execution_path=review_execution_path,
+            calibration_run_label=calibration_run_label,
+            revision=revision,
+            git_tree=tree,
+            source_manifest_sha256=source,
+            wheel_sha256=wheel,
+            native_sha256=native,
+            scheduler_sha256=scheduler,
+            performance_profile_path=profile_path,
+            performance_profile_file_sha256=profile_file_sha,
+            performance_profile_sha256=profile_canonical,
+            selected_build_profile="portable-lto",
+        )
 
     rejected = dict(payload)
     rejected["selector_recomputation_passed"] = False

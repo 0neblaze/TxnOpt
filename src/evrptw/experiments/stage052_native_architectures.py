@@ -72,8 +72,11 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v9"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v10"
+PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v9"
 PREVIOUS_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v7"
+CGROUP_IO_ACCOUNTING_SOURCE = "cgroup_v2_io_stat"
+PROCESS_TREE_IO_ACCOUNTING_SOURCE = "process_tree_proc_io"
 AXIS_PERSISTENCE_RECEIPT_SCHEMA_VERSION = "stage05.2-axis-persistence-receipt-v1"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
@@ -84,7 +87,7 @@ TOTAL_COMPUTE_THREADS = 24
 WORKLOAD_CLASSES = ("c5", "100-customer")
 WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v2"
 CALIBRATION_REVIEW_SCHEMA_VERSION = (
-    "stage05.2-native-architecture-performance-calibration-review-v1"
+    "stage05.2-native-architecture-performance-calibration-review-v2"
 )
 CALIBRATION_REVIEW_QUALIFICATION = "QUALIFIED_FOR_ATTEMPT08"
 PAIRED_REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
@@ -1577,6 +1580,33 @@ def _cgroup_io_deltas(
             return "unavailable"
         deltas[field] = after_value - before_value
     return deltas
+
+
+def _runtime_io_accounting(
+    cgroup_before: Mapping[str, object],
+    cgroup_after: Mapping[str, object],
+    process_tree: Mapping[str, object],
+) -> dict[str, object]:
+    """Return one explicit I/O provider without fabricating unavailable counters."""
+
+    cgroup_deltas = _cgroup_io_deltas(cgroup_before, cgroup_after)
+    if isinstance(cgroup_deltas, dict):
+        return {"source": CGROUP_IO_ACCOUNTING_SOURCE, **cgroup_deltas}
+    if (
+        cgroup_before.get("io") != "unavailable"
+        or cgroup_after.get("io") != "unavailable"
+    ):
+        raise RuntimeError("runtime cgroup I/O accounting is invalid")
+    values: dict[str, int] = {}
+    for target, source in (
+        ("read_bytes", "process_tree_read_bytes"),
+        ("write_bytes", "process_tree_write_bytes"),
+    ):
+        value = process_tree.get(source)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("runtime process-tree I/O accounting is unavailable")
+        values[target] = value
+    return {"source": PROCESS_TREE_IO_ACCOUNTING_SOURCE, **values}
 
 
 def _metric_int(value: object) -> int:
@@ -3363,9 +3393,11 @@ def run_experiment(
             }
             if any(isinstance(value, str) or value != 0 for value in memory_event_deltas.values()):
                 raise RuntimeError("runtime cgroup OOM accounting gate failed")
-            io_deltas = _cgroup_io_deltas(cgroup_before, cgroup_after)
-            if isinstance(io_deltas, str):
-                raise RuntimeError("runtime cgroup I/O accounting is unavailable")
+            io_accounting = _runtime_io_accounting(
+                cgroup_before,
+                cgroup_after,
+                mode_resource_statistics,
+            )
             raw_process_tree_cpu_seconds = mode_resource_statistics.get("process_tree_cpu_seconds")
             if (
                 isinstance(raw_process_tree_cpu_seconds, bool)
@@ -3435,7 +3467,7 @@ def run_experiment(
                     "cgroup_before": cgroup_before,
                     "cgroup_after": cgroup_after,
                     "cgroup_memory_event_deltas": memory_event_deltas,
-                    "cgroup_io_deltas": io_deltas,
+                    "io_accounting": io_accounting,
                     "memory_gate_bytes": memory_gate_bytes,
                     **mode_resource_statistics,
                 }

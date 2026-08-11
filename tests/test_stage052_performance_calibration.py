@@ -32,8 +32,13 @@ from evrptw.experiments.stage052_performance_calibration import (
 from evrptw.experiments.stage052_performance_calibration_review import (
     CalibrationReviewError,
     _resource_pss_components,
+    _review_io_accounting,
     _validate_live_memory_admission,
     _validate_resource_evidence,
+)
+from evrptw.experiments.stage052_performance_observation import (
+    PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    RESOURCE_EVIDENCE_SCHEMA_VERSION,
 )
 from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
@@ -51,6 +56,105 @@ from evrptw.stage052_performance import (
 from evrptw.storage_governance import StartPermit
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _process_tree_io(*, read_bytes: int, write_bytes: int) -> dict[str, object]:
+    return {
+        "process_tree_read_bytes": read_bytes,
+        "process_tree_write_bytes": write_bytes,
+        "process_metrics": [
+            {
+                "pid": 10,
+                "create_time": 1.0,
+                "counters": {"read_bytes": read_bytes, "write_bytes": write_bytes},
+            }
+        ],
+    }
+
+
+def test_calibration_reviewer_replays_process_tree_io_provider() -> None:
+    evidence = {
+        "schema_version": RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "io_accounting": {
+            "source": "process_tree_proc_io",
+            "read_bytes": 123,
+            "write_bytes": 456,
+        }
+    }
+    assert _review_io_accounting(
+        evidence=evidence,
+        cgroup_before={"io": "unavailable"},
+        cgroup_after={"io": "unavailable"},
+        process_tree=_process_tree_io(read_bytes=123, write_bytes=456),
+    ) == evidence["io_accounting"]
+
+
+def test_calibration_reviewer_rejects_process_tree_io_drift() -> None:
+    with pytest.raises(CalibrationReviewError, match="process-tree I/O does not replay"):
+        _review_io_accounting(
+            evidence={
+                "schema_version": RESOURCE_EVIDENCE_SCHEMA_VERSION,
+                "io_accounting": {
+                    "source": "process_tree_proc_io",
+                    "read_bytes": 124,
+                    "write_bytes": 456,
+                }
+            },
+            cgroup_before={"io": "unavailable"},
+            cgroup_after={"io": "unavailable"},
+            process_tree={
+                **_process_tree_io(read_bytes=123, write_bytes=456),
+                "process_tree_read_bytes": 124,
+            },
+        )
+
+
+def test_calibration_reviewer_rejects_process_tree_when_cgroup_io_is_replayable() -> None:
+    before = {
+        "read_bytes": 1,
+        "write_bytes": 2,
+        "read_operations": 3,
+        "write_operations": 4,
+        "discard_bytes": 5,
+        "discard_operations": 6,
+    }
+    after = {name: value + 1 for name, value in before.items()}
+    with pytest.raises(CalibrationReviewError, match="did not prefer cgroup"):
+        _review_io_accounting(
+            evidence={
+                "schema_version": RESOURCE_EVIDENCE_SCHEMA_VERSION,
+                "io_accounting": {
+                    "source": "process_tree_proc_io",
+                    "read_bytes": 123,
+                    "write_bytes": 456,
+                },
+            },
+            cgroup_before={"io": before},
+            cgroup_after={"io": after},
+            process_tree=_process_tree_io(read_bytes=123, write_bytes=456),
+        )
+
+
+def test_calibration_reviewer_preserves_read_only_v1_cgroup_evidence() -> None:
+    before = {
+        "read_bytes": 1,
+        "write_bytes": 2,
+        "read_operations": 3,
+        "write_operations": 4,
+        "discard_bytes": 5,
+        "discard_operations": 6,
+    }
+    after = {name: value + 1 for name, value in before.items()}
+    evidence = {
+        "schema_version": PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "cgroup_io": {name: 1 for name in before},
+    }
+    assert _review_io_accounting(
+        evidence=evidence,
+        cgroup_before={"io": before},
+        cgroup_after={"io": after},
+        process_tree={},
+    ) == evidence["cgroup_io"]
 
 
 def test_performance_calibration_catalog_declares_stage052_prerequisites() -> None:

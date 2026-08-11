@@ -450,7 +450,7 @@ def test_resource_summary_preserves_cpu_io_tail_and_zero_queue_gate() -> None:
         payloads=(_axis_payload(), _axis_payload()),
         topology=_topology(),
         cgroup_after={"memory_current_bytes": 900, "memory_peak_bytes": 1_100},
-        cgroup_io={"read_bytes": 100, "write_bytes": 200},
+        io_accounting={"read_bytes": 100, "write_bytes": 200},
         scheduler_statistics={
             "request_queue": {
                 "total_wait_seconds": 0.1,
@@ -479,6 +479,64 @@ def test_resource_summary_preserves_cpu_io_tail_and_zero_queue_gate() -> None:
     assert summary.replay_seconds == 0.25
 
 
+def test_io_accounting_prefers_replayable_cgroup_v2_deltas() -> None:
+    before = {
+        "io": {
+            "read_bytes": 10,
+            "write_bytes": 20,
+            "read_operations": 1,
+            "write_operations": 2,
+            "discard_bytes": 0,
+            "discard_operations": 0,
+        }
+    }
+    after = {
+        "io": {
+            "read_bytes": 110,
+            "write_bytes": 220,
+            "read_operations": 11,
+            "write_operations": 22,
+            "discard_bytes": 30,
+            "discard_operations": 3,
+        }
+    }
+
+    assert observation_module._io_accounting_evidence(  # noqa: SLF001
+        before,
+        after,
+        {"process_tree_read_bytes": 999, "process_tree_write_bytes": 999},
+    ) == {
+        "source": "cgroup_v2_io_stat",
+        "read_bytes": 100,
+        "write_bytes": 200,
+        "read_operations": 10,
+        "write_operations": 20,
+        "discard_bytes": 30,
+        "discard_operations": 3,
+    }
+
+
+def test_io_accounting_uses_explicit_process_tree_source_when_io_controller_absent() -> None:
+    assert observation_module._io_accounting_evidence(  # noqa: SLF001
+        {"io": "unavailable"},
+        {"io": "unavailable"},
+        {"process_tree_read_bytes": 123, "process_tree_write_bytes": 456},
+    ) == {
+        "source": "process_tree_proc_io",
+        "read_bytes": 123,
+        "write_bytes": 456,
+    }
+
+
+def test_io_accounting_rejects_unavailable_process_tree_counters() -> None:
+    with pytest.raises(PerformanceObservationError, match="process-tree I/O accounting"):
+        observation_module._io_accounting_evidence(  # noqa: SLF001
+            {"io": "unavailable"},
+            {"io": "unavailable"},
+            {"process_tree_read_bytes": "unavailable", "process_tree_write_bytes": 1},
+        )
+
+
 def test_resource_summary_rejects_scheduler_queue_overflow() -> None:
     scheduler = {
         "request_queue": {
@@ -505,7 +563,7 @@ def test_resource_summary_rejects_scheduler_queue_overflow() -> None:
             payloads=(_axis_payload(),),
             topology=_topology(),
             cgroup_after={"memory_current_bytes": 900, "memory_peak_bytes": 1_100},
-            cgroup_io={"read_bytes": 100, "write_bytes": 200},
+            io_accounting={"read_bytes": 100, "write_bytes": 200},
             scheduler_statistics=scheduler,
         )
 

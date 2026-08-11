@@ -32,11 +32,11 @@ from evrptw.experiments.stage052_native_architectures import (
     ArchitectureAxisTask,
     ArchitectureMode,
     _assign_performance_topology,
-    _cgroup_io_deltas,
     _iter_semantic_candidate_trajectory,
     _row_evidence,
     _run_mode,
     _runtime_cgroup_snapshot,
+    _runtime_io_accounting,
     _scheduler_runtime_summary,
     load_warm_start_bundle,
     workload_class_for_instance,
@@ -74,7 +74,10 @@ from evrptw.stage052_performance import (
 from evrptw.stage052_semantic_journal import evidence_json_value
 
 FAILURE_SCHEMA_VERSION: Final = "stage05.2-performance-observation-failure-v1"
-RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v1"
+RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v2"
+PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
+    "stage05.2-calibration-resource-evidence-v1"
+)
 CALIBRATION_EXACT_CALLS: Final = 20
 CALIBRATION_MAX_ITERATIONS: Final = 200
 CALIBRATION_WATCHDOG_SECONDS: Final = 30.0
@@ -729,7 +732,7 @@ def _resource_summary(
     payloads: Sequence[Mapping[str, object]],
     topology: ExecutionTopology,
     cgroup_after: Mapping[str, object],
-    cgroup_io: Mapping[str, int],
+    io_accounting: Mapping[str, object],
     scheduler_statistics: Mapping[str, object] | None,
 ) -> RuntimeResourceSummaryV2:
     cpu_seconds = _finite_seconds(
@@ -803,8 +806,8 @@ def _resource_summary(
         pss_bytes=_required_resource_int(statistics_payload, "peak_aggregate_pss_bytes"),
         cgroup_memory_current_bytes=cgroup_current,
         cgroup_memory_peak_bytes=cgroup_peak,
-        io_read_bytes=_nonnegative_int(cgroup_io.get("read_bytes"), "cgroup read_bytes"),
-        io_write_bytes=_nonnegative_int(cgroup_io.get("write_bytes"), "cgroup write_bytes"),
+        io_read_bytes=_nonnegative_int(io_accounting.get("read_bytes"), "I/O read_bytes"),
+        io_write_bytes=_nonnegative_int(io_accounting.get("write_bytes"), "I/O write_bytes"),
         queue_wait_seconds=queue_wait,
         queue_depth_peak=queue_depth,
         pending_tasks_peak=pending_peak,
@@ -831,6 +834,21 @@ def _resource_summary(
         p99_end_to_end_seconds=_percentile(worker_times, 0.99),
         max_end_to_end_seconds=max(worker_times),
     )
+
+
+def _io_accounting_evidence(
+    cgroup_before: Mapping[str, object],
+    cgroup_after: Mapping[str, object],
+    process_tree: Mapping[str, object],
+) -> dict[str, object]:
+    """Select one explicit, independently replayable I/O accounting provider."""
+
+    try:
+        return _runtime_io_accounting(cgroup_before, cgroup_after, process_tree)
+    except RuntimeError as error:
+        raise PerformanceObservationError(
+            "calibration process-tree I/O accounting is unavailable"
+        ) from error
 
 
 def _scheduler_pss(
@@ -1059,9 +1077,7 @@ def execute_mode_block(
     for snapshot in (cgroup_before, cgroup_after):
         if snapshot.get("memory_swap_current_bytes") != 0:
             raise PerformanceObservationError("calibration used swap")
-    raw_io = _cgroup_io_deltas(cgroup_before, cgroup_after)
-    if not isinstance(raw_io, dict):
-        raise PerformanceObservationError("calibration cgroup I/O accounting is unavailable")
+    raw_io = _io_accounting_evidence(cgroup_before, cgroup_after, resource_statistics)
     payloads: list[Mapping[str, object]] = []
     inventory: list[Mapping[str, object]] = []
     axis_timings: list[dict[str, object]] = []
@@ -1129,7 +1145,7 @@ def execute_mode_block(
         payloads=payloads,
         topology=topology,
         cgroup_after=cgroup_after,
-        cgroup_io=cast(Mapping[str, int], raw_io),
+        io_accounting=raw_io,
         scheduler_statistics=scheduler_statistics,
     )
     raw_resource_evidence = {
@@ -1140,7 +1156,7 @@ def execute_mode_block(
         "process_tree": dict(resource_statistics),
         "cgroup_before": dict(cgroup_before),
         "cgroup_after": dict(cgroup_after),
-        "cgroup_io": dict(raw_io),
+        "io_accounting": dict(raw_io),
         "scheduler_process_id": scheduler_pid,
         "worker_process_lifecycle": "one_shard_per_spawned_process",
         "worker_multiprocessing_start_method": "spawn",

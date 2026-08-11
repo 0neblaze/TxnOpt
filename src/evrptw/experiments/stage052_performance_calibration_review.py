@@ -30,6 +30,8 @@ from evrptw.experiments.stage052_native_architecture_review import (
 )
 from evrptw.experiments.stage052_native_architectures import (
     AXIS_PERSISTENCE_RECEIPT_SCHEMA_VERSION,
+    CGROUP_IO_ACCOUNTING_SOURCE,
+    PROCESS_TREE_IO_ACCOUNTING_SOURCE,
     workload_class_for_instance,
 )
 from evrptw.experiments.stage052_performance_calibration import (
@@ -44,7 +46,11 @@ from evrptw.experiments.stage052_performance_calibration import (
     load_fixed_work_observations,
     load_wheel_receipts,
 )
-from evrptw.experiments.stage052_performance_observation import FIXED_WORK_BUDGET
+from evrptw.experiments.stage052_performance_observation import (
+    FIXED_WORK_BUDGET,
+    PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    RESOURCE_EVIDENCE_SCHEMA_VERSION,
+)
 from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
     load_telemetry_overhead_receipt,
@@ -713,6 +719,96 @@ def _resource_queue_totals(
     return wait_seconds, depth_peak, pending_peak, full_count, rejected_count
 
 
+def _review_io_accounting(
+    *,
+    evidence: Mapping[str, object],
+    cgroup_before: Mapping[str, object],
+    cgroup_after: Mapping[str, object],
+    process_tree: Mapping[str, object],
+) -> Mapping[str, object]:
+    schema_version = evidence.get("schema_version")
+    byte_fields = {"read_bytes", "write_bytes"}
+    cgroup_fields = byte_fields | {
+        "read_operations",
+        "write_operations",
+        "discard_bytes",
+        "discard_operations",
+    }
+    raw_before_io = cgroup_before.get("io")
+    raw_after_io = cgroup_after.get("io")
+    cgroup_replayable = (
+        isinstance(raw_before_io, Mapping)
+        and isinstance(raw_after_io, Mapping)
+        and set(raw_before_io) == cgroup_fields
+        and set(raw_after_io) == cgroup_fields
+    )
+    if cgroup_replayable:
+        before_io = cast(Mapping[str, object], raw_before_io)
+        after_io = cast(Mapping[str, object], raw_after_io)
+        cgroup_expected: dict[str, int] = {}
+        for name in cgroup_fields:
+            before_value = _integer(before_io.get(name), f"cgroup before {name}")
+            after_value = _integer(after_io.get(name), f"cgroup after {name}")
+            if after_value < before_value:
+                raise CalibrationReviewError("raw resource cgroup I/O does not replay")
+            cgroup_expected[name] = after_value - before_value
+        if schema_version == PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION:
+            reported = _mapping(evidence.get("cgroup_io"), "resource cgroup I/O")
+            if set(reported) != cgroup_fields:
+                raise CalibrationReviewError("raw resource cgroup I/O schema is invalid")
+        elif schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+            reported = _mapping(evidence.get("io_accounting"), "resource I/O accounting")
+            if (
+                reported.get("source") != CGROUP_IO_ACCOUNTING_SOURCE
+                or set(reported) != {"source", *cgroup_fields}
+            ):
+                raise CalibrationReviewError("raw resource I/O provider did not prefer cgroup")
+        else:
+            raise CalibrationReviewError("raw resource evidence schema is invalid")
+        if any(reported.get(name) != value for name, value in cgroup_expected.items()):
+            raise CalibrationReviewError("raw resource cgroup I/O does not replay")
+        return reported
+    if schema_version != RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        raise CalibrationReviewError("raw resource legacy cgroup I/O is unavailable")
+    if raw_before_io != "unavailable" or raw_after_io != "unavailable":
+        raise CalibrationReviewError("raw resource cgroup I/O availability is inconsistent")
+    reported = _mapping(evidence.get("io_accounting"), "resource I/O accounting")
+    if (
+        reported.get("source") != PROCESS_TREE_IO_ACCOUNTING_SOURCE
+        or set(reported) != {"source", *byte_fields}
+    ):
+        raise CalibrationReviewError("raw resource process-tree I/O schema is invalid")
+    metrics = process_tree.get("process_metrics")
+    if not isinstance(metrics, list) or not metrics:
+        raise CalibrationReviewError("raw resource process-tree I/O rows are unavailable")
+    totals = {name: 0 for name in byte_fields}
+    identities: set[tuple[int, float]] = set()
+    for index, raw_metric in enumerate(metrics):
+        metric = _mapping(raw_metric, f"process_metrics[{index}]")
+        pid = _integer(metric.get("pid"), f"process_metrics[{index}].pid")
+        create_time = _number(
+            metric.get("create_time"),
+            f"process_metrics[{index}].create_time",
+            positive=True,
+        )
+        if pid <= 0:
+            raise CalibrationReviewError("raw resource process-tree I/O PID is invalid")
+        identity = (pid, create_time)
+        if identity in identities:
+            raise CalibrationReviewError("raw resource process-tree I/O identity is duplicated")
+        identities.add(identity)
+        counters = _mapping(metric.get("counters"), f"process_metrics[{index}].counters")
+        for name in byte_fields:
+            totals[name] += _integer(counters.get(name), f"process_metrics[{index}].{name}")
+    for name, total in totals.items():
+        if (
+            process_tree.get(f"process_tree_{name}") != total
+            or reported.get(name) != total
+        ):
+            raise CalibrationReviewError("raw resource process-tree I/O does not replay")
+    return reported
+
+
 def _derive_resource_summary(
     evidence: Mapping[str, object],
     *,
@@ -720,7 +816,10 @@ def _derive_resource_summary(
     inventory_roles: Mapping[str, str],
     scheduler_statistics: Mapping[str, object] | None,
 ) -> tuple[RuntimeResourceSummaryV2, int, int, int, tuple[str, ...]]:
-    if evidence.get("schema_version") != "stage05.2-calibration-resource-evidence-v1":
+    if evidence.get("schema_version") not in {
+        PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }:
         raise CalibrationReviewError("raw resource evidence schema is invalid")
     if (
         evidence.get("worker_process_lifecycle") != "one_shard_per_spawned_process"
@@ -757,24 +856,12 @@ def _derive_resource_summary(
         or after.get("memory_swap_current_bytes") != 0
     ):
         raise CalibrationReviewError("raw resource cgroup/swap identity is invalid")
-    before_io = _mapping(before.get("io"), "resource cgroup before I/O")
-    after_io = _mapping(after.get("io"), "resource cgroup after I/O")
-    reported_io = _mapping(evidence.get("cgroup_io"), "resource cgroup I/O")
-    io_fields = {
-        "read_bytes",
-        "write_bytes",
-        "read_operations",
-        "write_operations",
-        "discard_bytes",
-        "discard_operations",
-    }
-    if set(before_io) != io_fields or set(after_io) != io_fields or set(reported_io) != io_fields:
-        raise CalibrationReviewError("raw resource cgroup I/O schema is invalid")
-    for name in io_fields:
-        before_value = _integer(before_io.get(name), f"cgroup before {name}")
-        after_value = _integer(after_io.get(name), f"cgroup after {name}")
-        if after_value < before_value or reported_io.get(name) != after_value - before_value:
-            raise CalibrationReviewError("raw resource cgroup I/O does not replay")
+    reported_io = _review_io_accounting(
+        evidence=evidence,
+        cgroup_before=before,
+        cgroup_after=after,
+        process_tree=process_tree,
+    )
     for event_name in ("oom", "oom_kill"):
         before_events = _mapping(before.get("memory_events"), "cgroup before memory events")
         after_events = _mapping(after.get("memory_events"), "cgroup after memory events")
