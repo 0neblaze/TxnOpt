@@ -29,6 +29,7 @@ _UNAVAILABLE = "unavailable"
 _MAX_BOUNDED_SAMPLES = 256
 _MAX_CPU_STAT_CORES = 256
 _MAX_THREAD_OBSERVATIONS = 4096
+DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS = 0.1
 PROCESS_TREE_STATISTICS_FIELDS = frozenset(
     {
         "sample_interval_seconds",
@@ -655,7 +656,10 @@ class ProcessTreeMonitor:
 
     additional_root_pids: tuple[int, ...] = ()
     excluded_root_pids: tuple[int, ...] = ()
-    sample_interval_seconds: float = 0.05
+    # A 100 ms cadence keeps the complete /proc, PSS, PSI, affinity, and
+    # thread-tree surface below the Stage 5.2 2% E2E overhead gate on the
+    # shortest representative axis while retaining bounded time-series detail.
+    sample_interval_seconds: float = DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
     thread_detail_interval_seconds: float = 0.25
     _MAX_BOUNDED_SAMPLES: ClassVar[int] = _MAX_BOUNDED_SAMPLES
     _stop: threading.Event = field(default_factory=threading.Event, init=False)

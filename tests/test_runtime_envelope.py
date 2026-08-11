@@ -13,6 +13,13 @@ import evrptw.runtime_envelope as runtime_envelope
 from evrptw.runtime_envelope import ProcessTreeMonitor
 
 
+def test_process_tree_monitor_default_cadence_limits_short_axis_overhead() -> None:
+    monitor = ProcessTreeMonitor()
+
+    assert monitor.sample_interval_seconds == 0.1
+    assert monitor.thread_detail_interval_seconds == 0.25
+
+
 def _statistics(
     monitor: ProcessTreeMonitor,
     *,

@@ -1837,7 +1837,10 @@ def _replay_telemetry_children(
     build_identity: Mapping[str, object],
     frozen_host: HostPerformanceEnvelope,
 ) -> int:
-    overhead.require_representative_fixed_work()
+    try:
+        overhead.require_representative_fixed_work()
+    except ValueError as error:
+        raise CalibrationReviewError(str(error)) from error
     run_root = run_root.resolve()
     evidence = overhead.workload_evidence
     warm = evidence.get("warm_sample_evidence")
@@ -1927,6 +1930,11 @@ def _replay_telemetry_children(
         elif fingerprint != expected_fingerprint:
             raise CalibrationReviewError("telemetry on/off semantic fingerprint diverged")
         resources = _mapping(row.get("resource_summary"), "telemetry sample resources")
+        if enabled:
+            if resources.get("sample_interval_seconds") != overhead.sample_interval_seconds:
+                raise CalibrationReviewError("telemetry sample interval differs")
+        elif "sample_interval_seconds" in resources:
+            raise CalibrationReviewError("unmonitored sample carries a telemetry interval")
         if resources.get("sample_storage_alias") != "stage052-performance-calibration-run":
             raise CalibrationReviewError("telemetry sample storage alias is invalid")
         sample_path = resolve_relative(
@@ -2035,6 +2043,15 @@ def _replay_telemetry_children(
             build_identity=build_identity,
         )
         axis_payload, _axis_digest = _load_signed_json(axis_path, "telemetry raw axis")
+        axis_topology = _mapping(axis_payload.get("topology"), "telemetry raw axis topology")
+        if enabled:
+            if (
+                axis_topology.get("sample_interval_seconds")
+                != overhead.sample_interval_seconds
+            ):
+                raise CalibrationReviewError("telemetry sample interval differs")
+        elif "sample_interval_seconds" in axis_topology:
+            raise CalibrationReviewError("unmonitored axis carries a telemetry interval")
         if (
             mode != "current_stage052"
             or workload != "c5"

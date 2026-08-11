@@ -229,7 +229,10 @@ def _runtime_profile() -> tuple[FrozenPerformanceProfile, dict[str, object]]:
         pair_orders=("off-on", "on-off", "off-on", "on-off", "off-on"),
         sample_interval_seconds=0.05,
         workload_output_sha256=hashlib.sha256(telemetry_fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 20} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {"sample_count": 20, "sample_interval_seconds": 0.05}
+            for _ in range(5)
+        ),
         workload_evidence=_representative_evidence(
             telemetry_fingerprint,
             (1.0,) * 5,
@@ -770,7 +773,10 @@ def test_telemetry_overhead_receipt_enforces_alternating_two_percent_gate() -> N
         pair_orders=("off-on", "on-off", "off-on", "on-off", "off-on"),
         sample_interval_seconds=0.05,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 20} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {"sample_count": 20, "sample_interval_seconds": 0.05}
+            for _ in range(5)
+        ),
         workload_evidence=_representative_evidence(
             fingerprint,
             unmonitored,
@@ -788,7 +794,10 @@ def test_telemetry_overhead_receipt_enforces_alternating_two_percent_gate() -> N
         pair_orders=("off-on", "on-off", "off-on", "on-off", "off-on"),
         sample_interval_seconds=0.05,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 20} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {"sample_count": 20, "sample_interval_seconds": 0.05}
+            for _ in range(5)
+        ),
         workload_evidence=_representative_evidence(
             fingerprint,
             unmonitored,

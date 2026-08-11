@@ -23,7 +23,10 @@ from evrptw.experiments.stage052_telemetry_overhead import (
 )
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
-from evrptw.runtime_envelope import PROCESS_TREE_STATISTICS_FIELDS
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    PROCESS_TREE_STATISTICS_FIELDS,
+)
 from evrptw.stage052_performance import (
     ExecutionTopology,
     HostPerformanceEnvelope,
@@ -81,7 +84,7 @@ def test_telemetry_overhead_measurement_is_paired_signed_and_bounded(
 
     class Monitor:
         def __init__(self, *, sample_interval_seconds: float) -> None:
-            assert sample_interval_seconds == 0.05
+            assert sample_interval_seconds == DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
 
         def __enter__(self) -> Monitor:
             return self
@@ -156,7 +159,19 @@ def test_representative_telemetry_gate_covers_complete_fixed_work_surface(
     def sample(enabled: bool, index: int) -> TelemetryWorkloadSample:
         return TelemetryWorkloadSample(
             b"a" * 64,
-            {"enabled": enabled, "sample_index": index},
+            {
+                "enabled": enabled,
+                "sample_index": index,
+                **(
+                    {
+                        "sample_interval_seconds": (
+                            DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+                        )
+                    }
+                    if enabled
+                    else {}
+                ),
+            },
             {
                 **evidence,
                 "semantic_telemetry": True,
@@ -171,6 +186,7 @@ def test_representative_telemetry_gate_covers_complete_fixed_work_surface(
         run_sample=sample,
         minimum_unmonitored_seconds=0.0,
     )
+    assert receipt.sample_interval_seconds == DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
     receipt.require_representative_fixed_work()
     assert receipt.passed
     assert receipt.p95_overhead_fraction == pytest.approx(0.0)
@@ -288,6 +304,7 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         }
         resource_topology = (
             {
+                "sample_interval_seconds": DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
                 "sample_count": 1,
                 "peak_concurrent_processes": 1,
                 "peak_aggregate_threads": 1,
@@ -379,6 +396,15 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
             "elapsed_seconds": elapsed,
             "fingerprint": fingerprint,
             "resource_summary": {
+                **(
+                    {
+                        "sample_interval_seconds": (
+                            DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+                        )
+                    }
+                    if enabled
+                    else {}
+                ),
                 "sample_storage_alias": "stage052-performance-calibration-run",
                 "sample_relative_path": sample_path.relative_to(tmp_path).as_posix(),
                 "sample_sidecar_relative_path": Path(f"{sample_path}.sha256")
@@ -441,9 +467,15 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         unmonitored_seconds=unmonitored,
         monitored_seconds=monitored,
         pair_orders=orders,
-        sample_interval_seconds=0.05,
+        sample_interval_seconds=DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {
+                "sample_count": 1,
+                "sample_interval_seconds": DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+            }
+            for _ in range(5)
+        ),
         workload_evidence=evidence,
     )
     monkeypatch.setattr(
@@ -483,6 +515,33 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
 
     assert replayed == 12
 
+    cadence_mismatch = TelemetryOverheadReceipt(
+        unmonitored_seconds=unmonitored,
+        monitored_seconds=monitored,
+        pair_orders=orders,
+        sample_interval_seconds=0.05,
+        workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
+        monitored_resource_summaries=tuple(
+            {
+                "sample_count": 1,
+                "sample_interval_seconds": DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+            }
+            for _ in range(5)
+        ),
+        workload_evidence=evidence,
+    )
+    with pytest.raises(
+        review.CalibrationReviewError,
+        match="telemetry sample interval differs",
+    ):
+        review._replay_telemetry_children(
+            cadence_mismatch,
+            run_root=tmp_path,
+            benchmark_dir=benchmark_dir,
+            build_identity={},
+            frozen_host=frozen_host,
+        )
+
     warm_samples = evidence["warm_sample_evidence"]
     assert isinstance(warm_samples, tuple)
     off_row = warm_samples[0]
@@ -512,9 +571,15 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         unmonitored_seconds=unmonitored,
         monitored_seconds=monitored,
         pair_orders=orders,
-        sample_interval_seconds=0.05,
+        sample_interval_seconds=DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {
+                "sample_count": 1,
+                "sample_interval_seconds": DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+            }
+            for _ in range(5)
+        ),
         workload_evidence=evidence,
     )
     with pytest.raises(review.CalibrationReviewError, match="raw axis path is duplicated"):
@@ -546,9 +611,15 @@ def test_independent_reviewer_replays_every_raw_telemetry_child(
         unmonitored_seconds=unmonitored,
         monitored_seconds=monitored,
         pair_orders=orders,
-        sample_interval_seconds=0.05,
+        sample_interval_seconds=DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 1} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {
+                "sample_count": 1,
+                "sample_interval_seconds": DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+            }
+            for _ in range(5)
+        ),
         workload_evidence=evidence,
     )
     with pytest.raises(review.CalibrationReviewError, match="legacy minimal receipt"):

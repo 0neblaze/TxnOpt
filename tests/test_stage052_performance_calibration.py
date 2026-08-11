@@ -39,6 +39,7 @@ from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
     write_telemetry_overhead_receipt,
 )
+from evrptw.runtime_envelope import DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
 from evrptw.stage052_performance import (
     BuildArtifactIdentity,
     ExecutionTopology,
@@ -178,7 +179,10 @@ def _overhead(tmp_path: Path) -> tuple[TelemetryOverheadReceipt, Path]:
         pair_orders=("off-on", "on-off", "off-on", "on-off", "off-on"),
         sample_interval_seconds=0.05,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 10} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {"sample_count": 10, "sample_interval_seconds": 0.05}
+            for _ in range(5)
+        ),
         workload_evidence=_telemetry_evidence(
             fingerprint,
             unmonitored,
@@ -911,6 +915,9 @@ def test_representative_telemetry_parent_accepts_current_shared_schema(
         command: tuple[str, ...],
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
+        assert float(
+            command[command.index("--resource-sample-interval-seconds") + 1]
+        ) == DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
         output = Path(command[command.index("--output") + 1])
         enabled = command[command.index("--telemetry-sample") + 1] == "on"
         sample_index = int(command[command.index("--telemetry-sample-index") + 1])
@@ -991,7 +998,10 @@ def test_signed_input_and_telemetry_overhead_are_hard_gates(tmp_path: Path) -> N
         pair_orders=("off-on", "on-off", "off-on", "on-off", "off-on"),
         sample_interval_seconds=0.05,
         workload_output_sha256=hashlib.sha256(fingerprint.encode("ascii")).hexdigest(),
-        monitored_resource_summaries=tuple({"sample_count": 10} for _ in range(5)),
+        monitored_resource_summaries=tuple(
+            {"sample_count": 10, "sample_interval_seconds": 0.05}
+            for _ in range(5)
+        ),
         workload_evidence=_telemetry_evidence(
             fingerprint,
             unmonitored,

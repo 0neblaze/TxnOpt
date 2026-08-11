@@ -1266,6 +1266,11 @@ class TelemetryOverheadReceipt:
             or any(monitored_surface[field] is not True for field in surface_fields)
         ):
             raise ValueError("telemetry overhead on/off surface contract is invalid")
+        if any(
+            summary.get("sample_interval_seconds") != self.sample_interval_seconds
+            for summary in self.monitored_resource_summaries
+        ):
+            raise ValueError("representative telemetry sample interval differs")
         exact_calls = self.workload_evidence.get("exact_calls")
         instance = self.workload_evidence.get("instance")
         if (

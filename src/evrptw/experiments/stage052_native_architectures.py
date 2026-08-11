@@ -39,7 +39,10 @@ from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
-from evrptw.runtime_envelope import ProcessTreeMonitor
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    ProcessTreeMonitor,
+)
 from evrptw.stage04 import Stage04Config
 from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_continuity_lease import require_owned
@@ -2104,11 +2107,18 @@ def _solve_mode(
     *,
     telemetry_enabled: bool = True,
     resource_telemetry_enabled: bool | None = None,
+    resource_telemetry_sample_interval_seconds: float | None = None,
     task_receipt_path: Path | None = None,
 ) -> tuple[ALNSResult, float, dict[str, object]]:
     monitor_enabled = (
         telemetry_enabled if resource_telemetry_enabled is None else resource_telemetry_enabled
     )
+    if resource_telemetry_sample_interval_seconds is not None and (
+        isinstance(resource_telemetry_sample_interval_seconds, bool)
+        or not math.isfinite(resource_telemetry_sample_interval_seconds)
+        or resource_telemetry_sample_interval_seconds <= 0.0
+    ):
+        raise RuntimeError("resource telemetry sample interval is invalid")
     profile_bound = task.performance_profile_sha256 is not None
     if profile_bound:
         if not task.axis_cpu_ids:
@@ -2212,7 +2222,14 @@ def _solve_mode(
     # values must not be summed across concurrent shard axes; the parent
     # mode-wave observation is the aggregate accounting source.
     if monitor_enabled:
-        with ProcessTreeMonitor(additional_root_pids=scheduler_roots) as resource_monitor:
+        with ProcessTreeMonitor(
+            additional_root_pids=scheduler_roots,
+            sample_interval_seconds=(
+                DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+                if resource_telemetry_sample_interval_seconds is None
+                else resource_telemetry_sample_interval_seconds
+            ),
+        ) as resource_monitor:
             started = time.perf_counter()
             result = execute_solver()
             solver_seconds = time.perf_counter() - started
@@ -2607,6 +2624,7 @@ def _run_mode(
     mode: ArchitectureMode,
     *,
     resource_telemetry_enabled: bool = True,
+    resource_telemetry_sample_interval_seconds: float | None = None,
 ) -> str:
     axis_started = time.perf_counter()
     path = _axis_path(task, mode)
@@ -2638,6 +2656,9 @@ def _run_mode(
             mode,
             task,
             resource_telemetry_enabled=resource_telemetry_enabled,
+            resource_telemetry_sample_interval_seconds=(
+                resource_telemetry_sample_interval_seconds
+            ),
             task_receipt_path=task_receipt_path,
         )
         solve_call_seconds = time.perf_counter() - solve_call_started

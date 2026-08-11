@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from evrptw.runtime_envelope import ProcessTreeMonitor
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    ProcessTreeMonitor,
+)
 from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_performance import (
     TelemetryOverheadReceipt,
@@ -82,7 +85,7 @@ def measure_telemetry_overhead(
     *,
     iterations: int,
     repeat_count: int = 5,
-    sample_interval_seconds: float = 0.05,
+    sample_interval_seconds: float = DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
     minimum_unmonitored_seconds: float = 0.5,
     workload: Callable[[int], bytes] = _invoke_workload,
 ) -> TelemetryOverheadReceipt:
@@ -171,7 +174,7 @@ def measure_representative_telemetry_overhead(
     *,
     run_sample: Callable[[bool, int], TelemetryWorkloadSample],
     repeat_count: int = 5,
-    sample_interval_seconds: float = 0.05,
+    sample_interval_seconds: float = DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
     minimum_unmonitored_seconds: float = 0.5,
 ) -> TelemetryOverheadReceipt:
     """Measure resource-monitor overhead on one complete, replayed real axis."""
@@ -217,6 +220,18 @@ def measure_representative_telemetry_overhead(
             raise TelemetryOverheadError("representative telemetry on/off surface is invalid")
         if result.workload_evidence.get("minimal_validator_replay") is not True:
             raise TelemetryOverheadError("representative minimal validation is missing")
+        if enabled:
+            if (
+                result.resource_summary.get("sample_interval_seconds")
+                != sample_interval_seconds
+            ):
+                raise TelemetryOverheadError(
+                    "representative telemetry sample interval differs"
+                )
+        elif "sample_interval_seconds" in result.resource_summary:
+            raise TelemetryOverheadError(
+                "unmonitored representative sample carries a telemetry interval"
+            )
         return elapsed, result
 
     def sample_evidence(
@@ -400,7 +415,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--iterations", type=int, default=3_000_000)
     parser.add_argument("--repeat-count", type=int, default=5)
-    parser.add_argument("--sample-interval-seconds", type=float, default=0.05)
+    parser.add_argument(
+        "--sample-interval-seconds",
+        type=float,
+        default=DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    )
     parser.add_argument("--minimum-unmonitored-seconds", type=float, default=0.5)
     arguments = parser.parse_args(argv)
     require_clean_repository_root(arguments.repository_root)

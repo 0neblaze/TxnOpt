@@ -32,6 +32,7 @@ from evrptw.experiments.stage052_telemetry_overhead import (
     measure_representative_telemetry_overhead,
     write_telemetry_overhead_receipt,
 )
+from evrptw.runtime_envelope import DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
 from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_continuity_lease import require_owned
 from evrptw.stage052_performance import (
@@ -2359,6 +2360,7 @@ def _representative_telemetry_runner(
     warm_start_bundle_path: Path,
     benchmark_dir: Path,
     continuity_lease_token: str,
+    sample_interval_seconds: float = DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
 ) -> Callable[[bool, int], TelemetryWorkloadSample]:
     """Build the attested child callback used by the complete telemetry A/B."""
 
@@ -2421,6 +2423,8 @@ def _representative_telemetry_runner(
             "on" if enabled else "off",
             "--telemetry-sample-index",
             str(sample_index),
+            "--resource-sample-interval-seconds",
+            repr(sample_interval_seconds),
         )
         completed = subprocess.run(
             command,
@@ -2658,6 +2662,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if telemetry_receipt is None:
             raise CalibrationError("portable-o3 is required for representative telemetry A/B")
+        telemetry_sample_interval_seconds = (
+            DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+        )
         telemetry = measure_representative_telemetry_overhead(
             run_sample=_representative_telemetry_runner(
                 repository_root_path=resolved_repository,
@@ -2668,8 +2675,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 warm_start_bundle_path=arguments.warm_start_bundle,
                 benchmark_dir=arguments.benchmark_dir,
                 continuity_lease_token=arguments.continuity_lease_token,
+                sample_interval_seconds=telemetry_sample_interval_seconds,
             ),
             repeat_count=arguments.telemetry_repeat_count,
+            sample_interval_seconds=telemetry_sample_interval_seconds,
         )
         write_telemetry_overhead_receipt(telemetry_path, telemetry)
         telemetry.require_passed()

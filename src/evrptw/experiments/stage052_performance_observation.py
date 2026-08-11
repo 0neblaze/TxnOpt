@@ -54,7 +54,10 @@ from evrptw.experiments.stage052_telemetry_overhead import (
 )
 from evrptw.native_scheduler import NativeHostScheduler
 from evrptw.repository import repository_root
-from evrptw.runtime_envelope import ProcessTreeMonitor
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    ProcessTreeMonitor,
+)
 from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_continuity_lease import require_owned
 from evrptw.stage052_performance import (
@@ -2117,6 +2120,9 @@ def produce_representative_telemetry_sample(
     parent_run_dir: Path,
     start_permit_path: Path,
     host_envelope_path: Path,
+    resource_sample_interval_seconds: float = (
+        DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+    ),
     repository_root_path: Path | None = None,
 ) -> dict[str, object]:
     """Run one representative current-stage fixed-work axis with telemetry on/off."""
@@ -2128,6 +2134,12 @@ def produce_representative_telemetry_sample(
         or (sample_index == -1 and not enabled)
     ):
         raise ValueError("representative telemetry sample index is invalid")
+    if (
+        isinstance(resource_sample_interval_seconds, bool)
+        or not math.isfinite(resource_sample_interval_seconds)
+        or resource_sample_interval_seconds <= 0.0
+    ):
+        raise ValueError("representative telemetry sample interval is invalid")
     if output_path.exists() or raw_output_root.exists():
         raise FileExistsError("representative telemetry sample namespace already exists")
     parent = parent_run_dir.resolve()
@@ -2206,6 +2218,9 @@ def produce_representative_telemetry_sample(
             task,
             ArchitectureMode.CURRENT_STAGE052,
             resource_telemetry_enabled=enabled,
+            resource_telemetry_sample_interval_seconds=(
+                resource_sample_interval_seconds
+            ),
         )
     )
     payload, inventory = _signed_axis(
@@ -2305,6 +2320,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--telemetry-sample", choices=("on", "off"))
     parser.add_argument("--telemetry-sample-index", type=int)
+    parser.add_argument(
+        "--resource-sample-interval-seconds",
+        type=float,
+        default=DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    )
     arguments = parser.parse_args(argv)
     resolved_repository = require_clean_repository_root(arguments.repository_root)
     try:
@@ -2342,6 +2362,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parent_run_dir=arguments.parent_run_dir,
                 start_permit_path=arguments.start_permit,
                 host_envelope_path=arguments.host_envelope,
+                resource_sample_interval_seconds=(
+                    arguments.resource_sample_interval_seconds
+                ),
                 repository_root_path=resolved_repository,
             )
     except BaseException as error:
