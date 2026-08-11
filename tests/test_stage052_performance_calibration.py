@@ -31,6 +31,7 @@ from evrptw.experiments.stage052_performance_calibration import (
 )
 from evrptw.experiments.stage052_performance_calibration_review import (
     CalibrationReviewError,
+    _raw_projection,
     _resource_pss_components,
     _review_io_accounting,
     _validate_live_memory_admission,
@@ -56,6 +57,48 @@ from evrptw.stage052_performance import (
 from evrptw.storage_governance import StartPermit
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _current_stage052_raw_projection_payload() -> dict[str, object]:
+    return {
+        "mode": "current_stage052",
+        "candidate_work_hash": "",
+        "route_result_hash": "",
+        "candidate_transaction_events": {
+            "count": 0,
+            "sha256": hashlib.sha256(b"stage05.2-row-evidence-v1\0").hexdigest(),
+        },
+        "candidate_control_statistics": {},
+        "candidate_transaction_statistics": {"native_candidate_transactions": 0},
+        "canonical_semantic_journal": {"sha256": "b" * 64},
+        "measurement_evidence": {
+            "exact_route_order": {"count": 0, "sha256": "c" * 64},
+            "cache_lifecycle": {"count": 0, "sha256": "d" * 64},
+        },
+        "semantic_trajectory": {"count": 0, "sha256": "e" * 64},
+    }
+
+
+def test_calibration_raw_projection_accepts_current_stage052_unavailable_hashes() -> None:
+    projection = _raw_projection(_current_stage052_raw_projection_payload())
+
+    assert projection["transaction_hashes"] == ["", "", "b" * 64]
+
+
+def test_calibration_raw_projection_rejects_other_mode_unavailable_hashes() -> None:
+    payload = _current_stage052_raw_projection_payload()
+    payload["mode"] = "python_candidate_control"
+
+    with pytest.raises(CalibrationReviewError, match="transaction hashes"):
+        _raw_projection(payload)
+
+
+def test_calibration_raw_projection_rejects_forged_empty_transaction_receipt() -> None:
+    payload = _current_stage052_raw_projection_payload()
+    payload["candidate_transaction_events"] = {"count": 0, "sha256": "a" * 64}
+
+    with pytest.raises(CalibrationReviewError, match="transaction hashes"):
+        _raw_projection(payload)
 
 
 def _process_tree_io(*, read_bytes: int, write_bytes: int) -> dict[str, object]:
@@ -568,7 +611,11 @@ def _axis(
         "candidate_trajectory": ["candidate-0", marker],
         "exact_order": ["route-0"],
         "cache_lifecycle": {"lookup": 1, "store": 1},
-        "transaction_hashes": ["d" * 64],
+        "transaction_hashes": (
+            ["", "", "d" * 64]
+            if mode == "current_stage052"
+            else ["d" * 64, "e" * 64, "f" * 64]
+        ),
         "confidence_interval": None,
     }
 
@@ -721,6 +768,17 @@ def _write_observations(
 def test_calibration_freezes_profile_and_signed_outputs(tmp_path: Path) -> None:
     receipts = load_wheel_receipts(_receipts(tmp_path))
     observations = load_fixed_work_observations(_write_observations(tmp_path))
+    current_hashes = {
+        observation.transaction_hashes
+        for observation in observations
+        if observation.mode == "current_stage052"
+    }
+    assert current_hashes == {("", "", "d" * 64)}
+    assert all(
+        all(hash_value for hash_value in observation.transaction_hashes)
+        for observation in observations
+        if observation.mode != "current_stage052"
+    )
     overhead, overhead_path = _overhead(tmp_path)
     result = calibrate_performance_profile(
         run_label="stage05.2_native_architecture_performance_calibration_attempt01",
@@ -762,6 +820,22 @@ def test_calibration_freezes_profile_and_signed_outputs(tmp_path: Path) -> None:
     assert outputs["receipt"].is_file()
     with pytest.raises(FileExistsError):
         write_calibration_bundle(result, output_root=result_dir)
+
+
+def test_observation_loader_rejects_unavailable_hashes_for_candidate_control(
+    tmp_path: Path,
+) -> None:
+    paths = _write_observations(tmp_path)
+    path = paths[0]
+    payload = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    axes = cast(list[dict[str, object]], payload["axes"])
+    axis = next(item for item in axes if item["mode"] == "python_candidate_control")
+    axis["transaction_hashes"] = ["", "", "d" * 64]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    _sign(path)
+
+    with pytest.raises(CalibrationError, match="transaction_hashes"):
+        load_fixed_work_observations(paths)
 
 
 def test_semantic_mismatch_rejects_only_divergent_candidate(tmp_path: Path) -> None:

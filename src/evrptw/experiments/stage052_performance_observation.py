@@ -96,6 +96,9 @@ FIXED_WORK_BUDGET: Final = {
     "batch_size": CALIBRATION_BATCH_SIZE,
 }
 _SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+_EMPTY_ROW_EVIDENCE_SHA256: Final = hashlib.sha256(
+    b"stage05.2-row-evidence-v1\0"
+).hexdigest()
 
 
 class PerformanceObservationError(RuntimeError):
@@ -1189,10 +1192,28 @@ def _semantic_projection(payload: Mapping[str, object]) -> dict[str, object]:
         payload.get("route_result_hash"),
         journal.get("sha256"),
     )
-    if any(
-        not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+    hashes_are_complete = all(
+        isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
         for value in transaction_hashes
-    ):
+    )
+    candidate_events = payload.get("candidate_transaction_events")
+    candidate_control = payload.get("candidate_control_statistics")
+    candidate_statistics = payload.get("candidate_transaction_statistics")
+    current_stage052_unavailable = (
+        payload.get("mode") == ArchitectureMode.CURRENT_STAGE052.value
+        and transaction_hashes[:2] == ("", "")
+        and isinstance(transaction_hashes[2], str)
+        and _SHA256_RE.fullmatch(transaction_hashes[2]) is not None
+        and isinstance(candidate_events, Mapping)
+        and set(candidate_events) == {"count", "sha256"}
+        and candidate_events.get("count") == 0
+        and candidate_events.get("sha256") == _EMPTY_ROW_EVIDENCE_SHA256
+        and isinstance(candidate_control, Mapping)
+        and not candidate_control
+        and isinstance(candidate_statistics, Mapping)
+        and candidate_statistics.get("native_candidate_transactions") == 0
+    )
+    if not hashes_are_complete and not current_stage052_unavailable:
         raise PerformanceObservationError("raw axis transaction hashes are invalid")
     return {
         "objective": payload.get("objective"),

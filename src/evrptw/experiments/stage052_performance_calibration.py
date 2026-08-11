@@ -151,6 +151,23 @@ def _sha256(value: object, name: str) -> str:
     return value
 
 
+def _validated_transaction_hashes(
+    mode: str,
+    values: Sequence[object],
+) -> tuple[str, str, str]:
+    if len(values) != 3:
+        raise CalibrationError("transaction_hashes must contain exactly three items")
+    if mode == "current_stage052" and tuple(values[:2]) == ("", ""):
+        return ("", "", _sha256(values[2], "transaction_hashes[2]"))
+    return cast(
+        tuple[str, str, str],
+        tuple(
+            _sha256(item, f"transaction_hashes[{index}]")
+            for index, item in enumerate(values)
+        ),
+    )
+
+
 def _git_sha1(value: object, name: str) -> str:
     if not isinstance(value, str) or _GIT_SHA1_RE.fullmatch(value) is None:
         raise CalibrationError(f"{name} must be a lowercase 40-character Git SHA-1")
@@ -630,10 +647,11 @@ class AxisObservation:
             ("fixed_work_budget", self.fixed_work_budget),
         ):
             _canonical(value, name=name)
-        if not self.transaction_hashes:
-            raise CalibrationError("transaction_hashes must not be empty")
-        for index, item in enumerate(self.transaction_hashes):
-            _sha256(item, f"transaction_hashes[{index}]")
+        object.__setattr__(
+            self,
+            "transaction_hashes",
+            _validated_transaction_hashes(self.mode, self.transaction_hashes),
+        )
         if self.confidence_interval is not None:
             low, high = self.confidence_interval
             if not math.isfinite(low) or not math.isfinite(high) or low <= 0 or high < low:
@@ -802,9 +820,9 @@ class AxisObservation:
             candidate_trajectory=payload["candidate_trajectory"],
             exact_order=payload["exact_order"],
             cache_lifecycle=payload["cache_lifecycle"],
-            transaction_hashes=tuple(
-                _sha256(item, f"transaction_hashes[{index}]")
-                for index, item in enumerate(transactions)
+            transaction_hashes=_validated_transaction_hashes(
+                payload["mode"],
+                transactions,
             ),
             confidence_interval=interval,
             lifecycle_evidence={} if lifecycle_evidence is None else lifecycle_evidence,

@@ -25,6 +25,7 @@ from evrptw.experiments.stage052_performance_observation import (
     _replay_identical,
     _require_live_host_identity,
     _resource_summary,
+    _semantic_projection,
     _signed_axis,
     _worker_descendant_peak_pss_bytes,
     compare_host_scheduler_lifecycles,
@@ -50,6 +51,57 @@ def test_optional_candidate_payload_receipt_preserves_unavailable_surface() -> N
     assert not _candidate_payload_receipt_matches(rows, "")
     assert _candidate_payload_receipt_matches(rows, digest)
     assert not _candidate_payload_receipt_matches((), digest)
+
+
+def _current_stage052_semantic_payload() -> dict[str, object]:
+    return {
+        "mode": "current_stage052",
+        "candidate_work_hash": "",
+        "route_result_hash": "",
+        "candidate_transaction_events": {
+            "count": 0,
+            "sha256": hashlib.sha256(b"stage05.2-row-evidence-v1\0").hexdigest(),
+        },
+        "candidate_control_statistics": {},
+        "candidate_transaction_statistics": {"native_candidate_transactions": 0},
+        "canonical_semantic_journal": {"sha256": "b" * 64},
+        "measurement_evidence": {
+            "exact_route_order": {"count": 0, "sha256": "c" * 64},
+            "cache_lifecycle": {"count": 0, "sha256": "d" * 64},
+        },
+        "semantic_trajectory": {"count": 0, "sha256": "e" * 64},
+    }
+
+
+def test_semantic_projection_accepts_explicit_current_stage052_unavailable_hashes() -> None:
+    projection = _semantic_projection(_current_stage052_semantic_payload())
+
+    assert projection["transaction_hashes"] == ["", "", "b" * 64]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("mode", "python_candidate_control"),
+        ("candidate_work_hash", "a" * 64),
+        ("candidate_transaction_events", {"count": 1, "sha256": "a" * 64}),
+        ("candidate_transaction_events", {"count": 0, "sha256": "a" * 64}),
+        ("candidate_control_statistics", {"candidate_count": 1}),
+        (
+            "candidate_transaction_statistics",
+            {"native_candidate_transactions": 1},
+        ),
+    ),
+)
+def test_semantic_projection_rejects_invalid_unavailable_hash_surface(
+    field: str,
+    value: object,
+) -> None:
+    payload = _current_stage052_semantic_payload()
+    payload[field] = value
+
+    with pytest.raises(PerformanceObservationError, match="transaction hashes"):
+        _semantic_projection(payload)
 
 
 def _topology(*, shards: int = 2) -> ExecutionTopology:
