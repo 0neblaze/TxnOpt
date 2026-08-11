@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -236,19 +238,47 @@ def test_real_host_scheduler_is_registered_before_worker_classification(
     )
     started = time.perf_counter()
     scheduler_pid: int | None = None
-    with ProcessTreeMonitor(sample_interval_seconds=0.002) as monitor:
-        try:
+    worker: subprocess.Popen[bytes] | None = None
+    monitor = ProcessTreeMonitor(sample_interval_seconds=0.002)
+    try:
+        with monitor:
             scheduler.start()
             scheduler_pid = scheduler.process_id
             monitor.register_additional_root(scheduler_pid)
-            time.sleep(0.02)
-        finally:
-            scheduler.close()
+            worker = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(5.0)"]
+            )
+            sample_deadline = time.monotonic() + 2.0
+            while True:
+                with monitor._root_lock:  # noqa: SLF001
+                    worker_observed = any(
+                        pid == worker.pid
+                        for pid, _create_time, _pss_bytes in (
+                            monitor._peak_worker_descendant_pss_processes  # noqa: SLF001
+                        )
+                    )
+                if worker_observed:
+                    break
+                if time.monotonic() >= sample_deadline:
+                    raise AssertionError(
+                        "worker was not classified before the sampling deadline"
+                    )
+                time.sleep(0.005)
+    finally:
+        if worker is not None:
+            worker.terminate()
+            worker.wait(timeout=5.0)
+        scheduler.close()
     elapsed = time.perf_counter() - started
     statistics = monitor.statistics(elapsed_seconds=elapsed, compute_thread_limit=1)
 
     assert scheduler_pid in statistics["additional_root_pids"]
-    assert statistics["worker_descendant_pss_peak"]["status"] == "unavailable"
+    assert worker is not None
+    peak = statistics["worker_descendant_pss_peak"]
+    assert peak["status"] == "available"
+    observed_worker_pids = {row["pid"] for row in peak["processes"]}
+    assert worker.pid in observed_worker_pids
+    assert scheduler_pid not in observed_worker_pids
 
 
 def _axis_payload(
