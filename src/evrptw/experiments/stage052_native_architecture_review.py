@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import statistics
 import struct
@@ -40,6 +41,7 @@ from evrptw.experiments.stage052_native_architectures import (
     PAIRED_INSTANCES,
     PREVIOUS_COMPARISON_SCHEMA_VERSION,
     PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+    PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
     PROCESS_TREE_IO_ACCOUNTING_SOURCE,
     SCHEMA_VERSION,
     SEEDS,
@@ -77,7 +79,7 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v11"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v12"
 REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
 REVIEW_EXECUTION_SCHEMA_VERSION = "experiment-review-execution-v1"
 REVIEWER_MODULE_NAME = "evrptw.experiments.stage052_native_architecture_review"
@@ -88,6 +90,7 @@ EXTERNAL_SEMANTIC_COMPARISON_SCHEMA_VERSIONS = frozenset(
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
 )
@@ -95,6 +98,7 @@ PROFILE_COMPARISON_SCHEMA_VERSIONS = frozenset(
     {
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
 )
@@ -133,8 +137,15 @@ _CURRENT_WORKER_PSS_SAMPLE_ACCOUNTING_FIELDS = frozenset(
         "worker_descendant_pss_incomplete_sample_count",
     }
 )
+_CURRENT_CPU_QUANTIZATION_ACCOUNTING_FIELDS = frozenset(
+    {"cpu_clock_tick_hz", "cpu_quantization_lane_count"}
+)
+_PROCESS_PROFILE_PROCESS_TREE_STATISTICS_FIELDS = (
+    PROCESS_TREE_STATISTICS_FIELDS - _CURRENT_CPU_QUANTIZATION_ACCOUNTING_FIELDS
+)
 _PRIOR_PROFILE_PROCESS_TREE_STATISTICS_FIELDS = (
-    PROCESS_TREE_STATISTICS_FIELDS - _CURRENT_WORKER_PSS_SAMPLE_ACCOUNTING_FIELDS
+    _PROCESS_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
+    - _CURRENT_WORKER_PSS_SAMPLE_ACCOUNTING_FIELDS
 )
 FULL_NATIVE_SEMANTIC_MODES = frozenset(
     {
@@ -187,7 +198,8 @@ def _mode_wave_affinity_matches_profile(
     if wave.get("actual_affinity_union") != list(allowed_cpu_ids):
         return False
     return (
-        comparison_schema == SCHEMA_VERSION
+        comparison_schema
+        in {PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}
         or wave.get("thread_affinity_union") == list(allowed_cpu_ids)
     )
 
@@ -211,11 +223,12 @@ def _resource_telemetry_topology_error(
     if expected_resource_telemetry:
         if "telemetry_status" in topology:
             return "enabled process-tree telemetry has a disabled-status marker"
-        statistics_fields = (
-            PROCESS_TREE_STATISTICS_FIELDS
-            if comparison_schema == SCHEMA_VERSION
-            else _PRIOR_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
-        )
+        if comparison_schema == SCHEMA_VERSION:
+            statistics_fields = PROCESS_TREE_STATISTICS_FIELDS
+        elif comparison_schema == PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION:
+            statistics_fields = _PROCESS_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
+        else:
+            statistics_fields = _PRIOR_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
         if require_complete_schema and set(topology) != (
             _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS
             | statistics_fields
@@ -1471,6 +1484,102 @@ def _review_process_tree_io(wave: Mapping[str, object]) -> dict[str, int]:
     return {field: totals[field] for field in ("read_bytes", "write_bytes")}
 
 
+def _review_current_cpu_budget(
+    statistics: Mapping[str, object],
+    *,
+    elapsed_seconds: float,
+    compute_limit: int,
+    cpu_seconds: float,
+    label: str,
+) -> None:
+    """Independently replay the current tick-quantized CPU accounting bound."""
+
+    clock_tick_hz = _review_nonnegative_integer(
+        statistics.get("cpu_clock_tick_hz"),
+        f"{label} CPU clock tick frequency",
+    )
+    peak_processes = _review_nonnegative_integer(
+        statistics.get("peak_concurrent_processes"),
+        f"{label} peak concurrent process count",
+    )
+    effective_elapsed = _review_nonnegative_number(
+        statistics.get("effective_elapsed_seconds"),
+        f"{label} effective elapsed time",
+    )
+    if (
+        clock_tick_hz == 0
+        or peak_processes == 0
+        or effective_elapsed <= 0.0
+        or statistics.get("compute_thread_limit") != compute_limit
+        or statistics.get("cpu_normalized_within_limit") is not True
+    ):
+        raise RuntimeError(f"{label} CPU accounting identity is invalid")
+    try:
+        observed_clock_tick_hz = int(os.sysconf("SC_CLK_TCK"))
+    except (OSError, TypeError, ValueError) as error:
+        raise RuntimeError(f"{label} CPU clock tick frequency is unavailable") from error
+    monitor_start = _review_nonnegative_number(
+        statistics.get("monitor_start_monotonic"),
+        f"{label} monitor start",
+    )
+    monitor_end = _review_nonnegative_number(
+        statistics.get("monitor_end_monotonic"),
+        f"{label} monitor end",
+    )
+    monitor_elapsed = monitor_end - monitor_start
+    expected_effective_elapsed = elapsed_seconds
+    if (
+        clock_tick_hz != observed_clock_tick_hz
+        or monitor_end < monitor_start
+        or monitor_elapsed > elapsed_seconds + 1e-9
+        or not math.isclose(
+            effective_elapsed,
+            expected_effective_elapsed,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        raise RuntimeError(f"{label} CPU accounting clock identity is invalid")
+    allowed_cpu_seconds = elapsed_seconds * compute_limit
+    expected_quantization_lanes = compute_limit
+    if statistics.get("cpu_quantization_lane_count") != expected_quantization_lanes:
+        raise RuntimeError(f"{label} CPU quantization lane count is invalid")
+    expected_tolerance = max(
+        1e-6,
+        allowed_cpu_seconds * 1e-6,
+        expected_quantization_lanes / clock_tick_hz,
+    )
+    reported_tolerance = _review_nonnegative_number(
+        statistics.get("cpu_limit_tolerance_seconds"),
+        f"{label} CPU accounting tolerance",
+    )
+    if (
+        not math.isclose(
+            reported_tolerance,
+            expected_tolerance,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        or cpu_seconds > allowed_cpu_seconds + expected_tolerance
+    ):
+        raise RuntimeError(f"{label} CPU accounting exceeds its quantized budget")
+    expected_utilization = min(
+        100.0,
+        100.0 * cpu_seconds / allowed_cpu_seconds,
+    )
+    reported_utilization = _review_nonnegative_number(
+        statistics.get("cpu_utilization_percent_of_compute_limit"),
+        f"{label} compute-limit utilization",
+    )
+    if not math.isclose(
+        reported_utilization,
+        expected_utilization,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise RuntimeError(f"{label} normalized CPU utilization does not replay")
+
+
 def _review_mode_wave_resources(
     wave: Mapping[str, object],
     *,
@@ -1482,7 +1591,10 @@ def _review_mode_wave_resources(
         or wave.get("worker_max_tasks_per_child") != 1
     ):
         raise RuntimeError("campaign worker process lifecycle is invalid")
-    if comparison_schema == SCHEMA_VERSION:
+    if comparison_schema in {
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    }:
         if (
             wave.get("resource_summary_accounting_source")
             != MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE
@@ -1567,7 +1679,11 @@ def _review_mode_wave_resources(
             and set(reported_io) != io_fields
         ) or (
             comparison_schema
-            in {PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}
+            in {
+                PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+                PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+                SCHEMA_VERSION,
+            }
             and set(reported_io) != {"source", *io_fields}
         ):
             raise RuntimeError("campaign cgroup I/O evidence is invalid")
@@ -1631,8 +1747,21 @@ def _review_mode_wave_resources(
         wave.get("process_tree_cpu_seconds"),
         "campaign process-tree CPU time",
     )
-    if elapsed <= 0.0 or compute_limit == 0 or cpu_seconds > elapsed * compute_limit * 1.000001:
-        raise RuntimeError("campaign process-tree CPU accounting exceeds its budget")
+    if elapsed <= 0.0 or compute_limit == 0:
+        raise RuntimeError("campaign process-tree CPU accounting identity is invalid")
+    if comparison_schema == SCHEMA_VERSION:
+        _review_current_cpu_budget(
+            wave,
+            elapsed_seconds=elapsed,
+            compute_limit=compute_limit,
+            cpu_seconds=cpu_seconds,
+            label="campaign process-tree",
+        )
+        derived_cpu_seconds = min(cpu_seconds, elapsed * compute_limit)
+    else:
+        if cpu_seconds > elapsed * compute_limit * 1.000001:
+            raise RuntimeError("campaign process-tree CPU accounting exceeds its budget")
+        derived_cpu_seconds = cpu_seconds
     axis_count = _review_nonnegative_integer(
         wave.get("axis_count"),
         "campaign mode-wave axis count",
@@ -1659,13 +1788,13 @@ def _review_mode_wave_resources(
         )
         or not math.isclose(
             effective_cores,
-            cpu_seconds / elapsed,
+            derived_cpu_seconds / elapsed,
             rel_tol=1e-9,
             abs_tol=1e-9,
         )
         or not math.isclose(
             utilization,
-            cpu_seconds / (elapsed * compute_limit),
+            derived_cpu_seconds / (elapsed * compute_limit),
             rel_tol=1e-9,
             abs_tol=1e-9,
         )
@@ -1725,7 +1854,10 @@ def _review_mode_wave_resources(
         ):
             raise RuntimeError("campaign unresolved thread identity is invalid")
         unresolved_identities.add(unresolved_identity)
-    if comparison_schema != SCHEMA_VERSION and (missed_processes or unresolved):
+    if comparison_schema not in {
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    } and (missed_processes or unresolved):
         raise RuntimeError("campaign thread-tree sampling evidence is incomplete")
     start_ticks = wave.get("monitor_start_boot_time_ticks")
     _review_nonnegative_integer(start_ticks, "campaign monitor boot-time tick marker")
@@ -3630,6 +3762,7 @@ def _replay_record(
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         raise RuntimeError(f"unsupported comparison schema: {record.path}")
@@ -3643,6 +3776,7 @@ def _replay_record(
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         if "semantic_trajectory" not in payload or payload.get("semantic_trajectory") is None:
@@ -3666,6 +3800,7 @@ def _replay_record(
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         if comparison_schema in EXTERNAL_SEMANTIC_COMPARISON_SCHEMA_VERSIONS:
@@ -4925,6 +5060,7 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         # First validate the complete, implementation-owned causal journal.

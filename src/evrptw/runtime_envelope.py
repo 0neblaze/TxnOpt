@@ -57,6 +57,8 @@ PROCESS_TREE_STATISTICS_FIELDS = frozenset(
         "monitor_start_boot_time_ticks",
         "monitor_end_monotonic",
         "compute_thread_limit",
+        "cpu_clock_tick_hz",
+        "cpu_quantization_lane_count",
         "process_tree_user_cpu_seconds",
         "process_tree_system_cpu_seconds",
         "process_tree_cpu_user_seconds",
@@ -871,7 +873,24 @@ class ProcessTreeMonitor:
         )
         effective_elapsed = max(elapsed_seconds, monitor_elapsed or 0.0)
         allowed_cpu_seconds = effective_elapsed * compute_thread_limit
-        tolerance_seconds = max(1e-6, allowed_cpu_seconds * 1e-6)
+        # Linux process CPU counters are quantized to scheduler clock ticks.
+        # Subtracting two independently quantized cumulative samples can
+        # overstate independently sampled lanes even when the process tree
+        # never exceeds its affinity budget.  Cap the uncertainty at one tick
+        # per permitted compute lane: lifetime or concurrent PID churn cannot
+        # enlarge the hard gate.  Keep raw CPU seconds observable; larger excess
+        # still fails closed.
+        quantization_lane_count = compute_thread_limit
+        quantization_tolerance_seconds = (
+            quantization_lane_count / self._cpu_stat_hz
+            if self._cpu_stat_hz is not None and self._cpu_stat_hz > 0
+            else 0.0
+        )
+        tolerance_seconds = max(
+            1e-6,
+            allowed_cpu_seconds * 1e-6,
+            quantization_tolerance_seconds,
+        )
         if cpu_seconds > allowed_cpu_seconds + tolerance_seconds:
             raise RuntimeError(
                 "process-tree CPU usage exceeds compute-thread limit: "
@@ -1082,6 +1101,10 @@ class ProcessTreeMonitor:
                 else _UNAVAILABLE
             ),
             "compute_thread_limit": compute_thread_limit,
+            "cpu_clock_tick_hz": (
+                self._cpu_stat_hz if self._cpu_stat_hz is not None else _UNAVAILABLE
+            ),
+            "cpu_quantization_lane_count": quantization_lane_count,
             "process_tree_user_cpu_seconds": user_cpu_seconds,
             "process_tree_system_cpu_seconds": system_cpu_seconds,
             "process_tree_cpu_user_seconds": user_cpu_seconds,

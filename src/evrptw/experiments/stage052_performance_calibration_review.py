@@ -35,6 +35,9 @@ from evrptw.experiments.stage052_native_architectures import (
     ArchitectureMode,
     workload_class_for_instance,
 )
+from evrptw.experiments.stage052_native_architectures import (
+    SCHEMA_VERSION as COMPARISON_SCHEMA_VERSION,
+)
 from evrptw.experiments.stage052_performance_calibration import (
     CALIBRATION_INPUT_DIRECTORY,
     CALIBRATION_INPUT_STORAGE_ALIAS,
@@ -51,6 +54,7 @@ from evrptw.experiments.stage052_performance_observation import (
     FIXED_WORK_BUDGET,
     LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_SUMMARY_ACCOUNTING_SOURCE,
 )
@@ -74,7 +78,7 @@ from evrptw.stage052_performance import (
 from evrptw.validation import validate_routes
 
 CALIBRATION_REVIEW_SCHEMA_VERSION: Final = (
-    "stage05.2-native-architecture-performance-calibration-review-v2"
+    "stage05.2-native-architecture-performance-calibration-review-v3"
 )
 CALIBRATION_REVIEW_QUALIFICATION: Final = "QUALIFIED_FOR_ATTEMPT08"
 CALIBRATION_REVIEW_FAILURE_SCHEMA_VERSION: Final = (
@@ -525,8 +529,12 @@ def _review_raw_axis(
     *,
     benchmark_dir: Path,
     build_identity: Mapping[str, object],
+    schema_versions: set[str] | None = None,
 ) -> tuple[dict[str, object], str, str, str]:
     payload = _load_reconciled_raw_axis(path)
+    comparison_schema = _text(payload.get("schema_version"), "raw comparison schema")
+    if schema_versions is not None:
+        schema_versions.add(comparison_schema)
     if payload.get("status") != "completed" or payload.get("axis") != "fixed_work":
         raise CalibrationReviewError(f"raw axis is not completed fixed-work evidence: {path}")
     for raw_field, identity_field in (
@@ -870,6 +878,103 @@ def _validate_resource_process_tree(
     return user_seconds, system_seconds, totals
 
 
+def _validate_current_resource_cpu_budget(
+    process_tree: Mapping[str, object],
+    *,
+    elapsed_seconds: float,
+    compute_limit: int,
+    cpu_seconds: float,
+) -> None:
+    """Independently replay the v4 scheduler-tick CPU uncertainty bound."""
+
+    clock_tick_hz = _integer(
+        process_tree.get("cpu_clock_tick_hz"),
+        "resource CPU clock tick frequency",
+    )
+    peak_processes = _integer(
+        process_tree.get("peak_concurrent_processes"),
+        "resource peak concurrent process count",
+    )
+    effective_elapsed = _number(
+        process_tree.get("effective_elapsed_seconds"),
+        "resource effective elapsed",
+        positive=True,
+    )
+    if (
+        clock_tick_hz <= 0
+        or peak_processes <= 0
+        or process_tree.get("compute_thread_limit") != compute_limit
+        or process_tree.get("cpu_normalized_within_limit") is not True
+    ):
+        raise CalibrationReviewError("raw resource CPU accounting identity is invalid")
+    try:
+        observed_clock_tick_hz = int(os.sysconf("SC_CLK_TCK"))
+    except (OSError, TypeError, ValueError) as error:
+        raise CalibrationReviewError(
+            "raw resource CPU clock tick frequency is unavailable"
+        ) from error
+    monitor_start = _number(
+        process_tree.get("monitor_start_monotonic"),
+        "resource monitor start",
+    )
+    monitor_end = _number(
+        process_tree.get("monitor_end_monotonic"),
+        "resource monitor end",
+    )
+    monitor_elapsed = monitor_end - monitor_start
+    expected_effective_elapsed = elapsed_seconds
+    if (
+        clock_tick_hz != observed_clock_tick_hz
+        or monitor_end < monitor_start
+        or monitor_elapsed > elapsed_seconds + 1e-9
+        or not math.isclose(
+            effective_elapsed,
+            expected_effective_elapsed,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        raise CalibrationReviewError("raw resource CPU accounting clock identity is invalid")
+    allowed_cpu_seconds = elapsed_seconds * compute_limit
+    expected_quantization_lanes = compute_limit
+    if process_tree.get("cpu_quantization_lane_count") != expected_quantization_lanes:
+        raise CalibrationReviewError("raw resource CPU quantization lane count is invalid")
+    expected_tolerance = max(
+        1e-6,
+        allowed_cpu_seconds * 1e-6,
+        expected_quantization_lanes / clock_tick_hz,
+    )
+    reported_tolerance = _number(
+        process_tree.get("cpu_limit_tolerance_seconds"),
+        "resource CPU accounting tolerance",
+    )
+    if (
+        not math.isclose(
+            reported_tolerance,
+            expected_tolerance,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        or cpu_seconds > allowed_cpu_seconds + expected_tolerance
+    ):
+        raise CalibrationReviewError("raw resource CPU accounting exceeds its budget")
+    expected_utilization = min(
+        100.0,
+        100.0 * cpu_seconds / allowed_cpu_seconds,
+    )
+    reported_utilization = _number(
+        process_tree.get("cpu_utilization_percent_of_compute_limit"),
+        "resource normalized CPU utilization",
+    )
+    if not math.isclose(
+        reported_utilization,
+        expected_utilization,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise CalibrationReviewError("raw resource normalized CPU use does not replay")
+
+
 def _resource_queue_totals(
     payloads: Sequence[Mapping[str, object]],
     scheduler_statistics: Mapping[str, object] | None,
@@ -968,6 +1073,7 @@ def _review_io_accounting(
                 raise CalibrationReviewError("raw resource cgroup I/O schema is invalid")
         elif schema_version in {
             PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
             RESOURCE_EVIDENCE_SCHEMA_VERSION,
         }:
             reported = _mapping(evidence.get("io_accounting"), "resource I/O accounting")
@@ -983,6 +1089,7 @@ def _review_io_accounting(
         return reported
     if schema_version not in {
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         raise CalibrationReviewError("raw resource legacy cgroup I/O is unavailable")
@@ -1035,6 +1142,7 @@ def _derive_resource_summary(
     if evidence.get("schema_version") not in {
         LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         raise CalibrationReviewError("raw resource evidence schema is invalid")
@@ -1054,9 +1162,16 @@ def _derive_resource_summary(
     process_tree = _mapping(evidence.get("process_tree"), "resource process_tree")
     _validate_resource_thread_tree(
         process_tree,
-        require_complete=schema_version != RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        require_complete=schema_version
+        not in {
+            PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        },
     )
-    if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+    if schema_version in {
+        PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }:
         if (
             evidence.get("resource_summary_accounting_source")
             != RESOURCE_SUMMARY_ACCOUNTING_SOURCE
@@ -1092,10 +1207,18 @@ def _derive_resource_summary(
     if (
         process_tree.get("compute_thread_limit") != compute_limit
         or process_tree.get("cpu_normalized_within_limit") is not True
-        or cpu_seconds > elapsed * compute_limit * 1.000001
         or process_tree.get("actual_affinity_union") != list(topology.cpu_ids)
     ):
         raise CalibrationReviewError("raw resource CPU/affinity budget is invalid")
+    if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        _validate_current_resource_cpu_budget(
+            process_tree,
+            elapsed_seconds=elapsed,
+            compute_limit=compute_limit,
+            cpu_seconds=cpu_seconds,
+        )
+    elif cpu_seconds > elapsed * compute_limit * 1.000001:
+        raise CalibrationReviewError("raw resource CPU accounting exceeds its budget")
     before = _mapping(evidence.get("cgroup_before"), "resource cgroup_before")
     after = _mapping(evidence.get("cgroup_after"), "resource cgroup_after")
     if (
@@ -1198,7 +1321,10 @@ def _derive_resource_summary(
         payloads,
         scheduler_statistics,
     )
-    use_process_accounting = schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION
+    use_process_accounting = schema_version in {
+        PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }
     schedstat = _mapping(
         process_tree.get(
             "process_tree_schedstat"
@@ -1217,13 +1343,25 @@ def _derive_resource_summary(
         process_tree,
         scheduler_process_id=scheduler_pid,
         require_complete_sample_accounting=(
-            schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION
+            schema_version
+            in {
+                PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+                RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            }
         ),
+    )
+    normalized_cpu_seconds = (
+        min(cpu_seconds, elapsed * compute_limit)
+        if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION
+        else cpu_seconds
     )
     summary = RuntimeResourceSummaryV2(
         elapsed_seconds=elapsed,
-        effective_cores=cpu_seconds / elapsed,
-        cpu_utilization_fraction=min(1.0, cpu_seconds / (elapsed * compute_limit)),
+        effective_cores=normalized_cpu_seconds / elapsed,
+        cpu_utilization_fraction=min(
+            1.0,
+            normalized_cpu_seconds / (elapsed * compute_limit),
+        ),
         user_cpu_seconds=(
             process_user_seconds
             if use_process_accounting
@@ -1324,6 +1462,7 @@ def _validate_resource_evidence(
     run_root: Path | None = None,
     inventory_roles: Mapping[str, str] | None = None,
     replayed: dict[tuple[str, str, str, str], dict[str, object]] | None = None,
+    schema_versions: set[str] | None = None,
 ) -> int:
     resources = _array(provenance.get("resource_summaries"), "resource_summaries")
     if not resources:
@@ -1355,6 +1494,10 @@ def _validate_resource_evidence(
                 else _mapping(scheduler_raw, "resource scheduler statistics")
             )
             raw_resource = _mapping(row.get("raw_resource_statistics"), "raw_resource_statistics")
+            if schema_versions is not None:
+                schema_versions.add(
+                    _text(raw_resource.get("schema_version"), "resource evidence schema")
+                )
             (
                 derived,
                 scheduler_pss,
@@ -2045,6 +2188,8 @@ def _replay_observation_children(
     *,
     benchmark_dir: Path,
     frozen_host: HostPerformanceEnvelope,
+    raw_schema_versions: set[str] | None = None,
+    resource_schema_versions: set[str] | None = None,
 ) -> tuple[int, int, int]:
     rows_by_source: dict[Path, list[AxisObservation]] = defaultdict(list)
     for row in observations:
@@ -2119,6 +2264,7 @@ def _replay_observation_children(
                 path,
                 benchmark_dir=benchmark_dir,
                 build_identity=build_identity,
+                schema_versions=raw_schema_versions,
             )
             raw_count += 1
             projection_bytes = _canonical(projection)
@@ -2141,6 +2287,7 @@ def _replay_observation_children(
             run_root=run_root,
             inventory_roles=inventory_roles,
             replayed=resource_replays,
+            schema_versions=resource_schema_versions,
         )
         expected_rows = rows_by_source.get(observation_path.resolve(), [])
         if not expected_rows:
@@ -2229,6 +2376,7 @@ def _replay_telemetry_children(
     benchmark_dir: Path,
     build_identity: Mapping[str, object],
     frozen_host: HostPerformanceEnvelope,
+    raw_schema_versions: set[str] | None = None,
 ) -> int:
     try:
         overhead.require_representative_fixed_work()
@@ -2434,6 +2582,7 @@ def _replay_telemetry_children(
             axis_path,
             benchmark_dir=benchmark_dir,
             build_identity=build_identity,
+            schema_versions=raw_schema_versions,
         )
         axis_payload, _axis_digest = _load_signed_json(axis_path, "telemetry raw axis")
         axis_topology = _mapping(axis_payload.get("topology"), "telemetry raw axis topology")
@@ -2587,19 +2736,33 @@ def derive_calibration_review(
     if len(portable_builds) != 1:
         raise CalibrationReviewError("telemetry portable-o3 build identity is ambiguous")
     telemetry_identity = portable_builds[0].artifact_identity
+    telemetry_raw_schema_versions: set[str] = set()
     telemetry_raw_count = _replay_telemetry_children(
         overhead,
         run_root=run_dir,
         benchmark_dir=benchmark_dir.resolve(),
         build_identity=telemetry_identity.to_dict(),
         frozen_host=profile.host,
+        raw_schema_versions=telemetry_raw_schema_versions,
     )
+    raw_schema_versions: set[str] = set()
+    resource_schema_versions: set[str] = set()
     raw_count, resource_count, rejection_count = _replay_observation_children(
         observation_paths,
         observations,
         benchmark_dir=benchmark_dir.resolve(),
         frozen_host=profile.host,
+        raw_schema_versions=raw_schema_versions,
+        resource_schema_versions=resource_schema_versions,
     )
+    if (
+        raw_schema_versions != {COMPARISON_SCHEMA_VERSION}
+        or telemetry_raw_schema_versions != {COMPARISON_SCHEMA_VERSION}
+        or resource_schema_versions != {RESOURCE_EVIDENCE_SCHEMA_VERSION}
+    ):
+        raise CalibrationReviewError(
+            "current calibration qualification requires only current child schemas"
+        )
     identity = profile.selected_build.artifact_identity
     if identity is None:
         raise CalibrationReviewError("selected build identity is unavailable")
@@ -2628,6 +2791,10 @@ def derive_calibration_review(
         "raw_axis_replay_count": raw_count,
         "telemetry_raw_axis_replay_count": telemetry_raw_count,
         "resource_summary_replay_count": resource_count,
+        "raw_axis_schema_versions": sorted(raw_schema_versions),
+        "telemetry_raw_axis_schema_versions": sorted(telemetry_raw_schema_versions),
+        "resource_evidence_schema_versions": sorted(resource_schema_versions),
+        "current_schema_qualified": True,
         "memory_rejection_replay_count": rejection_count,
         "fixed_work_semantics_identical": True,
         "validator_objective_replay_passed": True,

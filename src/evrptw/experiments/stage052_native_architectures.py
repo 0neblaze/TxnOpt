@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import time
 import zipfile
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -72,7 +72,8 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v11"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v12"
+PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v11"
 PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v10"
 LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v9"
 PREVIOUS_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v7"
@@ -89,10 +90,13 @@ TOTAL_COMPUTE_THREADS = 24
 WORKLOAD_CLASSES = ("c5", "100-customer")
 WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v2"
 CALIBRATION_REVIEW_SCHEMA_VERSION = (
-    "stage05.2-native-architecture-performance-calibration-review-v2"
+    "stage05.2-native-architecture-performance-calibration-review-v3"
 )
 CALIBRATION_REVIEW_QUALIFICATION = "QUALIFIED_FOR_ATTEMPT08"
-PAIRED_REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v11"
+CALIBRATION_RESOURCE_EVIDENCE_SCHEMA_VERSION = (
+    "stage05.2-calibration-resource-evidence-v4"
+)
+PAIRED_REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v12"
 PAIRED_REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
 PAIRED_REVIEW_EXECUTION_SCHEMA_VERSION = "experiment-review-execution-v1"
 PAIRED_REVIEWER_MODULE_NAME = "evrptw.experiments.stage052_native_architecture_review"
@@ -305,6 +309,11 @@ def _load_qualified_calibration_review(
         or payload.get("fixed_work_semantics_identical") is not True
         or payload.get("validator_objective_replay_passed") is not True
         or payload.get("selector_recomputation_passed") is not True
+        or payload.get("current_schema_qualified") is not True
+        or payload.get("raw_axis_schema_versions") != [SCHEMA_VERSION]
+        or payload.get("telemetry_raw_axis_schema_versions") != [SCHEMA_VERSION]
+        or payload.get("resource_evidence_schema_versions")
+        != [CALIBRATION_RESOURCE_EVIDENCE_SCHEMA_VERSION]
         or payload.get("queue_full_count") != 0
         or payload.get("rejected_count") != 0
         or payload.get("swap_used") is not False
@@ -2152,6 +2161,7 @@ def _solve_mode(
     resource_telemetry_enabled: bool | None = None,
     resource_telemetry_sample_interval_seconds: float | None = None,
     task_receipt_path: Path | None = None,
+    solved_result_sink: Callable[[ALNSResult], None] | None = None,
 ) -> tuple[ALNSResult, float, dict[str, object]]:
     monitor_enabled = (
         telemetry_enabled if resource_telemetry_enabled is None else resource_telemetry_enabled
@@ -2275,6 +2285,8 @@ def _solve_mode(
         ) as resource_monitor:
             started = time.perf_counter()
             result = execute_solver()
+            if solved_result_sink is not None:
+                solved_result_sink(result)
             solver_seconds = time.perf_counter() - started
         resource_statistics = resource_monitor.statistics(
             elapsed_seconds=solver_seconds,
@@ -2287,6 +2299,8 @@ def _solve_mode(
     else:
         started = time.perf_counter()
         result = execute_solver()
+        if solved_result_sink is not None:
+            solved_result_sink(result)
         solver_seconds = time.perf_counter() - started
         resource_statistics = {"telemetry_status": "disabled"}
     report = validate_routes(instance, [list(route) for route in result.routes])
@@ -2694,6 +2708,10 @@ def _run_mode(
     payload: dict[str, object] | None = None
     failure: BaseException | None = None
     try:
+        def retain_solved_result(solved_result: ALNSResult) -> None:
+            nonlocal result
+            result = solved_result
+
         solve_call_started = time.perf_counter()
         result, solver_seconds, topology = _solve_mode(
             mode,
@@ -2703,6 +2721,7 @@ def _run_mode(
                 resource_telemetry_sample_interval_seconds
             ),
             task_receipt_path=task_receipt_path,
+            solved_result_sink=retain_solved_result,
         )
         solve_call_seconds = time.perf_counter() - solve_call_started
         startup_seconds = max(0.0, solve_call_seconds - solver_seconds)
@@ -3420,6 +3439,10 @@ def run_experiment(
             ):
                 raise RuntimeError("runtime process-tree CPU accounting is invalid")
             process_tree_cpu_seconds = float(raw_process_tree_cpu_seconds)
+            derived_cpu_seconds = min(
+                process_tree_cpu_seconds,
+                mode_elapsed * len(topology.cpu_ids),
+            )
             if len(axis_parent_terminal_timings) != len(identity_block):
                 raise RuntimeError("mode-wave parent terminal timing inventory is incomplete")
             _require_campaign_identity(
@@ -3473,9 +3496,9 @@ def run_experiment(
                     ),
                     "elapsed_seconds": mode_elapsed,
                     "axes_per_hour": 3600.0 * len(identity_block) / mode_elapsed,
-                    "effective_cores": process_tree_cpu_seconds / mode_elapsed,
+                    "effective_cores": derived_cpu_seconds / mode_elapsed,
                     "cpu_utilization_fraction_of_compute_limit": (
-                        process_tree_cpu_seconds / (mode_elapsed * len(topology.cpu_ids))
+                        derived_cpu_seconds / (mode_elapsed * len(topology.cpu_ids))
                     ),
                     "cgroup_before": cgroup_before,
                     "cgroup_after": cgroup_after,

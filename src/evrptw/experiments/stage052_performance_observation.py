@@ -74,7 +74,10 @@ from evrptw.stage052_performance import (
 from evrptw.stage052_semantic_journal import evidence_json_value
 
 FAILURE_SCHEMA_VERSION: Final = "stage05.2-performance-observation-failure-v1"
-RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v3"
+RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v4"
+PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
+    "stage05.2-calibration-resource-evidence-v3"
+)
 PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
     "stage05.2-calibration-resource-evidence-v2"
 )
@@ -307,6 +310,7 @@ def _process_tree_resource_statistics(
     if resource_evidence.get("schema_version") not in {
         LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         raise PerformanceObservationError("resource evidence schema is invalid")
@@ -814,12 +818,14 @@ def _resource_summary(
     rejected += local_rejected
     cgroup_current = _required_resource_int(cgroup_after, "memory_current_bytes")
     cgroup_peak = _required_resource_int(cgroup_after, "memory_peak_bytes")
+    normalized_cpu_seconds = min(cpu_seconds, elapsed_seconds * len(topology.cpu_ids))
     return RuntimeResourceSummaryV2(
         elapsed_seconds=elapsed_seconds,
-        effective_cores=cpu_seconds / max(elapsed_seconds, 1e-12),
+        effective_cores=normalized_cpu_seconds / max(elapsed_seconds, 1e-12),
         cpu_utilization_fraction=min(
             1.0,
-            cpu_seconds / max(elapsed_seconds * len(topology.cpu_ids), 1e-12),
+            normalized_cpu_seconds
+            / max(elapsed_seconds * len(topology.cpu_ids), 1e-12),
         ),
         user_cpu_seconds=user_seconds,
         system_cpu_seconds=system_seconds,

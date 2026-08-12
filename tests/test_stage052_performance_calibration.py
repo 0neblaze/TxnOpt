@@ -1307,16 +1307,19 @@ def test_independent_review_rederives_the_exact_frozen_profile(
         status="complete",
         receipt_path=outputs["receipt"],
     )
-    monkeypatch.setattr(
-        review,
-        "_replay_observation_children",
-        lambda *_args, **_kwargs: (72, 30, 0),
-    )
-    monkeypatch.setattr(
-        review,
-        "_replay_telemetry_children",
-        lambda *_args, **_kwargs: 12,
-    )
+    def replay_observations(*_args: object, **kwargs: object) -> tuple[int, int, int]:
+        cast(set[str], kwargs["raw_schema_versions"]).add(review.COMPARISON_SCHEMA_VERSION)
+        cast(set[str], kwargs["resource_schema_versions"]).add(
+            review.RESOURCE_EVIDENCE_SCHEMA_VERSION
+        )
+        return 72, 30, 0
+
+    def replay_telemetry(*_args: object, **kwargs: object) -> int:
+        cast(set[str], kwargs["raw_schema_versions"]).add(review.COMPARISON_SCHEMA_VERSION)
+        return 12
+
+    monkeypatch.setattr(review, "_replay_observation_children", replay_observations)
+    monkeypatch.setattr(review, "_replay_telemetry_children", replay_telemetry)
 
     payload = review.derive_calibration_review(
         calibration_run_dir=outputs["run_dir"],
@@ -1327,6 +1330,27 @@ def test_independent_review_rederives_the_exact_frozen_profile(
     assert payload["profile_canonical_sha256"] == result.profile.canonical_sha256
     assert payload["rederived_profile_canonical_sha256"] == result.profile.canonical_sha256
     assert payload["raw_axis_replay_count"] == 72
+
+    def replay_historical_resources(
+        *_args: object,
+        **kwargs: object,
+    ) -> tuple[int, int, int]:
+        cast(set[str], kwargs["raw_schema_versions"]).add(review.COMPARISON_SCHEMA_VERSION)
+        cast(set[str], kwargs["resource_schema_versions"]).add(
+            review.PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION
+        )
+        return 72, 30, 0
+
+    monkeypatch.setattr(
+        review,
+        "_replay_observation_children",
+        replay_historical_resources,
+    )
+    with pytest.raises(review.CalibrationReviewError, match="current child schemas"):
+        review.derive_calibration_review(
+            calibration_run_dir=outputs["run_dir"],
+            benchmark_dir=tmp_path / "benchmarks",
+        )
 
 
 def test_calibration_bundle_replays_after_directory_relocation(
@@ -1368,16 +1392,19 @@ def test_calibration_bundle_replays_after_directory_relocation(
     shutil.copytree(outputs["run_dir"], relocated)
     shutil.rmtree(input_root)
     shutil.rmtree(outputs["run_dir"])
-    monkeypatch.setattr(
-        review,
-        "_replay_observation_children",
-        lambda *_args, **_kwargs: (72, 30, 0),
-    )
-    monkeypatch.setattr(
-        review,
-        "_replay_telemetry_children",
-        lambda *_args, **_kwargs: 12,
-    )
+    def replay_observations(*_args: object, **kwargs: object) -> tuple[int, int, int]:
+        cast(set[str], kwargs["raw_schema_versions"]).add(review.COMPARISON_SCHEMA_VERSION)
+        cast(set[str], kwargs["resource_schema_versions"]).add(
+            review.RESOURCE_EVIDENCE_SCHEMA_VERSION
+        )
+        return 72, 30, 0
+
+    def replay_telemetry(*_args: object, **kwargs: object) -> int:
+        cast(set[str], kwargs["raw_schema_versions"]).add(review.COMPARISON_SCHEMA_VERSION)
+        return 12
+
+    monkeypatch.setattr(review, "_replay_observation_children", replay_observations)
+    monkeypatch.setattr(review, "_replay_telemetry_children", replay_telemetry)
 
     payload = review.derive_calibration_review(
         calibration_run_dir=relocated,

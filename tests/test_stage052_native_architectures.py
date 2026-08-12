@@ -263,6 +263,55 @@ def test_run_mode_publishes_failed_axis_then_raises_fail_fast(
     assert axis_path.with_suffix(".json.persistence").is_file()
 
 
+def test_run_mode_releases_solved_trace_when_resource_summary_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    released = False
+
+    class Trace:
+        def release_runtime_semantic_storage(self) -> None:
+            nonlocal released
+            released = True
+
+    solved_result = SimpleNamespace(measurement_trace=Trace())
+
+    def fail_after_solve(
+        *_args: object,
+        solved_result_sink: object = None,
+        **_kwargs: object,
+    ) -> object:
+        assert callable(solved_result_sink)
+        solved_result_sink(solved_result)
+        raise RuntimeError("injected resource-summary failure")
+
+    monkeypatch.setattr(architectures, "_solve_mode", fail_after_solve)
+    task = ArchitectureAxisTask(
+        scope="paired",
+        repeat=0,
+        axis="fixed_work",
+        instance_name="c101C5",
+        seed=2014,
+        benchmark_dir=tmp_path,
+        output_root=tmp_path,
+        run_labels=run_labels_for_scope("paired", 98),
+        scheduler_socket_path=str(tmp_path / "scheduler.sock"),
+        wheel_sha256="a" * 64,
+        native_sha256="b" * 64,
+        scheduler_sha256="c" * 64,
+        revision="d" * 40,
+        initial_customer_sequences=(),
+        initial_solution_provenance={},
+    )
+
+    with pytest.raises(ArchitectureAxisExecutionFailed, match="resource-summary failure"):
+        architectures._run_mode(task, ArchitectureMode.CURRENT_STAGE052)
+
+    assert released is True
+
+
 def test_axis_failure_is_pickle_safe_for_process_pool_transport() -> None:
     original = ArchitectureAxisExecutionFailed(
         "/evidence/failed-axis.json",
@@ -726,6 +775,15 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "effective_cores": 1.5,
         "cpu_utilization_fraction_of_compute_limit": 0.75,
         "compute_thread_limit": 2,
+        "cpu_clock_tick_hz": 100,
+        "cpu_quantization_lane_count": 2,
+        "peak_concurrent_processes": 1,
+        "monitor_start_monotonic": 0.0,
+        "monitor_end_monotonic": 1.0,
+        "effective_elapsed_seconds": 1.0,
+        "cpu_limit_tolerance_seconds": 0.02,
+        "cpu_normalized_within_limit": True,
+        "cpu_utilization_percent_of_compute_limit": 75.0,
         "process_tree_cpu_seconds": 1.5,
         "process_tree_user_cpu_seconds": 1.2,
         "process_tree_system_cpu_seconds": 0.3,
@@ -2810,6 +2868,12 @@ def test_campaign_gate_requires_signed_qualified_calibration_review(
         "rejected_count": 0,
         "swap_used": False,
         "selector_recomputation_passed": True,
+        "current_schema_qualified": True,
+        "raw_axis_schema_versions": [SCHEMA_VERSION],
+        "telemetry_raw_axis_schema_versions": [SCHEMA_VERSION],
+        "resource_evidence_schema_versions": [
+            "stage05.2-calibration-resource-evidence-v4"
+        ],
         "reviewer_source_sha256": "3" * 64,
         "review_seconds": 1.0,
         "formal_started": False,

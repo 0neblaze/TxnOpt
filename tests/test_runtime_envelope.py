@@ -395,6 +395,59 @@ def test_process_tree_monitor_fails_fast_when_cpu_exceeds_limit() -> None:
         monitor.statistics(elapsed_seconds=0.001, compute_thread_limit=1)
 
 
+def test_process_tree_monitor_allows_one_clock_tick_of_cpu_quantization() -> None:
+    with ProcessTreeMonitor(sample_interval_seconds=0.002) as monitor:
+        time.sleep(0.02)
+    identity, observation = next(iter(monitor._observations.items()))  # noqa: SLF001
+    monitor._observations = {identity: observation}  # noqa: SLF001
+    monitor._monitor_start_monotonic = 0.0  # noqa: SLF001
+    monitor._monitor_end_monotonic = 0.358586933  # noqa: SLF001
+    monitor._cpu_stat_hz = 100  # noqa: SLF001
+    monitor._peak_processes = 1  # noqa: SLF001
+    observation.first_user_cpu_seconds = 0.0
+    observation.last_user_cpu_seconds = 0.36
+    observation.first_system_cpu_seconds = 0.0
+    observation.last_system_cpu_seconds = 0.0
+
+    statistics = monitor.statistics(
+        elapsed_seconds=0.358586933,
+        compute_thread_limit=1,
+    )
+
+    assert statistics["process_tree_cpu_seconds"] == pytest.approx(0.36)
+    assert statistics["cpu_limit_tolerance_seconds"] == pytest.approx(0.01)
+    assert statistics["cpu_quantization_lane_count"] == 1
+    assert statistics["cpu_utilization_percent_of_compute_limit"] == 100.0
+
+    observation.last_user_cpu_seconds = 0.38
+    with pytest.raises(RuntimeError, match="exceeds compute-thread limit"):
+        monitor.statistics(elapsed_seconds=0.358586933, compute_thread_limit=1)
+
+
+def test_process_tree_cpu_quantization_tolerance_is_bounded_by_compute_lanes() -> None:
+    with ProcessTreeMonitor(sample_interval_seconds=0.002) as monitor:
+        time.sleep(0.02)
+    identity, observation = next(iter(monitor._observations.items()))  # noqa: SLF001
+    monitor._observations = {  # noqa: SLF001
+        (identity[0] + generation, identity[1] + generation): observation
+        for generation in range(1000)
+    }
+    monitor._monitor_start_monotonic = 0.0  # noqa: SLF001
+    monitor._monitor_end_monotonic = 1.0  # noqa: SLF001
+    monitor._cpu_stat_hz = 100  # noqa: SLF001
+    monitor._peak_processes = 1000  # noqa: SLF001
+    observation.first_user_cpu_seconds = 0.0
+    observation.last_user_cpu_seconds = 0.0
+    observation.first_system_cpu_seconds = 0.0
+    observation.last_system_cpu_seconds = 0.0
+
+    statistics = monitor.statistics(elapsed_seconds=1.0, compute_thread_limit=1)
+
+    assert statistics["cpu_limit_tolerance_seconds"] == pytest.approx(0.01)
+    assert statistics["cpu_clock_tick_hz"] == 100
+    assert statistics["cpu_quantization_lane_count"] == 1
+
+
 def test_process_tree_monitor_marks_optional_pss_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

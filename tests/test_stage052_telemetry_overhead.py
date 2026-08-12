@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -11,10 +12,16 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS,
     ReviewRecord,
     _resource_telemetry_topology_error,
+    _review_current_cpu_budget,
 )
 from evrptw.experiments.stage052_native_architectures import (
     PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+    PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
     ArchitectureMode,
+)
+from evrptw.experiments.stage052_performance_calibration_review import (
+    CalibrationReviewError,
+    _validate_current_resource_cpu_budget,
 )
 from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
@@ -706,6 +713,8 @@ def test_enabled_resource_telemetry_requires_exact_current_schema() -> None:
 
 def test_prior_profile_resource_schema_does_not_require_new_worker_sample_counters() -> None:
     prior_statistics_fields = PROCESS_TREE_STATISTICS_FIELDS - {
+        "cpu_clock_tick_hz",
+        "cpu_quantization_lane_count",
         "worker_descendant_pss_complete_sample_count",
         "worker_descendant_pss_incomplete_sample_count",
     }
@@ -730,6 +739,130 @@ def test_prior_profile_resource_schema_does_not_require_new_worker_sample_counte
         expected_resource_telemetry=True,
         comparison_schema=PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
     ) is not None
+
+
+def test_process_profile_resource_schema_does_not_require_cpu_tick_frequency() -> None:
+    process_statistics_fields = PROCESS_TREE_STATISTICS_FIELDS - {
+        "cpu_clock_tick_hz",
+        "cpu_quantization_lane_count",
+    }
+    topology = {
+        field: None
+        for field in (_RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | process_statistics_fields)
+    }
+
+    assert (
+        _resource_telemetry_topology_error(
+            topology,
+            mode=ArchitectureMode.CURRENT_STAGE052,
+            expected_resource_telemetry=True,
+            comparison_schema=PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
+        is None
+    )
+    topology["cpu_clock_tick_hz"] = 100
+    assert _resource_telemetry_topology_error(
+        topology,
+        mode=ArchitectureMode.CURRENT_STAGE052,
+        expected_resource_telemetry=True,
+        comparison_schema=PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+    ) is not None
+
+
+def test_current_cpu_quantization_budget_is_independently_replayed() -> None:
+    statistics = {
+        "cpu_clock_tick_hz": int(os.sysconf("SC_CLK_TCK")),
+        "cpu_quantization_lane_count": 1,
+        "peak_concurrent_processes": 1,
+        "monitor_start_monotonic": 0.0,
+        "monitor_end_monotonic": 0.358586933,
+        "effective_elapsed_seconds": 0.358586933,
+        "compute_thread_limit": 1,
+        "cpu_normalized_within_limit": True,
+        "cpu_limit_tolerance_seconds": 0.01,
+        "cpu_utilization_percent_of_compute_limit": 100.0,
+    }
+
+    _review_current_cpu_budget(
+        statistics,
+        elapsed_seconds=0.358586933,
+        compute_limit=1,
+        cpu_seconds=0.36,
+        label="test",
+    )
+    _validate_current_resource_cpu_budget(
+        statistics,
+        elapsed_seconds=0.358586933,
+        compute_limit=1,
+        cpu_seconds=0.36,
+    )
+
+    tampered = {**statistics, "cpu_limit_tolerance_seconds": 1.0}
+    with pytest.raises(RuntimeError, match="quantized budget"):
+        _review_current_cpu_budget(
+            tampered,
+            elapsed_seconds=0.358586933,
+            compute_limit=1,
+            cpu_seconds=0.36,
+            label="test",
+        )
+    with pytest.raises(CalibrationReviewError, match="budget"):
+        _validate_current_resource_cpu_budget(
+            tampered,
+            elapsed_seconds=0.358586933,
+            compute_limit=1,
+            cpu_seconds=0.36,
+        )
+
+    for field, value in (
+        ("cpu_clock_tick_hz", 1),
+        ("effective_elapsed_seconds", 100.0),
+        ("monitor_end_monotonic", 100.0),
+    ):
+        coordinated = {
+            **statistics,
+            field: value,
+            "cpu_limit_tolerance_seconds": 1.0,
+            "cpu_utilization_percent_of_compute_limit": 0.36,
+        }
+        with pytest.raises(RuntimeError, match="clock identity"):
+            _review_current_cpu_budget(
+                coordinated,
+                elapsed_seconds=0.358586933,
+                compute_limit=1,
+                cpu_seconds=0.36,
+                label="test",
+            )
+        with pytest.raises(CalibrationReviewError, match="clock identity"):
+            _validate_current_resource_cpu_budget(
+                coordinated,
+                elapsed_seconds=0.358586933,
+                compute_limit=1,
+                cpu_seconds=0.36,
+            )
+
+    coordinated_interval = {
+        **statistics,
+        "monitor_end_monotonic": 100.0,
+        "effective_elapsed_seconds": 100.0,
+        "cpu_limit_tolerance_seconds": 0.01,
+        "cpu_utilization_percent_of_compute_limit": 0.36,
+    }
+    with pytest.raises(RuntimeError, match="clock identity"):
+        _review_current_cpu_budget(
+            coordinated_interval,
+            elapsed_seconds=0.358586933,
+            compute_limit=1,
+            cpu_seconds=0.36,
+            label="test",
+        )
+    with pytest.raises(CalibrationReviewError, match="clock identity"):
+        _validate_current_resource_cpu_budget(
+            coordinated_interval,
+            elapsed_seconds=0.358586933,
+            compute_limit=1,
+            cpu_seconds=0.36,
+        )
 
 
 def test_representative_control_rejects_stable_wrong_topology_or_watchdog() -> None:
