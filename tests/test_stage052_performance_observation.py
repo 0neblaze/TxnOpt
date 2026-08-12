@@ -15,6 +15,7 @@ import pytest
 
 import evrptw.experiments.stage052_performance_observation as observation_module
 from evrptw.experiments.stage052_performance_observation import (
+    ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS,
     BlockExecution,
     PerformanceObservationError,
     _atomic_signed_json,
@@ -22,6 +23,8 @@ from evrptw.experiments.stage052_performance_observation import (
     _local_work_pool_receipt,
     _memory_admission,
     _parallel_diagnostics,
+    _process_tree_resource_statistics,
+    _producer_peak_pss_bytes,
     _replay_identical,
     _require_live_host_identity,
     _resource_summary,
@@ -31,7 +34,10 @@ from evrptw.experiments.stage052_performance_observation import (
     compare_host_scheduler_lifecycles,
 )
 from evrptw.native_scheduler import NativeHostScheduler
-from evrptw.runtime_envelope import ProcessTreeMonitor
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    ProcessTreeMonitor,
+)
 from evrptw.stage052_performance import (
     ExecutionTopology,
     HostPerformanceEnvelope,
@@ -250,6 +256,8 @@ def test_worker_descendant_projection_uses_simultaneous_peak_not_lifetime_pids()
         "root_process_id": 10,
         "additional_root_pids": [],
         "sample_count": 2,
+        "worker_descendant_pss_complete_sample_count": 2,
+        "worker_descendant_pss_incomplete_sample_count": 0,
         "peak_aggregate_pss_bytes": 100,
         "peak_worker_descendant_pss_bytes": 80,
         "worker_descendant_pss_peak": {
@@ -286,6 +294,48 @@ def test_worker_descendant_projection_uses_simultaneous_peak_not_lifetime_pids()
         )
         == 80
     )
+    statistics["worker_descendant_pss_incomplete_sample_count"] = 1
+    with pytest.raises(PerformanceObservationError, match="receipt is invalid"):
+        _worker_descendant_peak_pss_bytes(
+            statistics,
+            scheduler_process_id=None,
+        )
+
+
+def test_resource_pss_projection_unwraps_signed_block_envelope() -> None:
+    process_tree: dict[str, object] = {
+        "root_process_id": 10,
+        "process_metrics": [
+            {
+                "pid": 10,
+                "create_time": 1.0,
+                "maximum_pss_bytes": 100,
+            }
+        ],
+    }
+    evidence = {
+        "schema_version": observation_module.RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "process_tree": process_tree,
+    }
+
+    observed = _process_tree_resource_statistics(evidence)
+
+    assert observed is process_tree
+    assert _producer_peak_pss_bytes(observed) == 100
+    assert (
+        ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS
+        == DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+    )
+
+
+def test_resource_pss_projection_rejects_bare_process_tree() -> None:
+    with pytest.raises(PerformanceObservationError, match="schema"):
+        _process_tree_resource_statistics(
+            {
+                "root_process_id": 10,
+                "process_metrics": [],
+            }
+        )
 
 
 def test_real_host_scheduler_is_registered_before_worker_classification(
@@ -529,6 +579,34 @@ def test_resource_summary_preserves_cpu_io_tail_and_zero_queue_gate() -> None:
     assert summary.io_write_bytes == 200
     assert summary.worker_p95_seconds == 2.0
     assert summary.replay_seconds == 0.25
+
+
+def test_resource_summary_uses_process_totals_when_thread_tree_is_partial() -> None:
+    resource_statistics = _resource_statistics()
+    resource_statistics["thread_tree"] = {
+        "status": "available",
+        "sample_missed_processes": 0,
+        "unresolved_thread_observation_count": 1,
+        "unresolved_thread_ids": [
+            {"pid": 20, "process_create_time": 2.0, "tid": 21}
+        ],
+    }
+
+    summary = _resource_summary(
+        elapsed_seconds=2.0,
+        independent_replay_seconds=0.25,
+        statistics_payload=resource_statistics,
+        payloads=(_axis_payload(),),
+        topology=_topology(),
+        cgroup_after={"memory_current_bytes": 900, "memory_peak_bytes": 1_100},
+        io_accounting={"read_bytes": 100, "write_bytes": 200},
+        scheduler_statistics=None,
+    )
+
+    assert summary.run_queue_wait_seconds == pytest.approx(0.01)
+    assert summary.context_switches == 20
+    assert summary.cpu_migrations == 2
+    assert summary.minor_faults == 40
 
 
 def test_io_accounting_prefers_replayable_cgroup_v2_deltas() -> None:

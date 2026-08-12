@@ -34,6 +34,8 @@ from evrptw.experiments.stage052_native_architectures import (
     AXIS_NAMES,
     AXIS_PERSISTENCE_RECEIPT_SCHEMA_VERSION,
     CGROUP_IO_ACCOUNTING_SOURCE,
+    LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
+    MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE,
     MODES,
     PAIRED_INSTANCES,
     PREVIOUS_COMPARISON_SCHEMA_VERSION,
@@ -75,7 +77,7 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v10"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v11"
 REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
 REVIEW_EXECUTION_SCHEMA_VERSION = "experiment-review-execution-v1"
 REVIEWER_MODULE_NAME = "evrptw.experiments.stage052_native_architecture_review"
@@ -84,12 +86,17 @@ INLINE_SEMANTIC_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-compa
 EXTERNAL_SEMANTIC_COMPARISON_SCHEMA_VERSIONS = frozenset(
     {
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
+        LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
 )
 PROFILE_COMPARISON_SCHEMA_VERSIONS = frozenset(
-    {PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}
+    {
+        LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
+        PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    }
 )
 _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS = frozenset(
     {
@@ -119,6 +126,15 @@ _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS = frozenset(
 )
 _RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS = (
     _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | {"telemetry_status"}
+)
+_CURRENT_WORKER_PSS_SAMPLE_ACCOUNTING_FIELDS = frozenset(
+    {
+        "worker_descendant_pss_complete_sample_count",
+        "worker_descendant_pss_incomplete_sample_count",
+    }
+)
+_PRIOR_PROFILE_PROCESS_TREE_STATISTICS_FIELDS = (
+    PROCESS_TREE_STATISTICS_FIELDS - _CURRENT_WORKER_PSS_SAMPLE_ACCOUNTING_FIELDS
 )
 FULL_NATIVE_SEMANTIC_MODES = frozenset(
     {
@@ -160,19 +176,49 @@ class ReviewRecord:
         )
 
 
+def _mode_wave_affinity_matches_profile(
+    wave: Mapping[str, object],
+    *,
+    comparison_schema: str,
+    allowed_cpu_ids: Sequence[int],
+) -> bool:
+    """Use process affinity as the v11 authority and retain older strict replay."""
+
+    if wave.get("actual_affinity_union") != list(allowed_cpu_ids):
+        return False
+    return (
+        comparison_schema == SCHEMA_VERSION
+        or wave.get("thread_affinity_union") == list(allowed_cpu_ids)
+    )
+
+
+def _records_use_current_profile_schema(records: Iterable[ReviewRecord]) -> bool:
+    """New qualification is available only for one all-current comparison schema."""
+
+    return {_string(record.payload, "schema_version") for record in records} == {
+        SCHEMA_VERSION
+    }
+
+
 def _resource_telemetry_topology_error(
     topology: Mapping[str, object],
     *,
     mode: ArchitectureMode,
     expected_resource_telemetry: bool,
     require_complete_schema: bool = True,
+    comparison_schema: str = SCHEMA_VERSION,
 ) -> str | None:
     if expected_resource_telemetry:
         if "telemetry_status" in topology:
             return "enabled process-tree telemetry has a disabled-status marker"
+        statistics_fields = (
+            PROCESS_TREE_STATISTICS_FIELDS
+            if comparison_schema == SCHEMA_VERSION
+            else _PRIOR_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
+        )
         if require_complete_schema and set(topology) != (
             _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS
-            | PROCESS_TREE_STATISTICS_FIELDS
+            | statistics_fields
         ):
             return "enabled process-tree telemetry schema is not exact"
         return None
@@ -1273,39 +1319,156 @@ def _review_axis_native_task_receipts(
         )
 
 
-def _review_process_tree_io(wave: Mapping[str, object]) -> dict[str, int]:
+def _review_process_tree_accounting(
+    wave: Mapping[str, object],
+) -> tuple[float, float, dict[str, int]]:
     raw_metrics = wave.get("process_metrics")
     if not isinstance(raw_metrics, list) or not raw_metrics:
-        raise RuntimeError("campaign process-tree I/O rows are unavailable")
-    fields = ("read_bytes", "write_bytes")
+        raise RuntimeError("campaign process-tree rows are unavailable")
+    fields = (
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_faults",
+        "major_faults",
+        "read_bytes",
+        "write_bytes",
+        "schedstat_runtime_ns",
+        "schedstat_runqueue_delay_ns",
+        "schedstat_timeslices",
+        "cpu_migrations",
+    )
     totals = {field: 0 for field in fields}
+    user_seconds = 0.0
+    system_seconds = 0.0
     identities: set[tuple[int, float]] = set()
+    affinity_union: set[int] = set()
+    affinity_intersection: set[int] | None = None
     for index, raw_metric in enumerate(raw_metrics):
         if not isinstance(raw_metric, Mapping):
-            raise RuntimeError("campaign process-tree I/O row is invalid")
+            raise RuntimeError("campaign process-tree row is invalid")
         pid = _review_nonnegative_integer(raw_metric.get("pid"), f"process_metrics[{index}].pid")
         create_time = _review_nonnegative_number(
             raw_metric.get("create_time"),
             f"process_metrics[{index}].create_time",
         )
         if pid <= 0 or create_time <= 0.0:
-            raise RuntimeError("campaign process-tree I/O identity is invalid")
+            raise RuntimeError("campaign process-tree identity is invalid")
         identity = (pid, create_time)
         if identity in identities:
-            raise RuntimeError("campaign process-tree I/O identity is duplicated")
+            raise RuntimeError("campaign process-tree identity is duplicated")
         identities.add(identity)
+        if _review_nonnegative_integer(
+            raw_metric.get("sample_count"),
+            f"process_metrics[{index}].sample_count",
+        ) == 0:
+            raise RuntimeError("campaign process-tree sample count is invalid")
+        if raw_metric.get("cpu_baseline_source") not in {
+            "monitor_start",
+            "process_create_time",
+        }:
+            raise RuntimeError("campaign process-tree CPU baseline is invalid")
+        user_seconds += _review_nonnegative_number(
+            raw_metric.get("user_cpu_seconds"),
+            f"process_metrics[{index}].user_cpu_seconds",
+        )
+        system_seconds += _review_nonnegative_number(
+            raw_metric.get("system_cpu_seconds"),
+            f"process_metrics[{index}].system_cpu_seconds",
+        )
         counters = raw_metric.get("counters")
-        if not isinstance(counters, Mapping):
-            raise RuntimeError("campaign process-tree I/O counters are invalid")
+        if not isinstance(counters, Mapping) or set(counters) != set(fields):
+            raise RuntimeError("campaign process-tree counter schema is invalid")
         for field in fields:
             totals[field] += _review_nonnegative_integer(
                 counters.get(field),
                 f"process_metrics[{index}].{field}",
             )
-    for field, expected in totals.items():
-        if wave.get(f"process_tree_{field}") != expected:
-            raise RuntimeError("campaign process-tree I/O aggregate does not replay")
-    return totals
+        if raw_metric.get("cpu_migrations") != counters["cpu_migrations"]:
+            raise RuntimeError("campaign process-tree migration alias differs")
+        schedstat = raw_metric.get("schedstat")
+        if not isinstance(schedstat, Mapping) or dict(schedstat) != {
+            "runtime_ns": counters["schedstat_runtime_ns"],
+            "runqueue_delay_ns": counters["schedstat_runqueue_delay_ns"],
+            "timeslices": counters["schedstat_timeslices"],
+        }:
+            raise RuntimeError("campaign process-tree schedstat row differs")
+        affinity = raw_metric.get("last_affinity")
+        if (
+            not isinstance(affinity, list)
+            or not affinity
+            or any(
+                isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0
+                for cpu in affinity
+            )
+            or affinity != sorted(set(affinity))
+        ):
+            raise RuntimeError("campaign process-tree affinity is invalid")
+        selected = set(cast(list[int], affinity))
+        affinity_union.update(selected)
+        affinity_intersection = (
+            selected
+            if affinity_intersection is None
+            else affinity_intersection.intersection(selected)
+        )
+    cpu_fields = {
+        "process_tree_user_cpu_seconds": user_seconds,
+        "process_tree_system_cpu_seconds": system_seconds,
+        "process_tree_cpu_seconds": user_seconds + system_seconds,
+        "process_tree_cpu_user_seconds": user_seconds,
+        "process_tree_cpu_system_seconds": system_seconds,
+    }
+    mismatches = [
+        name
+        for name, expected in cpu_fields.items()
+        if not math.isclose(
+            _review_nonnegative_number(wave.get(name), f"campaign {name}"),
+            expected,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ]
+    expected_fields: dict[str, object] = {
+        "process_tree_voluntary_context_switches": totals[
+            "voluntary_context_switches"
+        ],
+        "process_tree_involuntary_context_switches": totals[
+            "involuntary_context_switches"
+        ],
+        "process_tree_context_switches": totals["voluntary_context_switches"]
+        + totals["involuntary_context_switches"],
+        "process_tree_minor_faults": totals["minor_faults"],
+        "process_tree_major_faults": totals["major_faults"],
+        "process_tree_read_bytes": totals["read_bytes"],
+        "process_tree_write_bytes": totals["write_bytes"],
+        "process_tree_cpu_migrations": totals["cpu_migrations"],
+        "process_tree_migration_count": totals["cpu_migrations"],
+        "process_tree_schedstat": {
+            "runtime_ns": totals["schedstat_runtime_ns"],
+            "runqueue_delay_ns": totals["schedstat_runqueue_delay_ns"],
+            "timeslices": totals["schedstat_timeslices"],
+        },
+        "actual_affinity_union": sorted(affinity_union),
+        "actual_affinity_intersection": sorted(affinity_intersection or set()),
+        "cpu_affinity_union": sorted(affinity_union),
+        "cpu_affinity_intersection": sorted(affinity_intersection or set()),
+        "actual_affinity_union_count": len(affinity_union),
+        "actual_affinity_intersection_count": len(affinity_intersection or set()),
+        "affinity_status": "available",
+    }
+    mismatches.extend(
+        name for name, expected in expected_fields.items() if wave.get(name) != expected
+    )
+    if mismatches:
+        raise RuntimeError(
+            "campaign process-tree aggregates do not replay: "
+            + ", ".join(sorted(mismatches))
+        )
+    return user_seconds, system_seconds, totals
+
+
+def _review_process_tree_io(wave: Mapping[str, object]) -> dict[str, int]:
+    _user_seconds, _system_seconds, totals = _review_process_tree_accounting(wave)
+    return {field: totals[field] for field in ("read_bytes", "write_bytes")}
 
 
 def _review_mode_wave_resources(
@@ -1319,6 +1482,15 @@ def _review_mode_wave_resources(
         or wave.get("worker_max_tasks_per_child") != 1
     ):
         raise RuntimeError("campaign worker process lifecycle is invalid")
+    if comparison_schema == SCHEMA_VERSION:
+        if (
+            wave.get("resource_summary_accounting_source")
+            != MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE
+        ):
+            raise RuntimeError("campaign resource summary provider is invalid")
+        _review_process_tree_accounting(wave)
+    elif "resource_summary_accounting_source" in wave:
+        raise RuntimeError("campaign legacy resource summary provider is invalid")
     before = wave.get("cgroup_before")
     after = wave.get("cgroup_after")
     if not isinstance(before, Mapping) or not isinstance(after, Mapping):
@@ -1367,14 +1539,14 @@ def _review_mode_wave_resources(
     }
     reported_io = wave.get(
         "cgroup_io_deltas"
-        if comparison_schema == PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION
+        if comparison_schema == LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION
         else "io_accounting"
     )
     if not isinstance(reported_io, Mapping):
         raise RuntimeError("campaign I/O evidence is invalid")
     source = (
         CGROUP_IO_ACCOUNTING_SOURCE
-        if comparison_schema == PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION
+        if comparison_schema == LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION
         else reported_io.get("source")
     )
     before_io = before.get("io")
@@ -1391,10 +1563,11 @@ def _review_mode_wave_resources(
         replay_before_io = cast(Mapping[str, object], before_io)
         replay_after_io = cast(Mapping[str, object], after_io)
         if (
-            comparison_schema == PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION
+            comparison_schema == LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION
             and set(reported_io) != io_fields
         ) or (
-            comparison_schema == SCHEMA_VERSION
+            comparison_schema
+            in {PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}
             and set(reported_io) != {"source", *io_fields}
         ):
             raise RuntimeError("campaign cgroup I/O evidence is invalid")
@@ -1409,7 +1582,7 @@ def _review_mode_wave_resources(
             )
             if after_value < before_value or reported_io[field] != after_value - before_value:
                 raise RuntimeError("campaign cgroup I/O deltas do not replay")
-    elif comparison_schema == PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION:
+    elif comparison_schema == LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION:
         raise RuntimeError("campaign legacy cgroup I/O evidence is invalid")
     elif before_io != "unavailable" or after_io != "unavailable":
         raise RuntimeError("campaign cgroup I/O availability is inconsistent")
@@ -1514,11 +1687,45 @@ def _review_mode_wave_resources(
     ):
         raise RuntimeError("campaign thread-tree resource evidence is incomplete")
     unresolved = thread_tree.get("unresolved_thread_ids")
-    if (
-        thread_tree.get("sample_missed_processes") != 0
-        or thread_tree.get("unresolved_thread_observation_count") != 0
-        or unresolved != []
-    ):
+    missed_processes = _review_nonnegative_integer(
+        thread_tree.get("sample_missed_processes"),
+        "campaign missed thread-process samples",
+    )
+    unresolved_count = _review_nonnegative_integer(
+        thread_tree.get("unresolved_thread_observation_count"),
+        "campaign unresolved thread count",
+    )
+    if not isinstance(unresolved, list) or unresolved_count != len(unresolved):
+        raise RuntimeError("campaign thread-tree sampling evidence is incomplete")
+    unresolved_identities: set[tuple[int, float, int]] = set()
+    for index, raw_unresolved in enumerate(unresolved):
+        if not isinstance(raw_unresolved, Mapping) or set(raw_unresolved) != {
+            "pid",
+            "process_create_time",
+            "tid",
+        }:
+            raise RuntimeError("campaign unresolved thread schema is invalid")
+        unresolved_identity = (
+            _review_nonnegative_integer(
+                raw_unresolved.get("pid"),
+                f"campaign unresolved thread[{index}].pid",
+            ),
+            _review_nonnegative_number(
+                raw_unresolved.get("process_create_time"),
+                f"campaign unresolved thread[{index}].create_time",
+            ),
+            _review_nonnegative_integer(
+                raw_unresolved.get("tid"),
+                f"campaign unresolved thread[{index}].tid",
+            ),
+        )
+        if (
+            min(unresolved_identity[0], unresolved_identity[2]) == 0
+            or unresolved_identity in unresolved_identities
+        ):
+            raise RuntimeError("campaign unresolved thread identity is invalid")
+        unresolved_identities.add(unresolved_identity)
+    if comparison_schema != SCHEMA_VERSION and (missed_processes or unresolved):
         raise RuntimeError("campaign thread-tree sampling evidence is incomplete")
     start_ticks = wave.get("monitor_start_boot_time_ticks")
     _review_nonnegative_integer(start_ticks, "campaign monitor boot-time tick marker")
@@ -1663,7 +1870,7 @@ def load_records(
 ) -> tuple[ReviewRecord, ...]:
     labels = run_labels_for_scope(scope, attempt)
     records: list[ReviewRecord] = []
-    common_identity: tuple[str, str, str, str, str, str] | None = None
+    common_identity: tuple[str, str, str, str, str, str, str] | None = None
     for mode in MODES:
         mode_shared_review_started = time.perf_counter()
         run_dir = results_root / labels[mode.value]
@@ -1776,8 +1983,11 @@ def load_records(
                         != performance_profile.topologies[topology_key].to_dict()
                         or wave.get("compute_thread_limit") != len(allowed_cpu_ids)
                         or wave.get("cpu_normalized_within_limit") is not True
-                        or wave.get("actual_affinity_union") != allowed_cpu_ids
-                        or wave.get("thread_affinity_union") != allowed_cpu_ids
+                        or not _mode_wave_affinity_matches_profile(
+                            wave,
+                            comparison_schema=manifest_schema,
+                            allowed_cpu_ids=allowed_cpu_ids,
+                        )
                     ):
                         raise RuntimeError("campaign mode-wave performance profile does not replay")
                     utilization = wave.get("cpu_utilization_percent_of_compute_limit")
@@ -1853,6 +2063,7 @@ def load_records(
             else str(manifest.get("scheduler_sha256") or "legacy-unattested")
         )
         identity = (
+            manifest_schema,
             _string(manifest, "revision"),
             _string(manifest, "wheel_sha256"),
             _string(manifest, "native_sha256"),
@@ -1863,7 +2074,9 @@ def load_records(
         if common_identity is None:
             common_identity = identity
         elif identity != common_identity:
-            raise RuntimeError("comparison modes do not share one commit/wheel/native identity")
+            raise RuntimeError(
+                "comparison modes do not share one schema/commit/wheel/native identity"
+            )
         paths = sorted((run_dir / "axes").rglob("*.json"))
         mode_wave_by_key: dict[tuple[int, str, str, int], Mapping[str, object]] = {}
         if manifest_schema in PROFILE_COMPARISON_SCHEMA_VERSIONS:
@@ -1952,7 +2165,9 @@ def load_records(
                 _string(record.payload, "native_sha256"),
                 payload_scheduler_identity,
             )
-            if payload_identity != identity[:4]:
+            if _string(record.payload, "schema_version") != manifest_schema:
+                raise RuntimeError(f"axis schema does not match its run manifest: {record.path}")
+            if payload_identity != identity[1:5]:
                 raise RuntimeError(f"axis identity does not match its run manifest: {record.path}")
             if _string(record.payload, "run_label") != expected_run_label:
                 raise RuntimeError(f"axis run label mismatch: {record.path}")
@@ -3413,6 +3628,7 @@ def _replay_record(
         LEGACY_COMPARISON_SCHEMA_VERSION,
         INLINE_SEMANTIC_COMPARISON_SCHEMA_VERSION,
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
+        LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
@@ -3425,6 +3641,7 @@ def _replay_record(
     if comparison_schema in {
         INLINE_SEMANTIC_COMPARISON_SCHEMA_VERSION,
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
+        LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
@@ -3447,6 +3664,7 @@ def _replay_record(
     if comparison_schema in {
         INLINE_SEMANTIC_COMPARISON_SCHEMA_VERSION,
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
+        LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
@@ -3534,6 +3752,7 @@ def _replay_record(
             mode=record.mode,
             expected_resource_telemetry=expected_resource_telemetry,
             require_complete_schema=comparison_schema in PROFILE_COMPARISON_SCHEMA_VERSIONS,
+            comparison_schema=comparison_schema,
         )
         if resource_error is not None:
             return {"valid": False, "reason": resource_error}
@@ -4704,6 +4923,7 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
     if payload.get("schema_version") in {
         INLINE_SEMANTIC_COMPARISON_SCHEMA_VERSION,
         PREVIOUS_COMPARISON_SCHEMA_VERSION,
+        LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
@@ -5122,6 +5342,7 @@ def _mode_wave_metrics(records: Sequence[ReviewRecord]) -> dict[str, object]:
     cgroup_after: list[Mapping[str, object]] = []
     io_accounting: list[Mapping[str, object]] = []
     schedstat: list[Mapping[str, object]] = []
+    scheduler_accounting: list[Mapping[str, object]] = []
     for wave in waves:
         raw_scheduler = wave.get("scheduler_runtime_statistics")
         if isinstance(raw_scheduler, list):
@@ -5138,9 +5359,39 @@ def _mode_wave_metrics(records: Sequence[ReviewRecord]) -> dict[str, object]:
                 io_accounting.append(
                     {"source": CGROUP_IO_ACCOUNTING_SOURCE, **raw_legacy_io}
                 )
-        raw_schedstat = wave.get("thread_tree_schedstat")
+        use_process_accounting = (
+            wave.get("resource_summary_accounting_source")
+            == MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE
+        )
+        raw_schedstat = wave.get(
+            "process_tree_schedstat" if use_process_accounting else "thread_tree_schedstat"
+        )
         if isinstance(raw_schedstat, Mapping):
             schedstat.append(raw_schedstat)
+        scheduler_accounting.append(
+            {
+                "context_switches": wave.get(
+                    "process_tree_context_switches"
+                    if use_process_accounting
+                    else "thread_tree_context_switches"
+                ),
+                "cpu_migrations": wave.get(
+                    "process_tree_cpu_migrations"
+                    if use_process_accounting
+                    else "thread_tree_cpu_migrations"
+                ),
+                "minor_faults": wave.get(
+                    "process_tree_minor_faults"
+                    if use_process_accounting
+                    else "thread_tree_minor_faults"
+                ),
+                "major_faults": wave.get(
+                    "process_tree_major_faults"
+                    if use_process_accounting
+                    else "thread_tree_major_faults"
+                ),
+            }
+        )
     for statistics_payload in scheduler_statistics:
         request = statistics_payload.get("request_queue")
         work = statistics_payload.get("work_queue")
@@ -5168,10 +5419,14 @@ def _mode_wave_metrics(records: Sequence[ReviewRecord]) -> dict[str, object]:
         "run_queue_wait_seconds": _paired(
             [value / 1_000_000_000.0 for value in _numeric_values(schedstat, "runqueue_delay_ns")]
         ),
-        "context_switches": _paired(_numeric_values(waves, "thread_tree_context_switches")),
-        "cpu_migrations": _paired(_numeric_values(waves, "thread_tree_cpu_migrations")),
-        "minor_faults": _paired(_numeric_values(waves, "thread_tree_minor_faults")),
-        "major_faults": _paired(_numeric_values(waves, "thread_tree_major_faults")),
+        "context_switches": _paired(
+            _numeric_values(scheduler_accounting, "context_switches")
+        ),
+        "cpu_migrations": _paired(
+            _numeric_values(scheduler_accounting, "cpu_migrations")
+        ),
+        "minor_faults": _paired(_numeric_values(scheduler_accounting, "minor_faults")),
+        "major_faults": _paired(_numeric_values(scheduler_accounting, "major_faults")),
         "rss_bytes": _paired(_numeric_values(waves, "peak_aggregate_rss_bytes")),
         "pss_bytes": _paired(_numeric_values(waves, "peak_aggregate_pss_bytes")),
         "cgroup_memory_peak_bytes": _paired(_numeric_values(cgroup_after, "memory_peak_bytes")),
@@ -6127,11 +6382,13 @@ def review_records(
         if bool(differential[mode.value]["passed"])
         and bool(speedups[mode.value]["performance_qualified"])
     ]
+    current_schema_qualified = _records_use_current_profile_schema(records)
     qualification_passed = (
         axis_replay_passed
         and semantic_gates_passed
         and correctness_matrix_passed
         and bool(eligible_production_modes)
+        and current_schema_qualified
     )
     review_status = (
         "COMPARISON_COMPLETE_QUALIFIED"
@@ -6193,6 +6450,7 @@ def review_records(
         "production_default_changed": False,
         "correctness_matrix_passed": correctness_matrix_passed,
         "eligible_production_modes": eligible_production_modes,
+        "current_schema_qualified": current_schema_qualified,
         "qualification_passed": qualification_passed,
         "review_status": review_status,
     }

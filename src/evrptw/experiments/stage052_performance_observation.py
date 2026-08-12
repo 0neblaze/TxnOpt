@@ -74,16 +74,23 @@ from evrptw.stage052_performance import (
 from evrptw.stage052_semantic_journal import evidence_json_value
 
 FAILURE_SCHEMA_VERSION: Final = "stage05.2-performance-observation-failure-v1"
-RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v2"
+RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v3"
 PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
+    "stage05.2-calibration-resource-evidence-v2"
+)
+LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
     "stage05.2-calibration-resource-evidence-v1"
 )
+RESOURCE_SUMMARY_ACCOUNTING_SOURCE: Final = "process_tree_proc"
 CALIBRATION_EXACT_CALLS: Final = 20
 CALIBRATION_MAX_ITERATIONS: Final = 200
 CALIBRATION_WATCHDOG_SECONDS: Final = 30.0
 CALIBRATION_BATCH_SIZE: Final = 128
 REPRESENTATIVE_TRAJECTORY_MAX_ROWS: Final = 200_000
 REPRESENTATIVE_TRAJECTORY_MAX_BYTES: Final = 64 * 1024 * 1024
+ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS: Final = (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+)
 FIXED_WORK_BUDGET: Final = {
     "axis": "fixed_work",
     # Calibration is intentionally short.  The production 100-call protocol is
@@ -292,6 +299,23 @@ def _producer_peak_pss_bytes(statistics: Mapping[str, object]) -> int:
     return value
 
 
+def _process_tree_resource_statistics(
+    resource_evidence: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Return the monitored tree from one signed block-resource envelope."""
+
+    if resource_evidence.get("schema_version") not in {
+        LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }:
+        raise PerformanceObservationError("resource evidence schema is invalid")
+    process_tree = resource_evidence.get("process_tree")
+    if not isinstance(process_tree, Mapping):
+        raise PerformanceObservationError("resource process-tree evidence is unavailable")
+    return cast(Mapping[str, object], process_tree)
+
+
 def _worker_descendant_peak_pss_bytes(
     statistics: Mapping[str, object],
     *,
@@ -349,6 +373,12 @@ def _worker_descendant_peak_pss_bytes(
     sample_index = receipt.get("sample_index")
     process_rows = receipt.get("processes")
     sample_count = statistics.get("sample_count")
+    complete_sample_count = statistics.get(
+        "worker_descendant_pss_complete_sample_count"
+    )
+    incomplete_sample_count = statistics.get(
+        "worker_descendant_pss_incomplete_sample_count"
+    )
     if (
         isinstance(peak, bool)
         or not isinstance(peak, int)
@@ -357,6 +387,12 @@ def _worker_descendant_peak_pss_bytes(
         or not isinstance(sample_index, int)
         or isinstance(sample_count, bool)
         or not isinstance(sample_count, int)
+        or isinstance(complete_sample_count, bool)
+        or not isinstance(complete_sample_count, int)
+        or complete_sample_count <= 0
+        or isinstance(incomplete_sample_count, bool)
+        or not isinstance(incomplete_sample_count, int)
+        or incomplete_sample_count != 0
         or not 0 <= sample_index < sample_count
         or not isinstance(process_rows, list)
         or not process_rows
@@ -754,11 +790,10 @@ def _resource_summary(
     if (
         statistics_payload.get("thread_tree_status") != "available"
         or not isinstance(thread_tree, Mapping)
-        or thread_tree.get("sample_missed_processes") != 0
-        or thread_tree.get("unresolved_thread_observation_count") != 0
+        or thread_tree.get("status") not in {None, "available"}
     ):
-        raise PerformanceObservationError("thread-tree scheduler accounting is unavailable")
-    schedstat = statistics_payload.get("thread_tree_schedstat")
+        raise PerformanceObservationError("thread-tree diagnostic evidence is unavailable")
+    schedstat = statistics_payload.get("process_tree_schedstat")
     if not isinstance(schedstat, Mapping):
         raise PerformanceObservationError("process-tree schedstat is unavailable")
     runqueue_ns = _nonnegative_int(schedstat.get("runqueue_delay_ns"), "runqueue_delay_ns")
@@ -791,19 +826,19 @@ def _resource_summary(
         run_queue_wait_seconds=runqueue_ns / 1_000_000_000.0,
         context_switches=_required_resource_int(
             statistics_payload,
-            "thread_tree_context_switches",
+            "process_tree_context_switches",
         ),
         cpu_migrations=_required_resource_int(
             statistics_payload,
-            "thread_tree_cpu_migrations",
+            "process_tree_cpu_migrations",
         ),
         minor_faults=_required_resource_int(
             statistics_payload,
-            "thread_tree_minor_faults",
+            "process_tree_minor_faults",
         ),
         major_faults=_required_resource_int(
             statistics_payload,
-            "thread_tree_major_faults",
+            "process_tree_major_faults",
         ),
         rss_bytes=_required_resource_int(statistics_payload, "peak_aggregate_rss_bytes"),
         pss_bytes=_required_resource_int(statistics_payload, "peak_aggregate_pss_bytes"),
@@ -1008,7 +1043,14 @@ def execute_mode_block(
     paths: list[Path] = []
     parent_terminal_seconds: dict[Path, float] = {}
     started = time.perf_counter()
-    with ProcessTreeMonitor() as monitor:
+    sample_interval_seconds = (
+        ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS
+        if role == "isolated-memory-probe"
+        else DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+    )
+    with ProcessTreeMonitor(
+        sample_interval_seconds=sample_interval_seconds
+    ) as monitor:
         scheduler: NativeHostScheduler | None = None
         try:
             if mode is ArchitectureMode.HOST_SCHEDULER:
@@ -1153,6 +1195,7 @@ def execute_mode_block(
     )
     raw_resource_evidence = {
         "schema_version": RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "resource_summary_accounting_source": RESOURCE_SUMMARY_ACCOUNTING_SOURCE,
         "topology": topology.to_dict(),
         "elapsed_seconds": elapsed,
         "independent_replay_seconds": independent_replay_seconds,
@@ -1756,9 +1799,12 @@ def produce_fixed_work_observation(
                 )
                 inventory.extend(probe.raw_inventory)
                 scheduler_inventory.extend(probe.scheduler_task_receipt_inventory)
-                producer_pss = _producer_peak_pss_bytes(probe.resource_statistics)
+                probe_process_tree = _process_tree_resource_statistics(
+                    probe.resource_statistics
+                )
+                producer_pss = _producer_peak_pss_bytes(probe_process_tree)
                 worker_descendant_pss = _worker_descendant_peak_pss_bytes(
-                    probe.resource_statistics,
+                    probe_process_tree,
                     scheduler_process_id=probe.scheduler_process_id,
                 )
                 live_host = _require_live_host_identity(detected_host)

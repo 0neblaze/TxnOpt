@@ -72,11 +72,13 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v10"
-PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v9"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v11"
+PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v10"
+LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v9"
 PREVIOUS_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v7"
 CGROUP_IO_ACCOUNTING_SOURCE = "cgroup_v2_io_stat"
 PROCESS_TREE_IO_ACCOUNTING_SOURCE = "process_tree_proc_io"
+MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE = "process_tree_proc"
 AXIS_PERSISTENCE_RECEIPT_SCHEMA_VERSION = "stage05.2-axis-persistence-receipt-v1"
 SEEDS = (2014, 2015, 2016)
 PAIRED_INSTANCES = ("c101C5", "c101_21", "r101_21", "rc101_21")
@@ -90,6 +92,7 @@ CALIBRATION_REVIEW_SCHEMA_VERSION = (
     "stage05.2-native-architecture-performance-calibration-review-v2"
 )
 CALIBRATION_REVIEW_QUALIFICATION = "QUALIFIED_FOR_ATTEMPT08"
+PAIRED_REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v11"
 PAIRED_REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
 PAIRED_REVIEW_EXECUTION_SCHEMA_VERSION = "experiment-review-execution-v1"
 PAIRED_REVIEWER_MODULE_NAME = "evrptw.experiments.stage052_native_architecture_review"
@@ -415,7 +418,7 @@ def _load_qualified_calibration_review(
 def _recompute_paired_review_inventory(
     results_root: Path,
     paired_attempt: int,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], frozenset[str]]:
     # Local import avoids a module cycle: the independent reviewer imports the
     # runner's frozen scope constants, while Pilot calls this only at runtime.
     from evrptw.experiments.stage052_native_architecture_review import (
@@ -423,9 +426,15 @@ def _recompute_paired_review_inventory(
         load_records,
     )
 
-    return _raw_axis_inventory(
-        load_records("paired", attempt=paired_attempt, results_root=results_root)
+    records = load_records("paired", attempt=paired_attempt, results_root=results_root)
+    schemas = frozenset(
+        cast(str, record.payload["schema_version"])
+        for record in records
+        if isinstance(record.payload.get("schema_version"), str)
     )
+    if len(schemas) != 1:
+        raise RuntimeError("paired raw axes do not share one comparison schema")
+    return _raw_axis_inventory(records), schemas
 
 
 def _load_qualified_paired_review(
@@ -459,11 +468,13 @@ def _load_qualified_paired_review(
     reviewer = payload.get("reviewer_provenance")
     recorded_inventory = payload.get("raw_axis_inventory")
     if (
-        payload.get("scope") != "paired"
+        payload.get("schema_version") != PAIRED_REVIEW_SCHEMA_VERSION
+        or payload.get("scope") != "paired"
         or payload.get("attempt") != paired_attempt
         or payload.get("axis_count") != expected_axis_count("paired")
         or payload.get("axis_replay_passed") is not True
         or payload.get("semantic_gates_passed") is not True
+        or payload.get("current_schema_qualified") is not True
         or payload.get("qualification_passed") is not True
         or payload.get("review_status") != "COMPARISON_COMPLETE_QUALIFIED"
         or payload.get("replay_failures") != []
@@ -492,10 +503,12 @@ def _load_qualified_paired_review(
         or reviewer.get("source_sha256") != reviewer_source_sha256
     ):
         raise RuntimeError("paired review provenance is not bound to the campaign revision")
-    recomputed_inventory = _recompute_paired_review_inventory(
+    recomputed_inventory, recomputed_schemas = _recompute_paired_review_inventory(
         paired_results_root,
         paired_attempt,
     )
+    if recomputed_schemas != frozenset({SCHEMA_VERSION}):
+        raise RuntimeError("paired review raw axes do not use the current comparison schema")
     if recorded_inventory != recomputed_inventory:
         raise RuntimeError("paired review raw inventory does not match the 360 current axes")
     if recorded_inventory.get("axis_count") != expected_axis_count("paired") or not isinstance(
@@ -3468,6 +3481,9 @@ def run_experiment(
                     "cgroup_after": cgroup_after,
                     "cgroup_memory_event_deltas": memory_event_deltas,
                     "io_accounting": io_accounting,
+                    "resource_summary_accounting_source": (
+                        MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE
+                    ),
                     "memory_gate_bytes": memory_gate_bytes,
                     **mode_resource_statistics,
                 }

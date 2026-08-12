@@ -42,6 +42,8 @@ PROCESS_TREE_STATISTICS_FIELDS = frozenset(
         "peak_aggregate_pss_bytes",
         "peak_worker_descendant_pss_bytes",
         "worker_descendant_pss_peak",
+        "worker_descendant_pss_complete_sample_count",
+        "worker_descendant_pss_incomplete_sample_count",
         "process_tree_cpu_seconds",
         "cpu_utilization_percent_of_one_core",
         "cpu_utilization_percent_of_compute_limit",
@@ -708,6 +710,8 @@ class ProcessTreeMonitor:
         init=False,
     )
     _worker_descendant_pss_available: bool = field(default=True, init=False)
+    _worker_descendant_pss_complete_sample_count: int = field(default=0, init=False)
+    _worker_descendant_pss_incomplete_sample_count: int = field(default=0, init=False)
     _peak_processes: int = field(default=0, init=False)
     _peak_threads: int = field(default=0, init=False)
     _sample_count: int = field(default=0, init=False)
@@ -832,6 +836,8 @@ class ProcessTreeMonitor:
             self._peak_worker_descendant_pss_sample_index = None
             self._peak_worker_descendant_pss_processes = ()
             self._worker_descendant_pss_available = True
+            self._worker_descendant_pss_complete_sample_count = 0
+            self._worker_descendant_pss_incomplete_sample_count = 0
             self._bounded_samples["worker_descendant_pss_bytes"].clear()
 
     def statistics(
@@ -1040,6 +1046,12 @@ class ProcessTreeMonitor:
                 "peak_bytes"
             ],
             "worker_descendant_pss_peak": worker_descendant_pss_peak,
+            "worker_descendant_pss_complete_sample_count": (
+                self._worker_descendant_pss_complete_sample_count
+            ),
+            "worker_descendant_pss_incomplete_sample_count": (
+                self._worker_descendant_pss_incomplete_sample_count
+            ),
             "process_tree_cpu_seconds": cpu_seconds,
             "cpu_utilization_percent_of_one_core": utilization_of_one_core,
             "cpu_utilization_percent_of_compute_limit": utilization_of_limit,
@@ -1503,6 +1515,18 @@ class ProcessTreeMonitor:
         worker_descendant_pss_processes: list[tuple[int, float, int]] = []
         for identity, process in processes.items():
             sample = _read_process_sample(process)
+            if (
+                identity[0] not in process_root_pids
+                and (sample is None or sample.pss_bytes is None)
+                and _process_identity(process) == identity
+            ):
+                # Retry once in the same sampling turn.  `/proc` and smaps can
+                # transiently race a live worker; a second read commonly
+                # recovers without weakening the memory gate.  A repeated
+                # failure remains an explicitly incomplete sample below.
+                retry = _read_process_sample(process)
+                if retry is not None:
+                    sample = retry
             if sample is None:
                 # A short-lived spawn worker may exit between recursive
                 # discovery and the per-process read.  It is no longer part of
@@ -1639,12 +1663,20 @@ class ProcessTreeMonitor:
             ):
                 return
             if not complete:
+                # `complete=False` means a PID/create-time identity was still
+                # live after discovery but its memory could not be read.  Its
+                # true simultaneous PSS may exceed every earlier sample, so a
+                # calibration must fail closed instead of retaining a smaller
+                # historical peak.
+                self._worker_descendant_pss_incomplete_sample_count += 1
                 self._worker_descendant_pss_available = False
                 return
             normalized = tuple(sorted(processes))
             if any(pss_bytes <= 0 for _pid, _create_time, pss_bytes in normalized):
+                self._worker_descendant_pss_incomplete_sample_count += 1
                 self._worker_descendant_pss_available = False
                 return
+            self._worker_descendant_pss_complete_sample_count += 1
             aggregate = sum(pss_bytes for _pid, _create_time, pss_bytes in normalized)
             self._bounded_samples["worker_descendant_pss_bytes"].append(float(aggregate))
             if aggregate > self._peak_worker_descendant_pss_bytes:

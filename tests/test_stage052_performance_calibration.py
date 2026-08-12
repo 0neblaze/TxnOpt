@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -36,8 +39,11 @@ from evrptw.experiments.stage052_performance_calibration_review import (
     _review_io_accounting,
     _validate_live_memory_admission,
     _validate_resource_evidence,
+    _validate_resource_process_tree,
+    _validate_resource_thread_tree,
 )
 from evrptw.experiments.stage052_performance_observation import (
+    LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_EVIDENCE_SCHEMA_VERSION,
 )
@@ -45,7 +51,10 @@ from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
     write_telemetry_overhead_receipt,
 )
-from evrptw.runtime_envelope import DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    ProcessTreeMonitor,
+)
 from evrptw.stage052_performance import (
     BuildArtifactIdentity,
     ExecutionTopology,
@@ -132,6 +141,23 @@ def test_calibration_reviewer_replays_process_tree_io_provider() -> None:
     ) == evidence["io_accounting"]
 
 
+def test_calibration_reviewer_preserves_read_only_v2_process_tree_io() -> None:
+    evidence = {
+        "schema_version": PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "io_accounting": {
+            "source": "process_tree_proc_io",
+            "read_bytes": 123,
+            "write_bytes": 456,
+        },
+    }
+    assert _review_io_accounting(
+        evidence=evidence,
+        cgroup_before={"io": "unavailable"},
+        cgroup_after={"io": "unavailable"},
+        process_tree=_process_tree_io(read_bytes=123, write_bytes=456),
+    ) == evidence["io_accounting"]
+
+
 def test_calibration_reviewer_rejects_process_tree_io_drift() -> None:
     with pytest.raises(CalibrationReviewError, match="process-tree I/O does not replay"):
         _review_io_accounting(
@@ -189,7 +215,7 @@ def test_calibration_reviewer_preserves_read_only_v1_cgroup_evidence() -> None:
     }
     after = {name: value + 1 for name, value in before.items()}
     evidence = {
-        "schema_version": PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "schema_version": LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         "cgroup_io": {name: 1 for name in before},
     }
     assert _review_io_accounting(
@@ -198,6 +224,41 @@ def test_calibration_reviewer_preserves_read_only_v1_cgroup_evidence() -> None:
         cgroup_after={"io": after},
         process_tree={},
     ) == evidence["cgroup_io"]
+
+
+def test_calibration_reviewer_replays_process_rows_and_keeps_partial_threads_diagnostic() -> None:
+    started = time.perf_counter()
+    with ProcessTreeMonitor(sample_interval_seconds=0.01) as monitor:
+        time.sleep(0.04)
+    process_tree = monitor.statistics(
+        elapsed_seconds=time.perf_counter() - started,
+        compute_thread_limit=len(os.sched_getaffinity(0)),
+    )
+    _validate_resource_process_tree(process_tree)
+
+    partial = copy.deepcopy(process_tree)
+    thread_tree = cast(dict[str, object], partial["thread_tree"])
+    thread_tree["unresolved_thread_observation_count"] = 1
+    thread_tree["unresolved_thread_ids"] = [
+        {
+            "pid": os.getpid(),
+            "process_create_time": 1.0,
+            "tid": os.getpid() + 1,
+        }
+    ]
+    _validate_resource_thread_tree(partial, require_complete=False)
+    with pytest.raises(CalibrationReviewError, match="thread-tree evidence is incomplete"):
+        _validate_resource_thread_tree(partial, require_complete=True)
+
+    tampered = copy.deepcopy(process_tree)
+    tampered["process_tree_context_switches"] = (
+        cast(int, tampered["process_tree_context_switches"]) + 1
+    )
+    with pytest.raises(
+        CalibrationReviewError,
+        match="process_tree_context_switches",
+    ):
+        _validate_resource_process_tree(tampered)
 
 
 def test_performance_calibration_catalog_declares_stage052_prerequisites() -> None:
@@ -439,6 +500,8 @@ def test_calibration_reviewer_uses_simultaneous_worker_peak_receipt() -> None:
         "root_process_id": 10,
         "additional_root_pids": [20],
         "sample_count": 2,
+        "worker_descendant_pss_complete_sample_count": 2,
+        "worker_descendant_pss_incomplete_sample_count": 0,
         "peak_aggregate_pss_bytes": 100,
         "peak_worker_descendant_pss_bytes": 80,
         "worker_descendant_pss_peak": {
@@ -461,6 +524,22 @@ def test_calibration_reviewer_uses_simultaneous_worker_peak_receipt() -> None:
         process_tree,
         scheduler_process_id=20,
     ) == (100, 40, 80)
+
+    historical = dict(process_tree)
+    historical.pop("worker_descendant_pss_complete_sample_count")
+    historical.pop("worker_descendant_pss_incomplete_sample_count")
+    assert _resource_pss_components(
+        historical,
+        scheduler_process_id=20,
+        require_complete_sample_accounting=False,
+    ) == (100, 40, 80)
+    with pytest.raises(CalibrationReviewError):
+        _resource_pss_components(
+            historical,
+            scheduler_process_id=20,
+        )
+
+
 def _start_permit(
     tmp_path: Path,
     *,

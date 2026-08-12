@@ -12,7 +12,10 @@ from evrptw.experiments.stage052_native_architecture_review import (
     ReviewRecord,
     _resource_telemetry_topology_error,
 )
-from evrptw.experiments.stage052_native_architectures import ArchitectureMode
+from evrptw.experiments.stage052_native_architectures import (
+    PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+    ArchitectureMode,
+)
 from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
     TelemetryWorkloadSample,
@@ -698,6 +701,34 @@ def test_enabled_resource_telemetry_requires_exact_current_schema() -> None:
         topology,
         mode=ArchitectureMode.CURRENT_STAGE052,
         expected_resource_telemetry=True,
+    ) is not None
+
+
+def test_prior_profile_resource_schema_does_not_require_new_worker_sample_counters() -> None:
+    prior_statistics_fields = PROCESS_TREE_STATISTICS_FIELDS - {
+        "worker_descendant_pss_complete_sample_count",
+        "worker_descendant_pss_incomplete_sample_count",
+    }
+    topology = {
+        field: None
+        for field in (_RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | prior_statistics_fields)
+    }
+
+    assert (
+        _resource_telemetry_topology_error(
+            topology,
+            mode=ArchitectureMode.CURRENT_STAGE052,
+            expected_resource_telemetry=True,
+            comparison_schema=PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
+        is None
+    )
+    topology["worker_descendant_pss_complete_sample_count"] = 1
+    assert _resource_telemetry_topology_error(
+        topology,
+        mode=ArchitectureMode.CURRENT_STAGE052,
+        expected_resource_telemetry=True,
+        comparison_schema=PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
     ) is not None
 
 

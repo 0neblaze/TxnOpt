@@ -49,8 +49,10 @@ from evrptw.experiments.stage052_performance_calibration import (
 )
 from evrptw.experiments.stage052_performance_observation import (
     FIXED_WORK_BUDGET,
+    LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    RESOURCE_SUMMARY_ACCOUNTING_SOURCE,
 )
 from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
@@ -578,18 +580,55 @@ def _resource_percentile(values: Sequence[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))]
 
 
-def _validate_resource_thread_tree(process_tree: Mapping[str, object]) -> None:
+def _validate_resource_thread_tree(
+    process_tree: Mapping[str, object],
+    *,
+    require_complete: bool,
+) -> None:
     thread_tree = _mapping(process_tree.get("thread_tree"), "resource thread_tree")
     rows = _array(process_tree.get("thread_metrics"), "resource thread_metrics")
     if (
         process_tree.get("thread_tree_status") != "available"
         or thread_tree.get("status") != "available"
-        or thread_tree.get("sample_missed_processes") != 0
-        or thread_tree.get("unresolved_thread_observation_count") != 0
-        or thread_tree.get("unresolved_thread_ids") != []
         or thread_tree.get("observed_thread_identities") != len(rows)
         or not rows
     ):
+        raise CalibrationReviewError("resource thread-tree evidence is incomplete")
+    missed_processes = _integer(
+        thread_tree.get("sample_missed_processes"),
+        "resource missed thread-process samples",
+    )
+    unresolved_count = _integer(
+        thread_tree.get("unresolved_thread_observation_count"),
+        "resource unresolved thread count",
+    )
+    unresolved_rows = _array(
+        thread_tree.get("unresolved_thread_ids"),
+        "resource unresolved thread rows",
+    )
+    if unresolved_count != len(unresolved_rows):
+        raise CalibrationReviewError("resource unresolved thread receipt does not reconcile")
+    unresolved_identities: set[tuple[int, float, int]] = set()
+    for index, raw_unresolved in enumerate(unresolved_rows):
+        unresolved = _mapping(raw_unresolved, f"resource unresolved thread[{index}]")
+        if set(unresolved) != {"pid", "process_create_time", "tid"}:
+            raise CalibrationReviewError("resource unresolved thread schema is invalid")
+        unresolved_identity = (
+            _integer(unresolved.get("pid"), "resource unresolved process PID"),
+            _number(
+                unresolved.get("process_create_time"),
+                "resource unresolved process create time",
+                positive=True,
+            ),
+            _integer(unresolved.get("tid"), "resource unresolved thread ID"),
+        )
+        if (
+            min(unresolved_identity[0], unresolved_identity[2]) == 0
+            or unresolved_identity in unresolved_identities
+        ):
+            raise CalibrationReviewError("resource unresolved thread identity is invalid")
+        unresolved_identities.add(unresolved_identity)
+    if require_complete and (missed_processes or unresolved_rows):
         raise CalibrationReviewError("resource thread-tree evidence is incomplete")
     counter_names = {
         "voluntary_context_switches",
@@ -679,6 +718,156 @@ def _validate_resource_thread_tree(process_tree: Mapping[str, object]) -> None:
         )
     ):
         raise CalibrationReviewError("resource thread-tree aggregates do not replay")
+
+
+def _validate_resource_process_tree(
+    process_tree: Mapping[str, object],
+) -> tuple[float, float, dict[str, int]]:
+    """Replay authoritative process totals independently from per-process rows."""
+
+    rows = _array(process_tree.get("process_metrics"), "resource process_metrics")
+    if not rows:
+        raise CalibrationReviewError("resource process-tree rows are unavailable")
+    counter_names = {
+        "voluntary_context_switches",
+        "involuntary_context_switches",
+        "minor_faults",
+        "major_faults",
+        "read_bytes",
+        "write_bytes",
+        "schedstat_runtime_ns",
+        "schedstat_runqueue_delay_ns",
+        "schedstat_timeslices",
+        "cpu_migrations",
+    }
+    totals = {name: 0 for name in counter_names}
+    user_seconds = 0.0
+    system_seconds = 0.0
+    identities: set[tuple[int, float]] = set()
+    affinity_union: set[int] = set()
+    affinity_intersection: set[int] | None = None
+    for index, raw_row in enumerate(rows):
+        row = _mapping(raw_row, f"resource process_metrics[{index}]")
+        identity = (
+            _integer(row.get("pid"), f"resource process_metrics[{index}].pid"),
+            _number(
+                row.get("create_time"),
+                f"resource process_metrics[{index}].create_time",
+                positive=True,
+            ),
+        )
+        if identity[0] == 0 or identity in identities:
+            raise CalibrationReviewError("resource process identity is invalid")
+        identities.add(identity)
+        if _integer(row.get("sample_count"), "resource process sample count") == 0:
+            raise CalibrationReviewError("resource process sample count is invalid")
+        if row.get("cpu_baseline_source") not in {
+            "monitor_start",
+            "process_create_time",
+        }:
+            raise CalibrationReviewError("resource process CPU baseline is invalid")
+        user_seconds += _number(row.get("user_cpu_seconds"), "resource process user CPU")
+        system_seconds += _number(
+            row.get("system_cpu_seconds"),
+            "resource process system CPU",
+        )
+        counters = _mapping(row.get("counters"), "resource process counters")
+        if set(counters) != counter_names:
+            raise CalibrationReviewError("resource process counter schema is invalid")
+        for name in counter_names:
+            totals[name] += _integer(
+                counters.get(name),
+                f"resource process {name}",
+            )
+        if row.get("cpu_migrations") != counters["cpu_migrations"]:
+            raise CalibrationReviewError("resource process migration alias differs")
+        schedstat = _mapping(row.get("schedstat"), "resource process schedstat")
+        expected_schedstat = {
+            "runtime_ns": counters["schedstat_runtime_ns"],
+            "runqueue_delay_ns": counters["schedstat_runqueue_delay_ns"],
+            "timeslices": counters["schedstat_timeslices"],
+        }
+        if dict(schedstat) != expected_schedstat:
+            raise CalibrationReviewError("resource process schedstat row differs")
+        affinity = row.get("last_affinity")
+        if (
+            not isinstance(affinity, list)
+            or not affinity
+            or any(
+                isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0
+                for cpu in affinity
+            )
+            or affinity != sorted(set(affinity))
+        ):
+            raise CalibrationReviewError("resource process affinity is invalid")
+        selected = set(cast(list[int], affinity))
+        affinity_union.update(selected)
+        affinity_intersection = (
+            selected
+            if affinity_intersection is None
+            else affinity_intersection.intersection(selected)
+        )
+    cpu_seconds = user_seconds + system_seconds
+    expected_schedstat = {
+        "runtime_ns": totals["schedstat_runtime_ns"],
+        "runqueue_delay_ns": totals["schedstat_runqueue_delay_ns"],
+        "timeslices": totals["schedstat_timeslices"],
+    }
+    expected_context_switches = (
+        totals["voluntary_context_switches"]
+        + totals["involuntary_context_switches"]
+    )
+    cpu_fields = {
+        "process_tree_user_cpu_seconds": user_seconds,
+        "process_tree_system_cpu_seconds": system_seconds,
+        "process_tree_cpu_seconds": cpu_seconds,
+        "process_tree_cpu_user_seconds": user_seconds,
+        "process_tree_cpu_system_seconds": system_seconds,
+    }
+    mismatches = [
+        name
+        for name, expected in cpu_fields.items()
+        if not math.isclose(
+            _number(process_tree.get(name), f"resource {name}"),
+            expected,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ]
+    expected_fields: dict[str, object] = {
+        "process_tree_voluntary_context_switches": totals[
+            "voluntary_context_switches"
+        ],
+        "process_tree_involuntary_context_switches": totals[
+            "involuntary_context_switches"
+        ],
+        "process_tree_context_switches": expected_context_switches,
+        "process_tree_minor_faults": totals["minor_faults"],
+        "process_tree_major_faults": totals["major_faults"],
+        "process_tree_read_bytes": totals["read_bytes"],
+        "process_tree_write_bytes": totals["write_bytes"],
+        "process_tree_cpu_migrations": totals["cpu_migrations"],
+        "process_tree_migration_count": totals["cpu_migrations"],
+        "process_tree_schedstat": expected_schedstat,
+        "actual_affinity_union": sorted(affinity_union),
+        "actual_affinity_intersection": sorted(affinity_intersection or set()),
+        "cpu_affinity_union": sorted(affinity_union),
+        "cpu_affinity_intersection": sorted(affinity_intersection or set()),
+        "actual_affinity_union_count": len(affinity_union),
+        "actual_affinity_intersection_count": len(affinity_intersection or set()),
+        "affinity_status": "available",
+    }
+    mismatches.extend(
+        name
+        for name, expected in expected_fields.items()
+        if process_tree.get(name) != expected
+    )
+    if mismatches:
+        raise CalibrationReviewError(
+            "resource process-tree aggregates do not replay: "
+            + ", ".join(sorted(mismatches))
+        )
+    return user_seconds, system_seconds, totals
 
 
 def _resource_queue_totals(
@@ -773,11 +962,14 @@ def _review_io_accounting(
             if after_value < before_value:
                 raise CalibrationReviewError("raw resource cgroup I/O does not replay")
             cgroup_expected[name] = after_value - before_value
-        if schema_version == PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        if schema_version == LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION:
             reported = _mapping(evidence.get("cgroup_io"), "resource cgroup I/O")
             if set(reported) != cgroup_fields:
                 raise CalibrationReviewError("raw resource cgroup I/O schema is invalid")
-        elif schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        elif schema_version in {
+            PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        }:
             reported = _mapping(evidence.get("io_accounting"), "resource I/O accounting")
             if (
                 reported.get("source") != CGROUP_IO_ACCOUNTING_SOURCE
@@ -789,7 +981,10 @@ def _review_io_accounting(
         if any(reported.get(name) != value for name, value in cgroup_expected.items()):
             raise CalibrationReviewError("raw resource cgroup I/O does not replay")
         return reported
-    if schema_version != RESOURCE_EVIDENCE_SCHEMA_VERSION:
+    if schema_version not in {
+        PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }:
         raise CalibrationReviewError("raw resource legacy cgroup I/O is unavailable")
     if raw_before_io != "unavailable" or raw_after_io != "unavailable":
         raise CalibrationReviewError("raw resource cgroup I/O availability is inconsistent")
@@ -838,6 +1033,7 @@ def _derive_resource_summary(
     scheduler_statistics: Mapping[str, object] | None,
 ) -> tuple[RuntimeResourceSummaryV2, int, int, int, tuple[str, ...]]:
     if evidence.get("schema_version") not in {
+        LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
@@ -854,8 +1050,41 @@ def _derive_resource_summary(
         )
     except ValueError as error:
         raise CalibrationReviewError("raw resource topology is invalid") from error
+    schema_version = cast(str, evidence["schema_version"])
     process_tree = _mapping(evidence.get("process_tree"), "resource process_tree")
-    _validate_resource_thread_tree(process_tree)
+    _validate_resource_thread_tree(
+        process_tree,
+        require_complete=schema_version != RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    )
+    if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        if (
+            evidence.get("resource_summary_accounting_source")
+            != RESOURCE_SUMMARY_ACCOUNTING_SOURCE
+        ):
+            raise CalibrationReviewError("raw resource summary provider is invalid")
+        process_user_seconds, process_system_seconds, process_counters = (
+            _validate_resource_process_tree(process_tree)
+        )
+    elif "resource_summary_accounting_source" in evidence:
+        raise CalibrationReviewError("legacy raw resource summary provider is invalid")
+    else:
+        # v1/v2 summaries were defined by the complete thread-tree receipt.  Keep
+        # those immutable artifacts readable without retroactively requiring the
+        # richer per-process row schema introduced by v3.
+        process_user_seconds = 0.0
+        process_system_seconds = 0.0
+        process_counters = {
+            "voluntary_context_switches": 0,
+            "involuntary_context_switches": 0,
+            "minor_faults": 0,
+            "major_faults": 0,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "schedstat_runtime_ns": 0,
+            "schedstat_runqueue_delay_ns": 0,
+            "schedstat_timeslices": 0,
+            "cpu_migrations": 0,
+        }
     elapsed = _number(evidence.get("elapsed_seconds"), "resource elapsed", positive=True)
     replay_seconds = _number(evidence.get("independent_replay_seconds"), "resource replay")
     compute_limit = len(topology.cpu_ids)
@@ -969,7 +1198,15 @@ def _derive_resource_summary(
         payloads,
         scheduler_statistics,
     )
-    schedstat = _mapping(process_tree.get("thread_tree_schedstat"), "resource schedstat")
+    use_process_accounting = schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION
+    schedstat = _mapping(
+        process_tree.get(
+            "process_tree_schedstat"
+            if use_process_accounting
+            else "thread_tree_schedstat"
+        ),
+        "resource schedstat",
+    )
     scheduler_pid_raw = evidence.get("scheduler_process_id")
     scheduler_pid = (
         None
@@ -979,30 +1216,64 @@ def _derive_resource_summary(
     producer_pss, scheduler_pss, worker_descendant_pss = _resource_pss_components(
         process_tree,
         scheduler_process_id=scheduler_pid,
+        require_complete_sample_accounting=(
+            schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION
+        ),
     )
     summary = RuntimeResourceSummaryV2(
         elapsed_seconds=elapsed,
         effective_cores=cpu_seconds / elapsed,
         cpu_utilization_fraction=min(1.0, cpu_seconds / (elapsed * compute_limit)),
-        user_cpu_seconds=_number(
-            process_tree.get("process_tree_user_cpu_seconds"), "resource user CPU"
+        user_cpu_seconds=(
+            process_user_seconds
+            if use_process_accounting
+            else _number(
+                process_tree.get("process_tree_user_cpu_seconds"),
+                "resource user CPU",
+            )
         ),
-        system_cpu_seconds=_number(
-            process_tree.get("process_tree_system_cpu_seconds"), "resource system CPU"
+        system_cpu_seconds=(
+            process_system_seconds
+            if use_process_accounting
+            else _number(
+                process_tree.get("process_tree_system_cpu_seconds"),
+                "resource system CPU",
+            )
         ),
         run_queue_wait_seconds=_integer(schedstat.get("runqueue_delay_ns"), "runqueue delay")
         / 1_000_000_000.0,
-        context_switches=_integer(
-            process_tree.get("thread_tree_context_switches"), "resource context switches"
+        context_switches=(
+            process_counters["voluntary_context_switches"]
+            + process_counters["involuntary_context_switches"]
+            if use_process_accounting
+            else _integer(
+                process_tree.get("thread_tree_context_switches"),
+                "resource context switches",
+            )
         ),
-        cpu_migrations=_integer(
-            process_tree.get("thread_tree_cpu_migrations"), "resource CPU migrations"
+        cpu_migrations=(
+            process_counters["cpu_migrations"]
+            if use_process_accounting
+            else _integer(
+                process_tree.get("thread_tree_cpu_migrations"),
+                "resource CPU migrations",
+            )
         ),
-        minor_faults=_integer(
-            process_tree.get("thread_tree_minor_faults"), "resource minor faults"
+        minor_faults=(
+            process_counters["minor_faults"]
+            if use_process_accounting
+            else _integer(
+                process_tree.get("thread_tree_minor_faults"),
+                "resource minor faults",
+            )
         ),
-        major_faults=_integer(
-            process_tree.get("thread_tree_major_faults"), "resource major faults"
+        major_faults=(
+            process_counters["major_faults"]
+            if use_process_accounting
+            else _integer(
+                process_tree.get("thread_tree_major_faults"),
+                "resource major faults",
+            )
         ),
         rss_bytes=_integer(process_tree.get("peak_aggregate_rss_bytes"), "resource peak RSS"),
         pss_bytes=_integer(process_tree.get("peak_aggregate_pss_bytes"), "resource peak PSS"),
@@ -1223,6 +1494,7 @@ def _resource_pss_components(
     process_tree: Mapping[str, object],
     *,
     scheduler_process_id: int | None,
+    require_complete_sample_accounting: bool = True,
 ) -> tuple[int, int, int]:
     root_pid = _integer(process_tree.get("root_process_id"), "resource root process ID")
     additional_root_pids = _array(
@@ -1284,6 +1556,17 @@ def _resource_pss_components(
         "resource worker descendant PSS sample index",
     )
     sample_count = _integer(process_tree.get("sample_count"), "resource sample count")
+    complete_sample_count = 1
+    incomplete_sample_count = 0
+    if require_complete_sample_accounting:
+        complete_sample_count = _integer(
+            process_tree.get("worker_descendant_pss_complete_sample_count"),
+            "resource worker descendant complete sample count",
+        )
+        incomplete_sample_count = _integer(
+            process_tree.get("worker_descendant_pss_incomplete_sample_count"),
+            "resource worker descendant incomplete sample count",
+        )
     process_rows = _array(
         receipt.get("processes"),
         "resource worker descendant PSS processes",
@@ -1291,6 +1574,8 @@ def _resource_pss_components(
     if (
         receipt.get("status") != "available"
         or worker_descendant_pss <= 0
+        or complete_sample_count <= 0
+        or incomplete_sample_count != 0
         or not 0 <= sample_index < sample_count
         or not process_rows
         or process_tree.get("peak_worker_descendant_pss_bytes")

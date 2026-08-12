@@ -287,6 +287,24 @@ def test_process_tree_monitor_registers_late_shared_root_before_worker_samples()
         shared_root.wait(timeout=5.0)
 
 
+def test_process_tree_monitor_fails_closed_after_live_worker_pss_sample_is_incomplete() -> None:
+    monitor = ProcessTreeMonitor()
+    monitor._sample_count = 3  # noqa: SLF001
+    monitor._record_worker_descendant_pss_sample(  # noqa: SLF001
+        [(123, 10.0, 4096)],
+        complete=True,
+    )
+
+    monitor._sample_count = 4  # noqa: SLF001
+    monitor._record_worker_descendant_pss_sample([], complete=False)  # noqa: SLF001
+
+    assert monitor._worker_descendant_pss_available is False  # noqa: SLF001
+    assert monitor._peak_worker_descendant_pss_bytes == 4096  # noqa: SLF001
+    assert monitor._peak_worker_descendant_pss_sample_index == 3  # noqa: SLF001
+    assert monitor._worker_descendant_pss_complete_sample_count == 1  # noqa: SLF001
+    assert monitor._worker_descendant_pss_incomplete_sample_count == 1  # noqa: SLF001
+
+
 def test_process_tree_monitor_rejects_invalid_thread_detail_interval() -> None:
     with pytest.raises(ValueError, match="thread-detail sample interval"):
         ProcessTreeMonitor(thread_detail_interval_seconds=0.0)

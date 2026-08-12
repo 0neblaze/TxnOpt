@@ -34,9 +34,11 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _describe_first_divergence,
     _external_semantic_trajectory,
     _load_axis_record,
+    _mode_wave_affinity_matches_profile,
     _mode_wave_metrics,
     _NativeCanonicalProjectionHasher,
     _raw_axis_inventory,
+    _records_use_current_profile_schema,
     _relative_time_improvement,
     _replay_canonical_journal,
     _replay_initial_state_receipt,
@@ -57,8 +59,11 @@ from evrptw.experiments.stage052_native_architecture_review import (
 )
 from evrptw.experiments.stage052_native_architectures import (
     CALIBRATION_REVIEW_SCHEMA_VERSION,
+    LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
+    MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE,
     MODES,
     PAIRED_INSTANCES,
+    PAIRED_REVIEW_SCHEMA_VERSION,
     PREVIOUS_COMPARISON_SCHEMA_VERSION,
     PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
     SCHEMA_VERSION,
@@ -722,6 +727,63 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "cpu_utilization_fraction_of_compute_limit": 0.75,
         "compute_thread_limit": 2,
         "process_tree_cpu_seconds": 1.5,
+        "process_tree_user_cpu_seconds": 1.2,
+        "process_tree_system_cpu_seconds": 0.3,
+        "process_tree_cpu_user_seconds": 1.2,
+        "process_tree_cpu_system_seconds": 0.3,
+        "process_tree_voluntary_context_switches": 5,
+        "process_tree_involuntary_context_switches": 2,
+        "process_tree_context_switches": 7,
+        "process_tree_minor_faults": 4,
+        "process_tree_major_faults": 0,
+        "process_tree_read_bytes": 7,
+        "process_tree_write_bytes": 11,
+        "process_tree_cpu_migrations": 2,
+        "process_tree_migration_count": 2,
+        "process_tree_schedstat": {
+            "runtime_ns": 100,
+            "runqueue_delay_ns": 200,
+            "timeslices": 3,
+        },
+        "actual_affinity_union": [0, 1],
+        "actual_affinity_intersection": [0, 1],
+        "cpu_affinity_union": [0, 1],
+        "cpu_affinity_intersection": [0, 1],
+        "actual_affinity_union_count": 2,
+        "actual_affinity_intersection_count": 2,
+        "affinity_status": "available",
+        "process_metrics": [
+            {
+                "pid": 1,
+                "create_time": 1.0,
+                "sample_count": 2,
+                "cpu_baseline_source": "monitor_start",
+                "user_cpu_seconds": 1.2,
+                "system_cpu_seconds": 0.3,
+                "counters": {
+                    "voluntary_context_switches": 5,
+                    "involuntary_context_switches": 2,
+                    "minor_faults": 4,
+                    "major_faults": 0,
+                    "read_bytes": 7,
+                    "write_bytes": 11,
+                    "schedstat_runtime_ns": 100,
+                    "schedstat_runqueue_delay_ns": 200,
+                    "schedstat_timeslices": 3,
+                    "cpu_migrations": 2,
+                },
+                "cpu_migrations": 2,
+                "schedstat": {
+                    "runtime_ns": 100,
+                    "runqueue_delay_ns": 200,
+                    "timeslices": 3,
+                },
+                "last_affinity": [0, 1],
+            }
+        ],
+        "resource_summary_accounting_source": (
+            MODE_WAVE_RESOURCE_ACCOUNTING_SOURCE
+        ),
         "thread_tree_status": "available",
         "thread_tree": {
             "status": "available",
@@ -784,10 +846,34 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "thread_tree_major_faults": 0,
     }
     _review_mode_wave_resources(wave)
+    current_metrics = _mode_wave_metrics(
+        (
+            ReviewRecord(
+                Path("current-axis.json"),
+                {"schema_version": SCHEMA_VERSION},
+                wave,
+            ),
+        )
+    )
+    assert cast(dict[str, object], current_metrics["context_switches"])["median"] == 7.0
+    assert cast(dict[str, object], current_metrics["cpu_migrations"])["median"] == 2.0
+
+    wave["process_tree_context_switches"] = 8
+    with pytest.raises(RuntimeError, match="process-tree aggregates do not replay"):
+        _review_mode_wave_resources(wave)
+    wave["process_tree_context_switches"] = 7
+
+    partial_thread_wave = copy.deepcopy(wave)
+    partial_thread_tree = cast(dict[str, object], partial_thread_wave["thread_tree"])
+    partial_thread_tree["sample_missed_processes"] = 1
+    partial_thread_tree["unresolved_thread_observation_count"] = 1
+    partial_thread_tree["unresolved_thread_ids"] = [
+        {"pid": 2, "process_create_time": 2.0, "tid": 3}
+    ]
+    _review_mode_wave_resources(partial_thread_wave)
+
     prior_wave = copy.deepcopy(wave)
-    prior_io = cast(dict[str, object], prior_wave.pop("io_accounting"))
-    prior_io.pop("source")
-    prior_wave["cgroup_io_deltas"] = prior_io
+    prior_wave.pop("resource_summary_accounting_source")
     _review_mode_wave_resources(
         prior_wave,
         comparison_schema=PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
@@ -803,6 +889,26 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
     )
     assert cast(dict[str, object], prior_metrics["io_read_bytes"])["median"] == 5.0
     assert prior_metrics["io_accounting_sources"] == ["cgroup_v2_io_stat"]
+
+    legacy_wave = copy.deepcopy(prior_wave)
+    legacy_io = cast(dict[str, object], legacy_wave.pop("io_accounting"))
+    legacy_io.pop("source")
+    legacy_wave["cgroup_io_deltas"] = legacy_io
+    _review_mode_wave_resources(
+        legacy_wave,
+        comparison_schema=LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
+    )
+    legacy_metrics = _mode_wave_metrics(
+        (
+            ReviewRecord(
+                Path("legacy-axis.json"),
+                {"schema_version": LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION},
+                legacy_wave,
+            ),
+        )
+    )
+    assert cast(dict[str, object], legacy_metrics["io_read_bytes"])["median"] == 5.0
+    assert legacy_metrics["io_accounting_sources"] == ["cgroup_v2_io_stat"]
 
     thread_tree = cast(dict[str, object], wave["thread_tree"])
     counters = cast(dict[str, int], thread_tree["counters"])
@@ -826,20 +932,11 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "read_bytes": 7,
         "write_bytes": 11,
     }
-    wave["process_tree_read_bytes"] = 7
-    wave["process_tree_write_bytes"] = 11
-    wave["process_metrics"] = [
-        {
-            "pid": 1,
-            "create_time": 1.0,
-            "counters": {"read_bytes": 7, "write_bytes": 11},
-        }
-    ]
     _review_mode_wave_resources(wave)
     process_io = cast(dict[str, object], wave["io_accounting"])
     process_io["write_bytes"] = 12
     wave["process_tree_write_bytes"] = 12
-    with pytest.raises(RuntimeError, match="aggregate does not replay"):
+    with pytest.raises(RuntimeError, match="aggregates do not replay"):
         _review_mode_wave_resources(wave)
     process_io["write_bytes"] = 11
     wave["process_tree_write_bytes"] = 11
@@ -2565,6 +2662,7 @@ def test_pilot_gate_requires_signed_qualified_paired_review(
         "axis_count": 360,
         "axis_replay_passed": True,
         "semantic_gates_passed": True,
+        "current_schema_qualified": True,
         "qualification_passed": True,
         "review_status": "COMPARISON_COMPLETE_QUALIFIED",
         "replay_failures": [],
@@ -2604,8 +2702,9 @@ def test_pilot_gate_requires_signed_qualified_paired_review(
     execution_path = tmp_path / "paired-review_execution.json"
     monkeypatch.setattr(
         "evrptw.experiments.stage052_native_architectures._recompute_paired_review_inventory",
-        lambda _root, _attempt: raw_inventory,
+        lambda _root, _attempt: (raw_inventory, frozenset({SCHEMA_VERSION})),
     )
+    assert PAIRED_REVIEW_SCHEMA_VERSION == REVIEW_SCHEMA_VERSION
     gate = _load_qualified_paired_review(
         path,
         review_execution_path=execution_path,
@@ -2636,6 +2735,28 @@ def test_pilot_gate_requires_signed_qualified_paired_review(
             scheduler_sha256=scheduler,
             performance_profile_sha256=profile,
         )
+
+    for index, invalid_payload in enumerate(
+        (
+            {**payload, "schema_version": "stage05.2-native-architecture-review-v10"},
+            {key: value for key, value in payload.items() if key != "current_schema_qualified"},
+            {**payload, "current_schema_qualified": False},
+        )
+    ):
+        invalid_path = tmp_path / f"paired-review-schema-rejected-{index}.json"
+        _write_signed_json(invalid_path, invalid_payload)
+        with pytest.raises(RuntimeError, match="qualified 360/360"):
+            _load_qualified_paired_review(
+                invalid_path,
+                review_execution_path=execution_path,
+                paired_results_root=tmp_path,
+                paired_attempt=8,
+                revision=revision,
+                wheel_sha256=wheel,
+                native_sha256=native,
+                scheduler_sha256=scheduler,
+                performance_profile_sha256=profile,
+            )
 
 
 def test_campaign_gate_requires_signed_qualified_calibration_review(
@@ -2883,7 +3004,39 @@ def test_independent_review_replays_routes_and_accepts_equal_fixed_work(
     gates = review["differential_gates"]
     assert isinstance(gates, dict)
     assert all(bool(gates[mode.value]["passed"]) for mode in MODES[2:])
+    assert review["current_schema_qualified"] is False
+    assert review["qualification_passed"] is False
     assert "五模式事实表" in render_report(review)
+
+
+def test_v11_profile_gate_uses_process_affinity_and_historical_gate_keeps_thread_affinity() -> None:
+    wave = {
+        "actual_affinity_union": [0, 1, 2, 3],
+        "thread_affinity_union": [0, 1],
+    }
+
+    assert _mode_wave_affinity_matches_profile(
+        wave,
+        comparison_schema=SCHEMA_VERSION,
+        allowed_cpu_ids=(0, 1, 2, 3),
+    )
+    assert not _mode_wave_affinity_matches_profile(
+        wave,
+        comparison_schema=PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
+        allowed_cpu_ids=(0, 1, 2, 3),
+    )
+
+
+def test_only_current_comparison_schema_can_be_newly_qualified(tmp_path: Path) -> None:
+    current = ReviewRecord(tmp_path / "current.json", {"schema_version": SCHEMA_VERSION})
+    historical = ReviewRecord(
+        tmp_path / "historical.json",
+        {"schema_version": PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION},
+    )
+
+    assert _records_use_current_profile_schema((current,))
+    assert not _records_use_current_profile_schema((current, historical))
+    assert not _records_use_current_profile_schema((historical,))
 
 
 def test_semantic_trajectory_reports_the_real_first_divergence() -> None:
