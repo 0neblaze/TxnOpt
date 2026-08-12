@@ -91,9 +91,11 @@ CALIBRATION_WATCHDOG_SECONDS: Final = 30.0
 CALIBRATION_BATCH_SIZE: Final = 128
 REPRESENTATIVE_TRAJECTORY_MAX_ROWS: Final = 200_000
 REPRESENTATIVE_TRAJECTORY_MAX_BYTES: Final = 64 * 1024 * 1024
-ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS: Final = (
-    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
-)
+# A C5 isolated worker can spawn, solve, and exit between two 100 ms samples.
+# This probe is used for memory admission rather than the selected mode-block
+# timing, so sample it densely while keeping production/A-B telemetry at the
+# shared default cadence.
+ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS: Final = 0.01
 FIXED_WORK_BUDGET: Final = {
     "axis": "fixed_work",
     # Calibration is intentionally short.  The production 100-call protocol is

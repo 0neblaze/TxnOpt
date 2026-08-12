@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, cast
 
+import psutil
 import pytest
 
 import evrptw.runtime_envelope as runtime_envelope
@@ -303,6 +305,105 @@ def test_process_tree_monitor_fails_closed_after_live_worker_pss_sample_is_incom
     assert monitor._peak_worker_descendant_pss_sample_index == 3  # noqa: SLF001
     assert monitor._worker_descendant_pss_complete_sample_count == 1  # noqa: SLF001
     assert monitor._worker_descendant_pss_incomplete_sample_count == 1  # noqa: SLF001
+
+
+def test_process_liveness_distinguishes_terminal_and_unknown_sampling_races(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        pid = 123
+
+        def create_time(self) -> float:
+            return 10.0
+
+        def is_running(self) -> bool:
+            return True
+
+        def status(self) -> str:
+            return psutil.STATUS_ZOMBIE
+
+    process = Process()
+    assert runtime_envelope._same_process_is_live(process, (123, 10.0)) is False
+
+    monkeypatch.setattr(process, "status", lambda: psutil.STATUS_RUNNING)
+    assert runtime_envelope._same_process_is_live(process, (123, 10.0)) is True
+
+    def denied() -> str:
+        raise psutil.AccessDenied(pid=123)
+
+    monkeypatch.setattr(process, "status", denied)
+    assert runtime_envelope._same_process_is_live(process, (123, 10.0)) is None
+
+
+def test_exited_worker_with_missing_pss_retains_observed_cpu_and_rss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        def __init__(self, pid: int, create_time: float, *, zombie: bool) -> None:
+            self.pid = pid
+            self._create_time = create_time
+            self._zombie = zombie
+
+        def create_time(self) -> float:
+            return self._create_time
+
+        def children(self, *, recursive: bool) -> tuple[Process, ...]:
+            assert recursive is True
+            return (worker,) if self.pid == os.getpid() else ()
+
+        def is_running(self) -> bool:
+            return True
+
+        def status(self) -> str:
+            return psutil.STATUS_ZOMBIE if self._zombie else psutil.STATUS_RUNNING
+
+    root = Process(os.getpid(), 10.0, zombie=False)
+    worker = Process(os.getpid() + 1000, 20.0, zombie=True)
+    root_sample = runtime_envelope._ProcessSample(  # noqa: SLF001
+        user_cpu_seconds=1.0,
+        system_cpu_seconds=0.5,
+        rss_bytes=1000,
+        pss_bytes=800,
+        thread_count=1,
+        counters={name: 0 for name in runtime_envelope._COUNTER_NAMES},  # noqa: SLF001
+        affinity=(0,),
+    )
+    worker_sample = dataclasses.replace(
+        root_sample,
+        user_cpu_seconds=0.25,
+        system_cpu_seconds=0.1,
+        rss_bytes=400,
+        pss_bytes=None,
+    )
+    monkeypatch.setattr(
+        runtime_envelope.psutil,
+        "Process",
+        lambda pid: root if pid == os.getpid() else worker,
+    )
+    monkeypatch.setattr(
+        runtime_envelope,
+        "_read_process_sample",
+        lambda process: root_sample if process is root else worker_sample,
+    )
+    monitor = ProcessTreeMonitor()
+    monitor._monitor_start_wall_time = 15.0  # noqa: SLF001
+    monkeypatch.setattr(ProcessTreeMonitor, "_update_cpu_stat", lambda _self: None)
+    monkeypatch.setattr(ProcessTreeMonitor, "_update_pressure", lambda _self: None)
+    monkeypatch.setattr(
+        ProcessTreeMonitor,
+        "_sample_process_threads",
+        lambda *_args, **_kwargs: None,
+    )
+
+    monitor._sample()  # noqa: SLF001
+
+    worker_observation = monitor._observations[(worker.pid, 20.0)]  # noqa: SLF001
+    assert worker_observation.last_user_cpu_seconds == pytest.approx(0.25)
+    assert worker_observation.last_system_cpu_seconds == pytest.approx(0.1)
+    assert worker_observation.maximum_rss_bytes == 400
+    assert monitor._peak_aggregate_rss_bytes == 1400  # noqa: SLF001
+    assert monitor._worker_descendant_pss_incomplete_sample_count == 0  # noqa: SLF001
+    assert monitor._worker_descendant_pss_available is True  # noqa: SLF001
 
 
 def test_process_tree_monitor_rejects_invalid_thread_detail_interval() -> None:

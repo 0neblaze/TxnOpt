@@ -627,6 +627,36 @@ def _process_identity(process: psutil.Process) -> tuple[int, float] | None:
     return pid, create_time
 
 
+def _same_process_is_live(
+    process: psutil.Process,
+    expected_identity: tuple[int, float],
+) -> bool | None:
+    """Classify an expected PID/create-time identity as live, exited, or unknown."""
+
+    try:
+        pid = int(process.pid)
+        create_time = float(process.create_time())
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+    except _PROCESS_ERRORS:
+        return None
+    if (pid, create_time) != expected_identity:
+        return False
+    try:
+        if not process.is_running():
+            return False
+        status = process.status()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+    except _PROCESS_ERRORS:
+        return None
+    terminal_statuses = {
+        psutil.STATUS_ZOMBIE,
+        getattr(psutil, "STATUS_DEAD", "dead"),
+    }
+    return status not in terminal_statuses
+
+
 def _counter_delta(first: int | None, last: int | None) -> int | None:
     if first is None or last is None:
         return None
@@ -1550,29 +1580,37 @@ class ProcessTreeMonitor:
                 retry = _read_process_sample(process)
                 if retry is not None:
                     sample = retry
+            missing_worker_pss = (
+                identity[0] not in process_root_pids
+                and (sample is None or sample.pss_bytes is None)
+            )
+            worker_liveness = (
+                _same_process_is_live(process, identity) if missing_worker_pss else True
+            )
             if sample is None:
                 # A short-lived spawn worker may exit between recursive
-                # discovery and the per-process read.  It is no longer part of
-                # this simultaneous sample; only a still-identical live
-                # process makes the sample incomplete.
-                if (
-                    identity[0] not in process_root_pids
-                    and _process_identity(process) == identity
-                ):
+                # discovery and the basic read.  A proven exited or zombie
+                # identity no longer occupies memory and is omitted from this
+                # simultaneous sample.  A still-live or unclassifiable identity
+                # remains incomplete and therefore fails closed.
+                if missing_worker_pss and worker_liveness is not False:
                     worker_descendant_pss_complete = False
                 continue
+            worker_pss_omitted_after_exit = (
+                missing_worker_pss and worker_liveness is False
+            )
             aggregate_processes += 1
             aggregate_rss += sample.rss_bytes
             aggregate_user_cpu += sample.user_cpu_seconds
             aggregate_system_cpu += sample.system_cpu_seconds
-            if sample.pss_bytes is None:
+            if sample.pss_bytes is None and not worker_pss_omitted_after_exit:
                 aggregate_pss_complete = False
-            else:
+            elif sample.pss_bytes is not None:
                 aggregate_pss += sample.pss_bytes
             if identity[0] not in process_root_pids:
-                if sample.pss_bytes is None:
+                if sample.pss_bytes is None and not worker_pss_omitted_after_exit:
                     worker_descendant_pss_complete = False
-                else:
+                elif sample.pss_bytes is not None:
                     worker_descendant_pss_processes.append(
                         (identity[0], identity[1], sample.pss_bytes)
                     )

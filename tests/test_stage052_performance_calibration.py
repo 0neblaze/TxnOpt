@@ -40,9 +40,11 @@ from evrptw.experiments.stage052_performance_calibration_review import (
     _validate_live_memory_admission,
     _validate_resource_evidence,
     _validate_resource_process_tree,
+    _validate_resource_sample_interval,
     _validate_resource_thread_tree,
 )
 from evrptw.experiments.stage052_performance_observation import (
+    ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS,
     LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_EVIDENCE_SCHEMA_VERSION,
@@ -259,6 +261,38 @@ def test_calibration_reviewer_replays_process_rows_and_keeps_partial_threads_dia
         match="process_tree_context_switches",
     ):
         _validate_resource_process_tree(tampered)
+
+
+def test_calibration_reviewer_binds_resource_cadence_to_current_role() -> None:
+    isolated = {
+        "schema_version": RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "process_tree": {
+            "sample_interval_seconds": ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS
+        },
+    }
+    admitted = {
+        "schema_version": RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        "process_tree": {
+            "sample_interval_seconds": DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+        },
+    }
+    _validate_resource_sample_interval(isolated, role="isolated-memory-probe")
+    _validate_resource_sample_interval(admitted, role="admitted-mode-block")
+
+    isolated["process_tree"] = admitted["process_tree"]
+    with pytest.raises(CalibrationReviewError, match="sample interval"):
+        _validate_resource_sample_interval(isolated, role="isolated-memory-probe")
+
+    admitted["process_tree"] = {
+        "sample_interval_seconds": ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS
+    }
+    with pytest.raises(CalibrationReviewError, match="sample interval"):
+        _validate_resource_sample_interval(admitted, role="admitted-mode-block")
+
+    _validate_resource_sample_interval(
+        {"schema_version": PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION},
+        role="isolated-memory-probe",
+    )
 
 
 def test_performance_calibration_catalog_declares_stage052_prerequisites() -> None:

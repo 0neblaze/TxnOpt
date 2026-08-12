@@ -322,9 +322,10 @@ def test_resource_pss_projection_unwraps_signed_block_envelope() -> None:
 
     assert observed is process_tree
     assert _producer_peak_pss_bytes(observed) == 100
+    assert ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS == 0.01
     assert (
         ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS
-        == DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+        < DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
     )
 
 

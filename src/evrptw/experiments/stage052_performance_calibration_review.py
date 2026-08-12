@@ -52,6 +52,7 @@ from evrptw.experiments.stage052_performance_calibration import (
 )
 from evrptw.experiments.stage052_performance_observation import (
     FIXED_WORK_BUDGET,
+    ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS,
     LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
@@ -64,6 +65,7 @@ from evrptw.experiments.stage052_telemetry_overhead import (
 )
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
+from evrptw.runtime_envelope import DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
 from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_performance import (
     ExecutionTopology,
@@ -92,6 +94,25 @@ _EMPTY_ROW_EVIDENCE_SHA256: Final = hashlib.sha256(
 
 class CalibrationReviewError(RuntimeError):
     """The calibration cannot be independently qualified."""
+
+
+def _validate_resource_sample_interval(
+    evidence: Mapping[str, object],
+    *,
+    role: str,
+) -> None:
+    """Bind current resource evidence cadence to its producer role."""
+
+    if evidence.get("schema_version") != RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        return
+    process_tree = _mapping(evidence.get("process_tree"), "resource process_tree")
+    expected = (
+        ISOLATED_MEMORY_PROBE_SAMPLE_INTERVAL_SECONDS
+        if role == "isolated-memory-probe"
+        else DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+    )
+    if process_tree.get("sample_interval_seconds") != expected:
+        raise CalibrationReviewError("resource sample interval does not match its role")
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -1494,6 +1515,8 @@ def _validate_resource_evidence(
                 else _mapping(scheduler_raw, "resource scheduler statistics")
             )
             raw_resource = _mapping(row.get("raw_resource_statistics"), "raw_resource_statistics")
+            role = _text(row.get("role"), "resource role")
+            _validate_resource_sample_interval(raw_resource, role=role)
             if schema_versions is not None:
                 schema_versions.add(
                     _text(raw_resource.get("schema_version"), "resource evidence schema")
@@ -1514,7 +1537,6 @@ def _validate_resource_evidence(
                 raise CalibrationReviewError(
                     "runtime resource summary does not independently replay"
                 )
-            role = _text(row.get("role"), "resource role")
             if any(inventory_roles[path] != role for path in paths):
                 raise CalibrationReviewError("resource row does not bind its raw-axis role")
             if replayed is not None:
