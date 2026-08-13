@@ -66,6 +66,22 @@ cloud purchase, public alpha, or manuscript submission.
   100,000-round resource gates pass. Build09, Attempt17, and formal-plan
   Attempt18 remain immutable evidence but are not successor evidence for this
   implementation; Build10's additive refinement review remains pending.
+- Clean Build11 freezes the current producer and adds the hash-chained
+  `txnopt-evidence-lifecycle-v1` contract. New v2 raw/failure bundles bind
+  `PLANNED -> RUNNING -> SEALED`; independent replay appends `REVIEWED` while
+  Build10 v1 bundles remain readable and unchanged. Build11 passes its wheel,
+  Ruff, strict mypy, property, sanitizer, protected-history, and 100,000-round
+  resource gates with zero fallback.
+- Build11-bound local calibration Attempt22 completes 96/96 raw runs and 96/96
+  independent reviews with exact lifecycle, semantic, objective, and positive
+  measured-Cmax replay. Representative four-worker geometric-mean speedups are
+  1.35x for EVRPTW and 2.12x for RCPSP; maximum one-worker overheads are 8.08%
+  and 0.70%.
+- Build11 local fault Attempt01 is retained as an orchestration failure that
+  started no tests. Corrected Attempt02 executes 24 fault categories as 25
+  exact producer-test cases against the installed Build11 wheel. Completion
+  order, deadline/worker prefix safety, budget/cache/snapshot atomicity, late
+  rollback, unknown commit outcome, and T4 waste gates pass with zero fallback.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -289,24 +305,16 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
-Current gate status: **Build10 and its representative calibration are complete;
-successor formal review and a fresh pre-cloud decision remain required; purchase
-and execution are unauthorized**.
-Build09-bound calibration Attempt17 passed
-the representative EVRPTW and RCPSP performance thresholds at 1.35x and 2.13x
-with 100% fixed-work semantic/objective parity, zero fallback, and 2.68% maximum
-one-worker overhead. Those facts remain valid for Build09 only. Build10 now
-freezes the active native transaction source. Build10-bound local calibration
-Attempt20 completed 96/96 raw runs and independent reviews. Its fixed-work
-physical results preserve 100% semantic/objective parity, measure 1.32x EVRPTW
-and 2.12x RCPSP representative four-worker geometric-mean speedup, and keep
-maximum one-worker overhead below 1.85%. The 32-physical-core estimate is 4,243
-seconds. These measurements do not replace the pending independent successor
-refinement review or the full-scope confidence interval. Post-calibration Formal
-plan Attempt21 freezes 2,880 Build10-bound configs and a fresh absent raw root;
-its structural preflight passes but Pre-cloud Attempt02 remains blocked by the
-same external independent review gate. No procurement or execution authority is
-implied.
+Current gate status: **Build11 local build, semantic, representative
+performance, fault/prefix, and runtime-estimate gates are complete; external
+independent Build11 evidence-lifecycle/formal-successor review remains pending;
+purchase and execution are unauthorized**. Attempt22 is the current local
+calibration and Attempt02 is the current local fault receipt. Formal plan
+Attempt23 freezes 2,880 Build11-bound configs with a fresh absent raw root and
+passes structural preflight. Pre-cloud Attempt04 remains
+`BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; no procurement or execution
+authority is implied, and full-scope confidence intervals remain post-run
+Level 1 completion evidence.
 
 The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree

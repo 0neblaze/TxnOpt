@@ -195,7 +195,7 @@ PREPARED -> RESERVED -> EVALUATING -> VALIDATED -> COMMITTED
   pre-procurement gates. Procurement still requires separate explicit user
   authorization after the local pre-cloud gates pass.
 - The formal campaign runner requires a signed authorization bound to one exact
-  plan, analysis digest, config tree, Build09 manifest and wheel, absent raw
+  plan, analysis digest, config tree, producer build manifest and wheel, absent raw
   root, and 14-day exclusive-Linux resource contract. It atomically claims the
   attempt before raw writes and terminates complete process groups on timeout.
   It produces raw evidence only. Independent review runs in separate processes

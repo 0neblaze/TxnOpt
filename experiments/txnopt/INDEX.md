@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build11 calibration complete; pre-cloud Attempt03 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration retained; Attempt23 raw root absent/unexecuted | Build11 evidence-lifecycle and formal-successor review pending |
+| `txnopt-level1-protocol-v1` | Build11 local build/semantic/performance/fault/runtime gates complete; pre-cloud Attempt04 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration and fault Attempt02 retained; Attempt23 raw root absent/unexecuted | Build11 evidence-lifecycle and formal-successor review pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -177,7 +177,12 @@ configs are fixed by tree
 `4a828f134d971172cd6ebdef15d45e14b8315be9dc7cf51e96ea00856d27e901`,
 the preregistered analysis remains unchanged, its raw root and atomic claim are
 absent, and clean preflight is `PASS_NOT_AUTHORIZED_TO_EXECUTE`. A conservative
-32-physical-core estimate is about 4,300 seconds. Pre-cloud Attempt03 remains
+32-physical-core estimate is about 4,300 seconds. Local fault Attempt01 is an
+immutable orchestration failure that started no tests; Attempt02 passes 24
+fault categories and 25 exact Build11-wheel test cases with zero failures,
+errors, or fallback. Pre-cloud Attempt04 therefore records the complete local
+build, semantic, representative performance, fault/prefix, and runtime gates,
+but remains
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; it authorizes neither procurement
 nor execution.
 
