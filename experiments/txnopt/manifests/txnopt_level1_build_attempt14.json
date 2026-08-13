@@ -1,0 +1,210 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt14",
+  "status": "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T18:48:17Z",
+  "successor_of": "txnopt_level1_build_attempt13",
+  "producer": {
+    "revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+    "git_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+    "source_manifest_sha256": "d20d44e74f08de5ad101ec874a0f88a95355808b9056cad8be6e48e8c678bd5c",
+    "tracked_file_count": 1151,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot",
+    "performance_profile": "host-native-lto"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "a0f25119ab16519afae3df95e0e7d28236923dfc34d5e77da0254a7c1517eb5c",
+      "entry_count": 55,
+      "record_row_count": 55,
+      "installed_non_record_bytes_compared": 54,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "9888165f13a529dc9aa8f7692691a0a1271de8f6719903f99ce4933c8bd54a6e",
+      "entry_count": 1203
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+      "protocol": "txnopt-native-round-v1",
+      "prepared_receipt_trace": "txnopt-physical-trace-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/resource-soak-attempt14.json",
+      "sha256": "5e7d4ce8a05b35a4a9e46481eb7004fe1aba6c8128a33c0a1087228caed8f2cb",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "native_round_call_count": 101000,
+      "rss_growth_kib": 0,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "runtime_change": {
+    "components": [
+      "txnopt_evidence.reviewer",
+      "tools.txnopt_level1_campaign_common"
+    ],
+    "properties": [
+      "native receipt coverage includes COMMITTED, ABORTED, and INTERRUPTED positive started-work ledgers",
+      "positive discarded or post-boundary T4 work requires a native receipt even when semantic work metadata is absent",
+      "failure bundles with no physical stream or a zero-work native receipt fail closed when semantic native work started",
+      "multiple semantic failure streams sum their work requirement while each stream retains cumulative-ledger semantics",
+      "native receipt started-work totals across physical streams must cover the summed semantic requirement",
+      "campaign plan v2 rejects failed Build12 and Build13 producers and reserves the formal entry for Build14",
+      "Build09 through Build11 remain explicit plan-v1 compatibility readers only"
+    ],
+    "semantic_trace_changed": false,
+    "physical_trace_changed": false,
+    "raw_artifact_schema": "txnopt-raw-artifact-v3",
+    "failure_artifact_schema": "txnopt-failure-artifact-v3",
+    "review_artifact_schema": "txnopt-independent-review-v3",
+    "campaign_plan_schema": "txnopt-level1-campaign-plan-v2",
+    "lifecycle_schema": "txnopt-evidence-lifecycle-v1",
+    "fallback_count": 0
+  },
+  "formal_successor": {
+    "prior_reviewed_correction_path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
+    "prior_reviewed_correction_sha256": "858bc5a3a5c0da6725b1df3bfeb0ca0c7bcf73d479fb7d3de885f1fb7e8d0d94",
+    "prior_independent_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "prior_independent_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "failed_build13_review_path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt10.json",
+    "failed_build13_review_sha256": "8b5078ba559bbc0c932e66900de61c39e960f1860c2a23ddea9c4cc7b3d8dcbf",
+    "build13_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt13.json",
+    "build13_manifest_sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de",
+    "model_check_receipt_path": "formal/model-check-receipt.json",
+    "model_check_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+    "successor_status": "REVIEW_PENDING_BUILD14",
+    "independent_successor_review_completed": false,
+    "level1_formal_gate_passed": false
+  },
+  "superseded_active_evidence": {
+    "local_calibration": "txnopt_level1_local_calibration_attempt20",
+    "formal_plan": "level1-formal-plan-attempt23",
+    "precloud_gate": "txnopt_level1_precloud_gate_attempt02",
+    "binding_status": "IMMUTABLE_PRIOR_BUILD_EVIDENCE_NOT_REBOUND_TO_BUILD14"
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 44},
+    "pytest_wheel_installed": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 287,
+      "product_modules_loaded_from_installed_wheel": true
+    },
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "maximum_generated_examples": 600,
+      "hypothesis_seed": 20260814
+    },
+    "formal_contract_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 15
+    },
+    "wheel_surface_and_record": {
+      "exit_code": 0,
+      "status": "PASS",
+      "wheel_entry_count": 55,
+      "installed_non_record_bytes_compared": 54,
+      "fallback_count": 0
+    },
+    "native_source_identity": {
+      "exit_code": 0,
+      "status": "PASS",
+      "revision_and_tree_match": true,
+      "native_receipt_presence_and_work_coverage_enforced": true,
+      "phase_trace_match": true
+    },
+    "legacy_verify": {
+      "exit_code": 0,
+      "status": "PASS",
+      "verified_inputs": 3
+    },
+    "formal_model_receipt": {
+      "status": "SEALED_PRIOR_PACKAGE_UNCHANGED",
+      "receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+      "live_tlc_rerun": "NOT_RUN_JAVA_UNAVAILABLE",
+      "successor_independent_review": "PENDING"
+    },
+    "asan_ubsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "ctest_passed": 1,
+      "ctest_total": 1
+    },
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "ctest_passed": 1,
+      "ctest_total": 1
+    },
+    "resource_soak": {
+      "exit_code": 0,
+      "status": "PASS",
+      "completed_rounds": 100000
+    },
+    "historical_protected_paths": {
+      "exit_code": 0,
+      "status": "UNCHANGED",
+      "comparison_base_revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191"
+    }
+  },
+  "validation_harness_diagnostics": [
+    {
+      "step": "wheel frontend discovery from repository root",
+      "initial_exit_code": 1,
+      "classification": "HARNESS_COMMAND_ERROR",
+      "reason": "the repository build directory shadowed the absent PyPA build frontend module",
+      "corrected_boundary": "pip wheel with no build isolation invoked the same scikit-build-core backend from outside the project directory",
+      "corrected_exit_code": 0,
+      "corrected_result": "Build14 wheel created"
+    },
+    {
+      "step": "wheel frontend discovery from a neutral working directory",
+      "initial_exit_code": 1,
+      "classification": "HARNESS_DEPENDENCY_DISCOVERY",
+      "reason": "the source virtual environment does not install the optional PyPA build frontend",
+      "corrected_boundary": "the installed pip frontend used the repository-declared PEP 517 backend and existing exact build dependencies",
+      "corrected_exit_code": 0,
+      "corrected_result": "Build14 wheel created"
+    },
+    {
+      "step": "legacy CLI loop preflight",
+      "initial_exit_code": 0,
+      "classification": "HARNESS_ARGUMENT_EXPANSION_ERROR",
+      "reason": "the outer Windows shell expanded the inner loop variable to an empty path and the CLI correctly emitted structured errors",
+      "corrected_boundary": "three explicit absolute receipt paths were passed independently",
+      "corrected_exit_code": 0,
+      "corrected_result": "three verified legacy receipts"
+    }
+  ],
+  "claim_boundary": {
+    "build_complete": true,
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "complete an independent Build14 anchored-evidence and formal-successor review",
+      "complete a Build14-bound local calibration and independent review",
+      "freeze a new Build14 campaign plan v2 and pre-cloud decision",
+      "measure full-scope finite Cmax and both-domain confidence intervals",
+      "pass the preregistered EVRPTW and RCPSP speedup and one-worker overhead thresholds",
+      "complete the Level 1 raw matrix and independent replay"
+    ]
+  }
+}
