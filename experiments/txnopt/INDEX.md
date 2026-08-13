@@ -74,6 +74,13 @@ four-worker geometric-mean speedup; EVRPTW reaches only 1.19x. Consequently
 Attempt16 is retained as `PERFORMANCE_GATE_NOT_READY`, and neither cloud rental
 nor the Level 1 matrix is authorized.
 
+Independent formal successor review Attempt03 accepts the corrected atomic
+window and aggregate model granularity, but remains `NEEDS_WORK`: T3 is still a
+textual meta-theorem, generic contract-error paths lack uniform waste receipts,
+the refinement relation is not mechanically checked, and finite measured
+`Cmax` is absent. The Level 1 formal gate and Level 2 positive entry stay
+closed.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

@@ -1,0 +1,72 @@
+{
+  "schema_version": "txnopt-formal-independent-review-v1",
+  "run_label": "txnopt_t3_t4_review_attempt03",
+  "status": "NEEDS_WORK",
+  "responds_to": "txnopt_t3_t4_proof_correction_attempt02",
+  "review_scope": {
+    "proofs_path": "formal/proofs.md",
+    "proofs_sha256": "fd14ed2dfc9de95fb4acd8d571bfa979b44d9a1e4d3b1a4514ea85fb84226e67",
+    "mapping_path": "formal/refinement-mapping.md",
+    "mapping_sha256": "54ff0625cb92305db8f3caaaa1a409dbec1d7940534cdc9c341742a5daa33fd0",
+    "model_receipt_path": "formal/model-check-receipt.json",
+    "model_receipt_sha256": "f7390c1163f2d9446a934ed8b0de04ce8e0fb629f1ad34abb3d6c3afb65431f1",
+    "runtime_path": "src/txnopt/runtime.py",
+    "runtime_sha256": "6d30fa8d93db3aa3b7bc91b8d91f45acfa30d04ea6d241dacc15ec659be6088e",
+    "waste_bounds_path": "src/txnopt/_internal/waste_bounds.py",
+    "waste_bounds_sha256": "aa94600bd08551cb7a65f9155218c448924b9145ba7dbd2506c0e981b89df4f8",
+    "correction_path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt02.json",
+    "correction_sha256": "1f2a1537f5724d25f4ffd6071e968793efb796831188331f1ae57c93359ba9d7"
+  },
+  "classifications": {
+    "t3_predicate_structure": "PASS",
+    "t3_independent_gate": "NEEDS_WORK",
+    "t4_unit_bound_runtime_mapping": "CONDITIONAL_PASS",
+    "t4_full_runtime_audit_coverage": "NEEDS_WORK",
+    "aggregate_refinement_granularity": "PASS",
+    "aggregate_refinement_proof": "NEEDS_WORK",
+    "model_check": "TLC_SAFETY_PASS_ONLY",
+    "level1_gate": "NEEDS_WORK",
+    "level2_positive_entry": "BLOCKED"
+  },
+  "findings": [
+    {
+      "id": "T3-MECHANIZATION",
+      "severity": "major",
+      "summary": "T3 defines S, T, G, E, D, SI, ZW, AP and a state-dependence witness, but the available-branch scheduler class and witness quantifiers remain a textual meta-theorem"
+    },
+    {
+      "id": "T4-AUDIT-COVERAGE",
+      "severity": "critical",
+      "summary": "the atomic-window unit inequality is aligned and fail-closed on controlled abort paths, but general RuntimeContractError paths do not uniformly produce a waste audit"
+    },
+    {
+      "id": "REFINEMENT-PROOF",
+      "severity": "major",
+      "summary": "the model and runtime share aggregate phase and whole-batch publication granularity, but no simulation property or independent refinement replay proves the relation"
+    },
+    {
+      "id": "T4-PHYSICAL-COST",
+      "severity": "major",
+      "summary": "finite measured Cmax is absent; this does not refute the normalized unit inequality but blocks a non-vacuous physical-cost and Level 2 positive claim"
+    }
+  ],
+  "resolved_attempt01_findings": [
+    "T4-ATOMIC-WINDOW",
+    "T4-NATIVE-BATCH",
+    "REFINEMENT-GRANULARITY"
+  ],
+  "remaining_actions": [
+    "state the T3 scheduler class and quantifier order as a reviewable theorem or mechanize the meta-theorem",
+    "emit a unit-level waste audit for every failure path that can discard an uncommitted transaction",
+    "add a mechanically checked or independently replayed aggregate refinement relation",
+    "measure and bind finite Cmax before any physical-cost or Level 2 positive claim"
+  ],
+  "claim_boundary": {
+    "independent_successor_review_completed": true,
+    "t3_t4_gate_passed": false,
+    "unit_level_t4_inequality_accepted_conditionally": true,
+    "measured_cmax_available": false,
+    "level1_ready": false,
+    "level2_positive_entry_open": false
+  }
+}

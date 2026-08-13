@@ -67,6 +67,11 @@ cloud purchase, public alpha, or manuscript submission.
   formalizes the conditional T3 meta-theorem, and aligns the checked model with
   aggregate runtime publication. It remains `READY_FOR_INDEPENDENT_REVIEW`, not
   accepted evidence; measured finite `Cmax` is still required.
+- Independent successor review Attempt03 accepts the corrected atomic-window
+  unit inequality conditionally and confirms aggregate model/runtime
+  granularity. It remains `NEEDS_WORK`: T3 is a textual meta-theorem, general
+  contract-error paths lack uniform waste audits, the refinement relation is
+  not mechanically checked, and finite measured `Cmax` is absent.
 
 ## 3. Target repository and dependency structure
 

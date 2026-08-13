@@ -69,6 +69,27 @@ def test_second_proof_correction_is_signed_but_not_self_approved() -> None:
     assert correction["claim_boundary"]["t3_t4_gate_passed"] is False
 
 
+def test_independent_successor_review_keeps_the_formal_gate_open() -> None:
+    path = ROOT / "formal/reviews/txnopt_t3_t4_review_attempt03.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    review = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert review["status"] == "NEEDS_WORK"
+    assert review["classifications"]["t4_unit_bound_runtime_mapping"] == (
+        "CONDITIONAL_PASS"
+    )
+    assert review["classifications"]["t4_full_runtime_audit_coverage"] == (
+        "NEEDS_WORK"
+    )
+    assert review["claim_boundary"]["independent_successor_review_completed"] is True
+    assert review["claim_boundary"]["t3_t4_gate_passed"] is False
+    assert review["claim_boundary"]["level1_ready"] is False
+
+
 def test_first_generation_protocol_identities_are_exact() -> None:
     assert (
         CONTRACT_VERSION,
