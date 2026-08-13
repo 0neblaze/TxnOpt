@@ -12,6 +12,7 @@ class NativeRoundReceipt(TypedDict):
     context_pack_count: int
     round_call_count: int
     started_work: int
+    screened_work: int
     completed_work: int
     interrupted_work: int
     fallback_count: int
@@ -22,10 +23,12 @@ class EVRPTWContext:
     def __init__(
         self,
         node_kind: npt.NDArray[np.int64],
+        demand: npt.NDArray[np.float64],
         ready_time: npt.NDArray[np.float64],
         due_date: npt.NDArray[np.float64],
         service_time: npt.NDArray[np.float64],
         distance: npt.NDArray[np.float64],
+        reachable: npt.NDArray[np.uint8],
         vehicle: npt.NDArray[np.float64],
         worker_count: int,
     ) -> None: ...

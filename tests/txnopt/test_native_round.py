@@ -22,6 +22,7 @@ from txnopt_cases.evrptw.oracle import EVRPTWOracle, EVRPTWPlan
 def _context(worker_count: int) -> _native.EVRPTWContext:
     return _native.EVRPTWContext(
         np.asarray((0, 1, 1), dtype=np.int64),
+        np.asarray((0.0, 1.0, 1.0), dtype=np.float64),
         np.asarray((0.0, 0.0, 0.0), dtype=np.float64),
         np.asarray((100.0, 100.0, 100.0), dtype=np.float64),
         np.asarray((0.0, 0.0, 0.0), dtype=np.float64),
@@ -33,6 +34,7 @@ def _context(worker_count: int) -> _native.EVRPTWContext:
             ),
             dtype=np.float64,
         ),
+        np.ones((3, 3), dtype=np.uint8),
         np.asarray((100.0, 10.0, 1.0, 0.1, 1.0), dtype=np.float64),
         worker_count,
     )
@@ -80,6 +82,7 @@ def test_native_round_is_one_typed_call_and_matches_python_exact_charging() -> N
     assert receipt["protocol"] == "txnopt-native-round-v1"
     assert receipt["phase"] == "VALIDATED"
     assert receipt["context_pack_count"] == 1
+    assert receipt["screened_work"] == 2
     assert receipt["round_call_count"] == 1
     assert receipt["fallback_count"] == 0
     assert _round(context)[9]["round_call_count"] == 2

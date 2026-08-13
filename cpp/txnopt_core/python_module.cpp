@@ -69,10 +69,12 @@ class EVRPTWContext final {
 public:
     EVRPTWContext(
         const py::handle node_kind,
+        const py::handle demand,
         const py::handle ready_time,
         const py::handle due_date,
         const py::handle service_time,
         const py::handle distance,
+        const py::handle reachable,
         const py::handle vehicle,
         const std::int64_t worker_count)
         : worker_count_(worker_count) {
@@ -80,27 +82,37 @@ public:
             throw std::invalid_argument("worker_count must be in [1, 1024]");
         }
         const auto kinds = checked_array<std::int64_t>(node_kind, "node_kind", 1);
+        const auto demands = checked_array<double>(demand, "demand", 1);
         const auto ready = checked_array<double>(ready_time, "ready_time", 1);
         const auto due = checked_array<double>(due_date, "due_date", 1);
         const auto service = checked_array<double>(service_time, "service_time", 1);
         const auto distances = checked_array<double>(distance, "distance", 2);
+        const auto reachability = checked_array<std::uint8_t>(
+            reachable, "reachable", 2);
         const auto vehicle_values = checked_array<double>(vehicle, "vehicle", 1);
         node_count_ = static_cast<std::size_t>(kinds.shape(0));
         if (node_count_ == 0
             || ready.shape(0) != kinds.shape(0)
+            || demands.shape(0) != kinds.shape(0)
             || due.shape(0) != kinds.shape(0)
             || service.shape(0) != kinds.shape(0)
             || distances.shape(0) != kinds.shape(0)
             || distances.shape(1) != kinds.shape(0)
+            || reachability.shape(0) != kinds.shape(0)
+            || reachability.shape(1) != kinds.shape(0)
             || vehicle_values.shape(0) != 5) {
             throw std::invalid_argument("EVRPTW context array extents do not align");
         }
         kinds_.assign(kinds.data(), kinds.data() + node_count_);
+        demands_.assign(demands.data(), demands.data() + node_count_);
         ready_.assign(ready.data(), ready.data() + node_count_);
         due_.assign(due.data(), due.data() + node_count_);
         service_.assign(service.data(), service.data() + node_count_);
         distances_.assign(
             distances.data(), distances.data() + node_count_ * node_count_);
+        reachable_.assign(
+            reachability.data(),
+            reachability.data() + node_count_ * node_count_);
         vehicle_.assign(vehicle_values.data(), vehicle_values.data() + 5);
         for (std::size_t index = 0; index < node_count_; ++index) {
             if (kinds_[index] == evrptw::native_kernels::depot_kind) {
@@ -108,8 +120,10 @@ public:
                     throw std::invalid_argument("EVRPTW context has multiple depots");
                 }
                 depot_ = static_cast<std::int64_t>(index);
+                recharge_nodes_.push_back(static_cast<std::int64_t>(index));
             } else if (kinds_[index] == evrptw::native_kernels::station_kind) {
                 stations_.push_back(static_cast<std::int64_t>(index));
+                recharge_nodes_.push_back(static_cast<std::int64_t>(index));
             } else if (kinds_[index] != evrptw::native_kernels::customer_kind) {
                 throw std::invalid_argument("EVRPTW context contains an unknown node kind");
             }
@@ -167,8 +181,28 @@ public:
         }
 
         evrptw::native_kernels::ExactBatchOutput output;
+        std::int64_t screened_routes = 0;
         {
             py::gil_scoped_release release;
+            const double screen_options[4]{1.0, 1e-9, 0.0, 0.0};
+            const double incremental[6]{0.0, 0.0, 0.0, 0.0, 1.0, 1.0};
+            for (std::size_t route = 0; route < route_count; ++route) {
+                const auto first = offsets.data()[route];
+                const auto last = offsets.data()[route + 1];
+                const auto screened = evrptw::native_kernels::run_screen_route(
+                    kinds_.data(), demands_.data(), ready_.data(), due_.data(),
+                    service_.data(), distances_.data(), reachable_.data(),
+                    vehicle_.data(), indices.data() + first,
+                    static_cast<std::size_t>(last - first), node_count_, depot_,
+                    recharge_nodes_, screen_options, incremental);
+                if (screened.codes[0] != 1) {
+                    throw std::runtime_error(
+                        "Python-admitted EVRPTW route failed native safe screening: reason="
+                        + std::to_string(screened.codes[1])
+                        + ", check=" + std::to_string(screened.codes[2]));
+                }
+                ++screened_routes;
+            }
             if (worker_count_ == 1) {
                 output = run_exact(
                     offsets.data(), indices.data(), route_count,
@@ -201,6 +235,7 @@ public:
         receipt["context_pack_count"] = 1;
         receipt["round_call_count"] = round_calls_;
         receipt["started_work"] = output.batch_counters[1];
+        receipt["screened_work"] = screened_routes;
         receipt["completed_work"] = output.batch_counters[2];
         receipt["interrupted_work"] = output.batch_counters[3];
         receipt["fallback_count"] = 0;
@@ -260,12 +295,15 @@ private:
     std::int64_t worker_count_ = 0;
     std::int64_t round_calls_ = 0;
     std::vector<std::int64_t> kinds_;
+    std::vector<double> demands_;
     std::vector<double> ready_;
     std::vector<double> due_;
     std::vector<double> service_;
     std::vector<double> distances_;
+    std::vector<std::uint8_t> reachable_;
     std::vector<double> vehicle_;
     std::vector<std::int64_t> stations_;
+    std::vector<std::int64_t> recharge_nodes_;
     std::unique_ptr<NativeWorkPool> pool_;
 };
 
@@ -277,10 +315,11 @@ PYBIND11_MODULE(_native, module) {
     py::class_<txnopt::native::EVRPTWContext>(module, "EVRPTWContext")
         .def(
             py::init<
-                py::handle, py::handle, py::handle, py::handle,
-                py::handle, py::handle, std::int64_t>(),
-            py::arg("node_kind"), py::arg("ready_time"), py::arg("due_date"),
-            py::arg("service_time"), py::arg("distance"), py::arg("vehicle"),
+                py::handle, py::handle, py::handle, py::handle, py::handle,
+                py::handle, py::handle, py::handle, std::int64_t>(),
+            py::arg("node_kind"), py::arg("demand"), py::arg("ready_time"),
+            py::arg("due_date"), py::arg("service_time"), py::arg("distance"),
+            py::arg("reachable"), py::arg("vehicle"),
             py::arg("worker_count"))
         .def(
             "exact_round_v1",

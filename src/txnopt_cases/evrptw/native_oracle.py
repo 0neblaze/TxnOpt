@@ -50,12 +50,15 @@ class NativeEVRPTWOracle(EVRPTWOracle):
             ],
             dtype=np.float64,
         )
+        reachable = _optimistic_reachability(instance, distance)
         self._context = _native.EVRPTWContext(
             np.asarray([_KIND_CODE[node.kind] for node in instance.nodes], dtype=np.int64),
+            np.asarray([node.demand for node in instance.nodes], dtype=np.float64),
             np.asarray([node.ready_time for node in instance.nodes], dtype=np.float64),
             np.asarray([node.due_date for node in instance.nodes], dtype=np.float64),
             np.asarray([node.service_time for node in instance.nodes], dtype=np.float64),
             np.ascontiguousarray(distance),
+            reachable,
             np.asarray(
                 (
                     instance.vehicle.battery_capacity,
@@ -209,3 +212,35 @@ class NativeEVRPTWOracle(EVRPTWOracle):
 
 
 __all__ = ["NativeEVRPTWOracle"]
+
+
+def _optimistic_reachability(
+    instance: Instance,
+    distance: npt.NDArray[np.float64],
+) -> npt.NDArray[np.uint8]:
+    """Pack the safe full-battery station/depot transitive reachability bound."""
+
+    capacity = instance.vehicle.battery_capacity
+    rate = instance.vehicle.consumption_rate
+    safe = tuple(
+        index
+        for index, node in enumerate(instance.nodes)
+        if node.kind in {NodeType.DEPOT, NodeType.STATION}
+    )
+    reachable = np.zeros((len(instance.nodes), len(instance.nodes)), dtype=np.uint8)
+    for origin in range(len(instance.nodes)):
+        frontier = [origin]
+        visited_safe: set[int] = set()
+        while frontier:
+            current = frontier.pop()
+            for destination in range(len(instance.nodes)):
+                if distance[current, destination] * rate <= capacity + 1e-9:
+                    reachable[origin, destination] = 1
+            for safe_node in safe:
+                if (
+                    safe_node not in visited_safe
+                    and distance[current, safe_node] * rate <= capacity + 1e-9
+                ):
+                    visited_safe.add(safe_node)
+                    frontier.append(safe_node)
+    return np.ascontiguousarray(reachable)
