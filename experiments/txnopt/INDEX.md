@@ -10,10 +10,18 @@
 identity for new Level 1 runs. Creating the protocol does not authorize cloud
 purchase, benchmark launch, holdout access, or a readiness claim.
 
-The current internal build identity is recorded in
+The prior internal build identity is recorded in
 `manifests/txnopt_level1_build_attempt02.json`. Its status is deliberately
 `BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY`: build and soak
 success are not experiment readiness. Attempt01 remains immutable.
+
+The current clean internal producer is
+`manifests/txnopt_level1_build_attempt03.json`. It adds exact producer-identity
+binding for campaign configs and raw manifests, plus the corrected EVRPTW
+initialization and post-screen admission boundary. Its status remains
+`BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY`; the recorded local
+calibration points are exploratory and do not satisfy the two-domain speedup or
+confidence-interval gates.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
