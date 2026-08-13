@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | build complete, experiment not started | 12 EVRPTW + 24 RCPSP, 10 seeds | build manifest only | pending |
+| `txnopt-level1-protocol-v1` | representative calibration passed, formal matrix not started | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration only | formal matrix pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -96,9 +96,14 @@ Build Attempt09 is the first clean successor that binds those runtime,
 refinement, reviewer, and adaptive native-scheduling changes to an internal
 `txnopt 0.1.0a1` wheel. Wheel-installed tests, formal replay, legacy-freeze
 verification, ASan/UBSan, TSan, and the 100,000-round resource soak pass. It is
-still `NOT_LEVEL1_READY`: the 1.33x result remains an unbound dirty diagnostic,
-and Build09 requires a fresh clean local calibration, complete compatibility
-decision, full-scope Cmax/CI evidence, and the preregistered Level 1 matrix.
+still `NOT_LEVEL1_READY`: local calibration Attempt17 now binds 96/96 raw runs
+and independent replays to Build09, with zero fallback and exact fixed-work
+semantic/objective parity. Representative EVRPTW and RCPSP four-worker
+geometric-mean speedups are 1.35x and 2.13x, so both local performance gates
+pass. Complete compatibility, full-scope Cmax/CI evidence, and the
+preregistered Level 1 matrix remain open. A Build09-bound conservative
+32-physical-core estimate predicts about 4,321 seconds for the matrix, but no
+cloud purchase is authorized.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

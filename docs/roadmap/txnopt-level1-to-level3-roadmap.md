@@ -54,6 +54,12 @@ cloud purchase, public alpha, or manuscript submission.
   objective parity. RCPSP reaches 2.11x representative four-worker geometric
   mean; EVRPTW reaches only 1.19x, so the 1.30x gate remains failed and cloud
   rental remains unauthorized.
+- Build09-bound local calibration Attempt17 supersedes Attempt16 for the active
+  producer without rewriting it. All 96 raw runs pass independent replay with
+  zero fallback and exact fixed-work semantic/objective parity. Representative
+  four-worker geometric-mean speedup is 1.35x for EVRPTW and 2.13x for RCPSP;
+  maximum one-worker overhead is 2.68%. These local gates pass, but Attempt17
+  is not full Level 1 evidence and does not authorize cloud procurement.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -61,6 +67,10 @@ cloud purchase, public alpha, or manuscript submission.
 - The 32-physical-core estimate for the provisional 1200-work/3-second matrix
   is about 4,387 seconds (1.22 hours), but this does not authorize purchase:
   the EVRPTW performance gate and final budget freeze remain open.
+- The Build09-bound successor estimate uses Attempt17 p95 observations and
+  predicts about 4,321 seconds (1.20 hours) on 32 physical cores at 80%
+  scheduler efficiency. The ten-day runtime gate passes provisionally, while
+  procurement remains separately unauthorized.
 - Independent T3/T4 review Attempt01 reports `NEEDS_WORK`. TLC continues to
   support bounded safety only. A successor correction now uses the complete
   uncommitted atomic transaction as T4's `W`, emits receipt-bound unit audits,
@@ -261,14 +271,16 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
-Current gate status: **blocked before procurement**. The last clean calibration
-records representative EVRPTW fixed-work speedup of 1.19x, below 1.30x. A dirty
-developer probe reached 1.33x after adaptive native scheduling, but it is not
-evidence. Build Attempt09 now binds the implementation to a clean wheel and
-passes local build, sanitizer, formal, legacy-freeze, and resource-soak checks.
-The preregistered scope and threshold remain unchanged; a Build09-bound
-independent calibration, confidence interval, and complete compatibility gate
-are still required before the formal matrix may start.
+Current gate status: **blocked before procurement**. Build09-bound calibration
+Attempt17 now passes the representative EVRPTW and RCPSP performance thresholds
+at 1.35x and 2.13x with 100% fixed-work semantic/objective parity, zero fallback,
+and 2.68% maximum one-worker overhead. The preregistered scope and thresholds
+remain unchanged. Procurement and the formal matrix are still blocked until the
+complete compatibility decision, conservative runtime estimate, full-scope
+confidence intervals, and all remaining Level 1 gates are independently closed.
+The Build09-bound estimate is now complete at about 1.20 hours, but it does not
+waive the remaining compatibility/evidence gates or the separate purchase
+authorization boundary.
 
 ### Level 1 gate
 

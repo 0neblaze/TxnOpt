@@ -1,0 +1,100 @@
+{
+  "schema_version": "txnopt-level1-local-calibration-manifest-v1",
+  "run_label": "txnopt_level1_local_calibration_attempt17",
+  "status": "LOCAL_CALIBRATION_COMPLETE_REPRESENTATIVE_PERFORMANCE_PASS_NOT_LEVEL1_READY",
+  "producer_build": {
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt09.json",
+    "manifest_sha256": "f00d92a79bd6255152f5370aff5e97e4070602137a9c078dfba0c5c8b3cf302c",
+    "revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191",
+    "source_dirty": false,
+    "development_override": false
+  },
+  "plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-calibration-plan-attempt17/manifest.json",
+    "sha256": "c6edc9f843a1c7e0eab7977ea823ddacfd26a95322c3e0b78db24d4463749d45",
+    "config_count": 2880,
+    "config_tree_sha256": "e8dcc9e0a51d89b8553a90749f1253921eb26859f8dfa18f6bf2cec7b8a3f934",
+    "fixed_work": 1200,
+    "fixed_time_seconds": 3.0,
+    "max_rounds": 10,
+    "holdout_opened": false
+  },
+  "calibration": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt17.json",
+    "sha256": "f30b0eed28188fe16201fbb799a1184cee3f5841c9f491de0d6c531be3585740",
+    "representative_cases": {
+      "evrptw": [
+        "c101C5",
+        "c101_21"
+      ],
+      "rcpsp": [
+        "j1201_1",
+        "j1206_4"
+      ]
+    },
+    "seeds": [
+      2014,
+      2015,
+      2016
+    ],
+    "raw_run_count": 96,
+    "independent_review_pass_count": 96,
+    "fallback_count": 0,
+    "formal_level1_evidence": false
+  },
+  "fixed_work_physical_results": {
+    "evrptw": {
+      "paired_sample_count": 6,
+      "four_worker_geomean_speedup": 1.3537527777265477,
+      "minimum_four_worker_speedup": 0.9804244614512472,
+      "maximum_four_worker_speedup": 1.907965398324991,
+      "maximum_one_worker_overhead_fraction": 0.02683015717241166,
+      "semantic_digest_match_rate": 1.0,
+      "objective_match_rate": 1.0,
+      "level1_speedup_threshold": 1.3,
+      "speedup_gate": "PASS_REPRESENTATIVE_ONLY"
+    },
+    "rcpsp": {
+      "paired_sample_count": 6,
+      "four_worker_geomean_speedup": 2.13052063789116,
+      "minimum_four_worker_speedup": 1.9782127430710996,
+      "maximum_four_worker_speedup": 2.3846886109782615,
+      "maximum_one_worker_overhead_fraction": 0.003431020058863643,
+      "semantic_digest_match_rate": 1.0,
+      "objective_match_rate": 1.0,
+      "level1_speedup_threshold": 1.3,
+      "speedup_gate": "PASS_REPRESENTATIVE_ONLY"
+    }
+  },
+  "interpretation": {
+    "evrptw_large_case_speedup_range": [
+      1.8000795793362945,
+      1.907965398324991
+    ],
+    "evrptw_small_case_speedup_range": [
+      0.9804244614512472,
+      1.0138703791447456
+    ],
+    "finding": "adaptive native scheduling clears the preregistered representative two-domain speedup and one-worker-overhead thresholds without changing fixed-work semantics",
+    "fixed_time_semantic_parity_is_a_gate": false,
+    "scope_or_threshold_changed": false,
+    "formal_matrix_started": false,
+    "cloud_purchase_performed": false
+  },
+  "cloud_estimate": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-cloud-estimate-attempt03.json",
+    "sha256": "707ca8a66dcde7f750f718c2d09a5a3ea956232e04481151d0a585962ab40b85",
+    "physical_cores": 32,
+    "scheduler_efficiency": 0.8,
+    "predicted_matrix_seconds": 4320.889449309962,
+    "predicted_matrix_days": 0.05001029455219864,
+    "runtime_estimate_gate": "PASS_PROVISIONAL_BUDGETS_ONLY",
+    "purchase_authorized": false
+  },
+  "decision": {
+    "level1_ready": false,
+    "formal_cloud_matrix_authorized": false,
+    "reason": "representative performance gates pass, but complete legacy compatibility, full-scope confidence intervals, and the preregistered Level 1 matrix remain incomplete",
+    "next_step": "finish the compatibility decision and generate a Build09-bound conservative cloud-window estimate before any separately authorized procurement"
+  }
+}
