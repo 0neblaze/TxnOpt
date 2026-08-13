@@ -50,13 +50,22 @@ review Attempt01. It passes 102 tests and the same build, sanitizer, resource,
 legacy, and historical-path gates. Attempt14 remains bound to Build05 and is
 not relabelled as Build06 evidence. Build06 is not Level 1 ready.
 
-Build Attempt07 is the current clean internal artifact. It binds the corrected
+Build Attempt07 binds the corrected
 aggregate TLA+/PlusCal model, T3 conditional meta-theorem, runtime-audited T4
 unit bounds, and 111 active tests including property-generated cache, budget,
 duplicate-key, late-result, and transaction-window cases. Build, wheel,
 sanitizer, 100,000-round resource, formal replay, legacy, and protected-path
 gates pass. The correction is only `READY_FOR_INDEPENDENT_REVIEW`; measured
 finite `Cmax`, the EVRPTW speedup gate, and the Level 1 matrix remain open.
+
+Build Attempt08 is the current clean internal artifact. It adds a bounded,
+solve-local cache for independently reconstructed EVRPTW route reports. The
+cache rejects cross-instance reuse, keeps solution-level customer coverage
+outside the cache, and changes only physical statistics. Its 117 tests, wheel,
+sanitizers, formal replay, legacy verifier, protected-path check, and
+100,000-round soak pass. An unbound 12-case developer diagnostic measured only
+1.01x EVRPTW four-worker geometric-mean fixed-work speedup, so it does not
+replace Attempt14 and the cloud matrix remains blocked.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

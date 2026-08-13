@@ -43,9 +43,14 @@ cloud purchase, public alpha, or manuscript submission.
   deadline/failure prefix safety, cross-domain adapters, and non-vacuous waste
   bounds, not as the invention of speculative simulated annealing or ordered
   transactions.
-- Clean Build Attempt07 passes Ruff, strict mypy, 111 TxnOpt tests, wheel/CLI
+- Clean Build Attempt08 passes Ruff, strict mypy, 117 TxnOpt tests, wheel/CLI
   verification, ASan/UBSan, TSan, historical-path preservation, and a
   100,000-round resource soak with zero fallback.
+- Build08 adds a bounded solve-local EVRPTW route-report cache with exact
+  cached/uncached differential tests, LRU eviction, solution-level coverage
+  replay, and fail-closed cross-instance ownership. A 12-case developer
+  diagnostic measured about 1.01x four-worker fixed-work geometric-mean
+  speedup; it is not formal evidence and leaves the 1.30x gate failed.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while

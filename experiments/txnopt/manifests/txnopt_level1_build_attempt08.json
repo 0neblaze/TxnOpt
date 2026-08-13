@@ -1,0 +1,118 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt08",
+  "status": "BUILD_AND_VALIDATION_CACHE_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T07:13:47Z",
+  "successor_of": "txnopt_level1_build_attempt07",
+  "producer": {
+    "revision": "ae98bf8c33b6a2e82f4868b97cf62e5ef645a983",
+    "git_tree": "31d7ddef1367623895c1d0cd1c4ba605ec1c5555",
+    "source_manifest_sha256": "f59e398a7a0412cc31c521766f8ca5bd5af20cf164b0a485afa026d684409c86",
+    "tracked_file_count": 1068,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-ae98bf8/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "46d94c775aa71260bd724234df8c3800ef3726a0b988ba407caa4c9ad199cb1e",
+      "entry_count": 52,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-ae98bf8/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "91940c92ce3fa80eaaa3b4782b7a5c15f7d1239fcbaae1c7dbb28ee2f83a44b2"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "d8b3fac8d3fe930b699985197af6661b13da53e43cc03dbae690ecbfb2de6880",
+      "protocol": "txnopt-native-round-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-ae98bf8/resource-soak-attempt09.json",
+      "sha256": "d3350f3cb144b58c98c4c9a8212cd80ba8150a428e2ddefbd64ffd25cb3318c3",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 8,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "performance_change": {
+    "component": "txnopt_cases.evrptw.validation.RouteReportCache",
+    "scope": "bounded solve-local exact-route report reuse",
+    "capacity": 65536,
+    "semantic_trace_changed": false,
+    "solution_level_customer_coverage_recomputed": true,
+    "cross_instance_reuse_rejected": true,
+    "preliminary_full_scope_fixed_work_geomean_speedup": 1.0144103069158865,
+    "preliminary_measurement_status": "UNBOUND_DEVELOPER_DIAGNOSTIC_NOT_EVIDENCE",
+    "evrptw_speedup_gate": "FAIL"
+  },
+  "formal_correction": {
+    "path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt02.json",
+    "sha256": "1f2a1537f5724d25f4ffd6071e968793efb796831188331f1ae57c93359ba9d7",
+    "status": "READY_FOR_INDEPENDENT_REVIEW",
+    "independent_review_completed": false,
+    "t3_t4_gate_passed": false,
+    "model_check_scope": "AGGREGATE_BATCH_TLC_SAFETY_ONLY",
+    "measured_cmax_available": false
+  },
+  "predecessor_calibration": {
+    "build_manifest": "experiments/txnopt/manifests/txnopt_level1_build_attempt05.json",
+    "calibration_manifest": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt14.json",
+    "binding_status": "NOT_REBOUND_TO_BUILD08",
+    "evrptw_speedup_gate": "FAIL",
+    "formal_matrix_authorized": false
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 41},
+    "pytest": {"exit_code": 0, "status": "PASS", "passed": 117},
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "maximum_generated_examples": 600
+    },
+    "route_validation_cache_differential": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 4
+    },
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "legacy_verify": {"exit_code": 0, "status": "PASS"},
+    "formal_replay": {
+      "exit_code": 0,
+      "status": "PASS",
+      "primary_distinct_states": 22,
+      "pluscal_distinct_states": 8134
+    },
+    "asan_ubsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_drain_rounds": 20000,
+      "aslr_disabled_for_runtime": true
+    },
+    "historical_protected_paths": {"exit_code": 0, "status": "UNCHANGED"}
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "independent successor review of T3/T4 proof and aggregate refinement mapping",
+      "measure and receipt-bind finite Cmax for non-vacuous T4 cost bounds",
+      "resolve the EVRPTW four-worker geometric-mean speedup gate without changing the preregistered scope or threshold",
+      "freeze final Level 1 work/time parameters and create a Build08-bound campaign plan",
+      "Level 1 raw experiment matrix and independent replay",
+      "both-domain 95% confidence-interval thresholds"
+    ]
+  }
+}

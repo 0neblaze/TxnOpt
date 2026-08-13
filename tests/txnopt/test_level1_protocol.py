@@ -227,3 +227,25 @@ def test_seventh_build_receipt_binds_formal_correction_without_approving_it() ->
         "NOT_REBOUND_TO_BUILD07"
     )
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_eighth_build_receipt_keeps_the_evrptw_speedup_gate_open() -> None:
+    path = ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt08.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["validation"]["pytest"]["passed"] == 117
+    assert manifest["validation"]["route_validation_cache_differential"]["status"] == (
+        "PASS"
+    )
+    assert manifest["performance_change"]["semantic_trace_changed"] is False
+    assert manifest["performance_change"]["evrptw_speedup_gate"] == "FAIL"
+    assert manifest["predecessor_calibration"]["binding_status"] == (
+        "NOT_REBOUND_TO_BUILD08"
+    )
+    assert manifest["claim_boundary"]["level1_ready"] is False
