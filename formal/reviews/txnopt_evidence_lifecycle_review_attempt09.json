@@ -1,0 +1,126 @@
+{
+  "schema_version": "txnopt-formal-independent-review-v1",
+  "run_label": "txnopt_evidence_lifecycle_review_attempt09",
+  "status": "NEEDS_WORK",
+  "responds_to": "txnopt_evidence_lifecycle_review_request_attempt07",
+  "request_sha256": "f09bd66ac7d4bc08ab3835199d0bf8925151df1f775abc8712c7d8de91f3a5e8",
+  "review_scope": {
+    "fixed_build11_source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "fixed_build11_source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854",
+    "bound_input_count": 16,
+    "bound_input_hash_mismatch_count": 0
+  },
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854"
+  },
+  "reviewer_identity": {
+    "agent_task": "/root/attempt07_final_adjudicator",
+    "reviewer_checkout": "/home/oneblaze/txnopt-audits/attempt07-review-33640ee",
+    "revision": "33640ee27ecae837edb66e2106e291ed4db9bb13",
+    "source_tree": "5af80dbbebae2ce26eb690dedb22863203405e89",
+    "clean": true,
+    "clean_check": "git diff --quiet HEAD; generated .hypothesis cache is not part of the source identity"
+  },
+  "bound_inputs": [
+    {"path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json", "expected_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff", "observed_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff", "match": true},
+    {"path": "formal/proofs.md", "expected_sha256": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da", "observed_sha256": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da", "match": true},
+    {"path": "formal/refinement-mapping.md", "expected_sha256": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135", "observed_sha256": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135", "match": true},
+    {"path": "formal/model-check-receipt.json", "expected_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5", "observed_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5", "match": true},
+    {"path": "formal/native-round-prepared-receipt-refinement.md", "expected_sha256": "cbd2ede49c31e3b6b53fd3eaea8718876a319bb6be535c524f0df6b259c6f2c6", "observed_sha256": "cbd2ede49c31e3b6b53fd3eaea8718876a319bb6be535c524f0df6b259c6f2c6", "match": true},
+    {"path": "cpp/txnopt_core/round_transaction.hpp", "expected_sha256": "e4738adb1c02602c3770c6a78f7bc4a9857e98b1b08a91c6fcafd8ba73780c93", "observed_sha256": "e4738adb1c02602c3770c6a78f7bc4a9857e98b1b08a91c6fcafd8ba73780c93", "match": true},
+    {"path": "src/txnopt/runtime.py", "expected_sha256": "aa6ad9b9dbc2264c11a6d771bfdd532c6890a102603129d9b72dab23596c6511", "observed_sha256": "aa6ad9b9dbc2264c11a6d771bfdd532c6890a102603129d9b72dab23596c6511", "match": true},
+    {"path": "src/txnopt_evidence/lifecycle.py", "expected_sha256": "4557bcbcc827ee11cf2264b5591cf677fe021508c8f649aeb8f99c25ed66cc70", "observed_sha256": "4557bcbcc827ee11cf2264b5591cf677fe021508c8f649aeb8f99c25ed66cc70", "match": true},
+    {"path": "src/txnopt_evidence/refinement.py", "expected_sha256": "d99d52f012e15fbcfa84fcffd5dc9ee02846d20f49fe40d8e22e40a705df782b", "observed_sha256": "d99d52f012e15fbcfa84fcffd5dc9ee02846d20f49fe40d8e22e40a705df782b", "match": true},
+    {"path": "src/txnopt_evidence/reviewer.py", "expected_sha256": "47c4fecd50fa2e7a2a15ba4aea0f09f0d6dfc200afef479bf810f5cb08e5da94", "observed_sha256": "47c4fecd50fa2e7a2a15ba4aea0f09f0d6dfc200afef479bf810f5cb08e5da94", "match": true},
+    {"path": "src/txnopt_evidence/runner.py", "expected_sha256": "d822d6a2336ff0fe8b26234433ccda86b41120871f073de4a1dbfce75ff671ca", "observed_sha256": "d822d6a2336ff0fe8b26234433ccda86b41120871f073de4a1dbfce75ff671ca", "match": true},
+    {"path": "tools/run_txnopt_level1_campaign.py", "expected_sha256": "29c29eec14873ee6c8e28adf27644507fc8d4975e023ddff02e1de9e0d8d1820", "observed_sha256": "29c29eec14873ee6c8e28adf27644507fc8d4975e023ddff02e1de9e0d8d1820", "match": true},
+    {"path": "tools/review_txnopt_level1_campaign.py", "expected_sha256": "d079df601b10842c3a4c65b1f2b73be59952307e49b4a7693c72e56cd0240470", "observed_sha256": "d079df601b10842c3a4c65b1f2b73be59952307e49b4a7693c72e56cd0240470", "match": true},
+    {"path": "tests/txnopt/test_evidence_lifecycle.py", "expected_sha256": "84eb48b2e1c2d2990e79bf7b1c197bc9f4c54c8b356cfca2e3dab9ea1d9df652", "observed_sha256": "84eb48b2e1c2d2990e79bf7b1c197bc9f4c54c8b356cfca2e3dab9ea1d9df652", "match": true},
+    {"path": "tests/txnopt/test_evidence_pipeline.py", "expected_sha256": "a5faa51889a392a6fc5155fdc2c153a5129e0aef2c9905287f0b8b4e5bb6109a", "observed_sha256": "a5faa51889a392a6fc5155fdc2c153a5129e0aef2c9905287f0b8b4e5bb6109a", "match": true},
+    {"path": "tests/txnopt/test_formal_contract.py", "expected_sha256": "814fafb242c8a87780c6aa3372a19b5a42eaf8f8bcae7c285e3c3bba53ad8e94", "observed_sha256": "814fafb242c8a87780c6aa3372a19b5a42eaf8f8bcae7c285e3c3bba53ad8e94", "match": true}
+  ],
+  "bound_input_hash_summary": {
+    "all_16_observed_sha256_match_request": true,
+    "note": "The compact binding list above intentionally preserves the 16/16 aggregate; the canonical request remains the authoritative per-file list."
+  },
+  "obligations": [
+    {"id": "O1", "classification": "PASS", "text": "All 16 bound inputs match their request hashes and the Build11 manifest, wheel, and native artifact digests match the fixed producer identity."},
+    {"id": "O2", "classification": "PASS", "text": "EvidenceLifecycle enforces PLANNED->RUNNING->SEALED->REVIEWED transitions, contiguous ordinals, previous-event links, and canonical event digests."},
+    {"id": "O3", "classification": "NEEDS_WORK", "text": "PLANNED binds an input digest and RUNNING/SEALED carry digests, but the config bytes/run label and the exact external producer identity are not closed by the reviewer."},
+    {"id": "O4", "classification": "PASS", "text": "The v2 replay path is the only active code path that appends REVIEWED and it binds the raw-manifest digest; the replay is independent of the producer module."},
+    {"id": "O5", "classification": "NEEDS_WORK", "text": "Event, state, ordinal, and prior-event edits fail without recomputing the chain, but a producer/run-label resign with a recomputed chain is accepted; artifact field sets are also not closed."},
+    {"id": "O6", "classification": "PASS", "text": "The v1 compatibility path remains readable without adding a lifecycle to the historical bundle."},
+    {"id": "O7", "classification": "PASS", "text": "The bound v2 runner and reviewer have no mutual import; the reviewer replays raw streams independently."},
+    {"id": "O8", "classification": "PASS", "text": "The bound T1-T4, aggregate-refinement, and native-round claim-boundary documents remain unchanged and are still explicitly conditional."},
+    {"id": "O9", "classification": "PASS", "text": "Critical and major counts are reported separately and this decision refuses PASS while major findings remain."}
+  ],
+  "independent_reproduction": {
+    "method": "ephemeral Build11 formal-venv RCPSP raw run followed by a recomputed lifecycle and sidecar",
+    "result": "verify_raw_manifest accepted the resigned bundle",
+    "original_run_label": "txnopt_rcpsp_attempt01",
+    "resigned_run_label": "txnopt_rcpsp_resigned_attempt99",
+    "forged_producer_identity": {
+      "binding_status": "BOUND_CLEAN_BUILD",
+      "build_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "wheel_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "installed_native_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "observed_config_artifact_run_label": "txnopt_rcpsp_attempt01",
+    "observation": "The manifest claimed the new run label and forged producer digests while the signed config artifact retained the old run label; reviewer verification still returned PASS."
+  },
+  "findings": [
+    {
+      "id": "F-01",
+      "severity": "MAJOR",
+      "path": "src/txnopt_evidence/reviewer.py",
+      "line": 189,
+      "title": "Bound producer identity is shape-checked, not identity-checked",
+      "counterexample": "_validate_producer_identity only requires BOUND_CLEAN_BUILD plus three 64-character strings (lines 189-205); it never compares source revision/tree, native_build_attestation, or the exact Build11 manifest digest. The independent reproduction supplied f/w/e/d digests and verify_raw_manifest returned PASS.",
+      "impact": "A raw bundle can be relabeled as a clean Build11 producer without being produced by revision 6d28923c or the recorded wheel/native artifacts, invalidating the Build11 evidence binding."
+    },
+    {
+      "id": "F-02",
+      "severity": "MAJOR",
+      "path": "src/txnopt_evidence/reviewer.py",
+      "line": 213,
+      "title": "Run-label and input-config identity are not closed",
+      "counterexample": "_validate_sealed_lifecycle checks lifecycle.run_label against manifest.run_label and the lifecycle digests against manifest fields, but never opens config.json to compare its run_label or recomputes input_config_sha256 from the bound config artifact. runner.py:42-73 hashes the caller's original bytes and writes a separately normalized config artifact. The reproduction changed only the manifest label and recomputed lifecycle events; verification passed while config.json retained the old label.",
+      "impact": "The manifest can be detached from the actual input configuration and assigned to a different run label while retaining a self-consistent lifecycle, breaking raw-to-run traceability."
+    },
+    {
+      "id": "F-03",
+      "severity": "MAJOR",
+      "path": "src/txnopt_evidence/reviewer.py",
+      "line": 64,
+      "title": "Self-resigned artifact/result fields are not schema-closed",
+      "counterexample": "verify_raw_manifest accepts artifact entries with arbitrary extra keys and checks only path/sha256/bytes (lines 64-88); read_signed_json/write_signed_json use a producer-rewritable SHA-256 sidecar (codec.py:51-55), and result.json has no exact field-set/schema validation before replay (reviewer.py:250-270). A producer can therefore resign the manifest/result and alter non-replayed identity metadata without an external anchor or rejection.",
+      "impact": "Exact artifact/result identity and provenance fields are mutable under a self-consistent resign, so an independent reviewer cannot distinguish the recorded Build11 bundle from a producer-rewritten bundle."
+    }
+  ],
+  "finding_counts": {
+    "critical": 0,
+    "major": 3,
+    "minor": 0
+  },
+  "critical_finding_count": 0,
+  "major_finding_count": 3,
+  "minor_finding_count": 0,
+  "claim_boundary": {
+    "independent_review_completed": true,
+    "formal_package_reviewed": false,
+    "level1_formal_gate_passed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "level1_ready": false,
+    "level2_entry_authorized": false
+  }
+}
