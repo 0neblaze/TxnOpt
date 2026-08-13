@@ -179,29 +179,50 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
     native = _object(artifacts.get("native_extension"), "build native extension")
     resource_soak = _object(artifacts.get("resource_soak"), "build resource soak")
     validation = _object(build.get("validation"), "build validation")
-    formal_package = _object(build.get("formal_package"), "build formal package")
     if (
-        build.get("run_label") != "txnopt_level1_build_attempt09"
-        or build.get("status") != "BUILD_AND_FORMAL_PACKAGE_COMPLETE_NOT_LEVEL1_READY"
-        or producer.get("source_dirty") is not False
+        producer.get("source_dirty") is not False
         or producer.get("development_override") is not False
         or native.get("protocol") != "txnopt-native-round-v1"
         or resource_soak.get("status") != "PASS"
         or resource_soak.get("fallback_count") != 0
-        or formal_package.get("unresolved_critical_formal_findings") != 0
-        or formal_package.get("aggregate_refinement_replay") != "PASS"
     ):
         raise ValueError("campaign build is not a clean TxnOpt native-round producer")
+    run_label = build.get("run_label")
+    status = build.get("status")
+    if run_label == "txnopt_level1_build_attempt09":
+        formal_package = _object(build.get("formal_package"), "build formal package")
+        if (
+            status != "BUILD_AND_FORMAL_PACKAGE_COMPLETE_NOT_LEVEL1_READY"
+            or formal_package.get("unresolved_critical_formal_findings") != 0
+            or formal_package.get("aggregate_refinement_replay") != "PASS"
+        ):
+            raise ValueError("Build09 formal package is not independently accepted")
+        surface_gate = "wheel_surface"
+        additional_gates = ("formal_replay",)
+    elif run_label == "txnopt_level1_build_attempt10":
+        formal_successor = _object(build.get("formal_successor"), "build formal successor")
+        if (
+            status != "BUILD_COMPLETE_FORMAL_SUCCESSOR_REVIEW_PENDING_NOT_LEVEL1_READY"
+            or formal_successor.get("prior_review_binding_status") != "PRIOR_SOURCE_ONLY"
+            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD10"
+            or formal_successor.get("independent_successor_review_completed") is not False
+            or formal_successor.get("level1_formal_gate_passed") is not False
+        ):
+            raise ValueError("Build10 formal-successor boundary differs")
+        surface_gate = "wheel_surface_and_record"
+        additional_gates = ()
+    else:
+        raise ValueError("campaign build identity is not an approved Level 1 producer")
     for gate in (
         "ruff",
         "strict_mypy",
         "pytest_wheel_installed",
         "property_based_tests",
-        "wheel_surface",
+        surface_gate,
         "legacy_verify",
-        "formal_replay",
         "asan_ubsan",
         "tsan",
+        *additional_gates,
     ):
         gate_record = _object(validation.get(gate), f"build validation {gate}")
         if gate_record.get("status") != "PASS" or gate_record.get("exit_code") != 0:
@@ -376,9 +397,13 @@ def validate_authorization(
         _object(build.get("artifacts"), "build artifacts").get("wheel"),
         "build wheel",
     )
+    attempt = plan.payload.get("attempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise PermissionError("campaign plan attempt identity is invalid")
+    expected_scope = f"execute_exact_level1_attempt{attempt:02d}_only"
     if (
         payload.get("authorized") is not True
-        or payload.get("authorization_scope") != "execute_exact_level1_attempt18_only"
+        or payload.get("authorization_scope") != expected_scope
         or payload.get("campaign_plan_sha256") != plan.manifest_sha256
         or payload.get("analysis_protocol_sha256") != analysis_sha256
         or payload.get("config_tree_sha256") != plan.payload.get("config_tree_sha256")

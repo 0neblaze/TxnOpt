@@ -235,6 +235,73 @@ def test_preflight_verifies_the_complete_plan_without_creating_raw_output(
     assert not Path(receipt["raw_output_root"]).exists()
 
 
+def test_plan_loader_accepts_build10_only_with_its_pending_formal_boundary(
+    tmp_path: Path,
+) -> None:
+    plan_path, _analysis_path = _campaign(tmp_path)
+    plan_payload = json.loads(plan_path.read_bytes())
+    build_path = Path(plan_payload["build_manifest_path"])
+    build = json.loads(build_path.read_bytes())
+    build.update(
+        {
+            "run_label": "txnopt_level1_build_attempt10",
+            "status": "BUILD_COMPLETE_FORMAL_SUCCESSOR_REVIEW_PENDING_NOT_LEVEL1_READY",
+            "formal_successor": {
+                "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+                "successor_status": "REVIEW_PENDING_BUILD10",
+                "independent_successor_review_completed": False,
+                "level1_formal_gate_passed": False,
+            },
+        }
+    )
+    build["validation"]["wheel_surface_and_record"] = build["validation"].pop(
+        "wheel_surface"
+    )
+    build["validation"].pop("formal_replay")
+    build.pop("formal_package")
+    build_path.unlink()
+    build_path.with_suffix(".json.sha256").unlink()
+    build_sha256 = _write(build_path, build)
+    for entry in plan_payload["entries"]:
+        config_path = plan_path.parent / entry["path"]
+        config = json.loads(config_path.read_bytes())
+        config["build_manifest"]["sha256"] = build_sha256
+        config_bytes = canonical_json_bytes(config, pretty=True)
+        config_path.write_bytes(config_bytes)
+        entry["sha256"] = sha256_bytes(config_bytes)
+    plan_payload["build_manifest_sha256"] = build_sha256
+    plan_payload["config_tree_sha256"] = sha256_bytes(
+        canonical_json_bytes(plan_payload["entries"])
+    )
+    plan_path.unlink()
+    plan_path.with_suffix(".json.sha256").unlink()
+    _write(plan_path, plan_payload)
+
+    loaded = load_campaign_plan(plan_path)
+    assert loaded.payload["attempt"] == 18
+
+    build["formal_successor"]["independent_successor_review_completed"] = True
+    build_path.unlink()
+    build_path.with_suffix(".json.sha256").unlink()
+    build_sha256 = _write(build_path, build)
+    for entry in plan_payload["entries"]:
+        config_path = plan_path.parent / entry["path"]
+        config = json.loads(config_path.read_bytes())
+        config["build_manifest"]["sha256"] = build_sha256
+        config_bytes = canonical_json_bytes(config, pretty=True)
+        config_path.write_bytes(config_bytes)
+        entry["sha256"] = sha256_bytes(config_bytes)
+    plan_payload["build_manifest_sha256"] = build_sha256
+    plan_payload["config_tree_sha256"] = sha256_bytes(
+        canonical_json_bytes(plan_payload["entries"])
+    )
+    plan_path.unlink()
+    plan_path.with_suffix(".json.sha256").unlink()
+    _write(plan_path, plan_payload)
+    with pytest.raises(ValueError, match="formal-successor boundary"):
+        load_campaign_plan(plan_path)
+
+
 def test_preflight_rejects_config_tampering_and_an_existing_raw_root(
     tmp_path: Path,
 ) -> None:
