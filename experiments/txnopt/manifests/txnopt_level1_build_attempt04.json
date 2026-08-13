@@ -1,0 +1,98 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt04",
+  "status": "BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T05:01:51Z",
+  "successor_of": "txnopt_level1_build_attempt03",
+  "producer": {
+    "revision": "c96e16e3c3f9b404ca325f50456b8f97811cea40",
+    "git_tree": "0b76d3edcb2b7bc48722f32861d2ef4004b7748d",
+    "source_manifest_sha256": "8ced47b000fa831e4980b75442e5c0162b01ae2b748f995fbbdb7833d5dae177",
+    "tracked_file_count": 1050,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-c96e16e/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "23ea3582ae87bc63a8437433ce96cde4e8759970672ff207fe351951f99be968",
+      "entry_count": 52,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-c96e16e/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "65ed088aa0a7837ef6b8231673878c446e8075f87e065c02bdd42f1c19f0c27f"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "1fe5e1ec0fe452838fe57cad26e554d06ceacd06004670517172d372987a12e2",
+      "protocol": "txnopt-native-round-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-c96e16e/resource-soak-attempt05.json",
+      "sha256": "bfb5c428e3097dd98ce7f5dc59c4bc2a49ed9f65d91453088b2464fd2f038009",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 8,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "protocol": {
+    "path": "experiments/txnopt/level1-protocol.json",
+    "sha256": "603c452d60296c4f9cd4afba55842b3a826d67f7abbb2eed75dbf04de6a9d2f2",
+    "holdout_opened": false
+  },
+  "formal_model": {
+    "receipt_path": "formal/model-check-receipt.json",
+    "receipt_sha256": "8137f6c2297bf9ef8735c64bbba14c072254329b7259a75a6067700733fba05b",
+    "bounded_t1_t2_status": "PASS",
+    "t3_t4_independent_review_status": "PENDING"
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 43},
+    "pytest": {"exit_code": 0, "status": "PASS", "passed": 95},
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "asan_ubsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_drain_rounds": 20000,
+      "aslr_disabled_for_runtime": true
+    },
+    "historical_protected_paths": {"exit_code": 0, "status": "UNCHANGED"}
+  },
+  "failure_lineage": {
+    "failed_calibration_plan": "level1-calibration-plan-attempt11",
+    "reproducer_plan": "level1-calibration-plan-attempt12",
+    "failure": "RCPSP CP-SAT UNKNOWN under fixed-time was classified as RuntimeError",
+    "resolution": "UNKNOWN or FEASIBLE under an active deadline now raises TimeoutError and rolls back to the last committed prefix",
+    "same_attempt_reused": false
+  },
+  "environment": {
+    "kernel": "Linux 6.18.35.2-microsoft-standard-WSL2 x86_64",
+    "python": "3.13.13",
+    "compiler": "GNU 13.3.0",
+    "cmake": "3.28.3",
+    "performance_profile": "portable-o3"
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "independent T3/T4 proof review",
+      "clean-build local p95 calibration and ten-day matrix forecast",
+      "Level 1 raw experiment matrix and independent replay",
+      "single-worker overhead threshold",
+      "two-domain four-worker speedup and confidence-interval thresholds",
+      "fixed-work quality and measured T4 waste thresholds"
+    ]
+  }
+}
