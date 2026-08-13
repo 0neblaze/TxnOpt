@@ -57,3 +57,7 @@ review or declare readiness. After a complete run,
 replays every raw manifest into a new review root and recomputes the registered
 performance, confidence-interval, parity, prefix-safety, fallback, and Cmax
 gates. Failed attempts retain their raw root and require a new attempt label.
+The current local decision receipt is
+`manifests/txnopt_level1_precloud_gate_attempt01.json`; it is a procurement
+authorization gate result, not an authorization receipt and not a Level 1
+readiness claim.

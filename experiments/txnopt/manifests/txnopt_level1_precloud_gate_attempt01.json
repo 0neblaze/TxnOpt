@@ -1,0 +1,117 @@
+{
+  "schema_version": "txnopt-level1-precloud-gate-v1",
+  "run_label": "txnopt_level1_precloud_gate_attempt01",
+  "status": "READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION",
+  "created_at_utc": "2026-08-13T12:25:47Z",
+  "orchestration_identity": {
+    "revision": "ceb3e9ec55c4ca7750ef410e00416a475b641768",
+    "git_tree": "cb2d828780aa0551145fb57a75039ba9f99cd654",
+    "source_dirty": false,
+    "branch": "codex/txnopt-level1"
+  },
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt09.json",
+    "build_manifest_sha256": "f00d92a79bd6255152f5370aff5e97e4070602137a9c078dfba0c5c8b3cf302c",
+    "source_revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191",
+    "source_tree": "7ccb8af498db354aab9ae3b3c5f5010c4035efb4",
+    "wheel_sha256": "3bf15fb5508cfff9c602602258f98346ef42c9973f4f8d2f1454e2a301536732",
+    "native_sha256": "e142dfabecf85a43f247db87e184e0eb9b802454f63b5e0c540c105bfca283d3"
+  },
+  "formal_plan": {
+    "manifest_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt18/manifest.json",
+    "manifest_sha256": "85e6e6471fe4480c8a05e9887e6166e5d934ea557d53ce0a33fe098529947c8f",
+    "config_count": 2880,
+    "config_tree_sha256": "c609613e00928708bbb69e5d22be417e99489cdf921d2f677759412ab16b8929",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build09-attempt18",
+    "raw_output_root_absent": true,
+    "holdout_opened": false,
+    "formal_matrix_started": false
+  },
+  "analysis_preregistration": {
+    "path": "experiments/txnopt/level1-analysis-protocol-v1.json",
+    "sha256": "919347d133a88b682f1d6a7cba438e182cb115ec1109bc1c403f5a85038eac22",
+    "status": "PREREGISTERED_BEFORE_FORMAL_MATRIX",
+    "bootstrap_resamples": 20000,
+    "bootstrap_seed": 20260813,
+    "holdout_opened": false
+  },
+  "precloud_evidence": {
+    "local_calibration_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt17.json",
+    "local_calibration_sha256": "f30b0eed28188fe16201fbb799a1184cee3f5841c9f491de0d6c531be3585740",
+    "cloud_estimate_path": "/home/oneblaze/txnopt-calibration/level1-cloud-estimate-attempt03.json",
+    "cloud_estimate_sha256": "707ca8a66dcde7f750f718c2d09a5a3ea956232e04481151d0a585962ab40b85",
+    "cloud_estimate_status": "PURCHASE_GATE_PASS",
+    "estimated_32_physical_core_seconds": 4320.889,
+    "maximum_purchase_window_days": 14,
+    "predicted_completion_within_ten_days": true
+  },
+  "formal_and_legacy_reviews": {
+    "formal_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "formal_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "formal_scope": "BOUNDED_MODEL_CHECK_AND_CONDITIONAL_T3_T4_PASS",
+    "legacy_compatibility_path": "legacy/txnopt-legacy-compatibility-attempt01.json",
+    "legacy_compatibility_sha256": "8fa31e2bdd8b0457bff628e6c190c96da8ef4b9d988b8c83335abdaf7240f38e",
+    "legacy_review_path": "legacy/txnopt-legacy-compatibility-review-attempt01.json",
+    "legacy_review_sha256": "d675babbf86167788d19e94ab63010e0ef0ccfaff38fa0bc16ced76589976a0c",
+    "legacy_freeze_manifest_sha256": "d7d613f36e9e5b57f55c0e134d9e60259abe3f75666a0fc33cc08fa77961d16b"
+  },
+  "clean_cli_preflight": {
+    "exit_code": 0,
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE",
+    "config_count": 2880,
+    "active_target_process_count": 0,
+    "atomic_launch_claim_absent": true,
+    "raw_output_root_absent": true,
+    "installed_non_record_entry_count_verified": 52,
+    "wheel_entry_count_verified": 53,
+    "dependency_count": 18,
+    "dependency_lock_sha256": "bf252068a125f7293eb7bb905e23f9820c0f69ba195f3bc0b9fa59fa205423dd",
+    "python_executable_sha256": "54f284bbd2f89c36509390443ec1c9235de59c9c19e2ce9f8206e4e427d3c4b4",
+    "fallback_count": 0
+  },
+  "validation": {
+    "ruff": {
+      "exit_code": 0,
+      "status": "PASS"
+    },
+    "strict_mypy": {
+      "exit_code": 0,
+      "status": "PASS",
+      "source_file_count": 42
+    },
+    "pytest_txnopt_isolated_build09": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 168
+    },
+    "diff_check": {
+      "exit_code": 0,
+      "status": "PASS"
+    },
+    "protected_historical_paths": {
+      "status": "UNCHANGED"
+    },
+    "independent_code_review": {
+      "status": "PASS",
+      "critical_findings": 0,
+      "major_findings": 0
+    }
+  },
+  "execution_boundary": {
+    "procurement_authorized": false,
+    "cloud_purchase_performed": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "internal_level1_seal_created": false,
+    "level2_entry_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false
+  },
+  "decision": {
+    "precloud_gate": "PASS",
+    "next_required_authority": "EXPLICIT_USER_PROCUREMENT_AUTHORIZATION",
+    "authorized_next_action": "NONE_UNTIL_SEPARATE_AUTHORIZATION",
+    "claim_boundary": "This receipt authorizes no purchase and no execution. It records only that the exact Attempt18 plan has passed the local pre-cloud gate."
+  }
+}

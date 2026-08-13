@@ -556,3 +556,23 @@ def test_linux_resource_floor_measurements_are_positive() -> None:
     from tools.run_txnopt_level1_campaign import _memory_gib
 
     assert _memory_gib() > 0
+
+
+def test_precloud_gate_is_not_an_execution_or_level1_readiness_claim() -> None:
+    path = Path("experiments/txnopt/manifests/txnopt_level1_precloud_gate_attempt01.json")
+    payload = json.loads(path.read_bytes())
+
+    assert payload["status"] == "READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION"
+    assert payload["clean_cli_preflight"]["status"] == ("PASS_NOT_AUTHORIZED_TO_EXECUTE")
+    assert payload["execution_boundary"] == {
+        "procurement_authorized": False,
+        "cloud_purchase_performed": False,
+        "formal_matrix_started": False,
+        "holdout_opened": False,
+        "level1_ready": False,
+        "internal_level1_seal_created": False,
+        "level2_entry_authorized": False,
+        "push_authorized": False,
+        "public_release_authorized": False,
+    }
+    assert sha256_file(path) == path.with_suffix(".json.sha256").read_text().split()[0]

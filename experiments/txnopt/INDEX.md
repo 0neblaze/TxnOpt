@@ -122,6 +122,10 @@ semantic/objective parity, and measured-Cmax analysis before execution. The
 orchestration preflight passes structurally but cannot execute without a
 separate signed purchase authorization. Full-scope CI and Cmax are completion
 gates produced after the matrix, not circular preconditions for procurement.
+The signed local decision is
+`manifests/txnopt_level1_precloud_gate_attempt01.json`; it records
+`READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION` while keeping purchase,
+execution, holdout access, Level 1 readiness, and public release false.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
