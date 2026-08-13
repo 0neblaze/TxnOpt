@@ -116,6 +116,11 @@ def test_evrptw_safe_screen_cache_reuses_unchanged_routes() -> None:
         "route_screen_cache_size": 2,
         "route_screen_cache_capacity": 65_536,
         "route_screen_cache_evictions": 0,
+        "route_validation_cache_hits": 0,
+        "route_validation_cache_misses": 0,
+        "route_validation_cache_size": 0,
+        "route_validation_cache_capacity": 65_536,
+        "route_validation_cache_evictions": 0,
     }
     assert after_second["route_screen_cache_hits"] == 2
     assert after_second["route_screen_cache_misses"] == 2
@@ -133,4 +138,22 @@ def test_evrptw_safe_screen_cache_is_bounded_and_evicts_lru_routes() -> None:
         "route_screen_cache_size": 2,
         "route_screen_cache_capacity": 2,
         "route_screen_cache_evictions": 1,
+        "route_validation_cache_hits": 0,
+        "route_validation_cache_misses": 0,
+        "route_validation_cache_size": 0,
+        "route_validation_cache_capacity": 65_536,
+        "route_validation_cache_evictions": 0,
     }
+
+
+def test_evrptw_validator_reuses_independent_route_reports() -> None:
+    oracle = EVRPTWOracle(_instance())
+    solution = oracle.solve_initial(EVRPTWPlan((("C1",), ("C2",))))
+    before = dict(oracle.screening_statistics)
+
+    oracle.validate(solution)
+    after = dict(oracle.screening_statistics)
+
+    assert before["route_validation_cache_misses"] == 2
+    assert after["route_validation_cache_misses"] == 2
+    assert after["route_validation_cache_hits"] > before["route_validation_cache_hits"]

@@ -14,7 +14,7 @@ from typing import Final
 from txnopt_cases.evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from txnopt_cases.evrptw.models import Instance, NodeType
 from txnopt_cases.evrptw.objective import SolutionObjective
-from txnopt_cases.evrptw.validation import validate_routes
+from txnopt_cases.evrptw.validation import RouteReportCache, validate_routes
 
 _DEFAULT_ROUTE_SCREEN_CACHE_CAPACITY: Final = 65_536
 
@@ -60,6 +60,7 @@ class EVRPTWOracle:
         instance: Instance,
         *,
         route_screen_cache_capacity: int = _DEFAULT_ROUTE_SCREEN_CACHE_CAPACITY,
+        route_validation_cache_capacity: int = _DEFAULT_ROUTE_SCREEN_CACHE_CAPACITY,
     ) -> None:
         if (
             isinstance(route_screen_cache_capacity, bool)
@@ -74,6 +75,9 @@ class EVRPTWOracle:
         self._route_screen_cache_hits = 0
         self._route_screen_cache_misses = 0
         self._route_screen_cache_evictions = 0
+        self._route_validation_cache = RouteReportCache(
+            route_validation_cache_capacity
+        )
 
     @property
     def screening_statistics(self) -> Mapping[str, int]:
@@ -84,6 +88,7 @@ class EVRPTWOracle:
                 "route_screen_cache_size": len(self._route_screen_cache),
                 "route_screen_cache_capacity": self._route_screen_cache_capacity,
                 "route_screen_cache_evictions": self._route_screen_cache_evictions,
+                **self._route_validation_cache.statistics,
             }
         )
 
@@ -148,7 +153,11 @@ class EVRPTWOracle:
             if state.routes:
                 raise ValueError("an infeasible EVRPTW result cannot expose partial routes")
             return
-        report = validate_routes(self._instance, state.routes)
+        report = validate_routes(
+            self._instance,
+            state.routes,
+            route_report_cache=self._route_validation_cache,
+        )
         if not report.feasible:
             raise ValueError(f"invalid EVRPTW solution: {report.violations}")
         objective = SolutionObjective.from_report(self._instance, report)
@@ -239,7 +248,11 @@ class EVRPTWOracle:
         if failures:
             return EVRPTWSolution(candidate, (), False, None, failures)
         routes = tuple(result.route for result in exact_results)
-        report = validate_routes(self._instance, routes)
+        report = validate_routes(
+            self._instance,
+            routes,
+            route_report_cache=self._route_validation_cache,
+        )
         if not report.feasible:
             raise RuntimeError(
                 "exact charging and the independent EVRPTW validator disagree: "
