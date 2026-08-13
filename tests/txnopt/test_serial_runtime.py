@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+import json
+from collections.abc import Mapping, Sequence
 
 import pytest
 
@@ -310,3 +311,62 @@ def test_stale_cache_snapshot_interrupts_before_evaluation() -> None:
     assert result.last_committed_state == 0
     assert result.termination_reason == "stale_snapshot"
     assert oracle.evaluated_batches == []
+
+
+def test_runtime_emits_a_detached_complete_semantic_stream() -> None:
+    streams: list[tuple[Mapping[str, object], ...]] = []
+    runtime = SerialTxnRuntime[int, int, int](semantic_event_sink=streams.append)
+    result = runtime.run(
+        0,
+        kernel=IncrementKernel(),
+        oracle=IntegerOracle(),
+        config=RunConfig(
+            seed=0,
+            workers=1,
+            execution_mode="serial",
+            fixed_work=1,
+            max_rounds=1,
+        ),
+    )
+
+    assert len(streams) == 1
+    assert streams[0][0]["event"] == "run_open"
+    assert streams[0][-1] == {"event": "run_terminated", "reason": "max_rounds"}
+    assert (
+        hashlib.sha256(
+            json.dumps(
+                streams[0],
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        == result.semantic_digest
+    )
+
+
+def test_physical_timing_is_separate_from_the_semantic_digest() -> None:
+    first_physical: list[tuple[Mapping[str, object], ...]] = []
+    second_physical: list[tuple[Mapping[str, object], ...]] = []
+    config = RunConfig(
+        seed=0,
+        workers=1,
+        execution_mode="serial",
+        fixed_work=1,
+        trace_policy="semantic_and_physical",
+        max_rounds=1,
+    )
+    first_ticks = iter((10, 20))
+    second_ticks = iter((100, 300))
+    first = SerialTxnRuntime[int, int, int](
+        clock_ns=lambda: next(first_ticks),
+        physical_event_sink=first_physical.append,
+    ).run(0, kernel=IncrementKernel(), oracle=IntegerOracle(), config=config)
+    second = SerialTxnRuntime[int, int, int](
+        clock_ns=lambda: next(second_ticks),
+        physical_event_sink=second_physical.append,
+    ).run(0, kernel=IncrementKernel(), oracle=IntegerOracle(), config=config)
+
+    assert first.semantic_digest == second.semantic_digest
+    assert first.physical_artifact_ref == "txnopt-physical-trace-v1:external"
+    assert first_physical != second_physical

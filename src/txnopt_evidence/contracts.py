@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from txnopt import RunConfig
-
 
 @dataclass(frozen=True, slots=True)
 class RawArtifactRef:
@@ -24,9 +22,7 @@ class RunnerPort(Protocol):
     def run(
         self,
         *,
-        run_label: str,
-        output_dir: Path,
-        config: RunConfig,
+        config_path: Path,
     ) -> RawArtifactRef: ...
 
 
@@ -37,6 +33,6 @@ class ReviewerPort(Protocol):
     def review(
         self,
         *,
-        raw: RawArtifactRef,
+        manifest_path: Path,
         output_dir: Path,
     ) -> Mapping[str, object]: ...

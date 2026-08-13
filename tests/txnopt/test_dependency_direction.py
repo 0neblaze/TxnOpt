@@ -52,6 +52,13 @@ def test_legacy_reader_does_not_activate_frozen_solver() -> None:
     assert all(not imports for imports in observations.values()), observations
 
 
+def test_runner_and_reviewer_share_only_inward_codecs_not_each_other() -> None:
+    runner = SRC / "txnopt_evidence/runner.py"
+    reviewer = SRC / "txnopt_evidence/reviewer.py"
+    assert "txnopt_evidence.reviewer" not in runner.read_text(encoding="utf-8")
+    assert "txnopt_evidence.runner" not in reviewer.read_text(encoding="utf-8")
+
+
 def test_importing_txnopt_does_not_import_evrptw() -> None:
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(SRC)

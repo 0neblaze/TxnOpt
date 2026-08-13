@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import platform
 import sys
@@ -11,25 +10,11 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
+from txnopt_evidence.reviewer import replay_manifest, verify_raw_manifest
+from txnopt_evidence.runner import run_config_file
 from txnopt_legacy import LegacyReceiptReader
 
 _VERSION: Final = "0.1.0a1"
-
-
-def _signed_json(path: Path) -> dict[str, object]:
-    resolved = path.resolve(strict=True)
-    data = resolved.read_bytes()
-    digest = hashlib.sha256(data).hexdigest()
-    sidecar = resolved.with_suffix(resolved.suffix + ".sha256")
-    if not sidecar.is_file():
-        raise ValueError("signed JSON sidecar is missing")
-    fields = sidecar.read_text(encoding="utf-8").strip().split()
-    if len(fields) != 2 or fields[0] != digest or fields[1] != resolved.name:
-        raise ValueError("signed JSON sidecar differs")
-    payload = json.loads(data)
-    if not isinstance(payload, dict):
-        raise ValueError("signed JSON must contain an object")
-    return payload
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
 
     replay = commands.add_parser("replay")
     replay.add_argument("manifest", type=Path)
+    replay.add_argument("--output-dir", type=Path, required=True)
 
     commands.add_parser("env")
 
@@ -55,13 +41,14 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _unavailable(command: str) -> int:
+def _error(command: str, error: Exception) -> int:
     print(
         json.dumps(
             {
                 "schema_version": "txnopt-cli-error-v1",
                 "command": command,
-                "error": "level1_runtime_not_implemented",
+                "error_type": type(error).__name__,
+                "error": str(error),
                 "fallback_used": False,
             },
             sort_keys=True,
@@ -73,31 +60,47 @@ def _unavailable(command: str) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    if arguments.command == "run":
-        return _unavailable("run")
-    if arguments.command == "replay":
-        return _unavailable("replay")
-    if arguments.command == "verify":
-        payload = _signed_json(arguments.manifest)
-        result: object = {
-            "schema_version": "txnopt-verification-v1",
-            "status": "verified",
-            "manifest_schema_version": payload.get("schema_version", ""),
-        }
-    elif arguments.command == "env":
-        result = {
-            "schema_version": "txnopt-environment-v1",
-            "txnopt_version": _VERSION,
-            "python_version": platform.python_version(),
-            "platform": platform.platform(),
-        }
-    else:
-        payload = LegacyReceiptReader().read(arguments.receipt)
-        result = {
-            "schema_version": "txnopt-legacy-verification-v1",
-            "status": "verified",
-            "legacy_schema_version": payload.get("schema_version", ""),
-        }
+    try:
+        if arguments.command == "run":
+            raw = run_config_file(arguments.config)
+            result: object = {
+                "schema_version": "txnopt-run-command-v1",
+                "status": "complete",
+                "run_label": raw.run_label,
+                "manifest_path": str(raw.manifest_path),
+                "manifest_sha256": raw.manifest_sha256,
+                "fallback_count": 0,
+            }
+        elif arguments.command == "replay":
+            result = replay_manifest(
+                arguments.manifest,
+                output_dir=arguments.output_dir,
+            )
+        elif arguments.command == "verify":
+            payload = verify_raw_manifest(arguments.manifest)
+            result = {
+                "schema_version": "txnopt-verification-v1",
+                "status": "verified",
+                "manifest_schema_version": payload.get("schema_version", ""),
+                "run_label": payload.get("run_label", ""),
+                "fallback_count": 0,
+            }
+        elif arguments.command == "env":
+            result = {
+                "schema_version": "txnopt-environment-v1",
+                "txnopt_version": _VERSION,
+                "python_version": platform.python_version(),
+                "platform": platform.platform(),
+            }
+        else:
+            payload = LegacyReceiptReader().read(arguments.receipt)
+            result = {
+                "schema_version": "txnopt-legacy-verification-v1",
+                "status": "verified",
+                "legacy_schema_version": payload.get("schema_version", ""),
+            }
+    except (OSError, RuntimeError, ValueError) as error:
+        return _error(str(arguments.command), error)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

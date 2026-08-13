@@ -41,9 +41,14 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         *,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         cache_factory: Callable[[], InMemoryCacheStore[StateT]] = InMemoryCacheStore,
+        semantic_event_sink: (Callable[[tuple[Mapping[str, object], ...]], None] | None) = None,
+        physical_event_sink: (Callable[[tuple[Mapping[str, object], ...]], None] | None) = None,
     ) -> None:
         self._clock_ns = clock_ns
         self._cache_factory = cache_factory
+        self._semantic_event_sink = semantic_event_sink
+        self._physical_event_sink = physical_event_sink
+        self._physical_started_ns: int | None = None
 
     def run(
         self,
@@ -53,6 +58,12 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         oracle: Oracle[CandidateT, StateT, ObjectiveT],
         config: RunConfig,
     ) -> RunResult[StateT, ObjectiveT]:
+        if config.trace_policy == "semantic_and_physical":
+            if self._physical_event_sink is None:
+                raise RuntimeContractError(
+                    "semantic_and_physical tracing requires a physical event sink"
+                )
+            self._physical_started_ns = self._clock_ns()
         if oracle.deterministic is not True:
             raise RuntimeContractError("oracle did not declare deterministic semantics")
         if config.execution_mode != "serial" and oracle.parallel_safe is not True:
@@ -116,18 +127,14 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             if len(admitted_mask) != len(unique_candidates) or any(
                 not isinstance(admitted, bool) for admitted in admitted_mask
             ):
-                raise RuntimeContractError(
-                    "oracle screening decisions must be ordered booleans"
-                )
+                raise RuntimeContractError("oracle screening decisions must be ordered booleans")
             admitted = tuple(
                 candidate
                 for candidate, keep in zip(unique_candidates, admitted_mask, strict=True)
                 if keep
             )
             admitted_keys = tuple(
-                key
-                for key, keep in zip(candidate_keys, admitted_mask, strict=True)
-                if keep
+                key for key, keep in zip(candidate_keys, admitted_mask, strict=True) if keep
             )
             if not admitted:
                 semantic_events.append(
@@ -170,8 +177,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 if cached is None
             )
             missing_work = tuple(
-                self._validated_work_units(oracle, candidate)
-                for _index, _key, candidate in missing
+                self._validated_work_units(oracle, candidate) for _index, _key, candidate in missing
             )
             reservation = budget.reserve(sum(missing_work))
             if not reservation.granted:
@@ -203,9 +209,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 try:
                     evaluated = self._evaluate_candidates(
                         oracle=oracle,
-                        candidates=tuple(
-                            candidate for _index, _key, candidate in missing
-                        ),
+                        candidates=tuple(candidate for _index, _key, candidate in missing),
                         work_units=missing_work,
                         budget=budget,
                         config=config,
@@ -301,9 +305,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             oracle.validate(next_state)
             next_digest = self._validated_state_digest(oracle, next_state)
             allowed_digests = {state_digest}
-            allowed_digests.update(
-                self._validated_state_digest(oracle, item) for item in resolved
-            )
+            allowed_digests.update(self._validated_state_digest(oracle, item) for item in resolved)
             if next_digest not in allowed_digests:
                 cache.rollback(cache_transaction)
                 transaction = transaction.transition(TxnPhase.ABORTED)
@@ -401,8 +403,8 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             "candidate_keys": transaction.candidate_keys,
         }
 
-    @staticmethod
     def _result(
+        self,
         *,
         state: StateT,
         objective: ObjectiveT,
@@ -420,13 +422,46 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
+        if self._semantic_event_sink is not None:
+            detached = tuple(
+                json.loads(
+                    json.dumps(
+                        event,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
+                for event in final_events
+            )
+            self._semantic_event_sink(detached)
+        physical_ref: str | None = None
+        if config.trace_policy == "semantic_and_physical":
+            if self._physical_started_ns is None or self._physical_event_sink is None:
+                raise RuntimeContractError("physical trace owner is not initialized")
+            ended_ns = self._clock_ns()
+            self._physical_event_sink(
+                (
+                    {
+                        "event": "run_observation",
+                        "trace": "txnopt-physical-trace-v1",
+                        "execution_mode": config.execution_mode,
+                        "workers": config.workers,
+                        "started_ns": self._physical_started_ns,
+                        "ended_ns": ended_ns,
+                        "duration_ns": ended_ns - self._physical_started_ns,
+                        "termination_reason": reason,
+                    },
+                )
+            )
+            physical_ref = "txnopt-physical-trace-v1:external"
         oracle_identity = f"{type(oracle).__module__}.{type(oracle).__qualname__}"
         return RunResult(
             last_committed_state=state,
             objective=objective,
             termination_reason=reason,
             semantic_digest=semantic_digest,
-            physical_artifact_ref=None,
+            physical_artifact_ref=physical_ref,
             provenance={
                 "contract": CONTRACT_VERSION,
                 "runtime": "txnopt.python-reference-v1",
@@ -614,9 +649,7 @@ class SerialTxnRuntime[StateT, CandidateT, ObjectiveT](
         config: RunConfig,
     ) -> RunResult[StateT, ObjectiveT]:
         if config.execution_mode != "serial":
-            raise RuntimeContractError(
-                "SerialTxnRuntime supports only the serial execution mode"
-            )
+            raise RuntimeContractError("SerialTxnRuntime supports only the serial execution mode")
         return super().run(
             initial_state,
             kernel=kernel,

@@ -16,10 +16,12 @@ def _signed_json(path: Path, payload: object) -> None:
     )
 
 
-def test_cli_verify_and_legacy_verify(tmp_path: Path, capsys: object) -> None:
+def test_cli_legacy_verify_reads_only_signed_legacy_json(
+    tmp_path: Path,
+    capsys: object,
+) -> None:
     manifest = tmp_path / "manifest.json"
     _signed_json(manifest, {"schema_version": "txnopt-test-v1"})
-    assert main(["verify", str(manifest)]) == 0
     assert main(["legacy", "verify", str(manifest)]) == 0
 
 
@@ -30,4 +32,4 @@ def test_cli_run_and_replay_fail_closed_without_fallback(
     path = tmp_path / "config.json"
     path.write_text("{}\n", encoding="utf-8")
     assert main(["run", "--config", str(path)]) == 2
-    assert main(["replay", str(path)]) == 2
+    assert main(["replay", str(path), "--output-dir", str(tmp_path / "review")]) == 2
