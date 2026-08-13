@@ -13,6 +13,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from tools.txnopt_level1_campaign_common import (
+    load_campaign_plan,
+    load_prebound_expected_identity,
+    require_prebound_expected_identities,
+)
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -61,9 +67,8 @@ def main() -> int:
         raise FileExistsError(f"calibration review root already exists: {review_root}")
     plan_path = arguments.plan_manifest.resolve(strict=True)
     plan_sha256 = _verify_sidecar(plan_path)
-    plan = _object(json.loads(plan_path.read_bytes()), "plan manifest")
-    if plan.get("schema_version") != "txnopt-level1-campaign-plan-v1":
-        raise ValueError("unsupported campaign plan schema")
+    plan = load_campaign_plan(plan_path)
+    require_prebound_expected_identities(plan)
     cases: dict[str, set[str]] = defaultdict(set)
     for raw_case in arguments.case:
         if raw_case.count(":") != 1:
@@ -78,13 +83,12 @@ def main() -> int:
     if len(seeds) < 3 or len(set(seeds)) != len(seeds):
         raise ValueError("calibration requires at least three unique seeds")
 
-    selected: list[tuple[Path, str, str, str, int, str]] = []
-    for entry in plan.get("entries", []):
-        item = _object(entry, "plan entry")
-        relative = item.get("path")
-        if not isinstance(relative, str):
-            raise ValueError("plan entry path is invalid")
-        config_path = plan_path.parent / relative
+    selected: list[tuple[Path, Path, str, str, str, int, str]] = []
+    for entry in plan.entries:
+        load_prebound_expected_identity(entry)
+        if entry.expected_identity_path is None:  # guarded above; keeps typing exact
+            raise ValueError("plan entry lacks its expected identity")
+        config_path = entry.config_path
         config = _object(json.loads(config_path.read_bytes()), "run config")
         case = _object(config.get("case"), "case")
         run_config = _object(config.get("run_config"), "run config payload")
@@ -100,7 +104,17 @@ def main() -> int:
             and isinstance(seed, int)
             and seed in seeds
         ):
-            selected.append((config_path, domain, case_id, axis, seed, budget))
+            selected.append(
+                (
+                    config_path,
+                    entry.expected_identity_path,
+                    domain,
+                    case_id,
+                    axis,
+                    seed,
+                    budget,
+                )
+            )
     expected_count = sum(len(values) for values in cases.values()) * len(seeds) * 4 * 2
     if len(selected) != expected_count:
         raise ValueError(
@@ -110,7 +124,15 @@ def main() -> int:
     samples: list[dict[str, object]] = []
     groups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     review_root.mkdir(parents=True, exist_ok=False)
-    for ordinal, (config_path, domain, case_id, axis, seed, budget) in enumerate(selected, 1):
+    for ordinal, (
+        config_path,
+        expected_identity_path,
+        domain,
+        case_id,
+        axis,
+        seed,
+        budget,
+    ) in enumerate(selected, 1):
         run_output, elapsed = _run(
             [sys.executable, "-m", "txnopt_evidence.cli", "run", "--config", str(config_path)]
         )
@@ -125,6 +147,8 @@ def main() -> int:
                 str(manifest),
                 "--output-dir",
                 str(review_dir),
+                "--expected-identity",
+                str(expected_identity_path),
             ]
         )
         if review_output.get("status") != "PASS":

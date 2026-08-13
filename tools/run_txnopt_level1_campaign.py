@@ -24,10 +24,12 @@ from tools.txnopt_level1_campaign_common import (
     linux_host_identity,
     load_analysis_protocol,
     load_campaign_plan,
+    load_prebound_expected_identity,
     memory_gib,
     physical_core_count,
     read_signed_object,
     require_clean_repository,
+    require_prebound_expected_identities,
     run_isolated_process,
     sha256_file,
     validate_authorization,
@@ -35,7 +37,6 @@ from tools.txnopt_level1_campaign_common import (
     verify_sidecar,
     write_signed_object,
 )
-from txnopt_evidence.identity import ExpectedEvidenceIdentity
 
 
 class _WeightedTokens:
@@ -69,6 +70,7 @@ def preflight_campaign(
     wheel: Path | None = None,
 ) -> dict[str, Any]:
     plan = load_campaign_plan(plan_path)
+    require_prebound_expected_identities(plan)
     _analysis, analysis_sha256 = load_analysis_protocol(
         analysis_protocol_path,
         plan=plan,
@@ -97,6 +99,7 @@ def preflight_campaign(
         "analysis_protocol_sha256": analysis_sha256,
         "config_count": len(plan.entries),
         "config_tree_sha256": plan.payload["config_tree_sha256"],
+        "expected_identity_tree_sha256": plan.expected_identity_tree_sha256,
         "raw_output_root": str(plan.raw_output_root),
         "raw_output_root_absent": True,
         "atomic_launch_claim_absent": True,
@@ -122,6 +125,7 @@ def execute_campaign(
     if usable_cores <= 0 or per_run_timeout_seconds <= 0:
         raise ValueError("usable cores and per-run timeout must be positive")
     plan = load_campaign_plan(plan_path)
+    require_prebound_expected_identities(plan)
     analysis, analysis_sha256 = load_analysis_protocol(
         analysis_protocol_path,
         plan=plan,
@@ -169,12 +173,13 @@ def execute_campaign(
         (started_datetime + timedelta(days=maximum_window_days)).isoformat().replace("+00:00", "Z")
     )
     claim_payload = {
-        "schema_version": "txnopt-level1-campaign-launch-claim-v1",
+        "schema_version": "txnopt-level1-campaign-launch-claim-v2",
         "status": "CLAIMED_BEFORE_RAW_WRITE",
         "plan_manifest_sha256": plan.manifest_sha256,
         "analysis_protocol_sha256": analysis_sha256,
         "authorization_sha256": authorization_sha256,
         "raw_output_root": str(plan.raw_output_root),
+        "expected_identity_tree_sha256": plan.expected_identity_tree_sha256,
         "tool_identity": tool_identity,
         "runtime_identity": runtime_identity,
         "host": host_identity,
@@ -208,7 +213,6 @@ def execute_campaign(
             return _run_one(
                 entry,
                 python=python_path,
-                build_manifest_path=plan.build_manifest_path,
                 timeout_seconds=min(per_run_timeout_seconds, remaining_seconds),
             )
         finally:
@@ -247,12 +251,13 @@ def execute_campaign(
     if not global_window_satisfied:
         status = "FAILED"
     receipt = {
-        "schema_version": "txnopt-level1-campaign-execution-v1",
+        "schema_version": "txnopt-level1-campaign-execution-v2",
         "status": status,
         "plan_manifest_path": str(plan.manifest_path),
         "plan_manifest_sha256": plan.manifest_sha256,
         "analysis_protocol_path": str(analysis_protocol_path.resolve(strict=True)),
         "analysis_protocol_sha256": analysis_sha256,
+        "expected_identity_tree_sha256": plan.expected_identity_tree_sha256,
         "authorization_path": str(authorization_path.resolve(strict=True)),
         "authorization_sha256": authorization_sha256,
         "orchestration_identity": tool_identity,
@@ -285,9 +290,9 @@ def _run_one(
     entry: CampaignEntry,
     *,
     python: Path,
-    build_manifest_path: Path,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    expected_identity = load_prebound_expected_identity(entry)
     started_at = _utc_now()
     started_ns = time.monotonic_ns()
     completed = run_isolated_process(
@@ -361,10 +366,6 @@ def _run_one(
     if raw_manifest.get("schema_version") != "txnopt-raw-artifact-v3":
         return {**base, "status": "FAILED", "error": "raw artifact schema differs"}
     bundle_config = manifest_path.parent / "config.json"
-    expected_identity = ExpectedEvidenceIdentity.from_plan_inputs(
-        entry.config_path,
-        build_manifest_path=build_manifest_path,
-    )
     if (
         raw_manifest.get("run_label") != entry.run_label
         or raw_manifest.get("input_config_sha256") != entry.config_sha256
@@ -425,6 +426,13 @@ def _entry_identity(entry: CampaignEntry) -> dict[str, Any]:
         "run_label": entry.run_label,
         "config_path": str(entry.config_path),
         "config_sha256": entry.config_sha256,
+        "expected_identity_relative_path": entry.expected_identity_relative_path,
+        "expected_identity_path": (
+            str(entry.expected_identity_path)
+            if entry.expected_identity_path is not None
+            else None
+        ),
+        "expected_identity_sha256": entry.expected_identity_sha256,
         "domain": entry.domain,
         "case_id": entry.case_id,
         "seed": entry.seed,

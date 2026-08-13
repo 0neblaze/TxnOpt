@@ -216,6 +216,13 @@ failure receipt is
 `manifests/txnopt_level1_build_attempt12_failure.json`; no Build12 artifact may
 authorize calibration, procurement, or execution.
 
+The successor campaign contract is `txnopt-level1-campaign-plan-v2`. It binds
+one pre-run expected-identity digest per config plus an ordered identity-tree
+digest. Formal preflight, raw execution, and independent review consume those
+frozen files; they may not reconstruct trust anchors from a completed raw
+bundle. Launch, execution, per-run review, and final review receipts carry the
+same binding. Plan v1 remains a non-formal compatibility reader only.
+
 Static gate Attempt01 binds the unchanged Build11 implementation and installed
 wheel to 24/24 producer-owned contract, dependency, distribution, and CLI
 tests. It records entrypoint coverage 1, zero core import cycles, zero reverse

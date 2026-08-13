@@ -10,7 +10,13 @@ import pytest
 
 from txnopt import _native
 from txnopt_evidence.cli import main
-from txnopt_evidence.codec import read_signed_json, sha256_file, write_signed_json
+from txnopt_evidence.codec import (
+    canonical_json_bytes,
+    read_signed_json,
+    sha256_bytes,
+    sha256_file,
+    write_signed_json,
+)
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.lifecycle import (
     EvidenceLifecycle,
@@ -232,6 +238,9 @@ def test_runner_writes_raw_only_and_reviewer_reconstructs_both_domains(
         expected_identity=expected,
     )
     assert review["schema_version"] == "txnopt-independent-review-v3"
+    assert review["expected_identity_sha256"] == sha256_bytes(
+        canonical_json_bytes(expected.to_payload(), pretty=True)
+    )
     assert review["status"] == "PASS"
     assert review["prefix_safety"] == "PASS"
     assert review["case_replay"]["validator_status"] == "PASS"

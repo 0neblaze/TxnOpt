@@ -24,11 +24,13 @@ from tools.txnopt_level1_campaign_common import (
     linux_host_identity,
     load_analysis_protocol,
     load_campaign_plan,
+    load_prebound_expected_identity,
     memory_gib,
     physical_core_count,
     read_event_stream,
     read_signed_object,
     require_clean_repository,
+    require_prebound_expected_identities,
     run_isolated_process,
     sha256_bytes,
     sha256_file,
@@ -37,7 +39,6 @@ from tools.txnopt_level1_campaign_common import (
     verify_sidecar,
     write_signed_object,
 )
-from txnopt_evidence.identity import ExpectedEvidenceIdentity
 
 
 def review_campaign(
@@ -56,13 +57,14 @@ def review_campaign(
         raise ValueError("review workers and per-run timeout must be positive")
     reviewer_identity = _reviewer_identity()
     plan = load_campaign_plan(plan_path)
+    require_prebound_expected_identities(plan)
     analysis, analysis_sha256 = load_analysis_protocol(
         analysis_protocol_path,
         plan=plan,
     )
     execution = read_signed_object(
         execution_receipt_path,
-        schema_version="txnopt-level1-campaign-execution-v1",
+        schema_version="txnopt-level1-campaign-execution-v2",
     )
     execution_sha256 = verify_sidecar(execution_receipt_path)
     runtime_identity = verify_runtime_installation(plan, python=python, wheel=wheel)
@@ -88,8 +90,6 @@ def review_campaign(
     if review_receipt_path.exists() or review_receipt_path.is_symlink():
         raise FileExistsError(f"campaign review receipt already exists: {review_receipt_path}")
     review_destination.mkdir(parents=True, exist_ok=False)
-    expected_identity_root = review_destination / ".expected-identities"
-    expected_identity_root.mkdir()
     started_at = _utc_now()
     started_ns = time.monotonic_ns()
     records: list[dict[str, Any] | None] = [None] * len(plan.entries)
@@ -100,9 +100,7 @@ def review_campaign(
             entry,
             python=executable_path(python),
             review_root=review_destination,
-            expected_identity_root=expected_identity_root,
             timeout_seconds=per_run_timeout_seconds,
-            build_manifest_path=plan.build_manifest_path,
         )
 
     with ThreadPoolExecutor(max_workers=min(review_workers, len(plan.entries))) as executor:
@@ -130,13 +128,18 @@ def review_campaign(
         metrics = _aggregate(finalized, analysis, plan)
     gates = _gate_results(metrics, failures)
     all_pass = all(value == "PASS" for value in gates.values())
+    reviewed_identity_tree_sha256 = _reviewed_identity_tree_sha256(finalized)
+    if reviewed_identity_tree_sha256 != plan.expected_identity_tree_sha256:
+        raise ValueError("reviewed expected identity tree differs from the plan")
     receipt = {
-        "schema_version": "txnopt-level1-campaign-review-v1",
+        "schema_version": "txnopt-level1-campaign-review-v2",
         "status": "READY_FOR_INTERNAL_LEVEL1_SEAL" if all_pass else "NOT_READY",
         "plan_manifest_path": str(plan.manifest_path),
         "plan_manifest_sha256": plan.manifest_sha256,
         "analysis_protocol_path": str(analysis_protocol_path.resolve(strict=True)),
         "analysis_protocol_sha256": analysis_sha256,
+        "expected_identity_tree_sha256": plan.expected_identity_tree_sha256,
+        "reviewed_expected_identity_tree_sha256": reviewed_identity_tree_sha256,
         "execution_receipt_path": str(execution_receipt_path.resolve(strict=True)),
         "execution_receipt_sha256": execution_sha256,
         "reviewer_orchestration_identity": reviewer_identity,
@@ -169,10 +172,13 @@ def _review_one(
     *,
     python: Path,
     review_root: Path,
-    expected_identity_root: Path,
     timeout_seconds: float,
-    build_manifest_path: Path,
 ) -> dict[str, Any]:
+    load_prebound_expected_identity(entry)
+    expected_identity_path = entry.expected_identity_path
+    expected_identity_sha256 = entry.expected_identity_sha256
+    if expected_identity_path is None or expected_identity_sha256 is None:
+        raise ValueError("campaign entry lacks its prebound expected identity")
     raw_bundle = entry.raw_output_root / entry.run_label
     manifest_path = raw_bundle / "manifest.json"
     manifest_sha256 = verify_sidecar(manifest_path)
@@ -183,15 +189,6 @@ def _review_one(
             "status": "FAILED",
             "error": "raw artifact schema differs",
         }
-    expected_identity = ExpectedEvidenceIdentity.from_plan_inputs(
-        entry.config_path,
-        build_manifest_path=build_manifest_path,
-    )
-    expected_identity_path = expected_identity_root / f"{entry.run_label}.json"
-    expected_identity_sha256 = write_signed_object(
-        expected_identity_path,
-        expected_identity.to_payload(),
-    )
     review_dir = review_root / entry.run_label
     started_ns = time.monotonic_ns()
     completed = run_isolated_process(
@@ -243,6 +240,7 @@ def _review_one(
         or output.get("status") != "PASS"
         or review.get("status") != "PASS"
         or review.get("raw_manifest_sha256") != manifest_sha256
+        or review.get("expected_identity_sha256") != expected_identity_sha256
         or review.get("fallback_count") != 0
         or review.get("prefix_safety") != "PASS"
         or review.get("aggregate_refinement_replay") != "PASS"
@@ -634,6 +632,8 @@ def _validate_execution_receipt(
         execution.get("status") != "COMPLETE_RAW_ONLY_NOT_REVIEWED"
         or execution.get("plan_manifest_sha256") != plan.manifest_sha256
         or execution.get("analysis_protocol_sha256") != analysis_sha256
+        or execution.get("expected_identity_tree_sha256")
+        != plan.expected_identity_tree_sha256
         or execution.get("completed_run_count") != len(plan.entries)
         or execution.get("failed_run_count") != 0
         or execution.get("not_started_run_count") != 0
@@ -708,7 +708,7 @@ def _validate_execution_receipt(
         raise ValueError("campaign execution launch claim path differs")
     claim = read_signed_object(
         claim_path,
-        schema_version="txnopt-level1-campaign-launch-claim-v1",
+        schema_version="txnopt-level1-campaign-launch-claim-v2",
     )
     if (
         verify_sidecar(claim_path) != execution.get("launch_claim_sha256")
@@ -717,6 +717,8 @@ def _validate_execution_receipt(
         or claim.get("analysis_protocol_sha256") != analysis_sha256
         or claim.get("authorization_sha256") != execution.get("authorization_sha256")
         or claim.get("raw_output_root") != str(plan.raw_output_root)
+        or claim.get("expected_identity_tree_sha256")
+        != plan.expected_identity_tree_sha256
         or claim.get("tool_identity") != tool_identity
         or claim.get("runtime_identity") != runtime_identity
         or claim.get("host") != host
@@ -746,6 +748,16 @@ def _validate_execution_receipt(
             record.get("ordinal") != entry.ordinal
             or record.get("run_label") != entry.run_label
             or record.get("config_sha256") != entry.config_sha256
+            or record.get("expected_identity_relative_path")
+            != entry.expected_identity_relative_path
+            or record.get("expected_identity_path")
+            != (
+                str(entry.expected_identity_path)
+                if entry.expected_identity_path is not None
+                else None
+            )
+            or record.get("expected_identity_sha256")
+            != entry.expected_identity_sha256
             or record.get("status") != "COMPLETE"
             or record.get("raw_manifest_path") != str(manifest_path)
             or record.get("raw_manifest_sha256") != verify_sidecar(manifest_path)
@@ -822,12 +834,31 @@ def _entry_identity(entry: CampaignEntry) -> dict[str, Any]:
     return {
         "ordinal": entry.ordinal,
         "run_label": entry.run_label,
+        "expected_identity_relative_path": entry.expected_identity_relative_path,
+        "expected_identity_path": (
+            str(entry.expected_identity_path)
+            if entry.expected_identity_path is not None
+            else None
+        ),
+        "expected_identity_sha256": entry.expected_identity_sha256,
         "domain": entry.domain,
         "case_id": entry.case_id,
         "seed": entry.seed,
         "axis": entry.axis,
         "budget": entry.budget,
     }
+
+
+def _reviewed_identity_tree_sha256(records: list[dict[str, Any]]) -> str:
+    ordered = sorted(records, key=lambda record: int(record["ordinal"]))
+    entries: list[dict[str, str]] = []
+    for record in ordered:
+        path = record.get("expected_identity_relative_path")
+        digest = record.get("expected_identity_sha256")
+        if not isinstance(path, str) or not isinstance(digest, str):
+            raise ValueError("campaign review record lacks its expected identity binding")
+        entries.append({"path": path, "sha256": digest})
+    return sha256_bytes(canonical_json_bytes(entries))
 
 
 def _utc_now() -> str:

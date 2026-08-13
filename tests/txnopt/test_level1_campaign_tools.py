@@ -29,10 +29,60 @@ from tools.txnopt_level1_campaign_common import (
     validate_authorization,
     write_signed_object,
 )
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
 
 
 def _write(path: Path, payload: object) -> str:
     return write_signed_object(path, payload)
+
+
+def _rebind_plan_to_build(
+    plan_path: Path,
+    plan: dict[str, object],
+    build_path: Path,
+    build_sha256: str,
+) -> None:
+    entries = plan["entries"]
+    assert isinstance(entries, list)
+    for raw_entry in entries:
+        assert isinstance(raw_entry, dict)
+        config_path = plan_path.parent / str(raw_entry["path"])
+        config = json.loads(config_path.read_bytes())
+        config["build_manifest"]["sha256"] = build_sha256
+        config_bytes = canonical_json_bytes(config, pretty=True)
+        config_path.write_bytes(config_bytes)
+        raw_entry["sha256"] = sha256_bytes(config_bytes)
+        identity_path = plan_path.parent / str(raw_entry["expected_identity_path"])
+        identity_path.unlink()
+        identity_path.with_suffix(".json.sha256").unlink()
+        identity = ExpectedEvidenceIdentity.from_plan_inputs(
+            config_path,
+            build_manifest_path=build_path,
+        )
+        raw_entry["expected_identity_sha256"] = _write(
+            identity_path,
+            identity.to_payload(),
+        )
+    plan["build_manifest_sha256"] = build_sha256
+    plan["config_tree_sha256"] = sha256_bytes(
+        canonical_json_bytes(
+            [{"path": entry["path"], "sha256": entry["sha256"]} for entry in entries]
+        )
+    )
+    plan["expected_identity_tree_sha256"] = sha256_bytes(
+        canonical_json_bytes(
+            [
+                {
+                    "path": entry["expected_identity_path"],
+                    "sha256": entry["expected_identity_sha256"],
+                }
+                for entry in entries
+            ]
+        )
+    )
+    plan_path.unlink()
+    plan_path.with_suffix(".json.sha256").unlink()
+    _write(plan_path, plan)
 
 
 def _campaign(tmp_path: Path) -> tuple[Path, Path]:
@@ -61,6 +111,7 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
             "revision": "a" * 40,
             "git_tree": "b" * 40,
             "source_manifest_sha256": "c" * 64,
+            "tracked_file_count": 1,
             "source_dirty": False,
             "development_override": False,
         },
@@ -115,6 +166,8 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
     plan_root = tmp_path / "plan"
     configs = plan_root / "configs"
     configs.mkdir(parents=True)
+    identities_root = plan_root / "expected-identities"
+    identities_root.mkdir()
     entries: list[dict[str, str]] = []
     for domain, case_id in (("evrptw", "c101C5"), ("rcpsp", "j1201_1")):
         for axis, (mode, workers, speculation) in AXES.items():
@@ -147,10 +200,37 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
                 }
                 relative = f"configs/{label}.json"
                 data = canonical_json_bytes(config, pretty=True)
-                (plan_root / relative).write_bytes(data)
-                entries.append({"path": relative, "sha256": sha256_bytes(data)})
+                config_path = plan_root / relative
+                config_path.write_bytes(data)
+                expected_identity = ExpectedEvidenceIdentity.from_plan_inputs(
+                    config_path,
+                    build_manifest_path=build_path,
+                )
+                identity_relative = f"expected-identities/{label}.json"
+                identity_sha256 = _write(
+                    plan_root / identity_relative,
+                    expected_identity.to_payload(),
+                )
+                entries.append(
+                    {
+                        "path": relative,
+                        "sha256": sha256_bytes(data),
+                        "expected_identity_path": identity_relative,
+                        "expected_identity_sha256": identity_sha256,
+                    }
+                )
+    config_tree_entries = [
+        {"path": entry["path"], "sha256": entry["sha256"]} for entry in entries
+    ]
+    identity_tree_entries = [
+        {
+            "path": entry["expected_identity_path"],
+            "sha256": entry["expected_identity_sha256"],
+        }
+        for entry in entries
+    ]
     plan = {
-        "schema_version": "txnopt-level1-campaign-plan-v1",
+        "schema_version": "txnopt-level1-campaign-plan-v2",
         "status": "PLANNED_NOT_STARTED",
         "protocol_path": str(protocol_path),
         "protocol_sha256": protocol_sha256,
@@ -160,7 +240,10 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
         "build_manifest_path": str(build_path),
         "build_manifest_sha256": build_sha256,
         "config_count": len(entries),
-        "config_tree_sha256": sha256_bytes(canonical_json_bytes(entries)),
+        "config_tree_sha256": sha256_bytes(canonical_json_bytes(config_tree_entries)),
+        "expected_identity_tree_sha256": sha256_bytes(
+            canonical_json_bytes(identity_tree_entries)
+        ),
         "fixed_work": 1200,
         "fixed_time_seconds": 3.0,
         "max_rounds": 10,
@@ -230,9 +313,36 @@ def test_preflight_verifies_the_complete_plan_without_creating_raw_output(
 
     assert receipt["status"] == "PASS_NOT_AUTHORIZED_TO_EXECUTE"
     assert receipt["config_count"] == 16
+    assert receipt["expected_identity_tree_sha256"] == json.loads(
+        plan_path.read_bytes()
+    )["expected_identity_tree_sha256"]
     assert receipt["cloud_purchase_authorized"] is False
     assert receipt["formal_matrix_started"] is False
     assert not Path(receipt["raw_output_root"]).exists()
+
+
+def test_preflight_rejects_legacy_plan_without_prebound_identity_tree(
+    tmp_path: Path,
+) -> None:
+    plan_path, analysis_path = _campaign(tmp_path)
+    plan = json.loads(plan_path.read_bytes())
+    plan["schema_version"] = "txnopt-level1-campaign-plan-v1"
+    plan.pop("expected_identity_tree_sha256")
+    plan["entries"] = [
+        {"path": entry["path"], "sha256": entry["sha256"]}
+        for entry in plan["entries"]
+    ]
+    plan_path.unlink()
+    plan_path.with_suffix(".json.sha256").unlink()
+    _write(plan_path, plan)
+    analysis = json.loads(analysis_path.read_bytes())
+    analysis["campaign_plan_sha256"] = sha256_file(plan_path)
+    analysis_path.unlink()
+    analysis_path.with_suffix(".json.sha256").unlink()
+    _write(analysis_path, analysis)
+
+    with pytest.raises(ValueError, match="prebound expected identity"):
+        preflight_campaign(plan_path, analysis_path)
 
 
 def test_plan_loader_accepts_build10_only_with_its_pending_formal_boundary(
@@ -262,20 +372,7 @@ def test_plan_loader_accepts_build10_only_with_its_pending_formal_boundary(
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
-    for entry in plan_payload["entries"]:
-        config_path = plan_path.parent / entry["path"]
-        config = json.loads(config_path.read_bytes())
-        config["build_manifest"]["sha256"] = build_sha256
-        config_bytes = canonical_json_bytes(config, pretty=True)
-        config_path.write_bytes(config_bytes)
-        entry["sha256"] = sha256_bytes(config_bytes)
-    plan_payload["build_manifest_sha256"] = build_sha256
-    plan_payload["config_tree_sha256"] = sha256_bytes(
-        canonical_json_bytes(plan_payload["entries"])
-    )
-    plan_path.unlink()
-    plan_path.with_suffix(".json.sha256").unlink()
-    _write(plan_path, plan_payload)
+    _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
 
     loaded = load_campaign_plan(plan_path)
     assert loaded.payload["attempt"] == 18
@@ -284,20 +381,7 @@ def test_plan_loader_accepts_build10_only_with_its_pending_formal_boundary(
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
-    for entry in plan_payload["entries"]:
-        config_path = plan_path.parent / entry["path"]
-        config = json.loads(config_path.read_bytes())
-        config["build_manifest"]["sha256"] = build_sha256
-        config_bytes = canonical_json_bytes(config, pretty=True)
-        config_path.write_bytes(config_bytes)
-        entry["sha256"] = sha256_bytes(config_bytes)
-    plan_payload["build_manifest_sha256"] = build_sha256
-    plan_payload["config_tree_sha256"] = sha256_bytes(
-        canonical_json_bytes(plan_payload["entries"])
-    )
-    plan_path.unlink()
-    plan_path.with_suffix(".json.sha256").unlink()
-    _write(plan_path, plan_payload)
+    _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
     with pytest.raises(ValueError, match="formal-successor boundary"):
         load_campaign_plan(plan_path)
 
@@ -331,20 +415,7 @@ def test_plan_loader_accepts_build11_only_with_its_pending_lifecycle_boundary(
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
-    for entry in plan_payload["entries"]:
-        config_path = plan_path.parent / entry["path"]
-        config = json.loads(config_path.read_bytes())
-        config["build_manifest"]["sha256"] = build_sha256
-        config_bytes = canonical_json_bytes(config, pretty=True)
-        config_path.write_bytes(config_bytes)
-        entry["sha256"] = sha256_bytes(config_bytes)
-    plan_payload["build_manifest_sha256"] = build_sha256
-    plan_payload["config_tree_sha256"] = sha256_bytes(
-        canonical_json_bytes(plan_payload["entries"])
-    )
-    plan_path.unlink()
-    plan_path.with_suffix(".json.sha256").unlink()
-    _write(plan_path, plan_payload)
+    _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
 
     loaded = load_campaign_plan(plan_path)
     assert loaded.payload["attempt"] == 18
@@ -353,21 +424,48 @@ def test_plan_loader_accepts_build11_only_with_its_pending_lifecycle_boundary(
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
-    for entry in plan_payload["entries"]:
-        config_path = plan_path.parent / entry["path"]
-        config = json.loads(config_path.read_bytes())
-        config["build_manifest"]["sha256"] = build_sha256
-        config_bytes = canonical_json_bytes(config, pretty=True)
-        config_path.write_bytes(config_bytes)
-        entry["sha256"] = sha256_bytes(config_bytes)
-    plan_payload["build_manifest_sha256"] = build_sha256
-    plan_payload["config_tree_sha256"] = sha256_bytes(
-        canonical_json_bytes(plan_payload["entries"])
-    )
-    plan_path.unlink()
-    plan_path.with_suffix(".json.sha256").unlink()
-    _write(plan_path, plan_payload)
+    _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
     with pytest.raises(ValueError, match="Build11 formal-successor boundary"):
+        load_campaign_plan(plan_path)
+
+
+def test_plan_loader_accepts_build13_only_as_an_anchored_review_successor(
+    tmp_path: Path,
+) -> None:
+    plan_path, _analysis_path = _campaign(tmp_path)
+    plan = json.loads(plan_path.read_bytes())
+    build_path = Path(plan["build_manifest_path"])
+    build = json.loads(build_path.read_bytes())
+    build.update(
+        {
+            "run_label": "txnopt_level1_build_attempt13",
+            "status": "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY",
+            "formal_successor": {
+                "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+                "successor_status": "REVIEW_PENDING_BUILD13",
+                "independent_successor_review_completed": False,
+                "level1_formal_gate_passed": False,
+            },
+        }
+    )
+    build["validation"]["wheel_surface_and_record"] = build["validation"].pop(
+        "wheel_surface"
+    )
+    build["validation"].pop("formal_replay")
+    build.pop("formal_package")
+    build_path.unlink()
+    build_path.with_suffix(".json.sha256").unlink()
+    build_sha256 = _write(build_path, build)
+    _rebind_plan_to_build(plan_path, plan, build_path, build_sha256)
+
+    assert load_campaign_plan(plan_path).build_manifest_sha256 == build_sha256
+
+    build["formal_successor"]["successor_status"] = "REVIEW_PENDING_BUILD12"
+    build_path.unlink()
+    build_path.with_suffix(".json.sha256").unlink()
+    build_sha256 = _write(build_path, build)
+    _rebind_plan_to_build(plan_path, plan, build_path, build_sha256)
+    with pytest.raises(ValueError, match="Build13 formal-successor boundary"):
         load_campaign_plan(plan_path)
 
 
@@ -380,6 +478,37 @@ def test_preflight_rejects_config_tampering_and_an_existing_raw_root(
     first.write_bytes(first.read_bytes() + b" ")
     with pytest.raises(ValueError, match="config digest differs"):
         preflight_campaign(plan_path, analysis_path)
+
+
+def test_plan_loader_rejects_an_expected_identity_resigned_after_planning(
+    tmp_path: Path,
+) -> None:
+    plan_path, _analysis_path = _campaign(tmp_path)
+    plan = json.loads(plan_path.read_bytes())
+    first = plan["entries"][0]
+    identity_path = plan_path.parent / first["expected_identity_path"]
+    identity = json.loads(identity_path.read_bytes())
+    identity["expected_oracle"] = "forged.oracle"
+    identity_path.unlink()
+    identity_path.with_suffix(".json.sha256").unlink()
+    first["expected_identity_sha256"] = _write(identity_path, identity)
+    plan["expected_identity_tree_sha256"] = sha256_bytes(
+        canonical_json_bytes(
+            [
+                {
+                    "path": entry["expected_identity_path"],
+                    "sha256": entry["expected_identity_sha256"],
+                }
+                for entry in plan["entries"]
+            ]
+        )
+    )
+    plan_path.unlink()
+    plan_path.with_suffix(".json.sha256").unlink()
+    _write(plan_path, plan)
+
+    with pytest.raises(ValueError, match="expected identity differs from plan inputs"):
+        load_campaign_plan(plan_path)
 
     plan_path, analysis_path = _campaign(tmp_path / "second")
     raw_root = Path(json.loads(plan_path.read_bytes())["raw_output_root"])
@@ -400,6 +529,7 @@ def test_execution_requires_an_exact_separate_authorization(tmp_path: Path) -> N
         "campaign_plan_sha256": plan.manifest_sha256,
         "analysis_protocol_sha256": analysis_sha256,
         "config_tree_sha256": plan.payload["config_tree_sha256"],
+        "expected_identity_tree_sha256": plan.expected_identity_tree_sha256,
         "build_manifest_sha256": plan.build_manifest_sha256,
         "wheel_sha256": build["artifacts"]["wheel"]["sha256"],
         "raw_output_root": str(plan.raw_output_root),
@@ -409,6 +539,10 @@ def test_execution_requires_an_exact_separate_authorization(tmp_path: Path) -> N
     }
     validate_authorization(authorization, plan, analysis_sha256)
     authorization["campaign_plan_sha256"] = "0" * 64
+    with pytest.raises(PermissionError, match="exact campaign"):
+        validate_authorization(authorization, plan, analysis_sha256)
+    authorization["campaign_plan_sha256"] = plan.manifest_sha256
+    authorization["expected_identity_tree_sha256"] = "0" * 64
     with pytest.raises(PermissionError, match="exact campaign"):
         validate_authorization(authorization, plan, analysis_sha256)
 

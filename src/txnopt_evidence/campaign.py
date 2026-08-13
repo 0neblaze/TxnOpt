@@ -22,6 +22,7 @@ from txnopt_evidence.codec import (
     verify_sidecar,
     write_sidecar,
 )
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{1,63}")
 _AXES: Mapping[str, tuple[str, int, int]] = {
@@ -102,6 +103,8 @@ def materialize_level1_plan(
         raise FileExistsError(f"campaign plan destination already exists: {output}")
     configs_dir = output / "configs"
     configs_dir.mkdir(parents=True, exist_ok=False)
+    identities_dir = output / "expected-identities"
+    identities_dir.mkdir(exist_ok=False)
     raw_root = raw_output_root.resolve()
     entries: list[dict[str, str]] = []
     case_payloads = _load_cases(
@@ -147,12 +150,44 @@ def materialize_level1_plan(
                         }
                         relative = f"configs/{label}.json"
                         config_bytes = canonical_json_bytes(config, pretty=True)
-                        (output / relative).write_bytes(config_bytes)
-                        entries.append({"path": relative, "sha256": sha256_bytes(config_bytes)})
+                        config_path = output / relative
+                        config_path.write_bytes(config_bytes)
+                        expected_identity = ExpectedEvidenceIdentity.from_plan_inputs(
+                            config_path,
+                            build_manifest_path=build_manifest_source,
+                        )
+                        identity_relative = f"expected-identities/{label}.json"
+                        identity_path = output / identity_relative
+                        identity_bytes = canonical_json_bytes(
+                            expected_identity.to_payload(),
+                            pretty=True,
+                        )
+                        identity_path.write_bytes(identity_bytes)
+                        identity_sha256 = sha256_bytes(identity_bytes)
+                        write_sidecar(identity_path, identity_sha256)
+                        entries.append(
+                            {
+                                "path": relative,
+                                "sha256": sha256_bytes(config_bytes),
+                                "expected_identity_path": identity_relative,
+                                "expected_identity_sha256": identity_sha256,
+                            }
+                        )
 
-    tree_sha256 = sha256_bytes(canonical_json_bytes(entries))
+    config_tree_entries = [
+        {"path": entry["path"], "sha256": entry["sha256"]} for entry in entries
+    ]
+    identity_tree_entries = [
+        {
+            "path": entry["expected_identity_path"],
+            "sha256": entry["expected_identity_sha256"],
+        }
+        for entry in entries
+    ]
+    tree_sha256 = sha256_bytes(canonical_json_bytes(config_tree_entries))
+    identity_tree_sha256 = sha256_bytes(canonical_json_bytes(identity_tree_entries))
     manifest = {
-        "schema_version": "txnopt-level1-campaign-plan-v1",
+        "schema_version": "txnopt-level1-campaign-plan-v2",
         "status": "PLANNED_NOT_STARTED",
         "protocol_path": str(protocol_source),
         "protocol_sha256": _sha256_file(protocol_source),
@@ -163,6 +198,7 @@ def materialize_level1_plan(
         "build_manifest_sha256": build_manifest_sha256,
         "config_count": len(entries),
         "config_tree_sha256": tree_sha256,
+        "expected_identity_tree_sha256": identity_tree_sha256,
         "fixed_work": fixed_work,
         "fixed_time_seconds": fixed_time_seconds,
         "max_rounds": max_rounds,

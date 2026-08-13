@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
+
 AXES: dict[str, tuple[str, int, int]] = {
     "serial_1": ("serial", 1, 0),
     "txnopt_1": ("ordered", 1, 1),
@@ -45,6 +47,9 @@ class CampaignEntry:
     relative_path: str
     config_path: Path
     config_sha256: str
+    expected_identity_relative_path: str | None
+    expected_identity_path: Path | None
+    expected_identity_sha256: str | None
     run_label: str
     raw_output_root: Path
     domain: str
@@ -65,6 +70,7 @@ class CampaignPlan:
     raw_output_root: Path
     build_manifest_path: Path
     build_manifest_sha256: str
+    expected_identity_tree_sha256: str | None
     entries: tuple[CampaignEntry, ...]
 
 
@@ -144,8 +150,10 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
     manifest_path = path.resolve(strict=True)
     manifest_sha256 = verify_sidecar(manifest_path)
     plan = _object(json.loads(manifest_path.read_bytes()), "campaign plan")
+    schema_version = plan.get("schema_version")
     if (
-        plan.get("schema_version") != "txnopt-level1-campaign-plan-v1"
+        schema_version
+        not in {"txnopt-level1-campaign-plan-v1", "txnopt-level1-campaign-plan-v2"}
         or plan.get("status") != "PLANNED_NOT_STARTED"
         or plan.get("holdout_opened") is not False
         or plan.get("cloud_purchase_authorized") is not False
@@ -225,6 +233,19 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             raise ValueError("Build11 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
+    elif run_label == "txnopt_level1_build_attempt13":
+        formal_successor = _object(build.get("formal_successor"), "build formal successor")
+        if (
+            status
+            != "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY"
+            or formal_successor.get("prior_review_binding_status") != "PRIOR_SOURCE_ONLY"
+            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD13"
+            or formal_successor.get("independent_successor_review_completed") is not False
+            or formal_successor.get("level1_formal_gate_passed") is not False
+        ):
+            raise ValueError("Build13 formal-successor boundary differs")
+        surface_gate = "wheel_surface_and_record"
+        additional_gates = ()
     else:
         raise ValueError("campaign build identity is not an approved Level 1 producer")
     for gate in (
@@ -279,8 +300,21 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
     entries: list[CampaignEntry] = []
     identities: set[tuple[str, str, int, str, str]] = set()
     canonical_entries: list[dict[str, str]] = []
+    canonical_identity_entries: list[dict[str, str]] = []
     for ordinal, raw_entry in enumerate(raw_entries, 1):
         entry = _object(raw_entry, "campaign entry")
+        expected_entry_fields = (
+            {"path", "sha256"}
+            if schema_version == "txnopt-level1-campaign-plan-v1"
+            else {
+                "path",
+                "sha256",
+                "expected_identity_path",
+                "expected_identity_sha256",
+            }
+        )
+        if set(entry) != expected_entry_fields:
+            raise ValueError("campaign entry field set differs from its plan schema")
         relative_path = entry.get("path")
         expected_sha256 = entry.get("sha256")
         if not isinstance(relative_path, str) or not isinstance(expected_sha256, str):
@@ -297,6 +331,43 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
         if sha256_file(config_path) != expected_sha256:
             raise ValueError(f"campaign config digest differs: {relative_path}")
         config = _object(json.loads(config_path.read_bytes()), "campaign config")
+        identity_path: Path | None = None
+        identity_relative: str | None = None
+        identity_sha256: str | None = None
+        if schema_version == "txnopt-level1-campaign-plan-v2":
+            identity_relative = entry.get("expected_identity_path")
+            identity_sha256 = entry.get("expected_identity_sha256")
+            if not isinstance(identity_relative, str) or not isinstance(
+                identity_sha256, str
+            ):
+                raise ValueError("campaign expected identity binding is invalid")
+            identity_pure = PurePosixPath(identity_relative)
+            if (
+                identity_pure.is_absolute()
+                or ".." in identity_pure.parts
+                or identity_pure.parts[:1] != ("expected-identities",)
+            ):
+                raise ValueError("campaign expected identity path escapes its plan")
+            identity_candidate = manifest_path.parent / Path(*identity_pure.parts)
+            if identity_candidate.is_symlink():
+                raise ValueError("campaign expected identity cannot be a symlink")
+            identity_path = identity_candidate.resolve(strict=True)
+            if manifest_path.parent not in identity_path.parents:
+                raise ValueError("campaign expected identity must be an in-plan file")
+            if verify_sidecar(identity_path) != identity_sha256:
+                raise ValueError("campaign expected identity digest differs")
+            observed_identity = ExpectedEvidenceIdentity.from_payload(
+                json.loads(identity_path.read_bytes())
+            )
+            derived_identity = ExpectedEvidenceIdentity.from_plan_inputs(
+                config_path,
+                build_manifest_path=build_manifest_path,
+            )
+            if observed_identity != derived_identity:
+                raise ValueError("campaign expected identity differs from plan inputs")
+            canonical_identity_entries.append(
+                {"path": identity_relative, "sha256": identity_sha256}
+            )
         campaign_entry = _parse_config_entry(
             ordinal,
             relative_path,
@@ -308,6 +379,9 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             case_ids,
             catalog_sources,
             seeds,
+            expected_identity_path=identity_path,
+            expected_identity_relative_path=identity_relative,
+            expected_identity_sha256=identity_sha256,
         )
         identity = (
             campaign_entry.domain,
@@ -334,6 +408,15 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
         raise ValueError("campaign config identity set differs from the protocol")
     if sha256_bytes(canonical_json_bytes(canonical_entries)) != plan.get("config_tree_sha256"):
         raise ValueError("campaign config tree digest differs")
+    identity_tree_sha256: str | None = None
+    if schema_version == "txnopt-level1-campaign-plan-v2":
+        identity_tree_sha256 = sha256_bytes(
+            canonical_json_bytes(canonical_identity_entries)
+        )
+        if identity_tree_sha256 != plan.get("expected_identity_tree_sha256"):
+            raise ValueError("campaign expected identity tree digest differs")
+    elif "expected_identity_tree_sha256" in plan:
+        raise ValueError("legacy campaign plan cannot bind a v2 identity tree")
     return CampaignPlan(
         manifest_path=manifest_path,
         manifest_sha256=manifest_sha256,
@@ -343,8 +426,40 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
         raw_output_root=raw_output_root,
         build_manifest_path=build_manifest_path,
         build_manifest_sha256=build_manifest_sha256,
+        expected_identity_tree_sha256=identity_tree_sha256,
         entries=tuple(entries),
     )
+
+
+def require_prebound_expected_identities(plan: CampaignPlan) -> None:
+    if (
+        plan.payload.get("schema_version") != "txnopt-level1-campaign-plan-v2"
+        or plan.expected_identity_tree_sha256 is None
+        or any(
+            entry.expected_identity_relative_path is None
+            or entry.expected_identity_path is None
+            or entry.expected_identity_sha256 is None
+            for entry in plan.entries
+        )
+    ):
+        raise ValueError("formal campaign requires a prebound expected identity tree")
+
+
+def load_prebound_expected_identity(entry: CampaignEntry) -> ExpectedEvidenceIdentity:
+    if entry.expected_identity_path is None or entry.expected_identity_sha256 is None:
+        raise ValueError("campaign entry lacks its prebound expected identity")
+    if verify_sidecar(entry.expected_identity_path) != entry.expected_identity_sha256:
+        raise ValueError("campaign expected identity changed after plan validation")
+    identity = ExpectedEvidenceIdentity.from_payload(
+        json.loads(entry.expected_identity_path.read_bytes())
+    )
+    if (
+        identity.run_label != entry.run_label
+        or identity.input_config_sha256 != entry.config_sha256
+        or identity.domain != entry.domain
+    ):
+        raise ValueError("campaign expected identity differs from its entry")
+    return identity
 
 
 def load_analysis_protocol(path: Path, *, plan: CampaignPlan) -> tuple[dict[str, Any], str]:
@@ -421,6 +536,8 @@ def validate_authorization(
         or payload.get("campaign_plan_sha256") != plan.manifest_sha256
         or payload.get("analysis_protocol_sha256") != analysis_sha256
         or payload.get("config_tree_sha256") != plan.payload.get("config_tree_sha256")
+        or payload.get("expected_identity_tree_sha256")
+        != plan.expected_identity_tree_sha256
         or payload.get("build_manifest_sha256") != plan.build_manifest_sha256
         or payload.get("wheel_sha256") != wheel.get("sha256")
         or payload.get("raw_output_root") != str(plan.raw_output_root)
@@ -871,6 +988,10 @@ def _parse_config_entry(
     case_ids: dict[str, tuple[str, ...]],
     catalog_sources: dict[str, dict[str, Path]],
     seeds: tuple[int, ...],
+    *,
+    expected_identity_path: Path | None,
+    expected_identity_relative_path: str | None,
+    expected_identity_sha256: str | None,
 ) -> CampaignEntry:
     if config.get("schema_version") != "txnopt-run-config-v1":
         raise ValueError("campaign config schema differs")
@@ -956,6 +1077,9 @@ def _parse_config_entry(
         relative_path=relative_path,
         config_path=config_path,
         config_sha256=config_sha256,
+        expected_identity_relative_path=expected_identity_relative_path,
+        expected_identity_path=expected_identity_path,
+        expected_identity_sha256=expected_identity_sha256,
         run_label=run_label,
         raw_output_root=raw_output_root,
         domain=str(domain),

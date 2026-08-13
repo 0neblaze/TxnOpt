@@ -81,6 +81,12 @@ txnopt -> never cases/evidence/legacy
   bundle or its SHA-256 sidecar is observed evidence, not its own trust root.
   Unanchored v1/v2 replay is an explicit legacy-compatibility path and cannot
   satisfy a formal readiness gate.
+- New formal campaign plans use `txnopt-level1-campaign-plan-v2`. Plan
+  materialization writes one signed expected-identity file per config and binds
+  their ordered tree digest before any raw run starts. Formal preflight,
+  execution, and review reject legacy plan schemas; launch, execution, and
+  review receipts must preserve the same identity-tree digest, and each
+  independent per-run review binds the exact expected-identity digest it used.
 - `txnopt_legacy` is read-only. New active execution may not depend on it.
 - Break cycles by extracting immutable identities, DTOs, or ports. Do not hide
   an architectural cycle behind a local import.

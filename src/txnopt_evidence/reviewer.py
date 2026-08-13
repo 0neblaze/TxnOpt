@@ -10,9 +10,11 @@ from typing import Any
 
 from txnopt_evidence.case_codec import review_case
 from txnopt_evidence.codec import (
+    canonical_json_bytes,
     read_event_stream,
     read_signed_json,
     resolve_bundle_file,
+    sha256_bytes,
     sha256_file,
     verify_sidecar,
     write_signed_json,
@@ -656,6 +658,18 @@ def _replay_manifest(
         ),
         "run_label": manifest.get("run_label"),
         "raw_manifest_sha256": raw_manifest_sha256,
+        **(
+            {
+                "expected_identity_sha256": sha256_bytes(
+                    canonical_json_bytes(
+                        _required_identity(expected_identity).to_payload(),
+                        pretty=True,
+                    )
+                )
+            }
+            if manifest.get("schema_version") == "txnopt-raw-artifact-v3"
+            else {}
+        ),
         "producer_identity": manifest["producer_identity"],
         "status": "PASS",
         "semantic_digest": semantic_digest,

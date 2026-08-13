@@ -99,12 +99,26 @@ def test_campaign_materializer_binds_every_axis_without_starting_runs(
     )
 
     assert manifest["status"] == "PLANNED_NOT_STARTED"
+    assert manifest["schema_version"] == "txnopt-level1-campaign-plan-v2"
     assert manifest["config_count"] == 16
     assert manifest["holdout_opened"] is False
     assert manifest["cloud_purchase_authorized"] is False
     assert manifest["max_candidates"] == {"evrptw": 3, "rcpsp": 5}
     assert len(manifest["build_manifest_sha256"]) == 64
     assert len(list((tmp_path / "plan/configs").glob("*.json"))) == 16
+    assert len(list((tmp_path / "plan/expected-identities").glob("*.json"))) == 16
+    assert len(manifest["expected_identity_tree_sha256"]) == 64
+    first_entry = manifest["entries"][0]
+    assert set(first_entry) == {
+        "path",
+        "sha256",
+        "expected_identity_path",
+        "expected_identity_sha256",
+    }
+    expected_identity_path = tmp_path / "plan" / first_entry["expected_identity_path"]
+    expected_identity = json.loads(expected_identity_path.read_bytes())
+    assert expected_identity["run_label"] in first_entry["path"]
+    assert expected_identity["input_config_sha256"] == first_entry["sha256"]
     assert list((tmp_path / "plan/configs").glob("*tinyc5*"))
     evrptw_config = json.loads(
         next((tmp_path / "plan/configs").glob("*tinyc5*serial_1_fixed_work*.json")).read_bytes()
