@@ -27,11 +27,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _normalize_generated_tla(path: Path) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    path.write_text("\n".join(line.rstrip() for line in lines) + "\n", encoding="utf-8")
-
-
 def _run(command: list[str], *, cwd: Path) -> str:
     completed = subprocess.run(
         command,
@@ -109,7 +104,6 @@ def verify(
         )
         if "Translation completed" not in translation:
             raise RuntimeError("PlusCal translation did not report completion")
-        _normalize_generated_tla(temp / "TxnOptOrderedPlusCal.tla")
         if (
             _sha256(temp / "TxnOptOrderedPlusCal.tla")
             != expected_hashes["formal/TxnOptOrderedPlusCal.tla"]

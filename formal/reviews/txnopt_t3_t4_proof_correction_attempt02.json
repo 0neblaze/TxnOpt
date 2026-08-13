@@ -1,0 +1,68 @@
+{
+  "schema_version": "txnopt-formal-proof-correction-v1",
+  "run_label": "txnopt_t3_t4_proof_correction_attempt02",
+  "status": "READY_FOR_INDEPENDENT_REVIEW",
+  "supersedes_review": null,
+  "responds_to": "txnopt_t3_t4_review_attempt01",
+  "bound_inputs": {
+    "formal/proofs.md": "fd14ed2dfc9de95fb4acd8d571bfa979b44d9a1e4d3b1a4514ea85fb84226e67",
+    "formal/refinement-mapping.md": "54ff0625cb92305db8f3caaaa1a409dbec1d7940534cdc9c341742a5daa33fd0",
+    "formal/model-check-receipt.json": "f7390c1163f2d9446a934ed8b0de04ce8e0fb629f1ad34abb3d6c3afb65431f1",
+    "tools/verify_txnopt_formal.py": "aadff518585a676b15a3a96baf314d7bb002b556489a942c4cae96678d988a98",
+    "src/txnopt/runtime.py": "6d30fa8d93db3aa3b7bc91b8d91f45acfa30d04ea6d241dacc15ec659be6088e",
+    "src/txnopt/_internal/waste_bounds.py": "aa94600bd08551cb7a65f9155218c448924b9145ba7dbd2506c0e981b89df4f8",
+    "tests/txnopt/test_formal_contract.py": "60874945089b3a35af2d92184e84e0dbe5c63e81befb2e9852c3339fafc17269",
+    "tests/txnopt/test_parallel_runtime.py": "ecc1ec5606f6cf86d036bb2ed6364b7a3bd392a41d2b08b2d50b9c525729d1ef",
+    "tests/txnopt/test_transaction_properties.py": "d82696938d2b95092e7e9b6a99509e0e9207f73f26b75a2df6a8ec841614123b"
+  },
+  "corrections": [
+    {
+      "finding": "T3-PREDICATES",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "T3 now defines SI, ZW, AP, their quantifiers, a state-dependence witness, and the wait versus pre-resolution branch split."
+    },
+    {
+      "finding": "T4-ATOMIC-WINDOW",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "W is the full work-bearing uncommitted atomic transaction, including completed but unpublished candidates."
+    },
+    {
+      "finding": "T4-NATIVE-BATCH",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "P is expressed in non-terminal request work units; synchronous internal-native work before return is charged as discarded work, not hidden behind the Python submission width."
+    },
+    {
+      "finding": "T4-PARAMETER-BINDING",
+      "disposition": "PARTIAL",
+      "evidence": "Runtime physical receipts bind W, Qmax, P, actual discarded/non-terminal units, and unit bounds. Independently measured finite Cmax remains mandatory before a cost or Level 2 claim."
+    },
+    {
+      "finding": "REFINEMENT-GRANULARITY",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "The TLA+/PlusCal model now uses one aggregate batch phase and one atomic publication, matching CandidateTxn and runtime cache/state ownership."
+    },
+    {
+      "finding": "TLC-LIVENESS",
+      "disposition": "CLAIM_BOUNDARY_ACCEPTED",
+      "evidence": "The receipt explicitly claims bounded safety only. T3 is a separate meta-theorem; no TLC liveness or fairness claim is made."
+    }
+  ],
+  "verification": {
+    "tla_primary_generated_states": 75,
+    "tla_primary_distinct_states": 22,
+    "pluscal_generated_states": 36402,
+    "pluscal_distinct_states": 8134,
+    "formal_verifier_exit_code": 0,
+    "targeted_pytest_passed": 29,
+    "targeted_pytest_exit_code": 0,
+    "ruff_exit_code": 0,
+    "strict_mypy_exit_code": 0
+  },
+  "claim_boundary": {
+    "independent_review_completed": false,
+    "t3_t4_gate_passed": false,
+    "measured_cmax_available": false,
+    "level1_ready": false,
+    "level2_positive_entry_open": false
+  }
+}

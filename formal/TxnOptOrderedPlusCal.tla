@@ -4,79 +4,86 @@ EXTENDS Integers, Sequences
 CONSTANT CandidateCount
 
 CandidateOrder == [index \in 1..CandidateCount |-> index]
+CandidateIndices == 1..Len(CandidateOrder)
 TxnPhases == {
     "PREPARED", "RESERVED", "EVALUATING", "VALIDATED", "COMMITTED",
     "ABORTED", "INTERRUPTED"
 }
 
-(* --algorithm TxnOptOrdered {
+(* --algorithm TxnOptAtomicBatch {
 variables
-    pending = 1..Len(CandidateOrder),
+    pending = CandidateIndices,
     completed = {},
-    nextCommit = 1,
     committedTrace = <<>>,
     cacheVisible = {},
     terminated = FALSE,
-    txnPhase = [candidate \in 1..Len(CandidateOrder) |-> "PREPARED"];
+    txnPhase = "PREPARED";
 
 define {
-    CanonicalPrefix ==
-        committedTrace = SubSeq(CandidateOrder, 1, Len(committedTrace))
+    AtomicPublication ==
+        \/ committedTrace = <<>>
+        \/ committedTrace = CandidateOrder
     CacheRefinesTrace ==
         cacheVisible = {committedTrace[index] : index \in DOMAIN committedTrace}
-    PhaseTypeOK == txnPhase \in [1..Len(CandidateOrder) -> TxnPhases]
-    CommittedPhaseMatchesTrace ==
-        {candidate \in 1..Len(CandidateOrder) :
-            txnPhase[candidate] = "COMMITTED"} = cacheVisible
-    ValidatedMatchesCompleted ==
-        ~terminated =>
-            ({candidate \in 1..Len(CandidateOrder) :
-                txnPhase[candidate] = "VALIDATED"} = completed)
+    PhaseTypeOK == txnPhase \in TxnPhases
+    PrivateCompletionOnly ==
+        txnPhase # "COMMITTED" => /\ committedTrace = <<>> /\ cacheVisible = {}
+    CommittedPublishesWholeBatch ==
+        txnPhase = "COMMITTED" =>
+            /\ committedTrace = CandidateOrder
+            /\ cacheVisible = CandidateIndices
 }
 
-process (Worker \in 1..Len(CandidateOrder)) {
-Reserve:
-    await ~terminated /\ self \in pending;
-    txnPhase[self] := "RESERVED";
-Evaluate:
-    await ~terminated;
-    txnPhase[self] := "EVALUATING";
+process (Worker \in CandidateIndices) {
+AwaitEvaluation:
+    await terminated \/ txnPhase = "EVALUATING";
 Complete:
-    await ~terminated;
-    pending := pending \ {self};
-    completed := completed \cup {self};
-    txnPhase[self] := "VALIDATED";
+    if (~terminated) {
+        pending := pending \ {self};
+        completed := completed \cup {self};
+    };
 DoneWorker:
     skip;
 }
 
-process (Committer = 0) {
-CommitLoop:
-    while (~terminated /\ nextCommit <= Len(CandidateOrder)) {
-AwaitNext:
-        await nextCommit \in completed;
-CommitNext:
-        await ~terminated;
-        completed := completed \ {nextCommit};
-        committedTrace := Append(committedTrace, CandidateOrder[nextCommit]);
-        cacheVisible := cacheVisible \cup {CandidateOrder[nextCommit]};
-        txnPhase[nextCommit] := "COMMITTED";
-        nextCommit := nextCommit + 1;
+process (Owner = 0) {
+Reserve:
+    if (~terminated) {
+        txnPhase := "RESERVED";
     };
-DoneCommitter:
+StartEvaluation:
+    if (~terminated) {
+        txnPhase := "EVALUATING";
+    };
+AwaitBatch:
+    await terminated \/ pending = {};
+Validate:
+    if (~terminated) {
+        txnPhase := "VALIDATED";
+    };
+Commit:
+    if (~terminated) {
+        committedTrace := CandidateOrder;
+        cacheVisible := CandidateIndices;
+        txnPhase := "COMMITTED";
+    };
+DoneOwner:
     skip;
 }
 
 process (Failure = -1) {
 ChooseFailure:
     either {
-        terminated := TRUE;
-        pending := {};
-        completed := {};
-        txnPhase := [candidate \in 1..Len(CandidateOrder) |->
-            IF txnPhase[candidate] = "COMMITTED" THEN "COMMITTED"
-            ELSE IF txnPhase[candidate] = "EVALUATING" THEN "INTERRUPTED"
-            ELSE "ABORTED"];
+        if (txnPhase # "COMMITTED") {
+            terminated := TRUE;
+            pending := {};
+            completed := {};
+            either {
+                txnPhase := "ABORTED";
+            } or {
+                txnPhase := "INTERRUPTED";
+            };
+        };
     } or {
         skip;
     };
@@ -84,124 +91,136 @@ DoneFailure:
     skip;
 }
 } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "538b992b" /\ chksum(tla) = "a123ddd6")
-VARIABLES pending, completed, nextCommit, committedTrace, cacheVisible,
-          terminated, txnPhase, pc
+\* BEGIN TRANSLATION (chksum(pcal) = "17f11d5e" /\ chksum(tla) = "bb29cb5c")
+VARIABLES pending, completed, committedTrace, cacheVisible, terminated, 
+          txnPhase, pc
 
 (* define statement *)
-CanonicalPrefix ==
-    committedTrace = SubSeq(CandidateOrder, 1, Len(committedTrace))
+AtomicPublication ==
+    \/ committedTrace = <<>>
+    \/ committedTrace = CandidateOrder
 CacheRefinesTrace ==
     cacheVisible = {committedTrace[index] : index \in DOMAIN committedTrace}
-PhaseTypeOK == txnPhase \in [1..Len(CandidateOrder) -> TxnPhases]
-CommittedPhaseMatchesTrace ==
-    {candidate \in 1..Len(CandidateOrder) :
-        txnPhase[candidate] = "COMMITTED"} = cacheVisible
-ValidatedMatchesCompleted ==
-    ~terminated =>
-        ({candidate \in 1..Len(CandidateOrder) :
-            txnPhase[candidate] = "VALIDATED"} = completed)
+PhaseTypeOK == txnPhase \in TxnPhases
+PrivateCompletionOnly ==
+    txnPhase # "COMMITTED" => /\ committedTrace = <<>> /\ cacheVisible = {}
+CommittedPublishesWholeBatch ==
+    txnPhase = "COMMITTED" =>
+        /\ committedTrace = CandidateOrder
+        /\ cacheVisible = CandidateIndices
 
 
-vars == << pending, completed, nextCommit, committedTrace, cacheVisible,
-           terminated, txnPhase, pc >>
+vars == << pending, completed, committedTrace, cacheVisible, terminated, 
+           txnPhase, pc >>
 
-ProcSet == (1..Len(CandidateOrder)) \cup {0} \cup {-1}
+ProcSet == (CandidateIndices) \cup {0} \cup {-1}
 
 Init == (* Global variables *)
-        /\ pending = 1..Len(CandidateOrder)
+        /\ pending = CandidateIndices
         /\ completed = {}
-        /\ nextCommit = 1
         /\ committedTrace = <<>>
         /\ cacheVisible = {}
         /\ terminated = FALSE
-        /\ txnPhase = [candidate \in 1..Len(CandidateOrder) |-> "PREPARED"]
-        /\ pc = [self \in ProcSet |-> CASE self \in 1..Len(CandidateOrder) -> "Reserve"
-                                        [] self = 0 -> "CommitLoop"
+        /\ txnPhase = "PREPARED"
+        /\ pc = [self \in ProcSet |-> CASE self \in CandidateIndices -> "AwaitEvaluation"
+                                        [] self = 0 -> "Reserve"
                                         [] self = -1 -> "ChooseFailure"]
 
-Reserve(self) == /\ pc[self] = "Reserve"
-                 /\ ~terminated /\ self \in pending
-                 /\ txnPhase' = [txnPhase EXCEPT ![self] = "RESERVED"]
-                 /\ pc' = [pc EXCEPT ![self] = "Evaluate"]
-                 /\ UNCHANGED << pending, completed, nextCommit,
-                                 committedTrace, cacheVisible, terminated >>
-
-Evaluate(self) == /\ pc[self] = "Evaluate"
-                  /\ ~terminated
-                  /\ txnPhase' = [txnPhase EXCEPT ![self] = "EVALUATING"]
-                  /\ pc' = [pc EXCEPT ![self] = "Complete"]
-                  /\ UNCHANGED << pending, completed, nextCommit,
-                                  committedTrace, cacheVisible, terminated >>
+AwaitEvaluation(self) == /\ pc[self] = "AwaitEvaluation"
+                         /\ terminated \/ txnPhase = "EVALUATING"
+                         /\ pc' = [pc EXCEPT ![self] = "Complete"]
+                         /\ UNCHANGED << pending, completed, committedTrace, 
+                                         cacheVisible, terminated, txnPhase >>
 
 Complete(self) == /\ pc[self] = "Complete"
-                  /\ ~terminated
-                  /\ pending' = pending \ {self}
-                  /\ completed' = (completed \cup {self})
-                  /\ txnPhase' = [txnPhase EXCEPT ![self] = "VALIDATED"]
+                  /\ IF ~terminated
+                        THEN /\ pending' = pending \ {self}
+                             /\ completed' = (completed \cup {self})
+                        ELSE /\ TRUE
+                             /\ UNCHANGED << pending, completed >>
                   /\ pc' = [pc EXCEPT ![self] = "DoneWorker"]
-                  /\ UNCHANGED << nextCommit, committedTrace, cacheVisible,
-                                  terminated >>
+                  /\ UNCHANGED << committedTrace, cacheVisible, terminated, 
+                                  txnPhase >>
 
 DoneWorker(self) == /\ pc[self] = "DoneWorker"
                     /\ TRUE
                     /\ pc' = [pc EXCEPT ![self] = "Done"]
-                    /\ UNCHANGED << pending, completed, nextCommit,
-                                    committedTrace, cacheVisible, terminated,
-                                    txnPhase >>
+                    /\ UNCHANGED << pending, completed, committedTrace, 
+                                    cacheVisible, terminated, txnPhase >>
 
-Worker(self) == Reserve(self) \/ Evaluate(self) \/ Complete(self)
-                   \/ DoneWorker(self)
+Worker(self) == AwaitEvaluation(self) \/ Complete(self) \/ DoneWorker(self)
 
-CommitLoop == /\ pc[0] = "CommitLoop"
-              /\ IF ~terminated /\ nextCommit <= Len(CandidateOrder)
-                    THEN /\ pc' = [pc EXCEPT ![0] = "AwaitNext"]
-                    ELSE /\ pc' = [pc EXCEPT ![0] = "DoneCommitter"]
-              /\ UNCHANGED << pending, completed, nextCommit, committedTrace,
-                              cacheVisible, terminated, txnPhase >>
+Reserve == /\ pc[0] = "Reserve"
+           /\ IF ~terminated
+                 THEN /\ txnPhase' = "RESERVED"
+                 ELSE /\ TRUE
+                      /\ UNCHANGED txnPhase
+           /\ pc' = [pc EXCEPT ![0] = "StartEvaluation"]
+           /\ UNCHANGED << pending, completed, committedTrace, cacheVisible, 
+                           terminated >>
 
-AwaitNext == /\ pc[0] = "AwaitNext"
-             /\ nextCommit \in completed
-             /\ pc' = [pc EXCEPT ![0] = "CommitNext"]
-             /\ UNCHANGED << pending, completed, nextCommit, committedTrace,
-                             cacheVisible, terminated, txnPhase >>
+StartEvaluation == /\ pc[0] = "StartEvaluation"
+                   /\ IF ~terminated
+                         THEN /\ txnPhase' = "EVALUATING"
+                         ELSE /\ TRUE
+                              /\ UNCHANGED txnPhase
+                   /\ pc' = [pc EXCEPT ![0] = "AwaitBatch"]
+                   /\ UNCHANGED << pending, completed, committedTrace, 
+                                   cacheVisible, terminated >>
 
-CommitNext == /\ pc[0] = "CommitNext"
-              /\ ~terminated
-              /\ completed' = completed \ {nextCommit}
-              /\ committedTrace' = Append(committedTrace, CandidateOrder[nextCommit])
-              /\ cacheVisible' = (cacheVisible \cup {CandidateOrder[nextCommit]})
-              /\ txnPhase' = [txnPhase EXCEPT ![nextCommit] = "COMMITTED"]
-              /\ nextCommit' = nextCommit + 1
-              /\ pc' = [pc EXCEPT ![0] = "CommitLoop"]
-              /\ UNCHANGED << pending, terminated >>
+AwaitBatch == /\ pc[0] = "AwaitBatch"
+              /\ terminated \/ pending = {}
+              /\ pc' = [pc EXCEPT ![0] = "Validate"]
+              /\ UNCHANGED << pending, completed, committedTrace, cacheVisible, 
+                              terminated, txnPhase >>
 
-DoneCommitter == /\ pc[0] = "DoneCommitter"
-                 /\ TRUE
-                 /\ pc' = [pc EXCEPT ![0] = "Done"]
-                 /\ UNCHANGED << pending, completed, nextCommit,
-                                 committedTrace, cacheVisible, terminated,
-                                 txnPhase >>
+Validate == /\ pc[0] = "Validate"
+            /\ IF ~terminated
+                  THEN /\ txnPhase' = "VALIDATED"
+                  ELSE /\ TRUE
+                       /\ UNCHANGED txnPhase
+            /\ pc' = [pc EXCEPT ![0] = "Commit"]
+            /\ UNCHANGED << pending, completed, committedTrace, cacheVisible, 
+                            terminated >>
 
-Committer == CommitLoop \/ AwaitNext \/ CommitNext \/ DoneCommitter
+Commit == /\ pc[0] = "Commit"
+          /\ IF ~terminated
+                THEN /\ committedTrace' = CandidateOrder
+                     /\ cacheVisible' = CandidateIndices
+                     /\ txnPhase' = "COMMITTED"
+                ELSE /\ TRUE
+                     /\ UNCHANGED << committedTrace, cacheVisible, txnPhase >>
+          /\ pc' = [pc EXCEPT ![0] = "DoneOwner"]
+          /\ UNCHANGED << pending, completed, terminated >>
+
+DoneOwner == /\ pc[0] = "DoneOwner"
+             /\ TRUE
+             /\ pc' = [pc EXCEPT ![0] = "Done"]
+             /\ UNCHANGED << pending, completed, committedTrace, cacheVisible, 
+                             terminated, txnPhase >>
+
+Owner == Reserve \/ StartEvaluation \/ AwaitBatch \/ Validate \/ Commit
+            \/ DoneOwner
 
 ChooseFailure == /\ pc[-1] = "ChooseFailure"
-                 /\ \/ /\ terminated' = TRUE
-                       /\ pending' = {}
-                       /\ completed' = {}
-                       /\ txnPhase' =         [candidate \in 1..Len(CandidateOrder) |->
-                                      IF txnPhase[candidate] = "COMMITTED" THEN "COMMITTED"
-                                      ELSE IF txnPhase[candidate] = "EVALUATING" THEN "INTERRUPTED"
-                                      ELSE "ABORTED"]
+                 /\ \/ /\ IF txnPhase # "COMMITTED"
+                             THEN /\ terminated' = TRUE
+                                  /\ pending' = {}
+                                  /\ completed' = {}
+                                  /\ \/ /\ txnPhase' = "ABORTED"
+                                     \/ /\ txnPhase' = "INTERRUPTED"
+                             ELSE /\ TRUE
+                                  /\ UNCHANGED << pending, completed, 
+                                                  terminated, txnPhase >>
                     \/ /\ TRUE
                        /\ UNCHANGED <<pending, completed, terminated, txnPhase>>
                  /\ pc' = [pc EXCEPT ![-1] = "DoneFailure"]
-                 /\ UNCHANGED << nextCommit, committedTrace, cacheVisible >>
+                 /\ UNCHANGED << committedTrace, cacheVisible >>
 
 DoneFailure == /\ pc[-1] = "DoneFailure"
                /\ TRUE
                /\ pc' = [pc EXCEPT ![-1] = "Done"]
-               /\ UNCHANGED << pending, completed, nextCommit, committedTrace,
+               /\ UNCHANGED << pending, completed, committedTrace, 
                                cacheVisible, terminated, txnPhase >>
 
 Failure == ChooseFailure \/ DoneFailure
@@ -210,8 +229,8 @@ Failure == ChooseFailure \/ DoneFailure
 Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
                /\ UNCHANGED vars
 
-Next == Committer \/ Failure
-           \/ (\E self \in 1..Len(CandidateOrder): Worker(self))
+Next == Owner \/ Failure
+           \/ (\E self \in CandidateIndices: Worker(self))
            \/ Terminating
 
 Spec == Init /\ [][Next]_vars

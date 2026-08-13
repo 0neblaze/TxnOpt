@@ -4,6 +4,10 @@
 # Never apply line-ending conversion to these immutable artifacts.
 experiments/** -text whitespace=cr-at-eol
 
+# The PlusCal translator emits checksummed alignment spaces. Stripping them
+# makes TLC report that the checked-in translation changed after generation.
+formal/TxnOptOrderedPlusCal.tla whitespace=-trailing-space
+
 *.png binary
 *.jpg binary
 *.jpeg binary

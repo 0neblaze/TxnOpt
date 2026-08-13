@@ -19,6 +19,7 @@ from txnopt._internal.cache import (
 from txnopt._internal.candidate_txn import CandidateTxn, TxnPhase
 from txnopt._internal.random_tape import RandomTape
 from txnopt._internal.versions import CONTRACT_VERSION
+from txnopt._internal.waste_bounds import WasteAudit, audit_waste
 from txnopt.contracts import Oracle, RunConfig, RunResult, SearchKernel
 
 _DIGEST: Final = re.compile(r"[0-9a-f]{64}")
@@ -31,6 +32,22 @@ class RuntimeContractError(RuntimeError):
 
 class OracleWorkerError(RuntimeError):
     """Controlled worker failure that refines to the last commit prefix."""
+
+
+class _EvaluationAbort(RuntimeError):
+    """Private carrier for a detected evaluation boundary and its live work."""
+
+    def __init__(
+        self,
+        cause: OracleWorkerError | TimeoutError,
+        *,
+        post_boundary_work_units: int,
+        post_boundary_capacity_units: int,
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.post_boundary_work_units = post_boundary_work_units
+        self.post_boundary_capacity_units = post_boundary_capacity_units
 
 
 @runtime_checkable
@@ -55,6 +72,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         self._semantic_event_sink = semantic_event_sink
         self._physical_event_sink = physical_event_sink
         self._physical_started_ns: int | None = None
+        self._waste_audits: list[Mapping[str, object]] = []
 
     def run(
         self,
@@ -64,6 +82,8 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         oracle: Oracle[CandidateT, StateT, ObjectiveT],
         config: RunConfig,
     ) -> RunResult[StateT, ObjectiveT]:
+        self._physical_started_ns = None
+        self._waste_audits = []
         if config.trace_policy == "semantic_and_physical":
             if self._physical_event_sink is None:
                 raise RuntimeContractError(
@@ -208,6 +228,8 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             missing_work = tuple(
                 self._validated_work_units(oracle, candidate) for _index, _key, candidate in missing
             )
+            remaining_before = budget.remaining
+            started_before = budget.started
             reservation = budget.reserve(sum(missing_work))
             if not reservation.granted:
                 cache.rollback(cache_transaction)
@@ -244,28 +266,34 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                         config=config,
                         deadline_ns=deadline_ns,
                     )
-                except OracleWorkerError:
+                except _EvaluationAbort as abort:
                     cache.rollback(cache_transaction)
-                    transaction = transaction.transition(TxnPhase.ABORTED)
-                    semantic_events.append(self._phase_event(transaction))
-                    return self._result(
-                        state=state,
-                        objective=objective,
-                        reason="worker_failure",
-                        events=semantic_events,
-                        config=config,
-                        oracle=oracle,
+                    if isinstance(abort.cause, OracleWorkerError):
+                        phase = TxnPhase.ABORTED
+                        reason = "worker_failure"
+                    else:
+                        if deadline_ns is None:
+                            raise abort.cause from abort
+                        phase = TxnPhase.INTERRUPTED
+                        reason = "deadline"
+                    self._record_waste_audit(
+                        reason=reason,
+                        remaining_budget_before=remaining_before,
+                        work_units=missing_work,
+                        observed_discarded_work_units=budget.started - started_before,
+                        observed_post_boundary_work_units=(
+                            abort.post_boundary_work_units
+                        ),
+                        post_boundary_capacity_units=(
+                            abort.post_boundary_capacity_units
+                        ),
                     )
-                except TimeoutError:
-                    if deadline_ns is None:
-                        raise
-                    cache.rollback(cache_transaction)
-                    transaction = transaction.transition(TxnPhase.INTERRUPTED)
+                    transaction = transaction.transition(phase)
                     semantic_events.append(self._phase_event(transaction))
                     return self._result(
                         state=state,
                         objective=objective,
-                        reason="deadline",
+                        reason=reason,
                         events=semantic_events,
                         config=config,
                         oracle=oracle,
@@ -289,6 +317,14 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
 
             if deadline_ns is not None and self._clock_ns() >= deadline_ns:
                 cache.rollback(cache_transaction)
+                self._record_waste_audit(
+                    reason="deadline",
+                    remaining_budget_before=remaining_before,
+                    work_units=missing_work,
+                    observed_discarded_work_units=budget.started - started_before,
+                    observed_post_boundary_work_units=0,
+                    post_boundary_capacity_units=0,
+                )
                 transaction = transaction.transition(TxnPhase.INTERRUPTED)
                 semantic_events.append(self._phase_event(transaction))
                 return self._result(
@@ -312,6 +348,14 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                     self._validated_state_digest(oracle, evaluated_state)
             except ValueError:
                 cache.rollback(cache_transaction)
+                self._record_waste_audit(
+                    reason="validation_failure",
+                    remaining_budget_before=remaining_before,
+                    work_units=missing_work,
+                    observed_discarded_work_units=budget.started - started_before,
+                    observed_post_boundary_work_units=0,
+                    post_boundary_capacity_units=0,
+                )
                 transaction = transaction.transition(TxnPhase.ABORTED)
                 semantic_events.append(self._phase_event(transaction))
                 return self._result(
@@ -347,6 +391,14 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             try:
                 cache_receipt = cache.commit(cache_transaction)
             except StaleCacheSnapshotError:
+                self._record_waste_audit(
+                    reason="stale_snapshot",
+                    remaining_budget_before=remaining_before,
+                    work_units=missing_work,
+                    observed_discarded_work_units=budget.started - started_before,
+                    observed_post_boundary_work_units=0,
+                    post_boundary_capacity_units=0,
+                )
                 transaction = transaction.transition(TxnPhase.INTERRUPTED)
                 semantic_events.append(self._phase_event(transaction))
                 return self._result(
@@ -358,6 +410,14 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                     oracle=oracle,
                 )
             except CacheCommitError:
+                self._record_waste_audit(
+                    reason="cache_write_failure",
+                    remaining_budget_before=remaining_before,
+                    work_units=missing_work,
+                    observed_discarded_work_units=budget.started - started_before,
+                    observed_post_boundary_work_units=0,
+                    post_boundary_capacity_units=0,
+                )
                 transaction = transaction.transition(TxnPhase.ABORTED)
                 semantic_events.append(self._phase_event(transaction))
                 return self._result(
@@ -480,21 +540,18 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                     "oracle screening_statistics must contain non-negative integers"
                 )
             ended_ns = self._clock_ns()
-            self._physical_event_sink(
-                (
-                    {
-                        "event": "run_observation",
-                        "trace": "txnopt-physical-trace-v1",
-                        "execution_mode": config.execution_mode,
-                        "workers": config.workers,
-                        "started_ns": self._physical_started_ns,
-                        "ended_ns": ended_ns,
-                        "duration_ns": ended_ns - self._physical_started_ns,
-                        "termination_reason": reason,
-                        **screening_statistics,
-                    },
-                )
-            )
+            run_observation: Mapping[str, object] = {
+                "event": "run_observation",
+                "trace": "txnopt-physical-trace-v1",
+                "execution_mode": config.execution_mode,
+                "workers": config.workers,
+                "started_ns": self._physical_started_ns,
+                "ended_ns": ended_ns,
+                "duration_ns": ended_ns - self._physical_started_ns,
+                "termination_reason": reason,
+                **screening_statistics,
+            }
+            self._physical_event_sink((run_observation, *self._waste_audits))
             physical_ref = "txnopt-physical-trace-v1:external"
         oracle_identity = f"{type(oracle).__module__}.{type(oracle).__qualname__}"
         return RunResult(
@@ -511,6 +568,52 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             },
         )
 
+    def _record_waste_audit(
+        self,
+        *,
+        reason: str,
+        remaining_budget_before: int | None,
+        work_units: tuple[int, ...],
+        observed_discarded_work_units: int,
+        observed_post_boundary_work_units: int,
+        post_boundary_capacity_units: int,
+    ) -> None:
+        """Bind a fixed-work abort observation to the atomic transaction window."""
+
+        if remaining_budget_before is None or not work_units:
+            return
+        audit: WasteAudit = audit_waste(
+            remaining_budget_before=remaining_budget_before,
+            uncommitted_window=len(work_units),
+            max_requests_per_candidate=max(work_units),
+            post_boundary_capacity_units=post_boundary_capacity_units,
+            observed_discarded_work_units=observed_discarded_work_units,
+            observed_post_boundary_work_units=observed_post_boundary_work_units,
+        )
+        self._waste_audits.append(
+            {
+                "event": "t4_waste_observation",
+                "trace": "txnopt-physical-trace-v1",
+                "reason": reason,
+                "cost_basis": "normalized_work_unit; measured_Cmax_required",
+                "remaining_budget_before": audit.remaining_budget_before,
+                "uncommitted_window": audit.uncommitted_window,
+                "max_requests_per_candidate": audit.max_requests_per_candidate,
+                "post_boundary_capacity_units": audit.post_boundary_capacity_units,
+                "observed_discarded_work_units": (
+                    audit.observed_discarded_work_units
+                ),
+                "observed_post_boundary_work_units": (
+                    audit.observed_post_boundary_work_units
+                ),
+                "discarded_work_bound_units": audit.bound.discarded_work_units,
+                "post_boundary_work_bound_units": (
+                    audit.bound.post_boundary_work_units
+                ),
+                "bound_satisfied": True,
+            }
+        )
+
     @staticmethod
     def _evaluate_candidates(
         *,
@@ -524,13 +627,21 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         if config.execution_mode == "serial" or oracle.internal_parallelism:
             work = sum(work_units)
             budget.start(work)
-            return tuple(
-                oracle.evaluate_batch(
-                    candidates,
-                    work_budget=work,
-                    deadline_ns=deadline_ns,
+            try:
+                return tuple(
+                    oracle.evaluate_batch(
+                        candidates,
+                        work_budget=work,
+                        deadline_ns=deadline_ns,
+                    )
                 )
-            )
+            except (OracleWorkerError, TimeoutError) as error:
+                budget.release_reserved()
+                raise _EvaluationAbort(
+                    error,
+                    post_boundary_work_units=0,
+                    post_boundary_capacity_units=0,
+                ) from error
         if config.execution_mode == "barrier":
             return PythonTxnRuntime._evaluate_barrier(
                 oracle=oracle,
@@ -590,11 +701,20 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                     )
                 ordered.extend(values)
             return tuple(ordered)
-        except Exception:
+        except (OracleWorkerError, TimeoutError) as error:
+            pending_work = sum(
+                sum(work_units[first:last])
+                for (first, last), future in zip(chunks, futures, strict=True)
+                if not future.done()
+            )
             for future in futures:
                 future.cancel()
             budget.release_reserved()
-            raise
+            raise _EvaluationAbort(
+                error,
+                post_boundary_work_units=pending_work,
+                post_boundary_capacity_units=sum(work_units),
+            ) from error
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
@@ -642,11 +762,20 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 ordered.append(values[0])
                 fill_window()
             return tuple(ordered)
-        except Exception:
+        except (OracleWorkerError, TimeoutError) as error:
+            pending_work = sum(
+                work_units[index]
+                for index, future in pending.items()
+                if not future.done()
+            )
             for future in pending.values():
                 future.cancel()
             budget.release_reserved()
-            raise
+            raise _EvaluationAbort(
+                error,
+                post_boundary_work_units=pending_work,
+                post_boundary_capacity_units=width * max(work_units),
+            ) from error
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 

@@ -1,74 +1,121 @@
 # TxnOpt T1-T4 proof obligations
 
-Status: T1/T2 inductive proof plus bounded TLC model; T3/T4 review draft.
+Status: corrected proof package, ready for independent review. The bounded TLC
+receipt checks T1/T2 safety for four candidates. It does not by itself approve
+T3, T4, liveness, or a performance claim.
 
 ## T1: completion-order independence under fixed work
 
-Assume a fixed initial state, random tape, canonical candidate sequence
-`C = <c1, ..., cn>`, deterministic Oracle results, and a commit rule that may
-commit only the least unresolved candidate index. Physical workers may complete
-any pending index.
+For round `r`, fix the visible snapshot `s_r`, its random-tape segment, the
+canonical candidate sequence `C_r = <c1, ..., cn>`, deterministic Oracle
+results, and the deterministic decision rule. Evaluation completion is private.
+The runtime reconstructs results in `C_r` order and has exactly one visible
+publication action: after every result validates, it atomically publishes the
+chosen next state and the entire staged cache transaction.
 
-Inductive invariant `I(k)`: after `k` commits, the visible semantic trace is
-exactly `<c1, ..., ck>`, the visible cache is exactly the set of results for that
-prefix, and no result with index greater than `k` is visible.
+Let `I(r)` state that after `r` committed rounds the visible state, cache and
+semantic trace equal the canonical serial execution after `r` rounds.
 
-- Base case `k = 0`: the trace and cache are empty.
-- Physical completion step: it changes only the private completed set, so
-  `I(k)` is preserved for every completion permutation.
-- Commit step: the guard permits only index `k + 1`; appending `c(k + 1)` and
-  atomically publishing its cache entries establishes `I(k + 1)`.
-- Termination step: it changes neither trace nor cache.
+- Initially, both executions have the same input state, empty solve-local cache,
+  and fixed random tape, so `I(0)` holds.
+- Reserving, starting, or completing any evaluation changes no visible state,
+  cache, or semantic event. Every permutation of these physical actions is a
+  stuttering step with respect to `I(r)`.
+- Determinism and ordered reconstruction give both executions the same resolved
+  result sequence. Validation and decision therefore select the same next
+  state.
+- The single commit publishes that state and the same cache entries atomically,
+  establishing `I(r + 1)`.
 
-Therefore every physical completion order refines to the same canonical commit
-trace. `TxnOpt.tla` checks the corresponding invariant for four candidates,
-including every completion/failure interleaving.
+Induction over committed rounds proves that fixed-work serial, barrier, and
+ordered execution have the same committed semantic trajectory regardless of
+physical completion order. `TxnOpt.tla` and the generated PlusCal model check
+the one-round atomic publication invariant for all completion/failure
+interleavings in the bounded four-candidate model.
 
 ## T2: deadline and worker failure return a commit prefix
 
-The only visible-state action is `Commit`. Deadline, worker failure, validation
-failure, stale snapshot, and cache publication failure take `Terminate`,
-`ABORTED`, or `INTERRUPTED` without changing committed state or cache. By T1's
-invariant, the state before failure is a canonical prefix; a failure action
-preserves it, and terminated states have no enabled commit action. Thus the
-returned state is the last complete commit prefix. The Python fault tests and
-native typed receipt are the refinement witnesses.
+Before the round commit, all evaluation results and cache writes are private.
+Deadline, worker failure, validation failure, stale snapshot, or cache
+publication failure moves the aggregate transaction to `ABORTED` or
+`INTERRUPTED` without publishing state or cache. Thus failure in round `r + 1`
+returns exactly the state after the first `r` complete commits. By T1 this is a
+canonical serial prefix. The TLA+ invariants check the single-round base case;
+the runtime fault tests exercise the inductive implementation boundary.
 
-## T3: unconditional trilemma counterexample
+## T3: state-dependent search trilemma
 
-Consider a state-dependent search with initial state `s0` and two logical
-candidates. Candidate `c2` is generated from the state produced by resolving
-`c1`. Choose an instance where `c1` is accepted and changes `s0` to `s1`, and
-where evaluating the version of `c2` generated from `s0` is not equivalent to
-evaluating it from `s1`.
+This is a meta-theorem about an extended state-dependent search model, not a
+property checked by the fixed-candidate TLA+ model.
 
-Before `c1` resolves, an implementation has three exhaustive choices:
+Let `S` be the visible-state set, `T` a deterministic random tape, `G(s, t)` the
+candidate generator, `E(s, c)` deterministic evaluation, and `D(s, c, E(s,c))`
+the serial decision. Define:
 
-1. Do not start `c2`: serial semantics and zero waste hold, but fully
-   asynchronous progress does not.
-2. Start `c2(s0)`: asynchronous progress holds; if `c1` is accepted, that work
-   must be discarded, so zero speculative waste fails.
-3. Make `c2(s0)` visible despite accepting `c1`: asynchronous progress and zero
-   discard may hold, but the result is not the serial `c2(s1)` result, so
-   schedule independence fails.
+- **SI (schedule independence):** for every physical completion schedule, the
+  visible trajectory is observationally equal to the canonical serial
+  trajectory generated by repeated `G`, `E`, and `D` on the latest committed
+  state.
+- **ZW (zero speculative waste):** every started evaluation contributes to the
+  realized canonical trajectory; no started branch is discarded, invalidated,
+  or recomputed.
+- **AP (fully asynchronous progress):** while an evaluation predecessor is
+  unresolved, an idle worker starts any available successor/branch work instead
+  of waiting for that predecessor's state transition.
 
-Hence schedule independence, zero speculative waste, and fully asynchronous
-progress cannot all hold unconditionally for arbitrary state-dependent search.
+Assume the search is non-trivially state dependent: there exist `s0`, a tape
+segment, and a first candidate `c1` such that accepting `c1` produces `s1`, and
+the next serial candidate/result generated from `s1` is not observationally
+equivalent to every successor/branch that can be generated using only
+pre-resolution information from `s0`.
 
-## T4: bounded speculative waste
+Before `c1` resolves, either no successor/branch evaluation starts or at least
+one starts. In the first case AP is false. In the second case choose the witness
+outcome in which `c1` is accepted. Any work generated only from pre-resolution
+information is not the required serial successor from `s1`. Discarding or
+recomputing it makes ZW false; publishing or using it makes SI false. Starting
+both acceptance and rejection branches does not escape the result: at least one
+unrealized branch is discarded on the realized trajectory, so ZW is false.
 
-Let `W` be the maximum number of unresolved speculative candidates, `Qmax` the
-maximum requests per candidate, `Cmax` an upper bound on one request's cost,
-`Bremaining` the remaining fixed-work budget at the boundary, and `P` the
-physical parallelism.
+Therefore `SI /\ ZW /\ AP` is impossible for arbitrary state-dependent search
+with such a witness. The conclusion is conditional: state-independent or
+observationally equivalent successor generation is outside the witness class.
 
-At most `W * Qmax` speculative requests can exist. Budget admission additionally
-limits started speculative requests to `Bremaining`, so discarded work units are
-at most `min(Bremaining, W * Qmax)`. Multiplication by non-negative `Cmax` gives
-the discarded-cost bound. After the boundary, at most `P` requests can still be
-executing, while the same window bound applies; therefore post-boundary in-flight
-cost is at most `min(P, W * Qmax) * Cmax`.
+## T4: bounded transaction waste
 
-The executable function `txnopt._internal.waste_bounds.bounded_waste` evaluates
-these expressions. A performance claim additionally requires measured finite
-`Qmax` and `Cmax`; otherwise the algebraic statement is rejected as vacuous.
+For one atomic transaction `tau`, define:
+
+- `W` as the number of work-bearing candidates retained between reservation and
+  the single commit/abort. It includes completed but unpublished candidates and
+  is not the executor submission width.
+- `q(c)` as request work units for candidate `c`, with
+  `1 <= q(c) <= Qmax`.
+- `Bremaining` as fixed-work budget immediately before reservation. Admission
+  requires `sum(q(c)) <= Bremaining`.
+- `P` as a declared upper bound, in request work units, on non-terminal work at
+  boundary detection. It is not merely the worker count.
+- `Cmax` as a finite non-negative upper bound on one request unit's physical
+  cost.
+
+On abort, discarded started work is no greater than admitted work:
+
+`discarded <= sum(q(c)) <= min(Bremaining, W * Qmax)`.
+
+At boundary detection, non-terminal work is bounded both by `P` and total
+transaction capacity:
+
+`post_boundary <= min(P, W * Qmax)`.
+
+Multiplying either inequality by non-negative `Cmax` preserves it, giving the
+stated cost bounds. In the Python ordered adapter, physical submission width
+`w <= W` and `P <= w * Qmax`; in barrier mode the conservative declaration is
+the admitted work; a synchronous/internal-native call detects its boundary
+only when the call returns, so work performed before detection is discarded
+work and its post-detection `P` is zero.
+
+`txnopt._internal.waste_bounds.audit_waste` now fails closed when fixed-work
+observations exceed these unit bounds. `txnopt-physical-trace-v1` records `W`,
+`Qmax`, `P`, observed discarded/non-terminal units, and both bounds. The receipt
+labels cost as normalized work units. A non-vacuous physical-cost claim still
+requires independently measured and enforced `Cmax`; this proof does not
+manufacture that measurement.

@@ -43,7 +43,7 @@ cloud purchase, public alpha, or manuscript submission.
   deadline/failure prefix safety, cross-domain adapters, and non-vacuous waste
   bounds, not as the invention of speculative simulated annealing or ordered
   transactions.
-- Clean Build Attempt05 passes Ruff, strict mypy, 98 TxnOpt tests, wheel/CLI
+- Clean Build Attempt06 passes Ruff, strict mypy, 103 TxnOpt tests, wheel/CLI
   verification, ASan/UBSan, TSan, historical-path preservation, and a
   100,000-round resource soak with zero fallback.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
@@ -54,9 +54,11 @@ cloud purchase, public alpha, or manuscript submission.
   is about 4,387 seconds (1.22 hours), but this does not authorize purchase:
   the EVRPTW performance gate and final budget freeze remain open.
 - Independent T3/T4 review Attempt01 reports `NEEDS_WORK`. TLC continues to
-  support bounded T1/T2 safety only; the current T4 physical-window
-  interpretation undercounts completed but unpublished atomic-batch work, and
-  the per-candidate formal model lacks a proved mapping to the batch runtime.
+  support bounded safety only. A successor correction now uses the complete
+  uncommitted atomic transaction as T4's `W`, emits receipt-bound unit audits,
+  formalizes the conditional T3 meta-theorem, and aligns the checked model with
+  aggregate runtime publication. It remains `READY_FOR_INDEPENDENT_REVIEW`, not
+  accepted evidence; measured finite `Cmax` is still required.
 
 ## 3. Target repository and dependency structure
 

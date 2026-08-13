@@ -16,9 +16,11 @@ The earlier local EVRPTW roadmap remains ignored historical planning input.
 - Stage 5.2 performance-calibration Attempt16 is retained and closed as a
   known unique failure; it is not a successful benchmark result.
 - TxnOpt Level 1 implementation is in progress on `codex/txnopt-level1`.
-- Clean Build Attempt05 passes local build, sanitizer, resource, and replay
+- Clean Build Attempt06 passes local build, sanitizer, resource, and replay
   gates. Local calibration Attempt14 is complete but not Level 1 evidence:
   RCPSP passes the representative speedup threshold and EVRPTW does not.
+- The corrected aggregate T1/T2 model and T3/T4 proof package are ready for a
+  new independent review; Attempt01 remains immutable `NEEDS_WORK` evidence.
 - Cloud procurement and the formal Level 1 matrix remain blocked. The current
   32-core estimate is only for provisional 1200-work/3-second budgets.
 - Level 2 and Level 3 remain required future gates and are not implemented.
