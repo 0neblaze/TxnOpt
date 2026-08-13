@@ -54,12 +54,17 @@ cloud purchase, public alpha, or manuscript submission.
   objective parity. RCPSP reaches 2.11x representative four-worker geometric
   mean; EVRPTW reaches only 1.19x, so the 1.30x gate remains failed and cloud
   rental remains unauthorized.
-- Build09-bound local calibration Attempt17 supersedes Attempt16 for the active
-  producer without rewriting it. All 96 raw runs pass independent replay with
+- Build09-bound local calibration Attempt17 supersedes Attempt16 for the
+  Build09 producer without rewriting it. All 96 raw runs pass independent replay with
   zero fallback and exact fixed-work semantic/objective parity. Representative
   four-worker geometric-mean speedup is 1.35x for EVRPTW and 2.13x for RCPSP;
   maximum one-worker overhead is 2.68%. These local gates pass, but Attempt17
   is not full Level 1 evidence and does not authorize cloud procurement.
+- The active post-Build09 source deepens `cpp/txnopt_core` with a prepared native
+  phase machine, complete-work reservation, atomic cache delta, and semantic
+  phase receipt. That changes the source/native identity. Build09, Attempt17,
+  and formal-plan Attempt18 remain immutable evidence but are not successor
+  evidence for this implementation.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -228,9 +233,11 @@ after proving equivalence to the canonical round stream.
 
 - [x] Freeze every `stage05.2-*` ABI and introduce a separate
   `txnopt-native-round-v1` source identity.
-- [ ] Move the active generic transaction and trace path into `cpp/txnopt_core`;
-  the first slice reuses the frozen concurrency and exact-kernel headers behind
-  a new module identity while keeping budget/cache ownership in Python.
+- [x] Move the active prepared transaction, reservation, cache-delta, and trace
+  path into the deep `cpp/txnopt_core` round module. It reuses the frozen
+  concurrency and exact-kernel headers behind a new module identity while
+  keeping solve-wide budget and publishable cache ownership in Python
+  `TxnRuntime`.
 - [x] Keep EVRPTW packing, safe screening, and exact charging in the
   case-native adapter.
 - [x] Require one contiguous SoA request and one typed receipt per round, with
@@ -278,21 +285,24 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
-Current gate status: **ready for separate procurement authorization, not
-authorized to execute and not Level 1 ready**. Build09-bound calibration
-Attempt17 passes the representative EVRPTW and RCPSP performance thresholds at
-1.35x and 2.13x with 100% fixed-work semantic/objective parity, zero fallback,
-and 2.68% maximum one-worker overhead. The compatibility decision is complete,
-and the conservative 32-physical-core estimate is about 1.20 hours, below the
-ten-day purchase threshold.
+Current gate status: **successor build and pre-cloud evidence required; purchase
+and execution remain unauthorized**. Build09-bound calibration Attempt17 passed
+the representative EVRPTW and RCPSP performance thresholds at 1.35x and 2.13x
+with 100% fixed-work semantic/objective parity, zero fallback, and 2.68% maximum
+one-worker overhead. Those facts remain valid for Build09 only. The active
+native transaction source requires a new clean build, local calibration,
+runtime estimate, formal plan, and pre-cloud decision before procurement can be
+considered again.
 
-The formal matrix is frozen separately as external plan Attempt18: 2,880 unique
+The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree
 `c609613e00928708bbb69e5d22be417e99489cdf921d2f677759412ab16b8929`,
 raw root `/home/oneblaze/txnopt-results/level1-formal-build09-attempt18`, and
 plan SHA-256
 `85e6e6471fe4480c8a05e9887e6166e5d934ea557d53ce0a33fe098529947c8f`.
-The raw root is absent. `experiments/txnopt/level1-analysis-protocol-v1.json`
+The raw root is absent. Attempt18 remains unexecuted and is not the active-source
+formal identity after the native transaction change.
+`experiments/txnopt/level1-analysis-protocol-v1.json`
 preregisters the paired fixed-work geometric mean, deterministic 20,000-sample
 percentile bootstrap, 95% confidence interval, one-worker overhead, exact
 semantic/objective parity, and measured `Cmax` gates before any formal run.
@@ -300,17 +310,17 @@ semantic/objective parity, and measured `Cmax` gates before any formal run.
 Full-scope confidence intervals, measured full-scope `Cmax`, and the final
 performance predicates are outputs of the formal matrix and therefore remain
 post-procurement Level 1 completion gates; requiring them before procurement
-would be circular. Actual execution remains fail-closed until the user supplies
-a separate signed authorization bound to exact Attempt18, the preregistered
-analysis digest, config tree, Build09 manifest and wheel, fresh raw root,
-exclusive-Linux resource contract, and 14-day maximum window. The campaign
-runner then creates an atomic launch claim, rejects an active target process,
-verifies the provisioned host and exact installed payload, and terminates the
-complete process group on timeout. It produces raw evidence only and records no
-readiness decision. A separate process and tool must replay all raw manifests,
-independently recompute every present T4 waste bound, and reconcile all 2,880
-prefix/refinement receipts before any aggregate gate or internal-seal decision
-is issued.
+would be circular. Actual execution remains fail-closed until a clean successor
+plan exists and the user supplies a separate signed authorization bound to that
+exact plan, preregistered analysis digest, config tree, build manifest and
+wheel, fresh raw root, exclusive-Linux resource contract, and 14-day maximum
+window. The campaign runner then creates an atomic launch claim, rejects an
+active target process, verifies the provisioned host and exact installed
+payload, and terminates the complete process group on timeout. It produces raw
+evidence only and records no readiness decision. A separate process and tool
+must replay all raw manifests, independently recompute every present T4 waste
+bound, and reconcile every prefix/refinement receipt before any aggregate gate
+or internal-seal decision is issued.
 
 ### Level 1 gate
 

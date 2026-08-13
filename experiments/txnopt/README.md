@@ -32,8 +32,10 @@ anything. `tools/estimate_txnopt_cloud_window.py` converts the complete local
 p95 calibration into a signed 32/64-core time forecast. Server rental remains
 blocked unless that forecast is at most ten days.
 
-The active formal identity is external Attempt18, bound to Build09 and a fresh
-raw root. Its analysis is preregistered in
+The prior formal identity is external Attempt18, bound to Build09 and a fresh
+raw root. It was never executed. The active post-Build09 native source requires
+a new formal identity, so Attempt18 may not be launched as successor evidence.
+Its analysis was preregistered in
 `level1-analysis-protocol-v1.json`. Structural preflight is read-only:
 
 ```bash
@@ -42,7 +44,8 @@ python -m tools.run_txnopt_level1_campaign preflight \
   --analysis-protocol experiments/txnopt/level1-analysis-protocol-v1.json
 ```
 
-The preflight status is `PASS_NOT_AUTHORIZED_TO_EXECUTE`. The `run` subcommand
+The preserved Build09 preflight status was `PASS_NOT_AUTHORIZED_TO_EXECUTE`.
+The `run` subcommand
 also requires an exact Build09 wheel, an isolated Python installation, host
 resource checks, and a separately signed
 `txnopt-level1-procurement-authorization-v1` receipt. That receipt must bind the

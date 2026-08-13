@@ -109,6 +109,7 @@ class NativeEVRPTWOracle(EVRPTWOracle):
             np.asarray(indices, dtype=np.int64),
             deadline_seconds,
             self._batch_size,
+            work_budget,
         )
         (
             path_offsets,
@@ -207,6 +208,17 @@ class NativeEVRPTWOracle(EVRPTWOracle):
             or resolution_order.tolist() != list(range(route_count))
             or receipt["protocol"] != "txnopt-native-round-v1"
             or receipt["fallback_count"] != 0
+            or receipt["budget_limit"] != route_count
+            or receipt["budget_reserved_work"] != route_count
+            or receipt["budget_remaining_work"] != 0
+            or receipt["prepared_cache_write_count"]
+            != (route_count if receipt["phase"] == "VALIDATED" else 0)
+            or receipt["semantic_event_count"] != len(receipt["phase_trace"])
+            or receipt["phase_trace"]
+            not in {
+                ("PREPARED", "RESERVED", "EVALUATING", "VALIDATED"),
+                ("PREPARED", "RESERVED", "EVALUATING", "INTERRUPTED"),
+            }
             or receipt["parallel_route_threshold"] != receipt["worker_count"] * 2
             or receipt["scheduled_worker_count"] < 1
             or receipt["scheduled_worker_count"] > receipt["worker_count"]

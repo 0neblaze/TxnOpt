@@ -33,6 +33,13 @@ class NativeRoundReceipt(TypedDict):
     screened_work: int
     completed_work: int
     interrupted_work: int
+    budget_limit: int
+    budget_reserved_work: int
+    budget_remaining_work: int
+    prepared_cache_write_count: int
+    prepared_cache_key_checksum: int
+    phase_trace: tuple[str, ...]
+    semantic_event_count: int
     fallback_count: int
     source_revision: str
     source_tree: str
@@ -58,6 +65,7 @@ class EVRPTWContext:
         route_indices: npt.NDArray[np.int64],
         deadline_seconds: float,
         batch_size: int = 64,
+        work_budget: int = -1,
     ) -> tuple[
         npt.NDArray[np.int64],
         npt.NDArray[np.int64],

@@ -12,6 +12,7 @@
 #include <pybind11/pybind11.h>
 
 #include "concurrency.hpp"
+#include "round_transaction.hpp"
 #include "../txnopt_cases/evrptw/exact_kernels.hpp"
 #include "../txnopt_cases/evrptw/parallel_exact.hpp"
 
@@ -22,6 +23,25 @@ namespace txnopt::native {
 namespace evrptw_native = txnopt::cases::evrptw::native;
 
 constexpr auto protocol_version = "txnopt-native-round-v1";
+
+std::uint64_t route_key_checksum(
+    const std::int64_t* const indices,
+    const std::int64_t first,
+    const std::int64_t last) noexcept {
+    constexpr std::uint64_t offset = 1469598103934665603ULL;
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    auto checksum = offset;
+    for (auto index = first; index < last; ++index) {
+        const auto value = static_cast<std::uint64_t>(indices[index]);
+        for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+            checksum ^= (value >> (byte * 8U)) & 0xffU;
+            checksum *= prime;
+        }
+    }
+    checksum ^= static_cast<std::uint64_t>(last - first);
+    checksum *= prime;
+    return checksum;
+}
 
 template <typename Value>
 py::array_t<Value> checked_array(
@@ -153,7 +173,8 @@ public:
         const py::handle route_offsets,
         const py::handle route_indices,
         const double deadline_seconds,
-        const std::int64_t batch_size) {
+        const std::int64_t batch_size,
+        const std::int64_t work_budget) {
         const auto offsets = checked_array<std::int64_t>(
             route_offsets, "route_offsets", 1);
         const auto indices = checked_array<std::int64_t>(
@@ -161,12 +182,25 @@ public:
         if (offsets.shape(0) < 1 || offsets.data()[0] != 0
             || offsets.data()[offsets.shape(0) - 1] != indices.shape(0)
             || batch_size <= 0
+            || work_budget < -1
             || (!std::isfinite(deadline_seconds)
                 && !(std::isinf(deadline_seconds) && deadline_seconds > 0.0))
             || deadline_seconds <= 0.0) {
-            throw std::invalid_argument("native round control or offsets are invalid");
+            throw std::invalid_argument(
+                "native round control, budget, or offsets are invalid");
         }
         const auto route_count = static_cast<std::size_t>(offsets.shape(0) - 1);
+        if (route_count
+            > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+            throw std::invalid_argument("native round has too many routes");
+        }
+        const auto requested_work = static_cast<std::int64_t>(route_count);
+        const auto effective_work_budget = work_budget < 0
+            ? requested_work
+            : work_budget;
+        PreparedRoundTransaction transaction(
+            requested_work, effective_work_budget);
+        transaction.reserve();
         for (std::size_t route = 0; route < route_count; ++route) {
             const auto first = offsets.data()[route];
             const auto last = offsets.data()[route + 1];
@@ -189,7 +223,8 @@ public:
             std::max<std::int64_t>(1, worker_count_ * 2));
         const bool use_parallel = worker_count_ > 1
             && route_count >= parallel_route_threshold;
-        {
+        transaction.begin_evaluation();
+        try {
             py::gil_scoped_release release;
             const double screen_options[4]{1.0, 1e-9, 0.0, 0.0};
             const double incremental[6]{0.0, 0.0, 0.0, 0.0, 1.0, 1.0};
@@ -231,13 +266,27 @@ public:
                 output, kinds_.data(), offsets.data(), indices.data(),
                 node_count_, route_count,
                 static_cast<std::size_t>(indices.shape(0)), depot_, batch_size);
+        } catch (...) {
+            transaction.abort();
+            throw;
         }
+        std::vector<std::uint64_t> prepared_cache_keys;
+        if (output.batch_counters[3] == 0) {
+            prepared_cache_keys.reserve(route_count);
+            for (std::size_t route = 0; route < route_count; ++route) {
+                prepared_cache_keys.push_back(route_key_checksum(
+                    indices.data(), offsets.data()[route],
+                    offsets.data()[route + 1]));
+            }
+        }
+        transaction.resolve(
+            output.batch_counters[1], output.batch_counters[2],
+            output.batch_counters[3], prepared_cache_keys);
+        const auto transaction_receipt = transaction.receipt();
         ++round_calls_;
         py::dict receipt;
         receipt["protocol"] = protocol_version;
-        receipt["phase"] = output.batch_counters[3] == 0
-            ? "VALIDATED"
-            : "INTERRUPTED";
+        receipt["phase"] = std::string(phase_name(transaction_receipt.phase));
         receipt["worker_count"] = worker_count_;
         receipt["scheduled_worker_count"] = use_parallel
             ? static_cast<std::int64_t>(std::min<std::size_t>(
@@ -254,6 +303,22 @@ public:
         receipt["screened_work"] = screened_routes;
         receipt["completed_work"] = output.batch_counters[2];
         receipt["interrupted_work"] = output.batch_counters[3];
+        receipt["budget_limit"] = transaction_receipt.budget_limit;
+        receipt["budget_reserved_work"] = transaction_receipt.reserved_work;
+        receipt["budget_remaining_work"] = transaction_receipt.remaining_work;
+        receipt["prepared_cache_write_count"] =
+            transaction_receipt.prepared_cache_write_count;
+        receipt["prepared_cache_key_checksum"] =
+            transaction_receipt.prepared_cache_key_checksum;
+        py::tuple phase_trace(transaction_receipt.phase_trace.size());
+        for (std::size_t index = 0;
+             index < transaction_receipt.phase_trace.size(); ++index) {
+            phase_trace[index] = std::string(
+                phase_name(transaction_receipt.phase_trace[index]));
+        }
+        receipt["phase_trace"] = std::move(phase_trace);
+        receipt["semantic_event_count"] = static_cast<std::int64_t>(
+            transaction_receipt.phase_trace.size());
         receipt["fallback_count"] = 0;
         receipt["source_revision"] = TXNOPT_BUILD_GIT_REVISION;
         receipt["source_tree"] = TXNOPT_BUILD_GIT_TREE;
@@ -357,7 +422,8 @@ PYBIND11_MODULE(_native, module) {
             "exact_round_v1",
             &txnopt::native::EVRPTWContext::exact_round_v1,
             py::arg("route_offsets"), py::arg("route_indices"),
-            py::arg("deadline_seconds"), py::arg("batch_size") = 64)
+            py::arg("deadline_seconds"), py::arg("batch_size") = 64,
+            py::arg("work_budget") = -1)
         .def_property_readonly(
             "worker_count", &txnopt::native::EVRPTWContext::worker_count);
 }

@@ -98,6 +98,18 @@ def test_native_round_is_one_typed_call_and_matches_python_exact_charging() -> N
     assert receipt["context_pack_count"] == 1
     assert receipt["screened_work"] == 2
     assert receipt["round_call_count"] == 1
+    assert receipt["budget_limit"] == 2
+    assert receipt["budget_reserved_work"] == 2
+    assert receipt["budget_remaining_work"] == 0
+    assert receipt["prepared_cache_write_count"] == 2
+    assert receipt["prepared_cache_key_checksum"] > 0
+    assert receipt["phase_trace"] == (
+        "PREPARED",
+        "RESERVED",
+        "EVALUATING",
+        "VALIDATED",
+    )
+    assert receipt["semantic_event_count"] == 4
     assert receipt["fallback_count"] == 0
     assert _round(context)[9]["round_call_count"] == 2
 
@@ -112,6 +124,9 @@ def test_native_serial_and_parallel_rounds_have_equal_semantic_arrays() -> None:
     assert parallel[9]["worker_count"] == 2
     assert parallel[9]["scheduled_worker_count"] == 2
     assert parallel[9]["execution_policy"] == "parallel"
+    assert serial[9]["prepared_cache_key_checksum"] == (
+        parallel[9]["prepared_cache_key_checksum"]
+    )
     assert parallel[8].shape == (2, 7)
 
 
@@ -138,6 +153,45 @@ def test_native_round_rejects_dtype_coercion_and_invalid_customer_indices() -> N
             np.asarray((0, 1), dtype=np.int64),
             np.asarray((0,), dtype=np.int64),
             math.inf,
+        )
+
+
+def test_native_round_reserves_the_complete_budget_before_evaluation() -> None:
+    context = _context(1)
+
+    with pytest.raises(ValueError, match="budget cannot reserve"):
+        context.exact_round_v1(
+            np.asarray((0, 1, 2), dtype=np.int64),
+            np.asarray((1, 2), dtype=np.int64),
+            math.inf,
+            64,
+            1,
+        )
+
+    assert _round(context)[9]["round_call_count"] == 1
+
+
+def test_native_round_reports_unused_reserved_budget_without_publishing_it() -> None:
+    context = _context(1)
+
+    output = context.exact_round_v1(
+        np.asarray((0, 1, 2), dtype=np.int64),
+        np.asarray((1, 2), dtype=np.int64),
+        math.inf,
+        64,
+        3,
+    )
+
+    assert output[9]["budget_limit"] == 3
+    assert output[9]["budget_reserved_work"] == 2
+    assert output[9]["budget_remaining_work"] == 1
+    with pytest.raises(ValueError, match="control, budget"):
+        context.exact_round_v1(
+            np.asarray((0, 1), dtype=np.int64),
+            np.asarray((1,), dtype=np.int64),
+            math.inf,
+            64,
+            -2,
         )
 
 

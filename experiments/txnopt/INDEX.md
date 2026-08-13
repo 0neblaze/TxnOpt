@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | ready for separate procurement authorization; purchase and formal matrix not started | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration only; Attempt18 raw root absent | formal matrix pending |
+| `txnopt-level1-protocol-v1` | successor build/pre-cloud evidence required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration retained; Attempt18 raw root absent and plan superseded for active source | successor formal identity pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -122,10 +122,12 @@ semantic/objective parity, and measured-Cmax analysis before execution. The
 orchestration preflight passes structurally but cannot execute without a
 separate signed purchase authorization. Full-scope CI and Cmax are completion
 gates produced after the matrix, not circular preconditions for procurement.
-The signed local decision is
+The signed Build09 local decision is
 `manifests/txnopt_level1_precloud_gate_attempt01.json`; it records
 `READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION` while keeping purchase,
-execution, holdout access, Level 1 readiness, and public release false.
+execution, holdout access, Level 1 readiness, and public release false. The
+post-Build09 native prepared-transaction change supersedes that procurement
+gate for the active source; the receipt itself remains immutable.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
