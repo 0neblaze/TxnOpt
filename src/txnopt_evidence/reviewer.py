@@ -261,7 +261,7 @@ def _verify_failure_manifest_payload(
         or failure.get("physical_stream_count") != len(physical_paths)
     ):
         raise ValueError("failure receipt does not match its manifest")
-    semantic_exact_work_started = False
+    semantic_started_work = 0
     for relative_path in semantic_paths:
         events, _digest = read_event_stream(bundle / relative_path)
         if not events:
@@ -281,16 +281,27 @@ def _verify_failure_manifest_payload(
         refinement = replay_aggregate_refinement(events)
         if refinement.final_state_digest != last_digest:
             raise ValueError("failure refinement replay differs from the committed prefix")
-        semantic_exact_work_started = (
-            semantic_exact_work_started or _semantic_exact_work_started(events)
-        )
+        semantic_started_work += _semantic_started_work(events)
+    native_started_work = 0
     for relative_path in physical_paths:
         events, _digest = read_event_stream(bundle / relative_path)
         _validate_physical_trace(
             events,
-            semantic_exact_work_started=semantic_exact_work_started,
             expected_identity=expected_identity,
         )
+        native_started_work += sum(
+            event["started_work"]
+            for event in events
+            if event.get("event") == "native_round_observation"
+        )
+    if (
+        expected_identity is not None
+        and expected_identity.expected_oracle
+        == "txnopt_cases.evrptw.native_oracle.NativeEVRPTWOracle"
+        and semantic_started_work > 0
+        and native_started_work < semantic_started_work
+    ):
+        raise ValueError("native exact work lacks its native round receipt")
     _validate_sealed_lifecycle(manifest)
     return manifest
 
@@ -606,6 +617,7 @@ def _replay_manifest(
         _validate_physical_trace(
             physical_events,
             semantic_exact_work_started=_semantic_exact_work_started(events),
+            semantic_started_work=_semantic_started_work(events),
             expected_identity=expected_identity,
         )
     has_physical_ref = result.get("physical_artifact_ref") is not None
@@ -710,8 +722,19 @@ def _validate_physical_trace(
     events: tuple[dict[str, Any], ...],
     *,
     semantic_exact_work_started: bool = False,
+    semantic_started_work: int = 0,
     expected_identity: ExpectedEvidenceIdentity | None = None,
 ) -> None:
+    if (
+        isinstance(semantic_started_work, bool)
+        or not isinstance(semantic_started_work, int)
+        or semantic_started_work < 0
+    ):
+        raise ValueError("semantic started-work requirement is malformed")
+    semantic_work_lower_bound = max(
+        semantic_started_work,
+        1 if semantic_exact_work_started else 0,
+    )
     observation = events[0] if events else {}
     if (
         not events
@@ -765,19 +788,19 @@ def _validate_physical_trace(
     )
     if len(native_events) + len(waste_events) != len(events) - 1:
         raise ValueError("physical trace contains an unsupported observation")
+    expects_native = False
     if expected_identity is not None:
         expects_native = (
             expected_identity.expected_oracle
             == "txnopt_cases.evrptw.native_oracle.NativeEVRPTWOracle"
         )
-        if expects_native and semantic_exact_work_started and not native_events:
-            raise ValueError("native exact work lacks its native round receipt")
         if not expects_native and native_events:
             raise ValueError("non-native evidence contains a native round receipt")
     _validate_native_round_observations(
         native_events,
         expected_identity=expected_identity,
     )
+    physical_work_lower_bound = 0
     for event in waste_events:
         if (
             event.get("event") != "t4_waste_observation"
@@ -812,6 +835,12 @@ def _validate_physical_trace(
             event["observed_discarded_work_units"] > 0
             or event["observed_post_boundary_work_units"] > 0
         )
+        if exact_work_started:
+            physical_work_lower_bound = max(
+                physical_work_lower_bound,
+                event["observed_discarded_work_units"],
+                event["observed_post_boundary_work_units"],
+            )
         if exact_work_started and (
             isinstance(observed_cmax, bool)
             or not isinstance(observed_cmax, int)
@@ -835,6 +864,17 @@ def _validate_physical_trace(
             != event["post_boundary_work_bound_units"] * cmax
         ):
             raise ValueError("physical trace contains an invalid measured Cmax binding")
+    required_native_work = max(semantic_work_lower_bound, physical_work_lower_bound)
+    if (
+        expects_native
+        and required_native_work > 0
+        and (
+            not native_events
+            or sum(event["started_work"] for event in native_events)
+            < required_native_work
+        )
+    ):
+        raise ValueError("native exact work lacks its native round receipt")
 
 
 def _validate_native_round_observations(
@@ -991,13 +1031,19 @@ def _validate_native_round_observations(
 
 
 def _semantic_exact_work_started(events: Sequence[Mapping[str, Any]]) -> bool:
-    return any(
-        event.get("event") == "candidate_transaction"
-        and event.get("phase") == "COMMITTED"
-        and isinstance(event.get("started_work"), int)
-        and not isinstance(event.get("started_work"), bool)
-        and event["started_work"] > 0
-        for event in events
+    return _semantic_started_work(events) > 0
+
+
+def _semantic_started_work(events: Sequence[Mapping[str, Any]]) -> int:
+    return max(
+        (
+            event["started_work"]
+            for event in events
+            if event.get("event") == "candidate_transaction"
+            and isinstance(event.get("started_work"), int)
+            and not isinstance(event.get("started_work"), bool)
+        ),
+        default=0,
     )
 
 
@@ -1025,6 +1071,14 @@ def _validate_event_stream(
         elif phase not in _TRANSITIONS[previous]:
             raise ValueError(f"illegal candidate transaction transition {previous}->{phase}")
         phases[txn_id] = phase
+        if "started_work" in event:
+            started_work = event["started_work"]
+            if (
+                isinstance(started_work, bool)
+                or not isinstance(started_work, int)
+                or started_work < 0
+            ):
+                raise ValueError("candidate transaction has an invalid started-work ledger")
         if phase == "COMMITTED":
             started_work = event.get("started_work")
             if (

@@ -106,7 +106,7 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
     build_path = tmp_path / "build.json"
     build = {
         "schema_version": "txnopt-level1-build-manifest-v1",
-        "run_label": "txnopt_level1_build_attempt13",
+        "run_label": "txnopt_level1_build_attempt14",
         "status": "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY",
         "producer": {
             "revision": "a" * 40,
@@ -126,7 +126,7 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
         },
         "formal_successor": {
             "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
-            "successor_status": "REVIEW_PENDING_BUILD13",
+            "successor_status": "REVIEW_PENDING_BUILD14",
             "independent_successor_review_completed": False,
             "level1_formal_gate_passed": False,
         },
@@ -371,7 +371,7 @@ def test_plan_loader_accepts_build10_only_with_its_pending_formal_boundary(
     build_sha256 = _write(build_path, build)
     _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
 
-    with pytest.raises(ValueError, match="cannot use a pre-Build13 producer"):
+    with pytest.raises(ValueError, match="requires the approved Build14 producer"):
         load_campaign_plan(plan_path)
 
     build["formal_successor"]["independent_successor_review_completed"] = True
@@ -409,7 +409,7 @@ def test_plan_loader_accepts_build11_only_with_its_pending_lifecycle_boundary(
     build_sha256 = _write(build_path, build)
     _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
 
-    with pytest.raises(ValueError, match="cannot use a pre-Build13 producer"):
+    with pytest.raises(ValueError, match="requires the approved Build14 producer"):
         load_campaign_plan(plan_path)
 
     build["formal_successor"]["successor_status"] = "REVIEW_PENDING_BUILD10"
@@ -421,7 +421,42 @@ def test_plan_loader_accepts_build11_only_with_its_pending_lifecycle_boundary(
         load_campaign_plan(plan_path)
 
 
-def test_plan_loader_accepts_build13_only_as_an_anchored_review_successor(
+def test_plan_loader_accepts_build14_only_as_an_anchored_review_successor(
+    tmp_path: Path,
+) -> None:
+    plan_path, _analysis_path = _campaign(tmp_path)
+    plan = json.loads(plan_path.read_bytes())
+    build_path = Path(plan["build_manifest_path"])
+    build = json.loads(build_path.read_bytes())
+    build.update(
+        {
+            "run_label": "txnopt_level1_build_attempt14",
+            "status": "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY",
+            "formal_successor": {
+                "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+                "successor_status": "REVIEW_PENDING_BUILD14",
+                "independent_successor_review_completed": False,
+                "level1_formal_gate_passed": False,
+            },
+        }
+    )
+    build_path.unlink()
+    build_path.with_suffix(".json.sha256").unlink()
+    build_sha256 = _write(build_path, build)
+    _rebind_plan_to_build(plan_path, plan, build_path, build_sha256)
+
+    assert load_campaign_plan(plan_path).build_manifest_sha256 == build_sha256
+
+    build["formal_successor"]["successor_status"] = "REVIEW_PENDING_BUILD12"
+    build_path.unlink()
+    build_path.with_suffix(".json.sha256").unlink()
+    build_sha256 = _write(build_path, build)
+    _rebind_plan_to_build(plan_path, plan, build_path, build_sha256)
+    with pytest.raises(ValueError, match="Build14 formal-successor boundary"):
+        load_campaign_plan(plan_path)
+
+
+def test_plan_v2_rejects_failed_build13_even_with_its_original_boundary(
     tmp_path: Path,
 ) -> None:
     plan_path, _analysis_path = _campaign(tmp_path)
@@ -445,14 +480,7 @@ def test_plan_loader_accepts_build13_only_as_an_anchored_review_successor(
     build_sha256 = _write(build_path, build)
     _rebind_plan_to_build(plan_path, plan, build_path, build_sha256)
 
-    assert load_campaign_plan(plan_path).build_manifest_sha256 == build_sha256
-
-    build["formal_successor"]["successor_status"] = "REVIEW_PENDING_BUILD12"
-    build_path.unlink()
-    build_path.with_suffix(".json.sha256").unlink()
-    build_sha256 = _write(build_path, build)
-    _rebind_plan_to_build(plan_path, plan, build_path, build_sha256)
-    with pytest.raises(ValueError, match="Build13 formal-successor boundary"):
+    with pytest.raises(ValueError, match="not an approved Level 1 producer"):
         load_campaign_plan(plan_path)
 
 

@@ -233,26 +233,26 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             raise ValueError("Build11 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
-    elif run_label == "txnopt_level1_build_attempt13":
+    elif run_label == "txnopt_level1_build_attempt14":
         formal_successor = _object(build.get("formal_successor"), "build formal successor")
         if (
             status
             != "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY"
             or formal_successor.get("prior_review_binding_status") != "PRIOR_SOURCE_ONLY"
-            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD13"
+            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD14"
             or formal_successor.get("independent_successor_review_completed") is not False
             or formal_successor.get("level1_formal_gate_passed") is not False
         ):
-            raise ValueError("Build13 formal-successor boundary differs")
+            raise ValueError("Build14 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
     else:
         raise ValueError("campaign build identity is not an approved Level 1 producer")
     if (
         schema_version == "txnopt-level1-campaign-plan-v2"
-        and run_label != "txnopt_level1_build_attempt13"
+        and run_label != "txnopt_level1_build_attempt14"
     ):
-        raise ValueError("campaign plan v2 cannot use a pre-Build13 producer")
+        raise ValueError("campaign plan v2 requires the approved Build14 producer")
     for gate in (
         "ruff",
         "strict_mypy",

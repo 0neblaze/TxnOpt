@@ -946,6 +946,170 @@ def test_runner_retains_a_signed_reviewable_bundle_for_fail_fast_errors(
         )
 
 
+@pytest.mark.parametrize(
+    "physical_evidence",
+    [
+        "t4_without_receipt",
+        "no_physical",
+        "zero_work_receipt",
+        "undercovered_multiple_streams",
+    ],
+)
+def test_native_failure_bundle_requires_receipt_for_aborted_started_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    physical_evidence: str,
+) -> None:
+    digest = "0" * 64
+
+    def fail_after_native_work(
+        _case: object,
+        *,
+        config: object,
+        semantic_sink: object,
+        physical_sink: object,
+    ) -> dict[str, object]:
+        del config
+        semantic_stream = (
+                {"event": "run_open", "state_digest": digest},
+                {"event": "candidate_screening", "admitted_count": 1},
+                {
+                    "event": "candidate_transaction",
+                    "txn_id": "round-00000000",
+                    "phase": "PREPARED",
+                    "snapshot_digest": digest,
+                    "candidate_keys": ["candidate-1"],
+                },
+                {
+                    "event": "candidate_transaction",
+                    "txn_id": "round-00000000",
+                    "phase": "RESERVED",
+                    "snapshot_digest": digest,
+                    "candidate_keys": ["candidate-1"],
+                },
+                {
+                    "event": "candidate_transaction",
+                    "txn_id": "round-00000000",
+                    "phase": "EVALUATING",
+                    "snapshot_digest": digest,
+                    "candidate_keys": ["candidate-1"],
+                },
+                {
+                    "event": "candidate_transaction",
+                    "txn_id": "round-00000000",
+                    "phase": "ABORTED",
+                    "snapshot_digest": digest,
+                    "candidate_keys": ["candidate-1"],
+                    "started_work": 1,
+                },
+                {"event": "run_terminated", "reason": "runtime_contract_error"},
+            )
+        semantic_sink(semantic_stream)  # type: ignore[operator]
+        if physical_evidence == "undercovered_multiple_streams":
+            semantic_sink(semantic_stream)  # type: ignore[operator]
+        if physical_evidence != "no_physical":
+            observations: list[dict[str, object]] = [
+                {
+                    "event": "run_observation",
+                    "trace": "txnopt-physical-trace-v1",
+                    "execution_mode": "serial",
+                    "workers": 1,
+                    "started_ns": 10,
+                    "ended_ns": 20,
+                    "duration_ns": 10,
+                    "termination_reason": "runtime_contract_error",
+                    "observed_cmax_upper_ns": 10,
+                }
+            ]
+            if physical_evidence == "t4_without_receipt":
+                observations.append(
+                    {
+                        "event": "t4_waste_observation",
+                        "trace": "txnopt-physical-trace-v1",
+                        "bound_satisfied": True,
+                        "remaining_budget_before": 4,
+                        "uncommitted_window": 1,
+                        "max_requests_per_candidate": 1,
+                        "post_boundary_capacity_units": 0,
+                        "observed_discarded_work_units": 1,
+                        "observed_post_boundary_work_units": 0,
+                        "discarded_work_bound_units": 1,
+                        "post_boundary_work_bound_units": 0,
+                        "cost_basis": "measured_transaction_elapsed_upper_bound_ns",
+                        "measured_cmax_ns": 10,
+                        "observed_discarded_cost_upper_ns": 10,
+                        "discarded_cost_bound_ns": 10,
+                        "observed_post_boundary_cost_upper_ns": 0,
+                        "post_boundary_cost_bound_ns": 0,
+                    }
+                )
+            else:
+                attestation = _native.BUILD_ATTESTATION
+                observed_work = (
+                    1 if physical_evidence == "undercovered_multiple_streams" else 0
+                )
+                observations.append(
+                    {
+                        "event": "native_round_observation",
+                        "trace": "txnopt-physical-trace-v1",
+                        "protocol": "txnopt-native-round-v1",
+                        "phase": "VALIDATED",
+                        "phase_trace": [
+                            "PREPARED",
+                            "RESERVED",
+                            "EVALUATING",
+                            "VALIDATED",
+                        ],
+                        "context_pack_count": 1,
+                        "round_call_count": 1,
+                        "worker_count": 1,
+                        "scheduled_worker_count": 1,
+                        "execution_policy": "serial_configured",
+                        "parallel_route_threshold": 2,
+                        "started_work": observed_work,
+                        "completed_work": observed_work,
+                        "interrupted_work": 0,
+                        "budget_limit": observed_work,
+                        "budget_reserved_work": observed_work,
+                        "budget_remaining_work": 0,
+                        "prepared_cache_write_count": observed_work,
+                        "prepared_cache_key_checksum": 0,
+                        "semantic_event_count": 4,
+                        "task_receipt_count": 0,
+                        "task_receipts": [],
+                        "fallback_count": 0,
+                        "source_revision": attestation["source_revision"],
+                        "source_tree": attestation["source_tree"],
+                    }
+                )
+            physical_sink(  # type: ignore[operator]
+                tuple(observations)
+            )
+        raise RuntimeError("simulated native worker failure")
+
+    monkeypatch.setattr("txnopt_evidence.runner.execute_case", fail_after_native_work)
+    payload = _evrptw_config(tmp_path)
+    case = payload["case"]
+    assert isinstance(case, dict)
+    case["backend"] = "native"
+    build_path = _bind_current_native_build(tmp_path, payload)
+    config_path = tmp_path / "native-failure.json"
+    _write_config(config_path, payload)
+    expected = ExpectedEvidenceIdentity.from_plan_inputs(
+        config_path,
+        build_manifest_path=build_path,
+    )
+
+    with pytest.raises(RunExecutionError) as captured:
+        run_config_file(config_path)
+
+    with pytest.raises(ValueError, match="lacks its native round receipt"):
+        verify_failure_manifest(
+            captured.value.manifest_path,
+            expected_identity=expected,
+        )
+
+
 def test_v2_failure_artifact_remains_explicitly_verifiable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
