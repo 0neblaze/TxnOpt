@@ -1,0 +1,46 @@
+{
+  "bootstrap": {
+    "confidence_level": 0.95,
+    "method": "paired_percentile_bootstrap_of_log_speedup",
+    "quantile_rule": "nearest_rank",
+    "resamples": 20000,
+    "seed": 20260813
+  },
+  "campaign_plan_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt18/manifest.json",
+  "campaign_plan_sha256": "85e6e6471fe4480c8a05e9887e6166e5d934ea557d53ce0a33fe098529947c8f",
+  "fixed_work_quality_gate": {
+    "comparison": "exact canonical objective and semantic digest equality across serial_1, txnopt_1, txnopt_4, and barrier_4",
+    "maximum_regressions": 0
+  },
+  "holdout_opened": false,
+  "level1_protocol_path": "experiments/txnopt/level1-protocol.json",
+  "level1_protocol_sha256": "603c452d60296c4f9cd4afba55842b3a826d67f7abbb2eed75dbf04de6a9d2f2",
+  "pairing_unit": [
+    "domain",
+    "case_id",
+    "seed"
+  ],
+  "performance_gates": {
+    "four_worker_ci_lower_minimum_exclusive": 1.05,
+    "four_worker_geomean_minimum": 1.3,
+    "one_worker_maximum_overhead_fraction": 0.15
+  },
+  "performance_measure": {
+    "budget_axis": "fixed_work",
+    "duration_field": "txnopt-physical-trace-v1.run_observation.duration_ns",
+    "four_worker_ratio": "serial_1_duration_ns / txnopt_4_duration_ns",
+    "one_worker_overhead": "max(0, txnopt_1_duration_ns / serial_1_duration_ns - 1)"
+  },
+  "resource_environment": {
+    "exclusive_linux_required": true,
+    "maximum_consecutive_window_days": 14,
+    "minimum_memory_gib": 128,
+    "minimum_physical_cores": 32
+  },
+  "schema_version": "txnopt-level1-analysis-protocol-v1",
+  "status": "PREREGISTERED_BEFORE_FORMAL_MATRIX",
+  "t4_cmax_gate": {
+    "require_positive_observed_cmax_for_every_run_with_semantic_exact_work": true,
+    "require_independent_waste_bound_recomputation": true
+  }
+}

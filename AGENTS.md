@@ -186,6 +186,18 @@ PREPARED -> RESERVED -> EVALUATING -> VALIDATED -> COMMITTED
   estimation gates pass. The Level 1 cloud window is at most 14 consecutive
   days and must be predicted to finish in ten days with four days of rerun
   margin.
+- Full-scope confidence intervals and measured full-scope Cmax are outputs of
+  the Level 1 formal matrix and are completion gates, not circular
+  pre-procurement gates. Procurement still requires separate explicit user
+  authorization after the local pre-cloud gates pass.
+- The formal campaign runner requires a signed authorization bound to one exact
+  plan, analysis digest, config tree, Build09 manifest and wheel, absent raw
+  root, and 14-day exclusive-Linux resource contract. It atomically claims the
+  attempt before raw writes and terminates complete process groups on timeout.
+  It produces raw evidence only. Independent review runs in separate processes
+  from those raw manifests, rechecks host/producer/orchestration identities and
+  per-run prefix/T4 receipts, and is the only layer allowed to aggregate
+  performance or issue an internal-seal decision.
 
 ## Naming gate
 

@@ -52,7 +52,8 @@ def test_active_wheel_does_not_resolve_the_frozen_namespace() -> None:
 import importlib.util
 spec = importlib.util.find_spec('evrptw')
 assert spec is None or spec.origin is None
-assert importlib.util.find_spec('evrptw.models') is None
+if spec is not None:
+    assert importlib.util.find_spec('evrptw.models') is None
 import txnopt_cases.evrptw.models
 import txnopt_cases.evrptw.parser
 """

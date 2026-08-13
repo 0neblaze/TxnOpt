@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | representative calibration passed, formal matrix not started | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration only | formal matrix pending |
+| `txnopt-level1-protocol-v1` | ready for separate procurement authorization; purchase and formal matrix not started | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration only; Attempt18 raw root absent | formal matrix pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -112,6 +112,16 @@ test files exit zero. The sole retained failing assertion is the declared
 four-file mismatch against an older immutable source-disposition receipt; all
 other 1,935 collected outcomes pass or skip as specified. The compatibility
 decision is complete without rewriting historical provenance.
+
+Formal campaign Attempt18 is a new Build09-bound identity, not the Attempt17
+calibration plan. Its 2,880 configs and config tree are frozen under
+`/home/oneblaze/txnopt-plans/level1-formal-plan-attempt18`; its dedicated raw
+root does not exist. `level1-analysis-protocol-v1.json` fixes the paired
+fixed-work speedup, 20,000-resample 95% bootstrap interval, one-worker overhead,
+semantic/objective parity, and measured-Cmax analysis before execution. The
+orchestration preflight passes structurally but cannot execute without a
+separate signed purchase authorization. Full-scope CI and Cmax are completion
+gates produced after the matrix, not circular preconditions for procurement.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
