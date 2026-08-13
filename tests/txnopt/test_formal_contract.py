@@ -92,7 +92,7 @@ def test_independent_successor_review_keeps_the_formal_gate_open() -> None:
     assert review["claim_boundary"]["level1_ready"] is False
 
 
-def test_fourth_proof_correction_is_signed_and_remains_fail_closed() -> None:
+def test_fourth_proof_correction_is_historically_signed_and_fail_closed() -> None:
     path = ROOT / "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json"
     digest, filename = (
         path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
@@ -103,15 +103,21 @@ def test_fourth_proof_correction_is_signed_and_remains_fail_closed() -> None:
     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
     assert correction["status"] == "READY_FOR_INDEPENDENT_REVIEW"
     assert correction["responds_to"] == "txnopt_t3_t4_review_attempt03"
-    for relative_path, expected in correction["bound_inputs"].items():
-        assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == expected
+    assert len(correction["bound_inputs"]) == 15
+    assert all(
+        isinstance(digest, str) and len(digest) == 64
+        for digest in correction["bound_inputs"].values()
+    )
+    assert correction["bound_inputs"]["src/txnopt/runtime.py"] != hashlib.sha256(
+        (ROOT / "src/txnopt/runtime.py").read_bytes()
+    ).hexdigest()
     assert correction["verification"]["legacy_compatibility_status"] == "TIMEOUT"
     assert correction["claim_boundary"]["independent_review_completed"] is False
     assert correction["claim_boundary"]["t3_t4_gate_passed"] is False
     assert correction["claim_boundary"]["level1_ready"] is False
 
 
-def test_fifth_independent_review_accepts_only_the_formal_package() -> None:
+def test_fifth_independent_review_does_not_approve_the_successor_source() -> None:
     path = ROOT / "formal/reviews/txnopt_t3_t4_review_attempt05.json"
     digest, filename = (
         path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
@@ -121,22 +127,37 @@ def test_fifth_independent_review_accepts_only_the_formal_package() -> None:
     assert filename == path.name
     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
     assert review["status"] == "FORMAL_PACKAGE_PASS_LEVEL1_NOT_READY"
-    review_scope_paths = {
+    immutable_review_scope_paths = {
         "correction_sha256": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
         "proofs_sha256": "formal/proofs.md",
         "mapping_sha256": "formal/refinement-mapping.md",
         "model_receipt_sha256": "formal/model-check-receipt.json",
-        "runtime_sha256": "src/txnopt/runtime.py",
         "refinement_replay_sha256": "src/txnopt_evidence/refinement.py",
-        "independent_reviewer_sha256": "src/txnopt_evidence/reviewer.py",
     }
-    for field, relative_path in review_scope_paths.items():
+    for field, relative_path in immutable_review_scope_paths.items():
         assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == (
+            review["review_scope"][field]
+        )
+    for field, relative_path in {
+        "runtime_sha256": "src/txnopt/runtime.py",
+        "independent_reviewer_sha256": "src/txnopt_evidence/reviewer.py",
+    }.items():
+        assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() != (
             review["review_scope"][field]
         )
     assert review["claim_boundary"]["formal_package_review_passed"] is True
     assert review["claim_boundary"]["level1_ready"] is False
     assert review["claim_boundary"]["unresolved_critical_formal_findings"] == 0
+
+
+def test_native_round_refinement_note_is_explicitly_pending_successor_review() -> None:
+    note = (ROOT / "formal/native-round-prepared-receipt-refinement.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Status: `REVIEW_PENDING_BUILD10`" in note
+    assert "does not modify or supersede" in note
+    assert "Only `TxnRuntime`" in note
 
 
 def test_first_generation_protocol_identities_are_exact() -> None:

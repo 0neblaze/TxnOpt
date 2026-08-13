@@ -320,7 +320,18 @@ def _audit_t4_waste_events(
         "discarded_work_bound_units",
         "post_boundary_work_bound_units",
     )
-    waste_events = physical_events[1:]
+    native_round_events = tuple(
+        event
+        for event in physical_events[1:]
+        if event.get("event") == "native_round_observation"
+    )
+    waste_events = tuple(
+        event
+        for event in physical_events[1:]
+        if event.get("event") == "t4_waste_observation"
+    )
+    if len(native_round_events) + len(waste_events) != len(physical_events) - 1:
+        raise ValueError("campaign physical trace contains an unsupported observation")
     for event in waste_events:
         if (
             event.get("event") != "t4_waste_observation"
@@ -382,6 +393,7 @@ def _audit_t4_waste_events(
     if len(waste_events) < expected_abort_audits:
         raise ValueError("fixed-work abort lacks its T4 waste observation")
     return {
+        "native_round_observation_count": len(native_round_events),
         "t4_waste_event_count": len(waste_events),
         "expected_fixed_work_abort_audit_count": expected_abort_audits,
         "independently_recomputed_t4_event_count": len(waste_events),
@@ -431,6 +443,9 @@ def _aggregate(
         record.get("physical_t4_recomputation") == "PASS" for record in records
     )
     t4_waste_event_count = sum(int(record.get("t4_waste_event_count", 0)) for record in records)
+    native_round_observation_count = sum(
+        int(record.get("native_round_observation_count", 0)) for record in records
+    )
     for domain in ("evrptw", "rcpsp"):
         identities = sorted(
             {
@@ -508,6 +523,7 @@ def _aggregate(
             "prefix_safety_pass_count": prefix_pass_count,
             "aggregate_refinement_pass_count": refinement_pass_count,
             "physical_t4_recomputation_pass_count": t4_recomputation_pass_count,
+            "native_round_observation_count": native_round_observation_count,
             "t4_waste_event_count": t4_waste_event_count,
             "build09_fault_and_formal_gate": "PASS",
         },

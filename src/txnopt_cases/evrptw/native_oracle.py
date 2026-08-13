@@ -72,6 +72,7 @@ class NativeEVRPTWOracle(EVRPTWOracle):
             worker_count,
         )
         self._last_receipt: Mapping[str, object] | None = None
+        self._physical_observations: list[Mapping[str, object]] = []
 
     @property
     def worker_count(self) -> int:
@@ -80,6 +81,13 @@ class NativeEVRPTWOracle(EVRPTWOracle):
     @property
     def last_receipt(self) -> Mapping[str, object] | None:
         return self._last_receipt
+
+    def drain_physical_observations(self) -> tuple[Mapping[str, object], ...]:
+        """Return prepared-round evidence once without exposing commit control."""
+
+        observations = tuple(self._physical_observations)
+        self._physical_observations.clear()
+        return observations
 
     def evaluate_batch(
         self,
@@ -135,6 +143,45 @@ class NativeEVRPTWOracle(EVRPTWOracle):
             receipt=receipt,
         )
         self._last_receipt = MappingProxyType(dict(receipt))
+        task_receipts = tuple(
+            tuple(int(value) for value in row)
+            for row in _physical_receipts.tolist()
+        )
+        self._physical_observations.append(
+            MappingProxyType(
+                {
+                    "event": "native_round_observation",
+                    "trace": "txnopt-physical-trace-v1",
+                    "protocol": receipt["protocol"],
+                    "phase": receipt["phase"],
+                    "phase_trace": receipt["phase_trace"],
+                    "context_pack_count": receipt["context_pack_count"],
+                    "round_call_count": receipt["round_call_count"],
+                    "worker_count": receipt["worker_count"],
+                    "scheduled_worker_count": receipt["scheduled_worker_count"],
+                    "execution_policy": receipt["execution_policy"],
+                    "parallel_route_threshold": receipt["parallel_route_threshold"],
+                    "started_work": receipt["started_work"],
+                    "completed_work": receipt["completed_work"],
+                    "interrupted_work": receipt["interrupted_work"],
+                    "budget_limit": receipt["budget_limit"],
+                    "budget_reserved_work": receipt["budget_reserved_work"],
+                    "budget_remaining_work": receipt["budget_remaining_work"],
+                    "prepared_cache_write_count": receipt[
+                        "prepared_cache_write_count"
+                    ],
+                    "prepared_cache_key_checksum": receipt[
+                        "prepared_cache_key_checksum"
+                    ],
+                    "semantic_event_count": receipt["semantic_event_count"],
+                    "task_receipt_count": len(task_receipts),
+                    "task_receipts": task_receipts,
+                    "fallback_count": receipt["fallback_count"],
+                    "source_revision": receipt["source_revision"],
+                    "source_tree": receipt["source_tree"],
+                }
+            )
+        )
         if receipt["phase"] == "INTERRUPTED":
             raise TimeoutError("native EVRPTW exact round crossed its deadline")
 

@@ -91,6 +91,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         self._physical_event_sink = physical_event_sink
         self._physical_started_ns: int | None = None
         self._waste_audits: list[Mapping[str, object]] = []
+        self._oracle_physical_observations: list[Mapping[str, object]] = []
         self._observed_cmax_upper_ns = 0
 
     def run(
@@ -103,6 +104,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
     ) -> RunResult[StateT, ObjectiveT]:
         self._physical_started_ns = None
         self._waste_audits = []
+        self._oracle_physical_observations = []
         self._observed_cmax_upper_ns = 0
         if config.trace_policy == "semantic_and_physical":
             if self._physical_event_sink is None:
@@ -110,6 +112,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                     "semantic_and_physical tracing requires a physical event sink"
                 )
             self._physical_started_ns = self._clock_ns()
+        self._collect_oracle_physical_observations(oracle, retain=False)
         if oracle.deterministic is not True:
             raise RuntimeContractError("oracle did not declare deterministic semantics")
         if config.execution_mode != "serial" and oracle.parallel_safe is not True:
@@ -352,6 +355,25 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                                 budget=budget,
                                 config=config,
                                 deadline_ns=deadline_ns,
+                            )
+                        except Exception as evaluation_error:
+                            try:
+                                self._collect_oracle_physical_observations(
+                                    oracle,
+                                    retain=config.trace_policy
+                                    == "semantic_and_physical",
+                                )
+                            except Exception as observation_error:
+                                evaluation_error.add_note(
+                                    "secondary physical observation failure: "
+                                    f"{observation_error}"
+                                )
+                            raise
+                        else:
+                            self._collect_oracle_physical_observations(
+                                oracle,
+                                retain=config.trace_policy
+                                == "semantic_and_physical",
                             )
                         finally:
                             elapsed_ns = self._cost_clock_ns() - evaluation_started_ns
@@ -910,6 +932,61 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             self._semantic_event_sink(detached)
         return final_events
 
+    def _collect_oracle_physical_observations(
+        self,
+        oracle: Oracle[CandidateT, StateT, ObjectiveT],
+        *,
+        retain: bool,
+    ) -> None:
+        """Drain an optional adapter-local physical seam without changing Oracle."""
+
+        drain = getattr(oracle, "drain_physical_observations", None)
+        if drain is None:
+            return
+        if not callable(drain):
+            raise RuntimeContractError(
+                "oracle drain_physical_observations must be callable"
+            )
+        raw_observations = drain()
+        if isinstance(raw_observations, (str, bytes)) or not isinstance(
+            raw_observations, Sequence
+        ):
+            raise RuntimeContractError(
+                "oracle physical observations must be an ordered sequence"
+            )
+        detached: list[Mapping[str, object]] = []
+        for raw in raw_observations:
+            if not isinstance(raw, Mapping):
+                raise RuntimeContractError(
+                    "oracle physical observation must be a mapping"
+                )
+            try:
+                event = json.loads(
+                    json.dumps(
+                        dict(raw),
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                raise RuntimeContractError(
+                    "oracle physical observation is not canonical JSON"
+                ) from error
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("event"), str)
+                or not event["event"]
+                or event["event"] in {"run_observation", "t4_waste_observation"}
+                or event.get("trace") != "txnopt-physical-trace-v1"
+            ):
+                raise RuntimeContractError(
+                    "oracle physical observation uses a reserved or invalid identity"
+                )
+            detached.append(event)
+        if retain:
+            self._oracle_physical_observations.extend(detached)
+
     def _emit_physical_trace(
         self,
         *,
@@ -946,7 +1023,13 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             **screening_statistics,
         }
         waste_audits = tuple(self._waste_audit_with_cost(event) for event in self._waste_audits)
-        self._physical_event_sink((run_observation, *waste_audits))
+        self._physical_event_sink(
+            (
+                run_observation,
+                *self._oracle_physical_observations,
+                *waste_audits,
+            )
+        )
         return "txnopt-physical-trace-v1:external"
 
     def _waste_audit_with_cost(

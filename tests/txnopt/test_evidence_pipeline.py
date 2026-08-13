@@ -271,6 +271,59 @@ def test_reviewer_accepts_one_run_observation_followed_by_audited_t4_events() ->
     )
 
 
+def test_reviewer_replays_native_prepared_round_observations() -> None:
+    run = {
+        "event": "run_observation",
+        "trace": "txnopt-physical-trace-v1",
+        "execution_mode": "barrier",
+        "workers": 2,
+        "started_ns": 1,
+        "ended_ns": 4,
+        "duration_ns": 3,
+        "termination_reason": "max_rounds",
+        "observed_cmax_upper_ns": 3,
+    }
+    native = {
+        "event": "native_round_observation",
+        "trace": "txnopt-physical-trace-v1",
+        "protocol": "txnopt-native-round-v1",
+        "phase": "VALIDATED",
+        "phase_trace": ["PREPARED", "RESERVED", "EVALUATING", "VALIDATED"],
+        "context_pack_count": 1,
+        "round_call_count": 2,
+        "worker_count": 2,
+        "scheduled_worker_count": 2,
+        "execution_policy": "parallel",
+        "parallel_route_threshold": 4,
+        "started_work": 4,
+        "completed_work": 4,
+        "interrupted_work": 0,
+        "budget_limit": 4,
+        "budget_reserved_work": 4,
+        "budget_remaining_work": 0,
+        "prepared_cache_write_count": 4,
+        "prepared_cache_key_checksum": 1,
+        "semantic_event_count": 4,
+        "task_receipt_count": 2,
+        "task_receipts": [
+            [0, 0, 0, 2, 1, 2, 3],
+            [1, 1, 2, 4, 1, 2, 3],
+        ],
+        "fallback_count": 0,
+        "source_revision": "a" * 40,
+        "source_tree": "b" * 40,
+    }
+
+    _validate_physical_trace((run, native), semantic_exact_work_started=True)
+    native["prepared_cache_write_count"] = 3
+    with pytest.raises(ValueError, match="prepared delta"):
+        _validate_physical_trace((run, native), semantic_exact_work_started=True)
+    native["prepared_cache_write_count"] = 4
+    native["task_receipts"][1][2] = 3
+    with pytest.raises(ValueError, match="task receipt is malformed"):
+        _validate_physical_trace((run, native), semantic_exact_work_started=True)
+
+
 def test_reviewer_recomputes_t4_bounds_and_rejects_a_claimed_pass() -> None:
     with pytest.raises(ValueError, match="recompute independently"):
         _validate_physical_trace(

@@ -333,7 +333,16 @@ def _validate_physical_trace(
         "discarded_work_bound_units",
         "post_boundary_work_bound_units",
     )
-    for event in events[1:]:
+    native_events = tuple(
+        event for event in events[1:] if event.get("event") == "native_round_observation"
+    )
+    waste_events = tuple(
+        event for event in events[1:] if event.get("event") == "t4_waste_observation"
+    )
+    if len(native_events) + len(waste_events) != len(events) - 1:
+        raise ValueError("physical trace contains an unsupported observation")
+    _validate_native_round_observations(native_events)
+    for event in waste_events:
         if (
             event.get("event") != "t4_waste_observation"
             or event.get("trace") != "txnopt-physical-trace-v1"
@@ -390,6 +399,142 @@ def _validate_physical_trace(
             != event["post_boundary_work_bound_units"] * cmax
         ):
             raise ValueError("physical trace contains an invalid measured Cmax binding")
+
+
+def _validate_native_round_observations(
+    events: Sequence[Mapping[str, Any]],
+) -> None:
+    previous_round_call = 0
+    integer_fields = (
+        "context_pack_count",
+        "round_call_count",
+        "worker_count",
+        "scheduled_worker_count",
+        "parallel_route_threshold",
+        "started_work",
+        "completed_work",
+        "interrupted_work",
+        "budget_limit",
+        "budget_reserved_work",
+        "budget_remaining_work",
+        "prepared_cache_write_count",
+        "prepared_cache_key_checksum",
+        "semantic_event_count",
+        "task_receipt_count",
+        "fallback_count",
+    )
+    valid_traces = {
+        ("PREPARED", "RESERVED", "EVALUATING", "VALIDATED"),
+        ("PREPARED", "RESERVED", "EVALUATING", "INTERRUPTED"),
+    }
+    for event in events:
+        if (
+            event.get("trace") != "txnopt-physical-trace-v1"
+            or event.get("protocol") != "txnopt-native-round-v1"
+            or any(
+                isinstance(event.get(field), bool)
+                or not isinstance(event.get(field), int)
+                or event[field] < 0
+                for field in integer_fields
+            )
+            or event["context_pack_count"] != 1
+            or event["fallback_count"] != 0
+            or event["worker_count"] <= 0
+            or event["scheduled_worker_count"] <= 0
+            or event["scheduled_worker_count"] > event["worker_count"]
+            or event["parallel_route_threshold"] != event["worker_count"] * 2
+            or event["budget_limit"]
+            != event["budget_reserved_work"] + event["budget_remaining_work"]
+            or event["started_work"] > event["budget_reserved_work"]
+            or event["started_work"]
+            != event["completed_work"] + event["interrupted_work"]
+        ):
+            raise ValueError("native round observation violates its numeric ledger")
+        phase_trace = event.get("phase_trace")
+        if (
+            not isinstance(phase_trace, list)
+            or tuple(phase_trace) not in valid_traces
+            or event.get("phase") != phase_trace[-1]
+            or event["semantic_event_count"] != len(phase_trace)
+        ):
+            raise ValueError("native round observation violates its phase trace")
+        phase = event["phase"]
+        if phase == "VALIDATED":
+            if (
+                event["interrupted_work"] != 0
+                or event["started_work"] != event["budget_reserved_work"]
+                or event["prepared_cache_write_count"] != event["completed_work"]
+            ):
+                raise ValueError("validated native round lacks an atomic prepared delta")
+        elif (
+            event["prepared_cache_write_count"] != 0
+            or (
+                event["interrupted_work"] == 0
+                and event["started_work"] == event["budget_reserved_work"]
+            )
+        ):
+            raise ValueError("interrupted native round exposed a prepared cache delta")
+        execution_policy = event.get("execution_policy")
+        expected_policy = (
+            "serial_configured"
+            if event["worker_count"] == 1
+            else (
+                "parallel"
+                if event["budget_reserved_work"] >= event["parallel_route_threshold"]
+                else "serial_small_batch"
+            )
+        )
+        expected_scheduled = (
+            min(event["budget_reserved_work"], event["worker_count"])
+            if expected_policy == "parallel"
+            else 1
+        )
+        if (
+            execution_policy != expected_policy
+            or event["scheduled_worker_count"] != expected_scheduled
+        ):
+            raise ValueError("native round observation violates worker topology")
+        task_receipts = event.get("task_receipts")
+        if (
+            not isinstance(task_receipts, list)
+            or event["task_receipt_count"] != len(task_receipts)
+            or len(task_receipts)
+            != (event["scheduled_worker_count"] if expected_policy == "parallel" else 0)
+        ):
+            raise ValueError("native round task-receipt count is inconsistent")
+        expected_first = 0
+        for sequence, task in enumerate(task_receipts):
+            if (
+                not isinstance(task, list)
+                or len(task) != 7
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in task
+                )
+                or task[0] != sequence
+                or task[1] >= event["worker_count"]
+                or task[2] != expected_first
+                or task[2] >= task[3]
+                or task[3] > event["budget_reserved_work"]
+                or task[4] > task[5]
+                or task[5] > task[6]
+            ):
+                raise ValueError("native round task receipt is malformed")
+            expected_first = task[3]
+        if task_receipts and expected_first != event["budget_reserved_work"]:
+            raise ValueError("native round task receipts do not cover reserved work")
+        round_call = event["round_call_count"]
+        if round_call <= previous_round_call:
+            raise ValueError("native round call count is not strictly increasing")
+        previous_round_call = round_call
+        for field in ("source_revision", "source_tree"):
+            digest = event.get(field)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 40
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("native round source identity is malformed")
 
 
 def _semantic_exact_work_started(events: Sequence[Mapping[str, Any]]) -> bool:

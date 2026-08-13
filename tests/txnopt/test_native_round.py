@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 import numpy as np
 import pytest
@@ -246,6 +247,43 @@ def test_native_oracle_crosses_one_round_seam_and_matches_python_semantics() -> 
     assert native_serial.last_receipt["round_call_count"] == 1
     assert native_parallel.last_receipt is not None
     assert native_parallel.last_receipt["round_call_count"] == 1
+
+
+def test_native_round_receipt_is_retained_only_in_the_physical_trace() -> None:
+    instance = _python_instance()
+    oracle = NativeEVRPTWOracle(instance, worker_count=1)
+    initial = EVRPTWOracle(instance).solve_initial(EVRPTWPlan((("C1",), ("C2",))))
+    physical: list[tuple[Mapping[str, object], ...]] = []
+
+    result = PythonTxnRuntime(physical_event_sink=physical.append).run(
+        initial,
+        kernel=EVRPTWSearchKernel(),
+        oracle=oracle,
+        config=RunConfig(
+            seed=2014,
+            workers=1,
+            execution_mode="serial",
+            fixed_work=64,
+            trace_policy="semantic_and_physical",
+            max_rounds=1,
+        ),
+    )
+
+    assert result.physical_artifact_ref == "txnopt-physical-trace-v1:external"
+    native_events = tuple(
+        event for event in physical[0] if event["event"] == "native_round_observation"
+    )
+    assert len(native_events) == 1
+    assert native_events[0]["phase_trace"] == [
+        "PREPARED",
+        "RESERVED",
+        "EVALUATING",
+        "VALIDATED",
+    ]
+    assert native_events[0]["prepared_cache_write_count"] == (
+        native_events[0]["completed_work"]
+    )
+    assert native_events[0]["task_receipts"] == []
 
 
 def test_native_oracle_worker_topology_must_match_run_config() -> None:
