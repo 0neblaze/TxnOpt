@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build11 local build/semantic/performance/fault/runtime gates complete; pre-cloud Attempt04 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration and fault Attempt02 retained; Attempt23 raw root absent/unexecuted | Build11 evidence-lifecycle and formal-successor review pending |
+| `txnopt-level1-protocol-v1` | Build11 local build/semantic/performance/bounded-exhaustive-fault/runtime gates complete; pre-cloud Attempt05 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration and fault Attempt03 retained; Attempt23 raw root absent/unexecuted | Build11 evidence-lifecycle and formal-successor review pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -180,7 +180,11 @@ absent, and clean preflight is `PASS_NOT_AUTHORIZED_TO_EXECUTE`. A conservative
 32-physical-core estimate is about 4,300 seconds. Local fault Attempt01 is an
 immutable orchestration failure that started no tests; Attempt02 passes 24
 fault categories and 25 exact Build11-wheel test cases with zero failures,
-errors, or fallback. Pre-cloud Attempt04 therefore records the complete local
+errors, or fallback. Attempt03 strengthens that scope with all six completion
+orders for three candidates across barrier and ordered execution, every
+candidate failure position, and both runtime deadline checkpoints: 50
+auditor-owned microstate cases plus the 25 retained producer cases all pass.
+Pre-cloud Attempt05 therefore records the complete local
 build, semantic, representative performance, fault/prefix, and runtime gates,
 but remains
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; it authorizes neither procurement

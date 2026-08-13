@@ -82,6 +82,12 @@ cloud purchase, public alpha, or manuscript submission.
   exact producer-test cases against the installed Build11 wheel. Completion
   order, deadline/worker prefix safety, budget/cache/snapshot atomicity, late
   rollback, unknown commit outcome, and T4 waste gates pass with zero fallback.
+- Attempt03 retains Attempt02 and adds 50 auditor-owned bounded-exhaustive
+  microstate cases against the same installed Build11 wheel: all six
+  three-candidate completion orders across barrier and ordered execution, all
+  three worker-failure positions crossed with those orders, and both runtime
+  deadline checkpoints. All 75 combined cases pass; this is bounded runtime
+  evidence, not a general unbounded proof.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -309,9 +315,9 @@ Current gate status: **Build11 local build, semantic, representative
 performance, fault/prefix, and runtime-estimate gates are complete; external
 independent Build11 evidence-lifecycle/formal-successor review remains pending;
 purchase and execution are unauthorized**. Attempt22 is the current local
-calibration and Attempt02 is the current local fault receipt. Formal plan
+calibration and Attempt03 is the current local fault receipt. Formal plan
 Attempt23 freezes 2,880 Build11-bound configs with a fresh absent raw root and
-passes structural preflight. Pre-cloud Attempt04 remains
+passes structural preflight. Pre-cloud Attempt05 remains
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; no procurement or execution
 authority is implied, and full-scope confidence intervals remain post-run
 Level 1 completion evidence.

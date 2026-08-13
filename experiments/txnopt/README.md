@@ -70,10 +70,11 @@ review or declare readiness. After a complete run,
 replays every raw manifest into a new review root and recomputes the registered
 performance, confidence-interval, parity, prefix-safety, fallback, and Cmax
 gates. Failed attempts retain their raw root and require a new attempt label.
-The local Build11 fault gate is recorded by
-`manifests/txnopt_level1_fault_gate_attempt02.json`; its first orchestration
+The representative Build11 fault gate is retained as Attempt02. The current
+bounded-exhaustive local gate is
+`manifests/txnopt_level1_fault_gate_attempt03.json`; its first orchestration
 failure remains separately retained. The current Build11 decision receipt is
-`manifests/txnopt_level1_precloud_gate_attempt04.json`. It is explicitly
+`manifests/txnopt_level1_precloud_gate_attempt05.json`. It is explicitly
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`, not an authorization receipt and
-not a Level 1 readiness claim. Pre-cloud Attempts01-03 remain immutable prior
+not a Level 1 readiness claim. Pre-cloud Attempts01-04 remain immutable prior
 results.

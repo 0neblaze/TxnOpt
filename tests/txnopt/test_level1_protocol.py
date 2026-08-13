@@ -454,3 +454,32 @@ def test_third_build11_fault_gate_exhausts_bounded_runtime_microstates() -> None
     assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
     assert manifest["claim_boundary"]["formal_matrix_started"] is False
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_fifth_precloud_receipt_binds_the_exhaustive_fault_gate() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_precloud_gate_attempt05.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING"
+    local = manifest["local_precloud_gates"]
+    assert local["local_precloud_gate_complete"] is True
+    assert local["exhaustive_bounded_microstate_fault_gate"] == "PASS_ATTEMPT03"
+    assert local["fault_category_count"] == 27
+    assert local["fault_pytest_case_count"] == 75
+    assert local["auditor_owned_exhaustive_microstate_case_count"] == 50
+    assert local["fallback_count"] == 0
+    assert manifest["formal_and_legacy_reviews"][
+        "build11_independent_successor_review_completed"
+    ] is False
+    assert manifest["decision"]["local_precloud_gate"] == "PASS"
+    assert manifest["decision"]["precloud_gate"] == "BLOCKED"
+    assert manifest["execution_boundary"]["procurement_authorized"] is False
+    assert manifest["execution_boundary"]["formal_matrix_started"] is False
+    assert manifest["execution_boundary"]["level1_ready"] is False
