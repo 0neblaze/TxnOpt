@@ -1,0 +1,427 @@
+{
+  "schema_version": "txnopt-formal-independent-review-v1",
+  "run_label": "txnopt_evidence_lifecycle_review_attempt11",
+  "status": "PASS_BUILD14_ANCHORED_EVIDENCE_NOT_LEVEL1_READY",
+  "responds_to": "txnopt_evidence_lifecycle_review_request_attempt07",
+  "request_sha256": "f09bd66ac7d4bc08ab3835199d0bf8925151df1f775abc8712c7d8de91f3a5e8",
+  "review_scope": {
+    "authoritative_checkout": "/home/oneblaze/work/Reproducible-EVRPTW",
+    "authoritative_revision": "91fafac06f122ec571c30f2873b70f0e272a794f",
+    "authoritative_tree": "878d3937043b9cd82c6574b9e86bba991f0a24ab",
+    "authoritative_clean": true,
+    "producer_revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+    "producer_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt14.json",
+    "build_manifest_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+    "external_root": "/home/oneblaze/txnopt-builds/level1-bec0dd8",
+    "formal_model_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "prior_build13_review_path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt10.json",
+    "prior_build13_review_sha256": "8b5078ba559bbc0c932e66900de61c39e960f1860c2a23ddea9c4cc7b3d8dcbf",
+    "scope_note": "Read-only independent review of Build14 anchored evidence and lifecycle gates; no formal matrix, cloud experiment, procurement, push, release, or Level 2 activity was started."
+  },
+  "producer_identity": {
+    "binding_status": "BOUND_CLEAN_BUILD",
+    "build_manifest_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+    "source_revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+    "source_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+    "source_manifest_sha256": "d20d44e74f08de5ad101ec874a0f88a95355808b9056cad8be6e48e8c678bd5c",
+    "tracked_file_count": 1151,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot",
+    "performance_profile": "host-native-lto",
+    "wheel_sha256": "a0f25119ab16519afae3df95e0e7d28236923dfc34d5e77da0254a7c1517eb5c",
+    "source_archive_sha256": "9888165f13a529dc9aa8f7692691a0a1271de8f6719903f99ce4933c8bd54a6e",
+    "native_wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+    "native_sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+    "installed_native_sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+    "resource_soak_sha256": "5e7d4ce8a05b35a4a9e46481eb7004fe1aba6c8128a33c0a1087228caed8f2cb",
+    "asan_ubsan_native_sha256": "ecf4f3d8e4a523b951478f1e9f065cb6290c9bdedcb0fa7251698948701dfab9",
+    "tsan_native_sha256": "52e3e6e27c3d5cf7efd1462f2af90ace82fb349a9d2fb27a367ac994260c3631",
+    "asan_ubsan_sanitizer_binary_sha256": "857e1e4f0d3bfdd89fab73668145a9f5e4fb535bbafd17c1ea282daf37de06d0",
+    "tsan_sanitizer_binary_sha256": "2b7f8cfe5f342df6a46c8b3baa2bc6ca8676fb5a29aa699bc3fe40f72ad8102c",
+    "resource_soak_attestation_matches_native": true
+  },
+  "reviewer_identity": {
+    "agent_task": "/root/build13_independent_review",
+    "reviewer_checkout": "/home/oneblaze/work/Reproducible-EVRPTW",
+    "revision": "91fafac06f122ec571c30f2873b70f0e272a794f",
+    "source_tree": "878d3937043b9cd82c6574b9e86bba991f0a24ab",
+    "clean": true,
+    "clean_check": "git status --short --branch showed only codex/txnopt-level1 with no changes; git write-tree matched 878d3937043b9cd82c6574b9e86bba991f0a24ab",
+    "reviewer_write_boundary": "Only this JSON and its SHA-256 sidecar are written by this review."
+  },
+  "bound_inputs": [
+    {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt14.json",
+      "sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414"
+    },
+    {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt13.json",
+      "sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de"
+    },
+    {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt12_failure.json",
+      "sha256": "9af9f6e18ff2bebde9bebce80540eb29944f4a17bf8e897834c24c4c13351028"
+    },
+    {
+      "path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt10.json",
+      "sha256": "8b5078ba559bbc0c932e66900de61c39e960f1860c2a23ddea9c4cc7b3d8dcbf"
+    },
+    {
+      "path": "formal/model-check-receipt.json",
+      "sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5"
+    },
+    {
+      "path": "src/txnopt_evidence/reviewer.py",
+      "sha256": "27b0079b095c44b1c727e58661f98489b292ddeb500420af0dc25430c616c077"
+    },
+    {
+      "path": "src/txnopt_evidence/runner.py",
+      "sha256": "a8d1e5b70f55d6d156f35e6c9ffd7443fccb15dc412c5a2b8930566c74c9ebaa"
+    },
+    {
+      "path": "src/txnopt_evidence/campaign.py",
+      "sha256": "de5dc5380c73b8ac2f2eefa32e62f9f73cee4f9fca31a7d23ccf818f96eef630"
+    },
+    {
+      "path": "src/txnopt_evidence/identity.py",
+      "sha256": "10c0ac49d538745a74e8304f89dbd540f0b5529710901a7c2f1281e69559c0bb"
+    },
+    {
+      "path": "tools/txnopt_level1_campaign_common.py",
+      "sha256": "c4d768f87f9fb4c16a9cea2638f27003299c2a534c90853fc58c6a9f048e53a7"
+    },
+    {
+      "path": "tools/run_txnopt_level1_campaign.py",
+      "sha256": "950b82c85f9800ec79287470f99c2f25c9e5a3efd6a8d6a9235705cbf7da7190"
+    },
+    {
+      "path": "tools/review_txnopt_level1_campaign.py",
+      "sha256": "33882a9e66a48168a0ef041ab8904410bad2c5756dee44572c6db05b58532f21"
+    },
+    {
+      "path": "tests/txnopt/test_evidence_pipeline.py",
+      "sha256": "80fba01a725b4b5073eb6c39bcd0d34d8a9065b1bf6f9021cc7133bbf7d8cd47"
+    },
+    {
+      "path": "tests/txnopt/test_level1_campaign_tools.py",
+      "sha256": "249b8d20a6caf20ea3ccf91885a17e1ede13d81eee2af9d76925f65d6ff755e4"
+    }
+  ],
+  "artifact_verification": {
+    "manifest_sidecar": {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt14.json.sha256",
+      "expected_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+      "observed_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+      "sidecar_exact": true,
+      "sidecar_format": "<json_sha256>  <filename>\\n"
+    },
+    "source_attestation_recomputed": {
+      "revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+      "git_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+      "source_manifest_sha256": "d20d44e74f08de5ad101ec874a0f88a95355808b9056cad8be6e48e8c678bd5c",
+      "tracked_file_count": 1151,
+      "source_dirty": false,
+      "development_override": false,
+      "result": "PASS"
+    },
+    "wheel": {
+      "path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "a0f25119ab16519afae3df95e0e7d28236923dfc34d5e77da0254a7c1517eb5c",
+      "entry_count": 55,
+      "record_row_count": 55,
+      "record_set_exact": true,
+      "record_rows_valid": true,
+      "installed_non_record_bytes_compared": 54,
+      "installed_record_valid": true,
+      "installed_modules_from_wheel": true,
+      "result": "PASS"
+    },
+    "source_archive": {
+      "path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "9888165f13a529dc9aa8f7692691a0a1271de8f6719903f99ce4933c8bd54a6e",
+      "entry_count": 1203,
+      "unsafe_path_count": 0,
+      "result": "PASS"
+    },
+    "native": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "installed_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/formal-venv/lib/python3.13/site-packages/txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "wheel_entry_sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+      "installed_sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+      "attestation_source_revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+      "attestation_source_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+      "attestation_source_manifest_sha256": "d20d44e74f08de5ad101ec874a0f88a95355808b9056cad8be6e48e8c678bd5c",
+      "result": "PASS"
+    },
+    "resource_soak": {
+      "path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/resource-soak-attempt14.json",
+      "sha256": "5e7d4ce8a05b35a4a9e46481eb7004fe1aba6c8128a33c0a1087228caed8f2cb",
+      "sidecar_exact": true,
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "native_round_call_count": 101000,
+      "rss_growth_kib": 0,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0,
+      "attestation_matches_installed_native": true,
+      "result": "PASS"
+    },
+    "sanitizer_binaries_observed": {
+      "asan_ubsan_native_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/asan-ubsan/_native.cpython-313-x86_64-linux-gnu.so",
+      "asan_ubsan_native_sha256": "ecf4f3d8e4a523b951478f1e9f065cb6290c9bdedcb0fa7251698948701dfab9",
+      "tsan_native_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/tsan/_native.cpython-313-x86_64-linux-gnu.so",
+      "tsan_native_sha256": "52e3e6e27c3d5cf7efd1462f2af90ace82fb349a9d2fb27a367ac994260c3631",
+      "asan_ubsan_binary_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/asan-ubsan/txnopt_native_concurrency_sanitizer",
+      "asan_ubsan_binary_sha256": "857e1e4f0d3bfdd89fab73668145a9f5e4fb535bbafd17c1ea282daf37de06d0",
+      "tsan_binary_path": "/home/oneblaze/txnopt-builds/level1-bec0dd8/tsan/txnopt_native_concurrency_sanitizer",
+      "tsan_binary_sha256": "2b7f8cfe5f342df6a46c8b3baa2bc6ca8676fb5a29aa699bc3fe40f72ad8102c",
+      "asan_ubsan_linked": [
+        "libasan.so.8",
+        "libubsan.so.1"
+      ],
+      "tsan_linked": [
+        "libtsan.so.2"
+      ],
+      "asan_ctest": "1/1 PASS",
+      "tsan_ctest": "1/1 PASS",
+      "result": "PASS"
+    },
+    "historical_protected_paths": {
+      "comparison_base_revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191",
+      "protected_path_changed_count": 0,
+      "result": "UNCHANGED"
+    },
+    "predecessor_integrity": [
+      {
+        "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt12_failure.json",
+        "sha256": "9af9f6e18ff2bebde9bebce80540eb29944f4a17bf8e897834c24c4c13351028",
+        "sidecar_exact": true
+      },
+      {
+        "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt13.json",
+        "sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de",
+        "sidecar_exact": true
+      },
+      {
+        "path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt10.json",
+        "sha256": "8b5078ba559bbc0c932e66900de61c39e960f1860c2a23ddea9c4cc7b3d8dcbf",
+        "sidecar_exact": true
+      }
+    ]
+  },
+  "obligations": [
+    {
+      "id": "O1",
+      "classification": "PASS",
+      "text": "Build14 manifest/sidecar, source attestation, wheel and installed RECORD, native identity, source archive, resource soak, sanitizer paths/hashes, and producer tree reconcile exactly."
+    },
+    {
+      "id": "O2",
+      "classification": "PASS",
+      "text": "Attempt09 F-01/F-02/F-03 remain closed in the anchored v3 path: pre-run producer identity, retained config/run label/input bytes, and exact manifest/artifact/result/failure schemas are independently exercised."
+    },
+    {
+      "id": "O3",
+      "classification": "PASS",
+      "text": "F-04 is fail-closed for T4-positive work without a native receipt, no physical stream, zero-work native receipt, and undercovered multiple semantic streams; all four adversarial full-bundle cases reject."
+    },
+    {
+      "id": "O4",
+      "classification": "PASS",
+      "text": "Campaign plan-v2 binds canonical expected identities and the identity tree before execution; Build12/Build13 are rejected, Build14 is the only v2 producer branch, and Build09-11 remain explicit v1 compatibility readers while formal execution requires v2."
+    },
+    {
+      "id": "O5",
+      "classification": "PASS",
+      "text": "Runner and reviewer do not mutually import; the dependency-direction and distribution identity tests pass, and txnopt core does not reverse-import campaign tooling."
+    },
+    {
+      "id": "O6",
+      "classification": "PASS",
+      "text": "Legacy v1 raw and v2 failure artifacts remain readable, while v1 plans cannot enter formal execution without prebound identities and v2 formal entry is Build14-only."
+    },
+    {
+      "id": "O7",
+      "classification": "PASS",
+      "text": "Build12 failure, Build13 evidence, and Attempt10 review remain hash/sidecar stable; protected historical paths are unchanged from the declared comparison base."
+    },
+    {
+      "id": "O8",
+      "classification": "PASS",
+      "text": "Both Build14 harness diagnostics are honest: initial frontend/argument errors are classified as errors, corrected gates have independent exit-0 evidence, and build_complete is separate from Level 1/formal readiness."
+    },
+    {
+      "id": "O9",
+      "classification": "PASS",
+      "text": "Full tests, property tests, formal-contract tests, Ruff, strict mypy, sanitizer CTests, resource soak, legacy/boundary checks, and all formal claim-boundary booleans reconcile; no Level 1 or formal claim is made."
+    }
+  ],
+  "independent_reproduction": {
+    "method": "Read-only artifact replay, producer attestation recomputation, wheel/RECORD and installed-byte verification, source-archive safety check, native/resource/sanitizer identity checks, targeted adversarial failure-bundle tests, legacy/compatibility tests, and static dependency checks.",
+    "commands": [
+      {
+        "command": "git rev-parse HEAD; git write-tree; git status --short --branch",
+        "exit_code": 0,
+        "result": "91fafac06f122ec571c30f2873b70f0e272a794f; 878d3937043b9cd82c6574b9e86bba991f0a24ab; clean branch codex/txnopt-level1"
+      },
+      {
+        "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:. python3 -c 'committed_source_attestation(root, bec0dd89...)'",
+        "exit_code": 0,
+        "result": "revision/tree/source-manifest/tracked count and clean flags matched Build14"
+      },
+      {
+        "command": "python3 wheel RECORD recomputation and installed non-RECORD byte comparison",
+        "exit_code": 0,
+        "result": "55 entries, 55 RECORD rows, exact set, 0 invalid rows, 54 installed bytes compared, 0 mismatches"
+      },
+      {
+        "command": "python3 tarfile source archive entry/path replay",
+        "exit_code": 0,
+        "result": "1203 entries, 0 unsafe paths"
+      },
+      {
+        "command": "formal-venv/bin/python import txnopt, txnopt_cases, txnopt_evidence, txnopt_legacy, txnopt._native",
+        "exit_code": 0,
+        "result": "all product modules and native extension loaded from installed wheel"
+      },
+      {
+        "command": "ctest --test-dir /home/oneblaze/txnopt-builds/level1-bec0dd8/asan-ubsan --output-on-failure",
+        "exit_code": 0,
+        "result": "1/1 PASS"
+      },
+      {
+        "command": "ctest --test-dir /home/oneblaze/txnopt-builds/level1-bec0dd8/tsan --output-on-failure",
+        "exit_code": 0,
+        "result": "1/1 PASS"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider --basetemp=/tmp/build14-review-full tests/txnopt -q",
+        "exit_code": 0,
+        "result": "287 passed"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider --basetemp=/tmp/build14-property --hypothesis-seed=20260814 tests/txnopt/test_transaction_properties.py -q",
+        "exit_code": 0,
+        "result": "5 passed; five property functions"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider tests/txnopt/test_formal_contract.py -q",
+        "exit_code": 0,
+        "result": "15 passed"
+      },
+      {
+        "command": "stage052-dev-fe35cd9/bin/ruff check src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy tests/txnopt",
+        "exit_code": 0,
+        "result": "All checks passed"
+      },
+      {
+        "command": "stage052-dev-fe35cd9/bin/mypy",
+        "exit_code": 0,
+        "result": "Success: no issues found in 44 source files"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider tests/txnopt/test_evidence_pipeline.py -k native_failure_bundle_requires_receipt_for_aborted_started_work -q",
+        "exit_code": 0,
+        "result": "4 passed; t4_without_receipt, no_physical, zero_work_receipt, undercovered_multiple_streams"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider tests/txnopt/test_evidence_pipeline.py -k 'accepts_one_run_observation_followed_by_audited_t4_events or v1_raw_artifact or v2_failure_artifact'",
+        "exit_code": 0,
+        "result": "3 passed; non-native/T4 and legacy compatibility paths"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider tests/txnopt/test_level1_campaign_tools.py -q",
+        "exit_code": 0,
+        "result": "25 passed"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider tests/txnopt/test_level1_campaign_tools.py -k 'legacy_plan or build10 or build11 or build13 or build14 or prebound_identity' -q",
+        "exit_code": 0,
+        "result": "6 passed; v1/v2 and Build14 boundaries"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider tests/txnopt/test_dependency_direction.py tests/txnopt/test_distribution_identity.py tests/txnopt/test_cli.py -q",
+        "exit_code": 0,
+        "result": "10 passed"
+      },
+      {
+        "command": "git diff --name-status --find-renames=100% 80d6cabdd9bedf4200afa60a3a86f6c27233e191 HEAD -- protected history paths",
+        "exit_code": 0,
+        "result": "empty; historical protected paths unchanged"
+      },
+      {
+        "command": "sha256sum -c predecessor manifest/review sidecars",
+        "exit_code": 0,
+        "result": "Build12 failure, Build13 manifest, and Attempt10 review sidecars all OK"
+      }
+    ]
+  },
+  "adversarial_temporary_copy_tests": {
+    "real_evidence_modified": false,
+    "cases": [
+      {
+        "name": "t4_without_receipt",
+        "expected": "REJECT",
+        "observed": "REJECTED_BY_VERIFY_FAILURE_MANIFEST"
+      },
+      {
+        "name": "no_physical",
+        "expected": "REJECT",
+        "observed": "REJECTED_BY_VERIFY_FAILURE_MANIFEST"
+      },
+      {
+        "name": "zero_work_receipt",
+        "expected": "REJECT",
+        "observed": "REJECTED_BY_VERIFY_FAILURE_MANIFEST"
+      },
+      {
+        "name": "undercovered_multiple_streams",
+        "expected": "REJECT",
+        "observed": "REJECTED_BY_VERIFY_FAILURE_MANIFEST"
+      }
+    ],
+    "non_native_zero_work_probe": {
+      "observed": "ACCEPTED",
+      "interpretation": "valid non-native zero-work physical trace was not over-rejected"
+    },
+    "native_zero_work_probe": {
+      "observed": "ACCEPTED",
+      "interpretation": "native zero-work receipt with no semantic work was not over-rejected"
+    },
+    "legacy_probe": {
+      "observed": "PASS",
+      "interpretation": "v1 raw and v2 failure compatibility tests remained readable"
+    },
+    "tamper_scope": "All adversarial data were temporary in-memory or pytest tmp_path fixtures; real evidence and predecessor artifacts were not modified."
+  },
+  "findings": [],
+  "finding_counts": {
+    "critical": 0,
+    "major": 0,
+    "minor": 0
+  },
+  "critical_finding_count": 0,
+  "major_finding_count": 0,
+  "minor_finding_count": 0,
+  "claim_boundary": {
+    "independent_review_completed": true,
+    "formal_package_reviewed": false,
+    "build_complete": true,
+    "level1_formal_gate_passed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "release_authorized": false,
+    "level2_entry_authorized": false
+  }
+}
+
