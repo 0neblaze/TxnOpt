@@ -1,0 +1,79 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt01",
+  "status": "BUILD_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T03:56:36Z",
+  "producer": {
+    "revision": "61877a6868685b3ca14d96a2fe31c2ca29215890",
+    "git_tree": "332507aa66e7779af0333525f9680eabff1173be",
+    "source_manifest_sha256": "41b38a577f257bdfb2671aa0e6912c6316643517e558a44b9ac93710adae2634",
+    "tracked_file_count": 1028,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-61877a6/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "096a5e0daf5d709d825113e8e580e6ee3813726d991ef141f83f2ad49caa66db",
+      "entry_count": 47,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-61877a6/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "68459c66b5001937687e186bddd24439a60f332bc2d0df375af4c4709e57be40"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "98e514f4af8f73ff3a76b74bbb22c51fe883610861cf0cdfee2043ea13cd5e54",
+      "protocol": "txnopt-native-round-v1"
+    }
+  },
+  "protocol": {
+    "path": "experiments/txnopt/level1-protocol.json",
+    "sha256": "603c452d60296c4f9cd4afba55842b3a826d67f7abbb2eed75dbf04de6a9d2f2",
+    "holdout_opened": false
+  },
+  "formal_model": {
+    "receipt_path": "formal/model-check-receipt.json",
+    "receipt_sha256": "8137f6c2297bf9ef8735c64bbba14c072254329b7259a75a6067700733fba05b",
+    "bounded_t1_t2_status": "PASS",
+    "t3_t4_independent_review_status": "PENDING"
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 36},
+    "pytest": {"exit_code": 0, "status": "PASS", "passed": 85},
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "asan_ubsan": {"exit_code": 0, "status": "PASS"},
+    "tsan": {"exit_code": 0, "status": "PASS", "aslr_disabled_for_runtime": true},
+    "historical_protected_paths": {"exit_code": 0, "status": "UNCHANGED"}
+  },
+  "environment": {
+    "kernel": "Linux 6.18.35.2-microsoft-standard-WSL2 x86_64",
+    "python": "3.13.13",
+    "compiler": "GNU 13.3.0",
+    "cmake": "3.28.3",
+    "performance_profile": "portable-o3"
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "independent T3/T4 proof review",
+      "formal EVRPTW and PSPLIB benchmark inputs",
+      "local runtime estimate and ten-day matrix forecast",
+      "long-duration resource leak test",
+      "Level 1 raw experiment matrix and independent replay",
+      "single-worker overhead threshold",
+      "two-domain four-worker speedup and confidence-interval thresholds",
+      "fixed-work quality and measured T4 waste thresholds"
+    ]
+  },
+  "noncritical_observations": [
+    "GCC emitted a pybind11 header array-bounds warning; both sanitizer executables passed and no project-source diagnostic was emitted."
+  ]
+}

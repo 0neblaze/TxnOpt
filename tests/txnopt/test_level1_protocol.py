@@ -31,3 +31,23 @@ def test_level1_case_set_and_holdout_boundary_are_exact() -> None:
     ]
     assert protocol["level2_holdout_opened"] is False
     assert protocol["level3_holdout_opened"] is False
+
+
+def test_internal_build_manifest_is_signed_and_does_not_claim_readiness() -> None:
+    path = (
+        ROOT
+        / "experiments/txnopt/manifests/txnopt_level1_build_attempt01.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    manifest = json.loads(path.read_bytes())
+
+    assert manifest["status"] == "BUILD_COMPLETE_NOT_LEVEL1_READY"
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["validation"]["wheel_surface"]["fallback_count"] == 0
+    assert manifest["claim_boundary"]["level1_ready"] is False
+    assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
+    assert manifest["claim_boundary"]["pending_gates"]
