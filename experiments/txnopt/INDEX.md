@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build14 anchored-evidence review passes; Attempt24 plan-v2 preflight passes structurally; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt24 has 2,880 configs and prebound identities; raw root and launch claim are absent | Attempt11 `PASS_BUILD14_ANCHORED_EVIDENCE_NOT_LEVEL1_READY`; Level 1 completion gates remain open |
+| `txnopt-level1-protocol-v1` | Build14 anchored-evidence review and local calibration pass; Attempt24 plan-v2 preflight passes; procurement and formal matrix remain unauthorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 has 2,880 configs and prebound identities but its raw root and launch claim are absent | Attempt11 and the Attempt25 calibration audit have zero findings; pre-cloud Attempt07 is ready only for a separate procurement-authorization decision; Level 1 completion gates remain open |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -26,6 +26,16 @@ External formal plan-v2 Attempt24 binds Build14, 2,880 canonical configs, and
 digests. Independent full-plan review found no findings. Its preflight is
 `PASS_NOT_AUTHORIZED_TO_EXECUTE`; the raw root, atomic launch claim, and target
 processes are absent.
+
+Build14 local calibration Attempt25 retains 96/96 anchored v3 raw bundles and
+96/96 independent reviews with zero fallback, positive measured Cmax, and exact
+fixed-work semantic/objective parity. The representative four-worker geometric
+means are 1.3741x for EVRPTW and 2.1841x for RCPSP; maximum one-worker overheads
+are 5.69% and 1.86%. Independent audit reports zero findings. The 32-physical-
+core estimate is about 4,092 seconds, but it remains provisional local evidence.
+Pre-cloud Attempt07 is `READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION_NOT_AUTHORIZED`:
+no purchase, formal execution, holdout access, Level 1 seal, push, or release has
+been authorized.
 
 The prior internal build identity is recorded in
 `manifests/txnopt_level1_build_attempt02.json`. Its status is deliberately

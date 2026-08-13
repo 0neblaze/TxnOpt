@@ -1,0 +1,122 @@
+{
+  "schema_version": "txnopt-level1-precloud-gate-v1",
+  "run_label": "txnopt_level1_precloud_gate_attempt07",
+  "status": "READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION_NOT_AUTHORIZED",
+  "created_at_utc": "2026-08-13T19:58:39Z",
+  "successor_of": "txnopt_level1_precloud_gate_attempt06",
+  "orchestration_identity": {
+    "revision": "0881a9c82d88735dfc625d067dd3bf6c2bf5acce",
+    "git_tree": "43b0edebbc0974d5ea3cf3e4162a90b04c5dd9be",
+    "source_dirty": false,
+    "branch": "codex/txnopt-level1",
+    "producer_identity_separate": true
+  },
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt14.json",
+    "build_manifest_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+    "source_revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+    "source_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+    "source_manifest_sha256": "d20d44e74f08de5ad101ec874a0f88a95355808b9056cad8be6e48e8c678bd5c",
+    "wheel_sha256": "a0f25119ab16519afae3df95e0e7d28236923dfc34d5e77da0254a7c1517eb5c",
+    "native_sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+    "fallback_count": 0
+  },
+  "formal_plan": {
+    "manifest_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt24/manifest.json",
+    "manifest_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+    "analysis_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt24/analysis-protocol.json",
+    "analysis_sha256": "ea726847648c241db15beeecee81f22668eeddd47d53ad03353e09f6256c86d1",
+    "config_count": 2880,
+    "expected_identity_count": 2880,
+    "config_tree_sha256": "168390f92af1e7d201ddfcb612db626ab319588883852b8240946ccf5f921d68",
+    "expected_identity_tree_sha256": "41529b246272b9f78cda93185f6d0c6fcfd34f9e75a2cd9d8e03ec8c6e832f15",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build14-attempt24",
+    "raw_output_root_absent": true,
+    "atomic_launch_claim_absent": true,
+    "active_target_process_count": 0,
+    "holdout_opened": false,
+    "formal_matrix_started": false
+  },
+  "local_precloud_gates": {
+    "build_manifest_status": "PASS",
+    "build14_independent_review_status": "PASS_BUILD14_ANCHORED_EVIDENCE_NOT_LEVEL1_READY",
+    "build14_independent_review_path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt11.json",
+    "build14_independent_review_sha256": "37270d49fd31b2e71fadfd706be18b043b482908d11cd74af08ca46da41b0c9b",
+    "build14_independent_review_finding_counts": {
+      "critical": 0,
+      "major": 0,
+      "minor": 0
+    },
+    "semantic_and_objective_parity": "PASS_REPRESENTATIVE_ONLY",
+    "representative_performance_and_overhead": "PASS_REPRESENTATIVE_ONLY",
+    "anchored_raw_and_independent_replay": "PASS_96_OF_96",
+    "native_started_work_receipt_coverage": "PASS",
+    "runtime_estimate_within_ten_days": "PASS_PROVISIONAL_CALIBRATION_ONLY",
+    "fallback_count": 0,
+    "static_identity_import_naming_gate": "PASS_RETAINED_ATTEMPT01",
+    "static_manifest_path": "experiments/txnopt/manifests/txnopt_level1_static_gate_attempt01.json",
+    "static_manifest_sha256": "cc1aef7003fe3fd03a58b28bd2a619d5d85a9202de43833e9e50a6f96fbe0daa",
+    "bounded_microstate_fault_gate": "PASS_RETAINED_ATTEMPT03",
+    "fault_manifest_path": "experiments/txnopt/manifests/txnopt_level1_fault_gate_attempt03.json",
+    "fault_manifest_sha256": "9b24bfeb888a97dc34ce9376279af5c117a39b98ab0a04f199312e965fc363a2",
+    "build14_validation_note": "Build14 independently closes the later native started-work receipt gap; retained Build11 static and microstate receipts are not relabelled or rebound",
+    "calibration_manifest_path": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt25.json",
+    "calibration_manifest_sha256": "3251a1b31b9def18cf99e210449eedac04401a09178e4948cccc1eb170c524b5",
+    "calibration_independent_audit_status": "PASS_LOCAL_CALIBRATION_REPRESENTATIVE_ONLY_NOT_LEVEL1_READY",
+    "calibration_independent_audit_finding_counts": {
+      "critical": 0,
+      "major": 0,
+      "minor": 0
+    },
+    "cloud_estimate_path": "/home/oneblaze/txnopt-calibration/level1-cloud-estimate-attempt06.json",
+    "cloud_estimate_sha256": "34c736fddd2ad96b33de4d9e559799b845cf4d48c286788503a3d213e3466cdd",
+    "estimated_32_physical_core_seconds": 4092.4705551400093,
+    "local_precloud_gate_complete": true
+  },
+  "legacy_compatibility": {
+    "manifest_path": "legacy/txnopt-legacy-compatibility-attempt01.json",
+    "manifest_sha256": "8fa31e2bdd8b0457bff628e6c190c96da8ef4b9d988b8c83335abdaf7240f38e",
+    "review_manifest_path": "legacy/txnopt-legacy-compatibility-review-attempt01.json",
+    "review_manifest_sha256": "d675babbf86167788d19e94ab63010e0ef0ccfaff38fa0bc16ced76589976a0c",
+    "status": "PASS_WITH_IMMUTABLE_PROVENANCE_CAVEAT",
+    "historical_receipts_rewritten": false
+  },
+  "clean_preflight": {
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE",
+    "authority_revision": "0881a9c82d88735dfc625d067dd3bf6c2bf5acce",
+    "authority_tree": "43b0edebbc0974d5ea3cf3e4162a90b04c5dd9be",
+    "authority_clean": true,
+    "active_target_process_count": 0,
+    "raw_output_root_absent": true,
+    "atomic_launch_claim_absent": true,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false
+  },
+  "completion_gates_remaining": {
+    "full_scope_2880_run_matrix": false,
+    "both_domain_95_percent_ci_lower_bounds_above_1_05": false,
+    "full_scope_geomean_speedup_at_least_1_30": false,
+    "full_scope_one_worker_overhead_at_most_0_15": false,
+    "full_scope_finite_cmax_replay": false,
+    "final_independent_campaign_review": false
+  },
+  "execution_boundary": {
+    "procurement_authorized": false,
+    "cloud_purchase_performed": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "internal_level1_seal_created": false,
+    "level2_entry_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false
+  },
+  "decision": {
+    "local_precloud_gate": "PASS",
+    "precloud_gate": "READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION",
+    "blocking_gate": "EXPLICIT_USER_PROCUREMENT_AUTHORIZATION_AND_SIGNED_AUTHORIZATION_RECEIPT",
+    "authorized_next_action": "REQUEST_SEPARATE_PROCUREMENT_AUTHORIZATION_ONLY",
+    "claim_boundary": "Build14, Attempt11, Attempt24, and local calibration Attempt25 establish a complete local pre-cloud evidence package. This receipt does not authorize procurement, cloud use, formal execution, holdout access, Level 1 readiness, push, or release."
+  }
+}

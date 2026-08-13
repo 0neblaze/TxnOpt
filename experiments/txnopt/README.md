@@ -73,6 +73,16 @@ Attempt24 preflight status is `PASS_NOT_AUTHORIZED_TO_EXECUTE`; holdouts and
 cloud purchase remain closed, and no launch claim or raw root exists. Attempt23
 remains permanently unexecuted and unauthorized. Current formal preflight
 intentionally rejects its plan-v1 input.
+Build14-bound local calibration Attempt25 separately retains 96/96 anchored v3
+raw bundles and 96/96 independent reviews. Its representative fixed-work
+geometric-mean speedups are 1.37x for EVRPTW and 2.18x for RCPSP, with maximum
+one-worker overheads of 5.69% and 1.86%; all fixed-work semantic and objective
+groups match and fallback remains zero. Independent calibration audit reports
+zero findings, but this is not the 2,880-run Level 1 matrix. Pre-cloud Attempt07
+therefore records `READY_FOR_SEPARATE_PROCUREMENT_AUTHORIZATION_NOT_AUTHORIZED`:
+it permits only a later explicit authorization decision and does not itself
+authorize procurement, cloud use, formal execution, holdout access, or Level 1
+readiness.
 The first v3 successor build is retained as failed Build12 evidence after an
 adversarial reviewer exposed a vacuous empty native-round receipt check. The
 corrected implementation must use a later build attempt and may not overwrite
@@ -100,8 +110,8 @@ gates. Failed attempts retain their raw root and require a new attempt label.
 The representative Build11 fault gate is retained as Attempt02. The current
 bounded-exhaustive local gate is
 `manifests/txnopt_level1_fault_gate_attempt03.json`; its first orchestration
-failure remains separately retained. The current Build11 decision receipt is
-`manifests/txnopt_level1_precloud_gate_attempt05.json`. It is explicitly
-`BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`, not an authorization receipt and
-not a Level 1 readiness claim. Pre-cloud Attempts01-04 remain immutable prior
-results.
+failure remains separately retained. The current Build14 decision receipt is
+`manifests/txnopt_level1_precloud_gate_attempt07.json`. It is explicitly ready
+only for a separate procurement-authorization decision, not an authorization
+receipt and not a Level 1 readiness claim. Pre-cloud Attempts01-06 remain
+immutable prior results.
