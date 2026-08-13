@@ -63,3 +63,20 @@ def test_example_catalog_names_exactly_the_preregistered_cases() -> None:
         scope = protocol["domains"][domain]
         expected = {*scope["pilot"], *scope["validation"]}
         assert set(catalog["domains"][domain]) == expected
+
+
+def test_first_resource_soak_failure_is_signed_and_not_promoted() -> None:
+    path = (
+        ROOT
+        / "experiments/txnopt/manifests/txnopt_resource_soak_attempt01_failure.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    failure = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert failure["status"] == "HARNESS_FAILED_BEFORE_RECEIPT"
+    assert failure["raw_receipt_written"] is False
+    assert failure["disposition"] == "FAILURE_RETAINED_NEW_ATTEMPT_REQUIRED"

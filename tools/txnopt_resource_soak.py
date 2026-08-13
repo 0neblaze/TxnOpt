@@ -16,7 +16,7 @@ def main() -> int:
     parser.add_argument("--warmup-rounds", type=int, default=1_000)
     parser.add_argument("--maximum-rss-growth-kib", type=int, default=65_536)
     arguments = parser.parse_args()
-    digest = write_resource_soak_receipt(
+    digest, status = write_resource_soak_receipt(
         arguments.output,
         rounds=arguments.rounds,
         workers=arguments.workers,
@@ -24,7 +24,7 @@ def main() -> int:
         maximum_rss_growth_kib=arguments.maximum_rss_growth_kib,
     )
     print(digest)
-    return 0
+    return 0 if status == "PASS" else 1
 
 
 if __name__ == "__main__":

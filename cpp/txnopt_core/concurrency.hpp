@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -186,6 +187,23 @@ public:
             output.service_histogram[index] = service_histogram_[index].load(
                 std::memory_order_relaxed);
         }
+        return output;
+    }
+
+    [[nodiscard]] std::vector<TaskReceipt> consume_task_receipts() {
+        rethrow_task_receipt_error();
+        std::lock_guard lock(mutex_);
+        if (!tasks_.empty()
+            || active_tasks_.load(std::memory_order_acquire) != 0) {
+            throw std::runtime_error(
+                "native work-pool receipts cannot be consumed while work is active");
+        }
+        std::vector<TaskReceipt> output;
+        output.reserve(task_receipts_.size());
+        std::move(
+            task_receipts_.begin(), task_receipts_.end(),
+            std::back_inserter(output));
+        task_receipts_.clear();
         return output;
     }
 

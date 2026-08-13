@@ -15,5 +15,6 @@ def test_native_resource_soak_keeps_threads_fds_and_rss_bounded() -> None:
     )
 
     assert result["status"] == "PASS"
+    assert result["completed_rounds"] == 16
     assert result["native_round_call_count"] == 18
     assert result["fallback_count"] == 0

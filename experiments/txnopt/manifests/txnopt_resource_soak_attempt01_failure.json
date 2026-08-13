@@ -1,0 +1,18 @@
+{
+  "schema_version": "txnopt-resource-soak-failure-audit-v1",
+  "run_label": "txnopt_resource_soak_attempt01",
+  "status": "HARNESS_FAILED_BEFORE_RECEIPT",
+  "producer_revision": "ccda52becae6f399b0ca7f18f38f2d6147fc9ff7",
+  "producer_tree": "2deb656cc64386a4a37b62c6816b25b4cc6a6061",
+  "source_manifest_sha256": "304860bffe309b8d3b3faf221a2b49df86e28626b57ac1499527e45b8b8849e2",
+  "requested_rounds": 100000,
+  "warmup_rounds": 1000,
+  "workers": 4,
+  "error_type": "RuntimeError",
+  "error_message": "native work-pool task receipt capacity exceeded",
+  "raw_receipt_written": false,
+  "failure_round": null,
+  "evidence_boundary": "The original harness raised before writing a signed receipt; this append-only audit records the exact terminal error and does not reconstruct missing counters.",
+  "root_cause": "NativeWorkPool retained every physical task receipt across rounds instead of exposing a per-round consume boundary.",
+  "disposition": "FAILURE_RETAINED_NEW_ATTEMPT_REQUIRED"
+}

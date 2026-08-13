@@ -7,10 +7,10 @@
 #include "concurrency.hpp"
 
 int main() {
-    constexpr std::size_t item_count = 4'096;
-    constexpr std::size_t rounds = 64;
+    constexpr std::size_t item_count = 64;
+    constexpr std::size_t rounds = 20'000;
+    txnopt::native::NativeWorkPool pool(4, 8);
     for (std::size_t round = 0; round < rounds; ++round) {
-        txnopt::native::NativeWorkPool pool(4, 8);
         std::vector<std::uint64_t> values(item_count, 0);
         std::atomic<std::size_t> nested_count{0};
         pool.parallel_for(item_count, [&](const std::size_t index) {
@@ -22,6 +22,10 @@ int main() {
             }
         });
         pool.wait_until_idle();
+        const auto receipts = pool.consume_task_receipts();
+        if (receipts.empty()) {
+            throw std::runtime_error("parallel work-pool emitted no task receipts");
+        }
         if (nested_count.load(std::memory_order_relaxed) != 32) {
             throw std::runtime_error("nested work-pool execution was incomplete");
         }
@@ -33,6 +37,7 @@ int main() {
         }
         const auto statistics = pool.statistics();
         if (statistics.pending_tasks != 0 || statistics.active_tasks != 0
+            || !statistics.task_receipts.empty()
             || statistics.completed_tasks == 0 || statistics.rejected_count != 0) {
             throw std::runtime_error("parallel work-pool accounting mismatch");
         }

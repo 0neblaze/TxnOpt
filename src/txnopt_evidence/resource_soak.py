@@ -44,13 +44,20 @@ def run_native_resource_soak(
     before = _resource_snapshot(proc)
     started_ns = time.monotonic_ns()
     last_receipt: _native.NativeRoundReceipt | None = None
-    for round_index in range(rounds):
-        output = context.exact_round_v1(offsets, indices, math.inf, 64)
-        last_receipt = output[9]
-        if round_index % 1_000 == 0:
-            gc.collect()
+    completed_rounds = 0
+    error_type: str | None = None
+    error_message: str | None = None
+    try:
+        for round_index in range(rounds):
+            output = context.exact_round_v1(offsets, indices, math.inf, 64)
+            last_receipt = output[9]
+            completed_rounds += 1
+            if round_index % 1_000 == 0:
+                gc.collect()
+    except (RuntimeError, ValueError) as error:
+        error_type = type(error).__name__
+        error_message = str(error)
     elapsed_ns = time.monotonic_ns() - started_ns
-    del output
     gc.collect()
     after = _resource_snapshot(proc)
     rss_growth_kib = after["rss_kib"] - before["rss_kib"]
@@ -59,6 +66,8 @@ def run_native_resource_soak(
         if rss_growth_kib <= maximum_rss_growth_kib
         and after["thread_count"] == before["thread_count"]
         and after["fd_count"] == before["fd_count"]
+        and completed_rounds == rounds
+        and error_type is None
         and last_receipt is not None
         and last_receipt["fallback_count"] == 0
         else "FAIL"
@@ -67,6 +76,7 @@ def run_native_resource_soak(
         "schema_version": "txnopt-native-resource-soak-v1",
         "status": status,
         "rounds": rounds,
+        "completed_rounds": completed_rounds,
         "warmup_rounds": warmup_rounds,
         "workers": workers,
         "elapsed_ns": elapsed_ns,
@@ -78,6 +88,8 @@ def run_native_resource_soak(
         "native_round_call_count": (
             0 if last_receipt is None else last_receipt["round_call_count"]
         ),
+        "error_type": error_type,
+        "error_message": error_message,
         "native_build_attestation": dict(_native.BUILD_ATTESTATION),
     }
 
@@ -89,17 +101,16 @@ def write_resource_soak_receipt(
     workers: int,
     warmup_rounds: int,
     maximum_rss_growth_kib: int,
-) -> str:
+) -> tuple[str, str]:
     result = run_native_resource_soak(
         rounds=rounds,
         workers=workers,
         warmup_rounds=warmup_rounds,
         maximum_rss_growth_kib=maximum_rss_growth_kib,
     )
-    if result["status"] != "PASS":
-        raise RuntimeError(f"native resource soak failed: {result}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    return write_signed_json(output, result)
+    digest = write_signed_json(output, result)
+    return digest, str(result["status"])
 
 
 def _resource_snapshot(proc: Path) -> dict[str, int]:

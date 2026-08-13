@@ -88,6 +88,11 @@ ExactBatchOutput run_exact_charging_parallel(
         chunk_completed[chunk] = exact_elapsed_nanoseconds(
             std::chrono::steady_clock::now() - started);
     });
+    const auto pool_receipts = pool.consume_task_receipts();
+    if (pool_receipts.size() != chunk_count) {
+        throw std::runtime_error(
+            "native parallel exact work-pool receipt count is invalid");
+    }
 
     ExactBatchOutput output;
     output.path_offsets.push_back(0);
