@@ -6,6 +6,8 @@ from pathlib import Path
 
 from txnopt_evidence.campaign import materialize_level1_plan
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
     evrptw = tmp_path / "tiny_ev.txt"
@@ -79,6 +81,9 @@ def test_campaign_materializer_binds_every_axis_without_starting_runs(
         catalog,
         destination=tmp_path / "plan",
         raw_output_root=tmp_path / "raw",
+        build_manifest_path=(
+            ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt02.json"
+        ),
         fixed_work=16,
         fixed_time_seconds=0.5,
         max_rounds=4,
@@ -98,6 +103,7 @@ def test_campaign_materializer_binds_every_axis_without_starting_runs(
     assert manifest["holdout_opened"] is False
     assert manifest["cloud_purchase_authorized"] is False
     assert manifest["max_candidates"] == {"evrptw": 3, "rcpsp": 5}
+    assert len(manifest["build_manifest_sha256"]) == 64
     assert len(list((tmp_path / "plan/configs").glob("*.json"))) == 16
     assert list((tmp_path / "plan/configs").glob("*tinyc5*"))
     evrptw_config = json.loads(

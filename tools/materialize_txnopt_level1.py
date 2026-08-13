@@ -14,6 +14,7 @@ def main() -> int:
     parser.add_argument("--catalog", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--raw-output-root", type=Path, required=True)
+    parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--fixed-work", type=int, required=True)
     parser.add_argument("--fixed-time-seconds", type=float, required=True)
     parser.add_argument("--max-rounds", type=int, required=True)
@@ -26,6 +27,7 @@ def main() -> int:
         arguments.catalog,
         destination=arguments.destination,
         raw_output_root=arguments.raw_output_root,
+        build_manifest_path=arguments.build_manifest,
         fixed_work=arguments.fixed_work,
         fixed_time_seconds=arguments.fixed_time_seconds,
         max_rounds=arguments.max_rounds,

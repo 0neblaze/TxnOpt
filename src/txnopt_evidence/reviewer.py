@@ -43,6 +43,21 @@ def verify_raw_manifest(manifest_path: Path) -> dict[str, Any]:
         raise ValueError("unsupported raw artifact schema")
     if manifest.get("runner_decision") is not None or manifest.get("fallback_count") != 0:
         raise ValueError("raw producer crossed the decision or fallback boundary")
+    producer_identity = manifest.get("producer_identity")
+    if not isinstance(producer_identity, dict) or producer_identity.get("binding_status") not in {
+        "BOUND_CLEAN_BUILD",
+        "UNBOUND_TEST_ONLY",
+    }:
+        raise ValueError("raw producer identity is missing or invalid")
+    if producer_identity.get("binding_status") == "BOUND_CLEAN_BUILD":
+        for key in (
+            "build_manifest_sha256",
+            "wheel_sha256",
+            "installed_native_sha256",
+        ):
+            value = producer_identity.get(key)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"bound producer identity lacks {key}")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) not in {3, 4}:
         raise ValueError("raw manifest must bind three or four primary artifacts")
@@ -144,6 +159,7 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
         "schema_version": "txnopt-independent-review-v1",
         "run_label": manifest.get("run_label"),
         "raw_manifest_sha256": verify_sidecar(manifest_path),
+        "producer_identity": manifest["producer_identity"],
         "status": "PASS",
         "semantic_digest": semantic_digest,
         "event_count": len(events),

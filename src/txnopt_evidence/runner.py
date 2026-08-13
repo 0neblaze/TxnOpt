@@ -8,10 +8,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from txnopt import _native
 from txnopt_evidence.case_codec import execute_case, parse_run_config
 from txnopt_evidence.codec import (
     canonical_json_bytes,
+    read_signed_json,
     sha256_bytes,
+    sha256_file,
     write_event_stream,
     write_exclusive,
     write_sidecar,
@@ -47,6 +50,7 @@ def run_config(
         raise ValueError("output_root must be a non-empty path string")
     if not isinstance(run_config_payload, dict) or not isinstance(case_payload, dict):
         raise ValueError("run_config and case must be objects")
+    producer_identity = _producer_identity(payload.get("build_manifest"))
 
     output_dir = Path(output_root).expanduser().resolve() / run_label
     if output_dir.exists() or output_dir.is_symlink():
@@ -117,6 +121,7 @@ def run_config(
         "semantic_trace": "txnopt-semantic-trace-v1",
         "physical_trace": "txnopt-physical-trace-v1",
         "domain": case_payload.get("domain"),
+        "producer_identity": producer_identity,
         "artifacts": artifacts,
         "runner_decision": None,
         "fallback_count": 0,
@@ -124,6 +129,69 @@ def run_config(
     manifest_path = output_dir / "manifest.json"
     manifest_digest = write_signed_json(manifest_path, manifest)
     return RawArtifactRef(run_label, manifest_path, manifest_digest)
+
+
+def _producer_identity(raw_binding: object) -> dict[str, object]:
+    attestation = dict(_native.BUILD_ATTESTATION)
+    native_path = Path(_native.__file__).resolve(strict=True)
+    native_sha256 = sha256_file(native_path)
+    if raw_binding is None:
+        return {
+            "binding_status": "UNBOUND_TEST_ONLY",
+            "native_build_attestation": attestation,
+            "installed_native_sha256": native_sha256,
+        }
+    if not isinstance(raw_binding, dict):
+        raise ValueError("build_manifest binding must be an object")
+    path = raw_binding.get("path")
+    expected_sha256 = raw_binding.get("sha256")
+    if not isinstance(path, str) or not isinstance(expected_sha256, str):
+        raise ValueError("build_manifest binding path and SHA-256 are required")
+    manifest_path = Path(path).resolve(strict=True)
+    manifest = read_signed_json(manifest_path)
+    actual_sha256 = sha256_file(manifest_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError("build_manifest binding SHA-256 differs")
+    producer = manifest.get("producer")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(producer, dict) or not isinstance(artifacts, dict):
+        raise ValueError("build manifest producer or artifacts are missing")
+    native = artifacts.get("native_extension")
+    wheel = artifacts.get("wheel")
+    if not isinstance(native, dict) or not isinstance(wheel, dict):
+        raise ValueError("build manifest native or wheel artifact is missing")
+    for key in (
+        "revision",
+        "git_tree",
+        "source_manifest_sha256",
+        "tracked_file_count",
+        "source_dirty",
+        "development_override",
+    ):
+        if producer.get(key) != attestation.get(
+            {"revision": "source_revision", "git_tree": "source_tree"}.get(key, key)
+        ):
+            raise ValueError(f"installed native build differs from build manifest: {key}")
+    if (
+        producer.get("source_dirty") is not False
+        or producer.get("development_override") is not False
+    ):
+        raise ValueError("formal run requires a clean non-development native build")
+    if (
+        native.get("protocol") != "txnopt-native-round-v1"
+        or native.get("sha256") != native_sha256
+    ):
+        raise ValueError("installed native extension differs from build manifest")
+    if not isinstance(wheel.get("sha256"), str):
+        raise ValueError("build manifest wheel SHA-256 is missing")
+    return {
+        "binding_status": "BOUND_CLEAN_BUILD",
+        "build_manifest_path": str(manifest_path),
+        "build_manifest_sha256": actual_sha256,
+        "wheel_sha256": wheel["sha256"],
+        "installed_native_sha256": native_sha256,
+        "native_build_attestation": attestation,
+    }
 
 
 __all__ = ["run_config", "run_config_file"]

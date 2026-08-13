@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Final
 
 from txnopt_evidence.reviewer import replay_manifest, verify_raw_manifest
-from txnopt_evidence.runner import run_config_file
 from txnopt_legacy import LegacyReceiptReader
 
 _VERSION: Final = "0.1.0a1"
@@ -62,6 +61,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         if arguments.command == "run":
+            from txnopt_evidence.runner import run_config_file
+
             raw = run_config_file(arguments.config)
             result: object = {
                 "schema_version": "txnopt-run-command-v1",

@@ -136,6 +136,7 @@ def test_runner_writes_raw_only_and_reviewer_reconstructs_both_domains(
     manifest = verify_raw_manifest(raw.manifest_path)
     assert manifest["runner_decision"] is None
     assert manifest["fallback_count"] == 0
+    assert manifest["producer_identity"]["binding_status"] == "UNBOUND_TEST_ONLY"
     review = replay_manifest(raw.manifest_path, output_dir=tmp_path / "review")
     assert review["status"] == "PASS"
     assert review["prefix_safety"] == "PASS"

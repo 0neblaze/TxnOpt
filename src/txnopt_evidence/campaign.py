@@ -15,7 +15,13 @@ from txnopt_cases.rcpsp import (
     parse_psplib_sm,
     precedence_feasible_initial_state,
 )
-from txnopt_evidence.codec import canonical_json_bytes, sha256_bytes, write_sidecar
+from txnopt_evidence.codec import (
+    canonical_json_bytes,
+    read_signed_json,
+    sha256_bytes,
+    verify_sidecar,
+    write_sidecar,
+)
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{1,63}")
 _AXES: Mapping[str, tuple[str, int, int]] = {
@@ -32,6 +38,7 @@ def materialize_level1_plan(
     *,
     destination: Path,
     raw_output_root: Path,
+    build_manifest_path: Path,
     fixed_work: int,
     fixed_time_seconds: float,
     max_rounds: int,
@@ -55,6 +62,10 @@ def materialize_level1_plan(
         raise ValueError("campaign budgets, rounds, and attempt must be positive")
     protocol_source = protocol_path.resolve(strict=True)
     catalog_source = catalog_path.resolve(strict=True)
+    build_manifest_source = build_manifest_path.resolve(strict=True)
+    build_manifest_sha256 = verify_sidecar(build_manifest_source)
+    build_manifest = read_signed_json(build_manifest_source)
+    _validate_build_manifest(build_manifest)
     protocol = _object(json.loads(protocol_source.read_bytes()), "protocol")
     catalog = _object(json.loads(catalog_source.read_bytes()), "catalog")
     if protocol.get("schema_version") != "txnopt-level1-protocol-v1":
@@ -113,6 +124,10 @@ def materialize_level1_plan(
                             "schema_version": "txnopt-run-config-v1",
                             "run_label": label,
                             "output_root": str(raw_root),
+                            "build_manifest": {
+                                "path": str(build_manifest_source),
+                                "sha256": build_manifest_sha256,
+                            },
                             "run_config": {
                                 "seed": seed,
                                 "workers": workers,
@@ -144,6 +159,8 @@ def materialize_level1_plan(
         "catalog_path": str(catalog_source),
         "catalog_sha256": _sha256_file(catalog_source),
         "raw_output_root": str(raw_root),
+        "build_manifest_path": str(build_manifest_source),
+        "build_manifest_sha256": build_manifest_sha256,
         "config_count": len(entries),
         "config_tree_sha256": tree_sha256,
         "fixed_work": fixed_work,
@@ -163,6 +180,21 @@ def materialize_level1_plan(
     manifest_path.write_bytes(manifest_bytes)
     write_sidecar(manifest_path, sha256_bytes(manifest_bytes))
     return manifest_path
+
+
+def _validate_build_manifest(manifest: Mapping[str, Any]) -> None:
+    producer = _object(manifest.get("producer"), "build producer")
+    artifacts = _object(manifest.get("artifacts"), "build artifacts")
+    native = _object(artifacts.get("native_extension"), "native extension")
+    if manifest.get("schema_version") != "txnopt-level1-build-manifest-v1":
+        raise ValueError("unsupported TxnOpt build manifest schema")
+    if (
+        producer.get("source_dirty") is not False
+        or producer.get("development_override") is not False
+    ):
+        raise ValueError("campaign build manifest must bind a clean producer")
+    if native.get("protocol") != "txnopt-native-round-v1":
+        raise ValueError("campaign build manifest uses an unsupported native protocol")
 
 
 def _expected_case_ids(protocol: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
