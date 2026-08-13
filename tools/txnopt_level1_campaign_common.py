@@ -211,6 +211,19 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             raise ValueError("Build10 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
+    elif run_label == "txnopt_level1_build_attempt11":
+        formal_successor = _object(build.get("formal_successor"), "build formal successor")
+        if (
+            status
+            != "BUILD_COMPLETE_EVIDENCE_LIFECYCLE_REVIEW_PENDING_NOT_LEVEL1_READY"
+            or formal_successor.get("prior_review_binding_status") != "PRIOR_SOURCE_ONLY"
+            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD11"
+            or formal_successor.get("independent_successor_review_completed") is not False
+            or formal_successor.get("level1_formal_gate_passed") is not False
+        ):
+            raise ValueError("Build11 formal-successor boundary differs")
+        surface_gate = "wheel_surface_and_record"
+        additional_gates = ()
     else:
         raise ValueError("campaign build identity is not an approved Level 1 producer")
     for gate in (
