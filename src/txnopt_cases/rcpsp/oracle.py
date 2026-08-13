@@ -200,8 +200,11 @@ class RCPSPOracle:
             solver.parameters.max_time_in_seconds = remaining
         status = solver.solve(model)
         if status != cp_model.OPTIMAL:
-            if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
-                raise TimeoutError("RCPSP exact repair did not finish before deadline")
+            if deadline_ns is not None and status in {
+                cp_model.UNKNOWN,
+                cp_model.FEASIBLE,
+            }:
+                raise TimeoutError("RCPSP exact repair did not prove optimal before deadline")
             raise RuntimeError(f"RCPSP exact repair was not optimal: {solver.status_name(status)}")
         schedule = RCPSPSchedule(
             state=candidate,

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
+from types import SimpleNamespace
+
+import pytest
+from ortools.sat.python import cp_model
 
 from txnopt import RunConfig
 from txnopt.runtime import SerialTxnRuntime
@@ -166,3 +171,28 @@ def test_rcpsp_kernel_generates_block_reinsertions_and_mode_changes() -> None:
     )
     assert any(candidate.mode_vector != initial_state.mode_vector for candidate in candidates)
     assert tuple(oracle.screen(candidates)).count(True) >= 1
+
+
+def test_rcpsp_unknown_under_deadline_refines_to_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnknownSolver:
+        def __init__(self) -> None:
+            self.parameters = SimpleNamespace()
+
+        def solve(self, _model: object) -> int:
+            return int(cp_model.UNKNOWN)
+
+        def status_name(self, _status: int) -> str:
+            return "UNKNOWN"
+
+    monkeypatch.setattr(cp_model, "CpSolver", UnknownSolver)
+    oracle = RCPSPOracle(_instance(), seed=2014)
+    state = RCPSPState((0, 1, 2, 3), (0, 0, 0, 0))
+
+    with pytest.raises(TimeoutError, match="prove optimal"):
+        oracle.evaluate_batch(
+            (state,),
+            work_budget=1,
+            deadline_ns=time.monotonic_ns() + 10_000_000_000,
+        )
