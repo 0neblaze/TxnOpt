@@ -665,6 +665,13 @@ def test_reviewer_replays_native_prepared_round_observations() -> None:
         semantic_exact_work_started=True,
         expected_identity=expected,
     )
+    mismatched_mode = {**run, "execution_mode": "serial"}
+    with pytest.raises(ValueError, match="execution mode differs"):
+        _validate_physical_trace(
+            (mismatched_mode, native),
+            semantic_exact_work_started=True,
+            expected_identity=expected,
+        )
     with pytest.raises(ValueError, match="lacks its native round receipt"):
         _validate_physical_trace(
             (run,),

@@ -22,6 +22,7 @@ from tools.txnopt_level1_campaign_common import (
     canonical_json_bytes,
     load_analysis_protocol,
     load_campaign_plan,
+    load_prebound_expected_identity,
     require_clean_repository,
     run_isolated_process,
     sha256_bytes,
@@ -509,6 +510,15 @@ def test_plan_loader_rejects_an_expected_identity_resigned_after_planning(
 
     with pytest.raises(ValueError, match="expected identity differs from plan inputs"):
         load_campaign_plan(plan_path)
+
+
+def test_prebound_identity_is_rechecked_immediately_before_use(tmp_path: Path) -> None:
+    plan_path, _analysis_path = _campaign(tmp_path)
+    entry = load_campaign_plan(plan_path).entries[0]
+    entry.config_path.write_bytes(entry.config_path.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match="config changed after plan validation"):
+        load_prebound_expected_identity(entry)
 
     plan_path, analysis_path = _campaign(tmp_path / "second")
     raw_root = Path(json.loads(plan_path.read_bytes())["raw_output_root"])

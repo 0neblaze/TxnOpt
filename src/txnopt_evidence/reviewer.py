@@ -735,6 +735,11 @@ def _validate_physical_trace(
         or not observation["termination_reason"]
     ):
         raise ValueError("physical run observation is inconsistent")
+    if (
+        expected_identity is not None
+        and observation["execution_mode"] != expected_identity.execution_mode
+    ):
+        raise ValueError("physical execution mode differs from expected evidence identity")
     observed_cmax = observation.get("observed_cmax_upper_ns")
     if semantic_exact_work_started and (
         isinstance(observed_cmax, bool)

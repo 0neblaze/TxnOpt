@@ -450,6 +450,8 @@ def load_prebound_expected_identity(entry: CampaignEntry) -> ExpectedEvidenceIde
         raise ValueError("campaign entry lacks its prebound expected identity")
     if verify_sidecar(entry.expected_identity_path) != entry.expected_identity_sha256:
         raise ValueError("campaign expected identity changed after plan validation")
+    if sha256_file(entry.config_path) != entry.config_sha256:
+        raise ValueError("campaign config changed after plan validation")
     identity = ExpectedEvidenceIdentity.from_payload(
         json.loads(entry.expected_identity_path.read_bytes())
     )
