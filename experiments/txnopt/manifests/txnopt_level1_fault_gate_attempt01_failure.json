@@ -1,0 +1,42 @@
+{
+  "schema_version": "txnopt-level1-local-fault-gate-failure-v1",
+  "run_label": "txnopt_level1_fault_gate_attempt01",
+  "status": "FAILED_ORCHESTRATION_ENVIRONMENT_IDENTITY",
+  "created_at_utc": "2026-08-13T14:52:31Z",
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304"
+  },
+  "orchestration_identity": {
+    "revision": "220326495324607f8fba6360197b6e5397895346",
+    "git_tree": "a275b2f59b3613e2e35f5877d79e0e8c9a7ef4cf",
+    "tool_path": "tools/audit_txnopt_level1_fault_gate.py",
+    "tool_sha256": "6f347f25302ec80ae79638e62f2ece1afe6a7680d82a0475a34b692d6b97bfac"
+  },
+  "retained_raw_evidence": {
+    "root": "/home/oneblaze/txnopt-calibration/level1-local-fault-gate-build11-attempt01",
+    "stdout_path": "/home/oneblaze/txnopt-calibration/level1-local-fault-gate-build11-attempt01/pytest.stdout.txt",
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stderr_path": "/home/oneblaze/txnopt-calibration/level1-local-fault-gate-build11-attempt01/pytest.stderr.txt",
+    "stderr_sha256": "b18850bc20e593c45a27b66cbb10e20689a620636ef5d8eb3de542c4e6e2bd20",
+    "junit_created": false,
+    "fault_tests_started": 0
+  },
+  "root_cause": {
+    "classification": "orchestration_tool_bug",
+    "finding": "the runner resolved the virtual-environment launcher symlink to its base interpreter and therefore bypassed the Build11 environment where pytest was installed",
+    "observed_error": "No module named pytest",
+    "producer_runtime_fault": false,
+    "fixed_by_revision": "e3535a9795402a6225cd573c2f7c7735eb2f4fd1",
+    "resolution": "preserve the virtual-environment launcher path and use a new attempt identity"
+  },
+  "claim_boundary": {
+    "local_fault_gate": "FAILED_NOT_RUN",
+    "reusable_as_pass_evidence": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false,
+    "level1_ready": false
+  }
+}

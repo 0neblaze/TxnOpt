@@ -350,3 +350,49 @@ def test_build10_precloud_receipt_blocks_procurement_pending_review() -> None:
     assert manifest["execution_boundary"]["procurement_authorized"] is False
     assert manifest["execution_boundary"]["formal_matrix_started"] is False
     assert manifest["execution_boundary"]["level1_ready"] is False
+
+
+def test_first_build11_fault_gate_failure_is_retained_and_not_promoted() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/"
+        "txnopt_level1_fault_gate_attempt01_failure.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "FAILED_ORCHESTRATION_ENVIRONMENT_IDENTITY"
+    assert manifest["retained_raw_evidence"]["fault_tests_started"] == 0
+    assert manifest["root_cause"]["producer_runtime_fault"] is False
+    assert manifest["claim_boundary"]["reusable_as_pass_evidence"] is False
+    assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_second_build11_fault_gate_passes_locally_without_claiming_level1() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_fault_gate_attempt02.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "LOCAL_FAULT_GATE_PASS_NOT_LEVEL1_READY"
+    assert manifest["matrix"]["fault_category_count"] == 24
+    assert manifest["matrix"]["pytest_case_count"] == 25
+    assert manifest["matrix"]["failed"] == 0
+    assert manifest["matrix"]["errors"] == 0
+    assert manifest["matrix"]["fallback_count"] == 0
+    assert set(manifest["gate_results"].values()) == {"PASS"}
+    assert manifest["immutability"]["failed_attempt01_retained"] is True
+    assert manifest["immutability"]["build11_review_request_hash_mismatch_count"] == 0
+    assert manifest["claim_boundary"]["local_fault_gate"] == "PASS"
+    assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
+    assert manifest["claim_boundary"]["formal_matrix_started"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False
