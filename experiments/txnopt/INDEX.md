@@ -67,6 +67,13 @@ sanitizers, formal replay, legacy verifier, protected-path check, and
 1.01x EVRPTW four-worker geometric-mean fixed-work speedup, so it does not
 replace Attempt14 and the cloud matrix remains blocked.
 
+Build08-bound local calibration Attempt16 supersedes that unbound diagnostic:
+96/96 raw runs passed 96/96 independent replays with zero fallback and exact
+fixed-work semantic/objective parity. RCPSP reaches 2.11x representative
+four-worker geometric-mean speedup; EVRPTW reaches only 1.19x. Consequently
+Attempt16 is retained as `PERFORMANCE_GATE_NOT_READY`, and neither cloud rental
+nor the Level 1 matrix is authorized.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

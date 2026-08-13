@@ -1,0 +1,73 @@
+{
+  "schema_version": "txnopt-level1-local-calibration-manifest-v1",
+  "run_label": "txnopt_level1_local_calibration_attempt16",
+  "status": "LOCAL_CALIBRATION_COMPLETE_PERFORMANCE_GATE_NOT_READY",
+  "producer_build": {
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt08.json",
+    "manifest_sha256": "94075c8e9558d043cb2d0bf4b0e5499fe063c18d2590f2ceed7f50c3b16c8bae",
+    "revision": "ae98bf8c33b6a2e82f4868b97cf62e5ef645a983",
+    "source_dirty": false,
+    "development_override": false
+  },
+  "plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-calibration-plan-attempt16/manifest.json",
+    "sha256": "187d5fcd8d7a584920bea3fe7e9788d20cf82c67700b32bd5bdbe74874d6276e",
+    "config_count": 2880,
+    "config_tree_sha256": "653216fec1ae76926833bae806d97a4b77b5addc014e38ac9ee6647202cd70e0",
+    "fixed_work": 1200,
+    "fixed_time_seconds": 3.0,
+    "max_rounds": 10,
+    "holdout_opened": false
+  },
+  "calibration": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt16.json",
+    "sha256": "1dbc5c3bf507ae2777fa3ee42bf9fc7d035e8f2c0fd9787916a5b632a30e4823",
+    "representative_cases": {
+      "evrptw": ["c101C5", "c101_21"],
+      "rcpsp": ["j1201_1", "j1206_4"]
+    },
+    "seeds": [2014, 2015, 2016],
+    "raw_run_count": 96,
+    "independent_review_pass_count": 96,
+    "fallback_count": 0,
+    "formal_level1_evidence": false
+  },
+  "fixed_work_physical_results": {
+    "evrptw": {
+      "paired_sample_count": 6,
+      "four_worker_geomean_speedup": 1.1942724797328426,
+      "minimum_four_worker_speedup": 0.876435922294423,
+      "maximum_four_worker_speedup": 1.5963857981877698,
+      "maximum_one_worker_overhead_fraction": 0.1235290540957763,
+      "semantic_digest_match_rate": 1.0,
+      "objective_match_rate": 1.0,
+      "level1_speedup_threshold": 1.3,
+      "speedup_gate": "FAIL"
+    },
+    "rcpsp": {
+      "paired_sample_count": 6,
+      "four_worker_geomean_speedup": 2.110836101043605,
+      "minimum_four_worker_speedup": 1.9443333705219359,
+      "maximum_four_worker_speedup": 2.3667427993727452,
+      "maximum_one_worker_overhead_fraction": 0.004041732320134495,
+      "semantic_digest_match_rate": 1.0,
+      "objective_match_rate": 1.0,
+      "level1_speedup_threshold": 1.3,
+      "speedup_gate": "PASS_REPRESENTATIVE_ONLY"
+    }
+  },
+  "interpretation": {
+    "evrptw_large_case_speedup_range": [1.506156654499135, 1.5963857981877698],
+    "evrptw_small_case_speedup_range": [0.876435922294423, 1.0148542605825357],
+    "finding": "route-report caching reduces repeated validation cost but does not amortize four-worker scheduling on tiny EVRPTW cases",
+    "scope_or_threshold_changed": false,
+    "formal_matrix_started": false,
+    "cloud_purchase_performed": false
+  },
+  "decision": {
+    "level1_ready": false,
+    "formal_cloud_matrix_authorized": false,
+    "reason": "Build08-bound representative EVRPTW fixed-work four-worker speedup is below 1.30x",
+    "next_step": "change the observable parallel granularity or remove shared post-processing while preserving the preregistered scope and threshold"
+  }
+}

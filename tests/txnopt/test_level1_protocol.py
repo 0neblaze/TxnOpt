@@ -249,3 +249,27 @@ def test_eighth_build_receipt_keeps_the_evrptw_speedup_gate_open() -> None:
         "NOT_REBOUND_TO_BUILD08"
     )
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_build08_calibration_is_complete_but_does_not_open_the_cloud_matrix() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt16.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer_build"]["revision"].startswith("ae98bf8")
+    assert manifest["calibration"]["raw_run_count"] == 96
+    assert manifest["calibration"]["independent_review_pass_count"] == 96
+    assert manifest["calibration"]["fallback_count"] == 0
+    assert manifest["fixed_work_physical_results"]["evrptw"]["speedup_gate"] == (
+        "FAIL"
+    )
+    assert manifest["fixed_work_physical_results"]["rcpsp"]["speedup_gate"] == (
+        "PASS_REPRESENTATIVE_ONLY"
+    )
+    assert manifest["decision"]["formal_cloud_matrix_authorized"] is False

@@ -48,9 +48,12 @@ cloud purchase, public alpha, or manuscript submission.
   100,000-round resource soak with zero fallback.
 - Build08 adds a bounded solve-local EVRPTW route-report cache with exact
   cached/uncached differential tests, LRU eviction, solution-level coverage
-  replay, and fail-closed cross-instance ownership. A 12-case developer
-  diagnostic measured about 1.01x four-worker fixed-work geometric-mean
-  speedup; it is not formal evidence and leaves the 1.30x gate failed.
+  replay, and fail-closed cross-instance ownership.
+- Build08-bound local calibration Attempt16 completes 96/96 raw runs and 96/96
+  independent replays with zero fallback and exact fixed-work semantic and
+  objective parity. RCPSP reaches 2.11x representative four-worker geometric
+  mean; EVRPTW reaches only 1.19x, so the 1.30x gate remains failed and cloud
+  rental remains unauthorized.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
