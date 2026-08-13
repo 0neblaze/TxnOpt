@@ -1,128 +1,104 @@
-# Reproducible-EVRPTW
+# TxnOpt
 
-> **TxnOpt transition:** the frozen EVRPTW implementation remains available at
-> tag `stage052-legacy-freeze-v1`. Active in-place restructuring now follows
-> [`docs/roadmap/txnopt-level1-to-level3-roadmap.md`](docs/roadmap/txnopt-level1-to-level3-roadmap.md).
-> Level 1 is in progress; no TxnOpt performance, formal-completeness, package
-> release, or publication claim is currently made.
+TxnOpt is an auditable ordered-transaction runtime for state-dependent
+optimization. The active internal alpha is `0.1.0a1`; it is not published to
+PyPI, Zenodo, or a remote Git repository.
 
-Reproducible research code and evidence for the Electric Vehicle Routing
-Problem with Time Windows and Recharging Stations (EVRP-TW).
+The Level 1 implementation provides:
 
-The repository develops an ALNS-based matheuristic with exact full-recharge
-route evaluation, deterministic candidate control, auditable deadline
-semantics, bounded artifact streaming, and independent evidence replay.
+- one state owner, `TxnRuntime`, with serial, deterministic barrier, and ordered
+  transaction execution;
+- pure `SearchKernel` proposal/decision logic and domain-owned `Oracle`
+  validation/objective logic;
+- fixed-work and deadline budgets, atomic cache publication, rollback, and no
+  hidden fallback;
+- one `txnopt-native-round-v1` Python/native call per EVRPTW round, with one
+  packed instance context per solve;
+- independent EVRPTW and RCPSP adapters;
+- separate semantic and physical trace artifacts, raw-only production, and
+  independent-process replay;
+- bounded TLA+/PlusCal models and T1--T4 proof obligations.
 
-## Research status
+The public roadmap is
+[`docs/roadmap/txnopt-level1-to-level3-roadmap.md`](docs/roadmap/txnopt-level1-to-level3-roadmap.md).
+Level 2 and Level 3 remain mandatory gated stages; Level 1 alone is not a
+publication result.
 
-| Stage | Capability | Current evidence |
-|---|---|---|
-| 0 | Frozen ALNS and exact-charging baseline | Accepted and immutable |
-| 1 | Lexicographic objective | Accepted |
-| 2.1--2.3 | Route reduction, cross-route quality, constraint guidance | Accepted |
-| 3.0--3.4 | Measurement, screening, cache/incremental evaluation, deadline and parallel control | `READY_FOR_STAGE04` |
-| 4 | Adaptive weights and search control | `READY_FOR_STAGE05` |
-| 5.1 | Best-known-value collection and model-compatibility audit | `READY_FOR_STAGE05_2` |
-| 5.2 Pilot | Performance and artifact-streaming protocol | Attempt 72: `READY_FOR_STAGE052_FORMAL_BENCHMARK` |
-| 5.2 Formal | 92-instance, ten-seed benchmark | Attempt 73 is incomplete and unreviewed |
-| 6--8 | BPC expansion, solution schema, partial/nonlinear charging | Roadmap only |
+## Public API
 
-Repository engineering and extensive audit evidence do **not** by themselves
-establish a Q1/Q2 paper contribution. In particular, no Stage 5.2 formal
-performance claim is made until a complete run passes independent review.
+The root package exports exactly five interfaces:
 
-## Formal objective
+```python
+from txnopt import Oracle, RunConfig, RunResult, SearchKernel, TxnRuntime
+```
 
-All solution comparisons use the lexicographic tuple
+Candidate transactions, budget/cache ledgers, random tapes, native receipts,
+and trace records are versioned internal contracts.
+
+The formal EVRPTW objective remains lexicographic:
 
 ```text
 (vehicle_count, total_distance, total_charging_time, charging_count)
 ```
 
-Vehicle count has absolute priority. A candidate that increases vehicle count
-is rejected, including during simulated annealing. Objective construction and
-comparison are centralized in `evrptw.objective`.
+Its only active implementation is `txnopt_cases.evrptw.objective`.
 
-## Installation
+## Install and verify
 
 Python 3.13 and [uv](https://docs.astral.sh/uv/) are required.
 
 ```bash
-uv sync --all-groups
-uv run pytest -m "not external_data"
-uv run ruff check .
+uv sync --frozen --all-groups
+uv run ruff check src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy
 uv run mypy
+uv run pytest tests/txnopt -q
 ```
 
-Commercial solver packages are optional and are not required by the default
-installation or continuous integration:
+The internal CLI surface is:
+
+```text
+txnopt run --config RUN.json
+txnopt verify RAW/manifest.json
+txnopt replay RAW/manifest.json --output-dir REVIEW
+txnopt env
+txnopt legacy verify LEGACY_RECEIPT.json
+```
+
+Runner output contains raw artifacts only. Readiness decisions must be made by
+a separate review/gate process after raw replay.
+
+## Evidence and formal verification
+
+New protocol definitions and indexes live under `experiments/txnopt/`; large
+raw output remains under ignored `results/` or a governed external root.
+
+The bounded formal receipt is re-run with:
 
 ```bash
-uv sync --all-groups --extra commercial-solvers
+python tools/verify_txnopt_formal.py \
+  --java /path/to/java \
+  --tla2tools /path/to/tla2tools.jar
 ```
 
-CPLEX and Gurobi remain subject to their own licenses.
+Model-check success is not presented as a complete mathematical proof or an
+independent review.
 
-## Benchmark data
+## Frozen EVRPTW history
 
-Schneider benchmark instances are not redistributed in this repository. Place
-the verified files under `data/schneider/`; formal runs validate the expected
-instance identities and hashes before execution. See
-[Third-party data and software](THIRD_PARTY_DATA.md).
+The pre-TxnOpt implementation is preserved at tag
+`stage052-legacy-freeze-v1`, commit
+`3b0cf371759f3465c7264b85894d090004f3cf43`. Historical Stage labels, schemas,
+paths, manifests, hashes, statuses, and ABI exports are not renamed or
+recomputed. The active `txnopt` wheel contains no `evrptw` package and no old
+Stage CLI wrappers; historical reproduction uses the frozen tag/wheel and the
+read-only `txnopt_legacy` reader.
 
-Tests marked `external_data` require the benchmark data or preserved historical
-comparison inputs. The unmarked test suite is self-contained and is the suite
-run by public CI.
+Schneider and PSPLIB benchmark data are not redistributed. Third-party data,
+papers, and solvers remain under their own licenses; see
+[THIRD_PARTY_DATA.md](THIRD_PARTY_DATA.md).
 
-## Reproducing the staged evidence
+## License and citation
 
-The high-level sequence is:
-
-1. install the locked environment;
-2. provide the external benchmark data;
-3. run or review the stage-specific CLI with its tracked TOML configuration;
-4. verify the raw manifest and checksum before trusting any summary;
-5. compare only against the baseline named by that stage's protocol.
-
-Start with:
-
-- [Research roadmap](docs/roadmap/README.md)
-- [Literature and citation index](docs/literature.md)
-- [Experiment evidence index](experiments/INDEX.md)
-- [Artifact index](artifacts/README.md)
-- [Migration and provenance](docs/provenance/README.md)
-- [Stage 5.2 workflow](docs/stage052_performance_benchmark_workflow.md)
-- [ALNS and exact-charging methodology](docs/methodology/alns-exact-charging.md)
-
-Generated raw artifacts belong below ignored `results/<run_label>/`. Curated
-summaries, registries, manifests, and review products are tracked only after
-the corresponding independent replay gate succeeds.
-
-## Artifact availability
-
-Large raw evidence is intentionally not stored in Git. The public artifact
-index records logical identity, status, byte count, checksum, source revision,
-and release state. Accepted release bundles will be deposited in an external
-archive such as Zenodo or OSF and linked by DOI and SHA-256.
-
-Attempt 72 is an accepted Stage 5.2 Pilot. Attempt 73 remains
-`partial_unreviewed`; its source campaign manifest still records `planned`.
-This distinction is deliberate and must not be rewritten as success.
-
-## Development
-
-Contributions must preserve the formal objective, immutable evidence rules,
-fail-fast behavior, and raw-to-summary replay semantics described in
-[AGENTS.md](AGENTS.md). See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a
-change.
-
-## Citation
-
-Use [CITATION.cff](CITATION.cff). A versioned archival DOI will be added when a
-paper-facing release bundle is accepted.
-
-## License
-
-Code and original documentation are licensed under Apache-2.0. Benchmark data,
-published papers, commercial solver packages, and third-party repositories are
-excluded; see [NOTICE](NOTICE) and [THIRD_PARTY_DATA.md](THIRD_PARTY_DATA.md).
+Original code and documentation are licensed under Apache-2.0. The internal
+alpha is not an archival release and has no DOI. See [CITATION.cff](CITATION.cff)
+for the current software citation metadata.

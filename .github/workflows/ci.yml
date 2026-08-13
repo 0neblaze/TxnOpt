@@ -20,14 +20,12 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --frozen --all-groups
-      - run: uv run ruff check .
-      - run: uv run mypy
       - run: >-
-          uv run experiment-lifecycle
-          --catalog configs/experiment_catalog.toml
-          --state-root .experiment-lifecycle-ci
-          audit --repository .
-      - run: uv run pytest -m "not external_data and not formal_environment" -q
+          uv run ruff check
+          src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy
+          tests/txnopt
+      - run: uv run mypy
+      - run: uv run pytest tests/txnopt -q
 
   windows-smoke:
     runs-on: windows-latest
@@ -41,10 +39,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --frozen --all-groups
-      - run: >-
-          uv run pytest
-          tests/txnopt
-          tests/test_benchmark_audit.py
-          tests/test_objective.py
-          tests/test_exact_charging.py
-          -q
+      - run: uv run pytest tests/txnopt -q

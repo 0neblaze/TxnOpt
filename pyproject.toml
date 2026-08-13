@@ -3,48 +3,19 @@ requires = ["scikit-build-core>=0.11,<0.12", "pybind11>=3.0,<4"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "reproducible-evrptw"
-version = "0.1.0"
-description = "Reproducible ALNS and exact-charging research for EVRP-TW"
+name = "txnopt"
+version = "0.1.0a1"
+description = "Auditable ordered-transaction runtime for state-dependent optimization"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 license = "Apache-2.0"
 dependencies = [
-  "highspy>=1.12,<2",
-  "jupyterlab>=4.5,<5",
-  "matplotlib>=3.10,<4",
-  "networkx>=3.5,<4",
-  "numba>=0.63,<1",
   "numpy>=2.3,<3",
   "ortools>=9.14,<10",
-  "orjson>=3.11,<4",
-  "pandas>=2.3,<4",
-  "psutil>=7.2,<8",
-  "pyarrow>=18,<24",
-  "scipy>=1.16,<2",
-  "seaborn>=0.13,<1",
-]
-
-[project.optional-dependencies]
-commercial-solvers = [
-  "cplex==22.2.0.0",
-  "docplex==2.32.264",
-  "gurobipy==13.0.2",
 ]
 
 [project.scripts]
 txnopt = "txnopt_evidence.cli:main"
-evrptw-env = "evrptw.environment:main"
-experiment-lifecycle = "evrptw.experiment_lifecycle:main"
-experiment-historical-review = "evrptw.experiments.lifecycle_historical_review:main"
-experiment-legacy-review = "evrptw.experiments.lifecycle_legacy_review:main"
-stage052-native-architectures = "evrptw.experiments.stage052_native_architectures:main"
-stage052-native-architecture-review = "evrptw.experiments.stage052_native_architecture_review:main"
-stage052-performance-build = "evrptw.experiments.stage052_performance_build:main"
-stage052-performance-calibration = "evrptw.experiments.stage052_performance_calibration:main"
-stage052-performance-observation = "evrptw.experiments.stage052_performance_observation:main"
-stage052-performance-calibration-review = "evrptw.experiments.stage052_performance_calibration_review:main"
-stage052-telemetry-overhead = "evrptw.experiments.stage052_telemetry_overhead:main"
 
 [dependency-groups]
 dev = [
@@ -59,12 +30,10 @@ dev = [
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages = [
-  "src/evrptw",
   "src/txnopt",
   "src/txnopt_cases",
   "src/txnopt_evidence",
   "src/txnopt_legacy",
-  "tools",
 ]
 
 [tool.ruff]
@@ -84,14 +53,6 @@ markers = [
 [tool.mypy]
 python_version = "3.13"
 mypy_path = "src"
-packages = ["evrptw", "txnopt", "txnopt_cases", "txnopt_evidence", "txnopt_legacy"]
+packages = ["txnopt", "txnopt_cases", "txnopt_evidence", "txnopt_legacy"]
 strict = true
 warn_unused_ignores = false
-
-[[tool.mypy.overrides]]
-module = ["cplex.*", "docplex.*", "gurobipy.*", "scipy.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["pyarrow.*"]
-ignore_missing_imports = true

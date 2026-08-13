@@ -31,7 +31,7 @@ def _repository(tmp_path: Path) -> Path:
     tools = root / "tools"
     tools.mkdir()
     (tools / "__init__.py").write_text("", encoding="utf-8")
-    package = root / "src" / "evrptw"
+    package = root / "src" / "txnopt"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     _git(
@@ -39,7 +39,7 @@ def _repository(tmp_path: Path) -> Path:
         "add",
         "cpp/producer.cpp",
         "tools/__init__.py",
-        "src/evrptw/__init__.py",
+        "src/txnopt/__init__.py",
     )
     _git(root, "commit", "-m", "initial")
     return root

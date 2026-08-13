@@ -47,21 +47,18 @@ else:
     assert completed.returncode == 0, completed.stderr
 
 
-def test_legacy_model_and_parser_are_identity_preserving_adapters() -> None:
+def test_active_wheel_does_not_resolve_the_frozen_namespace() -> None:
     script = """
-import evrptw.models as legacy_models
-import evrptw.parser as legacy_parser
-import txnopt_cases.evrptw.models as models
-import txnopt_cases.evrptw.parser as parser
-assert legacy_models.Instance is models.Instance
-assert legacy_models.Node is models.Node
-assert legacy_models.NodeType is models.NodeType
-assert legacy_models.Vehicle is models.Vehicle
-assert legacy_parser.parse_schneider is parser.parse_schneider
+import importlib.util
+spec = importlib.util.find_spec('evrptw')
+assert spec is None or spec.origin is None
+assert importlib.util.find_spec('evrptw.models') is None
+import txnopt_cases.evrptw.models
+import txnopt_cases.evrptw.parser
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],
-        cwd=ROOT,
+        cwd=ROOT.parent,
         check=False,
         capture_output=True,
         text=True,

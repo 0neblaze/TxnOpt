@@ -149,13 +149,13 @@ after proving equivalence to the canonical round stream.
 - [x] Migrate the EVRPTW model, parser, objective, validator, and exact-charging
   oracle behind `txnopt_cases.evrptw` without duplicating the formal
   vehicle-first objective.
-- [ ] Migrate the active EVRPTW neighborhood surface after its incremental,
+- [x] Migrate the active EVRPTW neighborhood surface after its incremental,
   measurement, and native protocols have been separated from the old module.
-- [ ] Split producer-only runners from independent raw-only reviewers in
+- [x] Split producer-only runners from independent raw-only reviewers in
   `txnopt_evidence` and eliminate mutual imports.
 - [x] Freeze the old repository instructions under tracked legacy governance,
   then replace the root instructions with current TxnOpt rules.
-- [ ] Switch distribution, wheel contents, CMake project, native module, CLI,
+- [x] Switch distribution, wheel contents, CMake project, native module, CLI,
   documentation, CI, tests, tools, and experiment entrypoints together. A
   partially renamed wheel is not a Level 1 artifact.
 
@@ -177,11 +177,11 @@ after proving equivalence to the canonical round stream.
 - [ ] Move the active generic transaction and trace path into `cpp/txnopt_core`;
   the first slice reuses the frozen concurrency and exact-kernel headers behind
   a new module identity while keeping budget/cache ownership in Python.
-- [x] Keep EVRPTW packing and exact charging in the case-native adapter;
-  case-native screening remains pending.
+- [x] Keep EVRPTW packing, safe screening, and exact charging in the
+  case-native adapter.
 - [x] Require one contiguous SoA request and one typed receipt per round, with
   identical fixed-work semantic digests for Python and native execution.
-- [ ] Do not implement a Level 1 multi-round full-native path.
+- [x] Do not implement a Level 1 multi-round full-native path.
 
 ### Weeks 5-6: RCPSP and formal model
 
@@ -191,9 +191,9 @@ after proving equivalence to the canonical round stream.
   remove/reinsert, and mode change.
 - [x] Use fixed-seed single-thread CP-SAT exact repair and reconstruct every
   schedule in an independent validator; the objective is feasible makespan.
-- [ ] Complete T1/T2 proof and model checking. Produce independently reviewable
-  T3/T4 proofs. Close the positive Level 2 entry if T3 fails or T4 is vacuous at
-  measured parameters.
+- [x] Complete bounded T1/T2 proof and model checking.
+- [ ] Produce independently reviewable T3/T4 proofs. Close the positive Level 2
+  entry if T3 fails or T4 is vacuous at measured parameters.
 
 The formal obligations are:
 

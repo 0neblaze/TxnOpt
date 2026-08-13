@@ -11,12 +11,15 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
-#include "native_exact_parallel.hpp"
-#include "native_solver_kernels.hpp"
+#include "concurrency.hpp"
+#include "../txnopt_cases/evrptw/exact_kernels.hpp"
+#include "../txnopt_cases/evrptw/parallel_exact.hpp"
 
 namespace py = pybind11;
 
 namespace txnopt::native {
+
+namespace evrptw_native = txnopt::cases::evrptw::native;
 
 constexpr auto protocol_version = "txnopt-native-round-v1";
 
@@ -115,16 +118,16 @@ public:
             reachability.data() + node_count_ * node_count_);
         vehicle_.assign(vehicle_values.data(), vehicle_values.data() + 5);
         for (std::size_t index = 0; index < node_count_; ++index) {
-            if (kinds_[index] == evrptw::native_kernels::depot_kind) {
+            if (kinds_[index] == evrptw_native::depot_kind) {
                 if (depot_ >= 0) {
                     throw std::invalid_argument("EVRPTW context has multiple depots");
                 }
                 depot_ = static_cast<std::int64_t>(index);
                 recharge_nodes_.push_back(static_cast<std::int64_t>(index));
-            } else if (kinds_[index] == evrptw::native_kernels::station_kind) {
+            } else if (kinds_[index] == evrptw_native::station_kind) {
                 stations_.push_back(static_cast<std::int64_t>(index));
                 recharge_nodes_.push_back(static_cast<std::int64_t>(index));
-            } else if (kinds_[index] != evrptw::native_kernels::customer_kind) {
+            } else if (kinds_[index] != evrptw_native::customer_kind) {
                 throw std::invalid_argument("EVRPTW context contains an unknown node kind");
             }
             if (!std::isfinite(ready_[index]) || !std::isfinite(due_[index])
@@ -175,12 +178,12 @@ public:
             const auto node = indices.data()[index];
             if (node < 0 || static_cast<std::size_t>(node) >= node_count_
                 || kinds_[static_cast<std::size_t>(node)]
-                    != evrptw::native_kernels::customer_kind) {
+                    != evrptw_native::customer_kind) {
                 throw std::invalid_argument("route indices must name customer nodes");
             }
         }
 
-        evrptw::native_kernels::ExactBatchOutput output;
+        evrptw_native::ExactBatchOutput output;
         std::int64_t screened_routes = 0;
         {
             py::gil_scoped_release release;
@@ -189,7 +192,7 @@ public:
             for (std::size_t route = 0; route < route_count; ++route) {
                 const auto first = offsets.data()[route];
                 const auto last = offsets.data()[route + 1];
-                const auto screened = evrptw::native_kernels::run_screen_route(
+                const auto screened = evrptw_native::run_screen_route(
                     kinds_.data(), demands_.data(), ready_.data(), due_.data(),
                     service_.data(), distances_.data(), reachable_.data(),
                     vehicle_.data(), indices.data() + first,
@@ -208,7 +211,7 @@ public:
                     offsets.data(), indices.data(), route_count,
                     deadline_seconds, batch_size);
             } else {
-                output = evrptw::native_parallel::run_exact_charging_parallel(
+                output = evrptw_native::run_exact_charging_parallel(
                     *pool_, offsets.data(), indices.data(), route_count,
                     deadline_seconds,
                     [&](const std::int64_t* chunk_offsets,
@@ -220,7 +223,7 @@ public:
                             remaining, batch_size);
                     });
             }
-            evrptw::native_kernels::validate_exact_batch_output(
+            evrptw_native::validate_exact_batch_output(
                 output, kinds_.data(), offsets.data(), indices.data(),
                 node_count_, route_count,
                 static_cast<std::size_t>(indices.shape(0)), depot_, batch_size);
@@ -239,8 +242,8 @@ public:
         receipt["completed_work"] = output.batch_counters[2];
         receipt["interrupted_work"] = output.batch_counters[3];
         receipt["fallback_count"] = 0;
-        receipt["source_revision"] = EVRPTW_BUILD_GIT_REVISION;
-        receipt["source_tree"] = EVRPTW_BUILD_GIT_TREE;
+        receipt["source_revision"] = TXNOPT_BUILD_GIT_REVISION;
+        receipt["source_tree"] = TXNOPT_BUILD_GIT_TREE;
 
         const std::vector<std::int64_t> semantic_counters{
             output.batch_counters[0],
@@ -278,13 +281,13 @@ public:
     }
 
 private:
-    evrptw::native_kernels::ExactBatchOutput run_exact(
+    evrptw_native::ExactBatchOutput run_exact(
         const std::int64_t* const offsets,
         const std::int64_t* const indices,
         const std::size_t route_count,
         const double deadline_seconds,
         const std::int64_t batch_size) const {
-        return evrptw::native_kernels::run_exact_charging_batch(
+        return evrptw_native::run_exact_charging_batch(
             kinds_.data(), ready_.data(), due_.data(), service_.data(),
             distances_.data(), vehicle_.data(), offsets, indices, node_count_,
             route_count, depot_, stations_, deadline_seconds, batch_size);

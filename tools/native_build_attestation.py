@@ -1,4 +1,4 @@
-"""Attest the exact tracked bytes used by a native EVRP-TW build."""
+"""Attest the exact tracked bytes used by a native TxnOpt build."""
 
 from __future__ import annotations
 
@@ -12,7 +12,13 @@ import tarfile
 from collections.abc import Mapping
 from pathlib import Path
 
-SCHEMA_VERSION = "stage05.2-native-build-attestation-v1"
+SCHEMA_VERSION = "txnopt-native-build-attestation-v1"
+_ACTIVE_PACKAGE_ROOTS = (
+    "src/txnopt/",
+    "src/txnopt_cases/",
+    "src/txnopt_evidence/",
+    "src/txnopt_legacy/",
+)
 
 
 def validate_scheduler_build_attestation(
@@ -193,10 +199,8 @@ def committed_wheel_project_entries(root: Path, revision: str) -> set[str]:
     entries: set[str] = set()
     for raw_path in raw_paths.rstrip(b"\0").split(b"\0"):
         path = raw_path.decode("utf-8")
-        if path.startswith("src/evrptw/"):
+        if path.startswith(_ACTIVE_PACKAGE_ROOTS):
             entries.add(path.removeprefix("src/"))
-        elif path.startswith("tools/"):
-            entries.add(path)
     if not entries:
         raise RuntimeError("committed wheel project inventory is empty")
     return entries
@@ -213,10 +217,25 @@ def committed_wheel_project_entry_sha256(root: Path, revision: str) -> dict[str,
         "-z",
         revision,
         "--",
-        "src/evrptw",
-        "tools",
+        "src/txnopt",
+        "src/txnopt_cases",
+        "src/txnopt_evidence",
+        "src/txnopt_legacy",
     )
-    archive_bytes = _git(root, "archive", "--format=tar", revision, "src/evrptw", "tools")
+    tracked_paths = [
+        item.split(b"\t", 1)[1].decode("utf-8")
+        for item in raw_tree.rstrip(b"\0").split(b"\0")
+        if item
+    ]
+    if not tracked_paths:
+        raise RuntimeError("committed wheel project inventory is empty")
+    archive_bytes = _git(
+        root,
+        "archive",
+        "--format=tar",
+        revision,
+        *tracked_paths,
+    )
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
         members = {member.name: member for member in archive.getmembers()}
         entries: dict[str, str] = {}

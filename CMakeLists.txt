@@ -6,18 +6,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(PYBIND11_FINDPYTHON ON)
 set(
-  _EVRPTW_EFFECTIVE_CXX_FLAGS
+  _TXNOPT_EFFECTIVE_CXX_FLAGS
   "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}"
 )
 string(
   TOLOWER
-  "${_EVRPTW_EFFECTIVE_CXX_FLAGS}"
-  _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER
+  "${_TXNOPT_EFFECTIVE_CXX_FLAGS}"
+  _TXNOPT_EFFECTIVE_CXX_FLAGS_LOWER
 )
 if(
-  _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "fast-math"
-  OR _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "(^|[ ;])-ofast([ ;]|$)"
-  OR _EVRPTW_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "/fp:fast"
+  _TXNOPT_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "fast-math"
+  OR _TXNOPT_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "(^|[ ;])-ofast([ ;]|$)"
+  OR _TXNOPT_EFFECTIVE_CXX_FLAGS_LOWER MATCHES "/fp:fast"
 )
   message(
     FATAL_ERROR
@@ -25,41 +25,41 @@ if(
   )
 endif()
 set(
-  EVRPTW_SANITIZER
+  TXNOPT_SANITIZER
   "none"
   CACHE STRING
   "Native sanitizer profile: none, address-undefined, or thread"
 )
 set_property(
-  CACHE EVRPTW_SANITIZER
+  CACHE TXNOPT_SANITIZER
   PROPERTY STRINGS none address-undefined thread
 )
 set(
-  EVRPTW_PERFORMANCE_PROFILE
+  TXNOPT_PERFORMANCE_PROFILE
   "portable-o3"
   CACHE STRING
   "Native performance profile: portable-o3, portable-lto, or host-native-lto"
 )
 set_property(
-  CACHE EVRPTW_PERFORMANCE_PROFILE
+  CACHE TXNOPT_PERFORMANCE_PROFILE
   PROPERTY STRINGS portable-o3 portable-lto host-native-lto
 )
 set(
-  _EVRPTW_PERFORMANCE_PROFILES
+  _TXNOPT_PERFORMANCE_PROFILES
   portable-o3
   portable-lto
   host-native-lto
 )
-if(NOT EVRPTW_PERFORMANCE_PROFILE IN_LIST _EVRPTW_PERFORMANCE_PROFILES)
+if(NOT TXNOPT_PERFORMANCE_PROFILE IN_LIST _TXNOPT_PERFORMANCE_PROFILES)
   message(
     FATAL_ERROR
-    "EVRPTW_PERFORMANCE_PROFILE must be portable-o3, portable-lto, or host-native-lto"
+    "TXNOPT_PERFORMANCE_PROFILE must be portable-o3, portable-lto, or host-native-lto"
   )
 endif()
-set(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION 0)
-set(EVRPTW_BUILD_HOST_NATIVE 0)
-if(EVRPTW_PERFORMANCE_PROFILE MATCHES "-lto$")
-  if(NOT EVRPTW_SANITIZER STREQUAL "none")
+set(TXNOPT_BUILD_INTERPROCEDURAL_OPTIMIZATION 0)
+set(TXNOPT_BUILD_HOST_NATIVE 0)
+if(TXNOPT_PERFORMANCE_PROFILE MATCHES "-lto$")
+  if(NOT TXNOPT_SANITIZER STREQUAL "none")
     message(
       FATAL_ERROR
       "LTO performance profiles cannot be combined with sanitizer builds"
@@ -67,16 +67,16 @@ if(EVRPTW_PERFORMANCE_PROFILE MATCHES "-lto$")
   endif()
   include(CheckIPOSupported)
   check_ipo_supported(
-    RESULT EVRPTW_IPO_SUPPORTED
-    OUTPUT EVRPTW_IPO_DIAGNOSTIC
+    RESULT TXNOPT_IPO_SUPPORTED
+    OUTPUT TXNOPT_IPO_DIAGNOSTIC
     LANGUAGES CXX
   )
-  if(NOT EVRPTW_IPO_SUPPORTED)
-    message(FATAL_ERROR "LTO is unavailable: ${EVRPTW_IPO_DIAGNOSTIC}")
+  if(NOT TXNOPT_IPO_SUPPORTED)
+    message(FATAL_ERROR "LTO is unavailable: ${TXNOPT_IPO_DIAGNOSTIC}")
   endif()
-  set(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION 1)
+  set(TXNOPT_BUILD_INTERPROCEDURAL_OPTIMIZATION 1)
 endif()
-if(EVRPTW_PERFORMANCE_PROFILE STREQUAL "host-native-lto")
+if(TXNOPT_PERFORMANCE_PROFILE STREQUAL "host-native-lto")
   if(
     NOT UNIX
     OR APPLE
@@ -87,10 +87,10 @@ if(EVRPTW_PERFORMANCE_PROFILE STREQUAL "host-native-lto")
       "host-native-lto is restricted to Linux/WSL x86-64"
     )
   endif()
-  set(EVRPTW_BUILD_HOST_NATIVE 1)
+  set(TXNOPT_BUILD_HOST_NATIVE 1)
 endif()
 option(
-  EVRPTW_ALLOW_DIRTY_BUILD
+  TXNOPT_ALLOW_DIRTY_BUILD
   "Allow a development-only native build from a dirty tracked source tree"
   OFF
 )
@@ -98,9 +98,9 @@ option(
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
-set(EVRPTW_ATTEST_OVERRIDE_ARGUMENT)
-if(EVRPTW_ALLOW_DIRTY_BUILD)
-  list(APPEND EVRPTW_ATTEST_OVERRIDE_ARGUMENT --development-override)
+set(TXNOPT_ATTEST_OVERRIDE_ARGUMENT)
+if(TXNOPT_ALLOW_DIRTY_BUILD)
+  list(APPEND TXNOPT_ATTEST_OVERRIDE_ARGUMENT --development-override)
 endif()
 execute_process(
   COMMAND
@@ -108,53 +108,53 @@ execute_process(
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/native_build_attestation.py"
     inspect
     --root "${CMAKE_CURRENT_SOURCE_DIR}"
-    ${EVRPTW_ATTEST_OVERRIDE_ARGUMENT}
+    ${TXNOPT_ATTEST_OVERRIDE_ARGUMENT}
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-  OUTPUT_VARIABLE EVRPTW_BUILD_ATTESTATION_JSON
+  OUTPUT_VARIABLE TXNOPT_BUILD_ATTESTATION_JSON
   OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_VARIABLE EVRPTW_BUILD_ATTESTATION_ERROR
-  RESULT_VARIABLE EVRPTW_BUILD_ATTESTATION_RESULT
+  ERROR_VARIABLE TXNOPT_BUILD_ATTESTATION_ERROR
+  RESULT_VARIABLE TXNOPT_BUILD_ATTESTATION_RESULT
 )
-if(NOT EVRPTW_BUILD_ATTESTATION_RESULT EQUAL 0)
-  message(FATAL_ERROR "${EVRPTW_BUILD_ATTESTATION_ERROR}")
+if(NOT TXNOPT_BUILD_ATTESTATION_RESULT EQUAL 0)
+  message(FATAL_ERROR "${TXNOPT_BUILD_ATTESTATION_ERROR}")
 endif()
-string(JSON EVRPTW_BUILD_GIT_REVISION GET "${EVRPTW_BUILD_ATTESTATION_JSON}" revision)
-string(JSON EVRPTW_BUILD_GIT_TREE GET "${EVRPTW_BUILD_ATTESTATION_JSON}" git_tree)
+string(JSON TXNOPT_BUILD_GIT_REVISION GET "${TXNOPT_BUILD_ATTESTATION_JSON}" revision)
+string(JSON TXNOPT_BUILD_GIT_TREE GET "${TXNOPT_BUILD_ATTESTATION_JSON}" git_tree)
 string(
-  JSON EVRPTW_BUILD_SOURCE_MANIFEST_SHA256
-  GET "${EVRPTW_BUILD_ATTESTATION_JSON}" source_manifest_sha256
+  JSON TXNOPT_BUILD_SOURCE_MANIFEST_SHA256
+  GET "${TXNOPT_BUILD_ATTESTATION_JSON}" source_manifest_sha256
 )
 string(
-  JSON EVRPTW_BUILD_TRACKED_FILE_COUNT
-  GET "${EVRPTW_BUILD_ATTESTATION_JSON}" tracked_file_count
+  JSON TXNOPT_BUILD_TRACKED_FILE_COUNT
+  GET "${TXNOPT_BUILD_ATTESTATION_JSON}" tracked_file_count
 )
-string(JSON EVRPTW_BUILD_SOURCE_DIRTY_JSON GET "${EVRPTW_BUILD_ATTESTATION_JSON}" source_dirty)
+string(JSON TXNOPT_BUILD_SOURCE_DIRTY_JSON GET "${TXNOPT_BUILD_ATTESTATION_JSON}" source_dirty)
 string(
-  JSON EVRPTW_BUILD_DEVELOPMENT_OVERRIDE_JSON
-  GET "${EVRPTW_BUILD_ATTESTATION_JSON}" development_override
+  JSON TXNOPT_BUILD_DEVELOPMENT_OVERRIDE_JSON
+  GET "${TXNOPT_BUILD_ATTESTATION_JSON}" development_override
 )
-if(EVRPTW_BUILD_SOURCE_DIRTY_JSON)
-  set(EVRPTW_BUILD_SOURCE_DIRTY 1)
-  set(EVRPTW_BUILD_SOURCE_DIRTY_TEXT true)
+if(TXNOPT_BUILD_SOURCE_DIRTY_JSON)
+  set(TXNOPT_BUILD_SOURCE_DIRTY 1)
+  set(TXNOPT_BUILD_SOURCE_DIRTY_TEXT true)
 else()
-  set(EVRPTW_BUILD_SOURCE_DIRTY 0)
-  set(EVRPTW_BUILD_SOURCE_DIRTY_TEXT false)
+  set(TXNOPT_BUILD_SOURCE_DIRTY 0)
+  set(TXNOPT_BUILD_SOURCE_DIRTY_TEXT false)
 endif()
-if(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE_JSON)
-  set(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE 1)
-  set(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE_TEXT true)
+if(TXNOPT_BUILD_DEVELOPMENT_OVERRIDE_JSON)
+  set(TXNOPT_BUILD_DEVELOPMENT_OVERRIDE 1)
+  set(TXNOPT_BUILD_DEVELOPMENT_OVERRIDE_TEXT true)
 else()
-  set(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE 0)
-  set(EVRPTW_BUILD_DEVELOPMENT_OVERRIDE_TEXT false)
+  set(TXNOPT_BUILD_DEVELOPMENT_OVERRIDE 0)
+  set(TXNOPT_BUILD_DEVELOPMENT_OVERRIDE_TEXT false)
 endif()
 
-if(EVRPTW_ALLOW_DIRTY_BUILD)
-  set(EVRPTW_NATIVE_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cpp")
-  set(EVRPTW_BUILD_CPP_SOURCE_KIND "working_tree_override")
+if(TXNOPT_ALLOW_DIRTY_BUILD)
+  set(TXNOPT_NATIVE_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cpp")
+  set(TXNOPT_BUILD_CPP_SOURCE_KIND "working_tree_override")
 else()
   set(
-    EVRPTW_NATIVE_SOURCE_SNAPSHOT
-    "${CMAKE_CURRENT_BINARY_DIR}/attested-source-${EVRPTW_BUILD_SOURCE_MANIFEST_SHA256}"
+    TXNOPT_NATIVE_SOURCE_SNAPSHOT
+    "${CMAKE_CURRENT_BINARY_DIR}/attested-source-${TXNOPT_BUILD_SOURCE_MANIFEST_SHA256}"
   )
   execute_process(
     COMMAND
@@ -162,44 +162,28 @@ else()
       "${CMAKE_CURRENT_SOURCE_DIR}/tools/native_build_attestation.py"
       materialize-cpp
       --root "${CMAKE_CURRENT_SOURCE_DIR}"
-      --revision "${EVRPTW_BUILD_GIT_REVISION}"
-      --destination "${EVRPTW_NATIVE_SOURCE_SNAPSHOT}"
+      --revision "${TXNOPT_BUILD_GIT_REVISION}"
+      --destination "${TXNOPT_NATIVE_SOURCE_SNAPSHOT}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    ERROR_VARIABLE EVRPTW_NATIVE_SNAPSHOT_ERROR
-    RESULT_VARIABLE EVRPTW_NATIVE_SNAPSHOT_RESULT
+    ERROR_VARIABLE TXNOPT_NATIVE_SNAPSHOT_ERROR
+    RESULT_VARIABLE TXNOPT_NATIVE_SNAPSHOT_RESULT
   )
-  if(NOT EVRPTW_NATIVE_SNAPSHOT_RESULT EQUAL 0)
-    message(FATAL_ERROR "${EVRPTW_NATIVE_SNAPSHOT_ERROR}")
+  if(NOT TXNOPT_NATIVE_SNAPSHOT_RESULT EQUAL 0)
+    message(FATAL_ERROR "${TXNOPT_NATIVE_SNAPSHOT_ERROR}")
   endif()
-  set(EVRPTW_NATIVE_CPP_DIR "${EVRPTW_NATIVE_SOURCE_SNAPSHOT}/cpp")
-  set(EVRPTW_BUILD_CPP_SOURCE_KIND "git_blob_snapshot")
+  set(TXNOPT_NATIVE_CPP_DIR "${TXNOPT_NATIVE_SOURCE_SNAPSHOT}/cpp")
+  set(TXNOPT_BUILD_CPP_SOURCE_KIND "git_blob_snapshot")
 endif()
 
-# Disable pybind11's implicit release-mode LTO/strip extras. The frozen EVRPTW
-# performance profile below is the sole owner of those build choices.
-pybind11_add_module(
-  _core
-  MODULE
-  NO_EXTRAS
-  "${EVRPTW_NATIVE_CPP_DIR}/evrptw_core.cpp"
-)
-target_include_directories(_core PRIVATE "${EVRPTW_NATIVE_CPP_DIR}")
+# Disable pybind11's implicit release-mode LTO/strip extras. The attested
+# TxnOpt profile below is the sole owner of those build choices.
 pybind11_add_module(
   _native
   MODULE
   NO_EXTRAS
-  "${EVRPTW_NATIVE_CPP_DIR}/txnopt_core/python_module.cpp"
+  "${TXNOPT_NATIVE_CPP_DIR}/txnopt_core/python_module.cpp"
 )
-target_include_directories(_native PRIVATE "${EVRPTW_NATIVE_CPP_DIR}")
-if(UNIX AND NOT APPLE)
-  add_executable(
-    _native_host_scheduler
-    "${EVRPTW_NATIVE_CPP_DIR}/native_host_scheduler.cpp"
-  )
-  target_include_directories(
-    _native_host_scheduler PRIVATE "${EVRPTW_NATIVE_CPP_DIR}"
-  )
-endif()
+target_include_directories(_native PRIVATE "${TXNOPT_NATIVE_CPP_DIR}")
 
 add_custom_target(
   native_source_attestation_check ALL
@@ -208,17 +192,17 @@ add_custom_target(
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/native_build_attestation.py"
     verify
     --root "${CMAKE_CURRENT_SOURCE_DIR}"
-    ${EVRPTW_ATTEST_OVERRIDE_ARGUMENT}
-    --expected-revision "${EVRPTW_BUILD_GIT_REVISION}"
-    --expected-tree "${EVRPTW_BUILD_GIT_TREE}"
-    --expected-manifest-sha256 "${EVRPTW_BUILD_SOURCE_MANIFEST_SHA256}"
-    --expected-source-dirty "${EVRPTW_BUILD_SOURCE_DIRTY_TEXT}"
-    --expected-development-override "${EVRPTW_BUILD_DEVELOPMENT_OVERRIDE_TEXT}"
+    ${TXNOPT_ATTEST_OVERRIDE_ARGUMENT}
+    --expected-revision "${TXNOPT_BUILD_GIT_REVISION}"
+    --expected-tree "${TXNOPT_BUILD_GIT_TREE}"
+    --expected-manifest-sha256 "${TXNOPT_BUILD_SOURCE_MANIFEST_SHA256}"
+    --expected-source-dirty "${TXNOPT_BUILD_SOURCE_DIRTY_TEXT}"
+    --expected-development-override "${TXNOPT_BUILD_DEVELOPMENT_OVERRIDE_TEXT}"
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
   COMMENT "Verifying native source-byte attestation"
   VERBATIM
 )
-if(NOT EVRPTW_ALLOW_DIRTY_BUILD)
+if(NOT TXNOPT_ALLOW_DIRTY_BUILD)
   add_custom_command(
     TARGET native_source_attestation_check POST_BUILD
     COMMAND
@@ -226,20 +210,16 @@ if(NOT EVRPTW_ALLOW_DIRTY_BUILD)
       "${CMAKE_CURRENT_SOURCE_DIR}/tools/native_build_attestation.py"
       verify-materialized-cpp
       --root "${CMAKE_CURRENT_SOURCE_DIR}"
-      --revision "${EVRPTW_BUILD_GIT_REVISION}"
-      --destination "${EVRPTW_NATIVE_SOURCE_SNAPSHOT}"
+      --revision "${TXNOPT_BUILD_GIT_REVISION}"
+      --destination "${TXNOPT_NATIVE_SOURCE_SNAPSHOT}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Verifying commit-materialized native C++ sources"
     VERBATIM
   )
 endif()
-add_dependencies(_core native_source_attestation_check)
 add_dependencies(_native native_source_attestation_check)
-if(TARGET _native_host_scheduler)
-  add_dependencies(_native_host_scheduler native_source_attestation_check)
-endif()
 
-function(evrptw_add_post_build_attestation target_name)
+function(txnopt_add_post_build_attestation target_name)
   add_custom_command(
     TARGET ${target_name} POST_BUILD
     COMMAND
@@ -247,17 +227,17 @@ function(evrptw_add_post_build_attestation target_name)
       "${CMAKE_CURRENT_SOURCE_DIR}/tools/native_build_attestation.py"
       verify
       --root "${CMAKE_CURRENT_SOURCE_DIR}"
-      ${EVRPTW_ATTEST_OVERRIDE_ARGUMENT}
-      --expected-revision "${EVRPTW_BUILD_GIT_REVISION}"
-      --expected-tree "${EVRPTW_BUILD_GIT_TREE}"
-      --expected-manifest-sha256 "${EVRPTW_BUILD_SOURCE_MANIFEST_SHA256}"
-      --expected-source-dirty "${EVRPTW_BUILD_SOURCE_DIRTY_TEXT}"
-      --expected-development-override "${EVRPTW_BUILD_DEVELOPMENT_OVERRIDE_TEXT}"
+      ${TXNOPT_ATTEST_OVERRIDE_ARGUMENT}
+      --expected-revision "${TXNOPT_BUILD_GIT_REVISION}"
+      --expected-tree "${TXNOPT_BUILD_GIT_TREE}"
+      --expected-manifest-sha256 "${TXNOPT_BUILD_SOURCE_MANIFEST_SHA256}"
+      --expected-source-dirty "${TXNOPT_BUILD_SOURCE_DIRTY_TEXT}"
+      --expected-development-override "${TXNOPT_BUILD_DEVELOPMENT_OVERRIDE_TEXT}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Rechecking native source-byte attestation after linking"
     VERBATIM
   )
-  if(NOT EVRPTW_ALLOW_DIRTY_BUILD)
+  if(NOT TXNOPT_ALLOW_DIRTY_BUILD)
     add_custom_command(
       TARGET ${target_name} POST_BUILD
       COMMAND
@@ -265,136 +245,100 @@ function(evrptw_add_post_build_attestation target_name)
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/native_build_attestation.py"
         verify-materialized-cpp
         --root "${CMAKE_CURRENT_SOURCE_DIR}"
-        --revision "${EVRPTW_BUILD_GIT_REVISION}"
-        --destination "${EVRPTW_NATIVE_SOURCE_SNAPSHOT}"
+        --revision "${TXNOPT_BUILD_GIT_REVISION}"
+        --destination "${TXNOPT_NATIVE_SOURCE_SNAPSHOT}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       COMMENT "Rechecking commit-materialized C++ sources after linking"
       VERBATIM
     )
   endif()
 endfunction()
-evrptw_add_post_build_attestation(_core)
-evrptw_add_post_build_attestation(_native)
-if(TARGET _native_host_scheduler)
-  evrptw_add_post_build_attestation(_native_host_scheduler)
-endif()
+txnopt_add_post_build_attestation(_native)
 
-set(EVRPTW_BUILD_ATTESTATION_DEFINITIONS
-  EVRPTW_BUILD_GIT_REVISION="${EVRPTW_BUILD_GIT_REVISION}"
-  EVRPTW_BUILD_GIT_TREE="${EVRPTW_BUILD_GIT_TREE}"
-  EVRPTW_BUILD_SOURCE_MANIFEST_SHA256="${EVRPTW_BUILD_SOURCE_MANIFEST_SHA256}"
-  EVRPTW_BUILD_TRACKED_FILE_COUNT=${EVRPTW_BUILD_TRACKED_FILE_COUNT}
-  EVRPTW_BUILD_SOURCE_DIRTY=${EVRPTW_BUILD_SOURCE_DIRTY}
-  EVRPTW_BUILD_DEVELOPMENT_OVERRIDE=${EVRPTW_BUILD_DEVELOPMENT_OVERRIDE}
-  EVRPTW_BUILD_CPP_SOURCE_KIND="${EVRPTW_BUILD_CPP_SOURCE_KIND}"
-  EVRPTW_BUILD_PERFORMANCE_PROFILE="${EVRPTW_PERFORMANCE_PROFILE}"
-  EVRPTW_BUILD_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
-  EVRPTW_BUILD_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
-  EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION=${EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION}
-  EVRPTW_BUILD_HOST_NATIVE=${EVRPTW_BUILD_HOST_NATIVE}
+set(TXNOPT_BUILD_ATTESTATION_DEFINITIONS
+  TXNOPT_BUILD_GIT_REVISION="${TXNOPT_BUILD_GIT_REVISION}"
+  TXNOPT_BUILD_GIT_TREE="${TXNOPT_BUILD_GIT_TREE}"
+  TXNOPT_BUILD_SOURCE_MANIFEST_SHA256="${TXNOPT_BUILD_SOURCE_MANIFEST_SHA256}"
+  TXNOPT_BUILD_TRACKED_FILE_COUNT=${TXNOPT_BUILD_TRACKED_FILE_COUNT}
+  TXNOPT_BUILD_SOURCE_DIRTY=${TXNOPT_BUILD_SOURCE_DIRTY}
+  TXNOPT_BUILD_DEVELOPMENT_OVERRIDE=${TXNOPT_BUILD_DEVELOPMENT_OVERRIDE}
+  TXNOPT_BUILD_CPP_SOURCE_KIND="${TXNOPT_BUILD_CPP_SOURCE_KIND}"
+  TXNOPT_BUILD_PERFORMANCE_PROFILE="${TXNOPT_PERFORMANCE_PROFILE}"
+  TXNOPT_BUILD_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+  TXNOPT_BUILD_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+  TXNOPT_BUILD_INTERPROCEDURAL_OPTIMIZATION=${TXNOPT_BUILD_INTERPROCEDURAL_OPTIMIZATION}
+  TXNOPT_BUILD_HOST_NATIVE=${TXNOPT_BUILD_HOST_NATIVE}
 )
-target_compile_definitions(_core PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS})
-target_compile_definitions(_native PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS})
-if(TARGET _native_host_scheduler)
-  target_compile_definitions(
-    _native_host_scheduler PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS}
-  )
-endif()
+target_compile_definitions(_native PRIVATE ${TXNOPT_BUILD_ATTESTATION_DEFINITIONS})
 
-if(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION)
-  set_property(TARGET _core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+if(TXNOPT_BUILD_INTERPROCEDURAL_OPTIMIZATION)
   set_property(TARGET _native PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-  if(TARGET _native_host_scheduler)
-    set_property(
-      TARGET _native_host_scheduler
-      PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE
-    )
-  endif()
 endif()
 
 if(MSVC)
-  target_compile_options(_core PRIVATE /O2)
   target_compile_options(_native PRIVATE /O2)
 else()
-  target_compile_options(_core PRIVATE -O3 -Wall -Wextra -Wpedantic)
   target_compile_options(_native PRIVATE -O3 -Wall -Wextra -Wpedantic)
-  if(EVRPTW_BUILD_HOST_NATIVE)
-    target_compile_options(_core PRIVATE -march=native)
+  if(TXNOPT_BUILD_HOST_NATIVE)
     target_compile_options(_native PRIVATE -march=native)
   endif()
-  if(TARGET _native_host_scheduler)
-    target_compile_options(
-      _native_host_scheduler PRIVATE -O3 -Wall -Wextra -Wpedantic
-    )
-    if(EVRPTW_BUILD_HOST_NATIVE)
-      target_compile_options(_native_host_scheduler PRIVATE -march=native)
-    endif()
-  endif()
 endif()
 
-if(NOT EVRPTW_SANITIZER STREQUAL "none")
+if(NOT TXNOPT_SANITIZER STREQUAL "none")
   if(MSVC)
-    message(FATAL_ERROR "EVRPTW_SANITIZER profiles require GCC or Clang")
-  elseif(EVRPTW_SANITIZER STREQUAL "address-undefined")
-    target_compile_options(
-      _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
-    )
-    target_link_options(_core PRIVATE -fsanitize=address,undefined)
-    target_compile_options(
-      _native PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
-    )
-    target_link_options(_native PRIVATE -fsanitize=address,undefined)
-    if(TARGET _native_host_scheduler)
-      target_compile_options(
-        _native_host_scheduler
-        PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
-      )
-      target_link_options(
-        _native_host_scheduler PRIVATE -fsanitize=address,undefined
-      )
-    endif()
-  elseif(EVRPTW_SANITIZER STREQUAL "thread")
-    target_compile_options(
-      _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
-    )
-    target_link_options(_core PRIVATE -fsanitize=thread)
-    target_compile_options(
-      _native PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
-    )
-    target_link_options(_native PRIVATE -fsanitize=thread)
-    if(TARGET _native_host_scheduler)
-      target_compile_options(
-        _native_host_scheduler
-        PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
-      )
-      target_link_options(_native_host_scheduler PRIVATE -fsanitize=thread)
-    endif()
-    add_executable(
-      stage052_native_concurrency_tsan
-      "${EVRPTW_NATIVE_CPP_DIR}/native_concurrency_tsan.cpp"
-    )
-    target_include_directories(
-      stage052_native_concurrency_tsan PRIVATE "${EVRPTW_NATIVE_CPP_DIR}"
-    )
-    add_dependencies(
-      stage052_native_concurrency_tsan native_source_attestation_check
-    )
-    evrptw_add_post_build_attestation(stage052_native_concurrency_tsan)
-    target_compile_options(
-      stage052_native_concurrency_tsan
-      PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
-    )
-    target_link_options(stage052_native_concurrency_tsan PRIVATE -fsanitize=thread)
-  else()
+    message(FATAL_ERROR "TXNOPT_SANITIZER profiles require GCC or Clang")
+  elseif(
+    NOT TXNOPT_SANITIZER STREQUAL "address-undefined"
+    AND NOT TXNOPT_SANITIZER STREQUAL "thread"
+  )
     message(
       FATAL_ERROR
-      "EVRPTW_SANITIZER must be none, address-undefined, or thread"
+      "TXNOPT_SANITIZER must be none, address-undefined, or thread"
+    )
+  endif()
+
+  add_executable(
+    txnopt_native_concurrency_sanitizer
+    "${TXNOPT_NATIVE_CPP_DIR}/txnopt_core/concurrency_sanitizer.cpp"
+  )
+  target_include_directories(
+    txnopt_native_concurrency_sanitizer PRIVATE "${TXNOPT_NATIVE_CPP_DIR}"
+  )
+  target_compile_options(
+    txnopt_native_concurrency_sanitizer PRIVATE -O1 -g -fno-omit-frame-pointer
+  )
+  foreach(_TXNOPT_SANITIZER_TARGET _native txnopt_native_concurrency_sanitizer)
+    if(TXNOPT_SANITIZER STREQUAL "address-undefined")
+      target_compile_options(
+        ${_TXNOPT_SANITIZER_TARGET} PRIVATE -fsanitize=address,undefined
+      )
+      target_link_options(
+        ${_TXNOPT_SANITIZER_TARGET} PRIVATE -fsanitize=address,undefined
+      )
+    else()
+      target_compile_options(${_TXNOPT_SANITIZER_TARGET} PRIVATE -fsanitize=thread)
+      target_link_options(${_TXNOPT_SANITIZER_TARGET} PRIVATE -fsanitize=thread)
+    endif()
+  endforeach()
+  enable_testing()
+  if(
+    TXNOPT_SANITIZER STREQUAL "thread"
+    AND UNIX
+    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"
+  )
+    find_program(TXNOPT_SETARCH_EXECUTABLE setarch REQUIRED)
+    add_test(
+      NAME txnopt-native-concurrency-sanitizer
+      COMMAND
+        "${TXNOPT_SETARCH_EXECUTABLE}" "${CMAKE_SYSTEM_PROCESSOR}" -R
+        "$<TARGET_FILE:txnopt_native_concurrency_sanitizer>"
+    )
+  else()
+    add_test(
+      NAME txnopt-native-concurrency-sanitizer
+      COMMAND txnopt_native_concurrency_sanitizer
     )
   endif()
 endif()
 
-install(TARGETS _core DESTINATION evrptw)
 install(TARGETS _native DESTINATION txnopt)
-if(TARGET _native_host_scheduler)
-  install(TARGETS _native_host_scheduler DESTINATION evrptw)
-endif()

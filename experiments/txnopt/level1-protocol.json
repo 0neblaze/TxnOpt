@@ -1,0 +1,76 @@
+{
+  "schema_version": "txnopt-level1-protocol-v1",
+  "status": "preregistered_local_scope",
+  "holdout_opened": false,
+  "domains": {
+    "evrptw": {
+      "pilot": [
+        "c101C5",
+        "r105C5",
+        "rc105C5",
+        "c104C10",
+        "r103C10",
+        "rc102C10",
+        "c106C15",
+        "r105C15"
+      ],
+      "validation": [
+        "rc103C15",
+        "c101_21",
+        "r101_21",
+        "rc101_21"
+      ]
+    },
+    "rcpsp": {
+      "pilot": [
+        "j1201_1",
+        "j1201_2",
+        "j1201_3",
+        "j1201_4",
+        "j1202_1",
+        "j1202_2",
+        "j1202_3",
+        "j1202_4",
+        "j1203_1",
+        "j1203_2",
+        "j1203_3",
+        "j1203_4",
+        "j1204_1",
+        "j1204_2",
+        "j1204_3",
+        "j1204_4"
+      ],
+      "validation": [
+        "j1205_1",
+        "j1205_2",
+        "j1205_3",
+        "j1205_4",
+        "j1206_1",
+        "j1206_2",
+        "j1206_3",
+        "j1206_4"
+      ]
+    }
+  },
+  "seeds": [2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023],
+  "formal_axes": [
+    "serial_1",
+    "txnopt_1",
+    "txnopt_4",
+    "barrier_4"
+  ],
+  "exploratory_axes": [
+    "txnopt_8_representative_only"
+  ],
+  "budgets": [
+    "fixed_work",
+    "fixed_time"
+  ],
+  "cloud_window_days": 14,
+  "predicted_formal_matrix_days_max": 10,
+  "rerun_margin_days": 4,
+  "minimum_physical_cores": 32,
+  "minimum_memory_gib": 128,
+  "level2_holdout_opened": false,
+  "level3_holdout_opened": false
+}

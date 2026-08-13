@@ -1,8 +1,8 @@
 cff-version: 1.2.0
-message: "If you use this software or its evidence protocols, please cite this repository."
-title: "Reproducible-EVRPTW"
+message: "If you use TxnOpt or its evidence protocols, please cite this repository."
+title: "TxnOpt"
 type: software
-version: 0.1.0
+version: 0.1.0a1
 authors:
   - family-names: Guo
     given-names: Yiyang
@@ -10,8 +10,9 @@ authors:
 repository-code: "https://github.com/0neblaze/Reproducible-EVRPTW"
 license: Apache-2.0
 keywords:
+  - transactional optimization
+  - deterministic parallelism
+  - formal methods
   - EVRP-TW
-  - ALNS
-  - vehicle routing
-  - exact charging
+  - RCPSP
   - reproducible optimization
