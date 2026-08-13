@@ -1,0 +1,72 @@
+{
+  "schema_version": "txnopt-build11-review-packet-verification-manifest-v1",
+  "run_label": "txnopt_build11_review_packet_verification_attempt08",
+  "status": "MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING",
+  "created_at_utc": "2026-08-13T15:21:44.525977Z",
+  "review_request": {
+    "path": "formal/reviews/txnopt_evidence_lifecycle_review_request_attempt07.json",
+    "sha256": "f09bd66ac7d4bc08ab3835199d0bf8925151df1f775abc8712c7d8de91f3a5e8",
+    "bound_input_count": 16,
+    "bound_input_hash_mismatch_count": 0,
+    "status": "READY_FOR_EXTERNAL_INDEPENDENT_REVIEW"
+  },
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854"
+  },
+  "orchestration_identity": {
+    "revision": "220d093c90bc677bea53e764da7fe534ad65ec62",
+    "git_tree": "1660c1c8db5f679adeda37a832a9b40907ee62df",
+    "source_dirty": false,
+    "tool_path": "tools/verify_txnopt_build11_review_packet.py",
+    "tool_sha256": "3b340667a431ac98a2d8a6d7495fe7aefcc3ca6c257e0657a0509ebd5d5cb982",
+    "common_path": "tools/txnopt_level1_campaign_common.py",
+    "common_sha256": "1785a9efffd4db6113e40861de031117cb123d8f2d77df399b2845e89db4769a"
+  },
+  "external_machine_receipt": {
+    "path": "/home/oneblaze/txnopt-reviews/build11-review-packet-verification-attempt01/receipt.json",
+    "sha256": "febf6127f7309484ed7568189af2f992a50190e2a5f534c6336c9009ba011af9",
+    "sidecar_verified": true,
+    "independent_verify_exit_code": 0,
+    "status": "PACKET_VERIFIED_REVIEW_DECISION_REQUIRED",
+    "junit_path": "/home/oneblaze/txnopt-reviews/build11-review-packet-verification-attempt01/pytest-junit.xml",
+    "junit_sha256": "b07df01819de38e11b2fbbc4683112f70d7daa372294b0b94e85e325674ee7c4",
+    "pytest_case_count": 46,
+    "passed": 46,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "machine_gates": {
+    "request_sidecar_and_claim_boundary": "PASS",
+    "bound_inputs": "PASS_16_OF_16",
+    "installed_build11_wheel": "PASS",
+    "sealed_formal_receipt_inputs": "PASS_10_OF_10",
+    "producer_reviewer_import_independence": "PASS",
+    "lifecycle_refinement_tests": "PASS_46_OF_46"
+  },
+  "external_reviewer_work_remaining": [
+    "independently inspect all nine review obligations and the claim boundary",
+    "record critical and major findings separately",
+    "bind a clean external reviewer revision and source tree to the request SHA-256",
+    "issue a new PASS_BUILD11_EVIDENCE_LIFECYCLE_REFINEMENT or NEEDS_WORK artifact"
+  ],
+  "claim_boundary": {
+    "machine_packet_verification": "PASS",
+    "external_independent_review_completed": false,
+    "review_decision": null,
+    "level1_formal_gate_passed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "level2_entry_authorized": false,
+    "public_release_authorized": false
+  }
+}

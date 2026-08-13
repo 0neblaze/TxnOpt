@@ -88,6 +88,13 @@ cloud purchase, public alpha, or manuscript submission.
   three worker-failure positions crossed with those orders, and both runtime
   deadline checkpoints. All 75 combined cases pass; this is bounded runtime
   evidence, not a general unbounded proof.
+- Review-packet verification Attempt08 makes the Build11 successor request
+  executable without self-approving it. It verifies the unchanged 16 bound
+  inputs, installed Build11 wheel, sealed 10-input formal receipt,
+  producer/reviewer import independence, and 46/46 lifecycle/refinement tests.
+  Its status remains `MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING`; a separately
+  identified external reviewer must still issue the allowed PASS or
+  `NEEDS_WORK` decision.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -312,12 +319,13 @@ days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
 Current gate status: **Build11 local build, semantic, representative
-performance, fault/prefix, and runtime-estimate gates are complete; external
-independent Build11 evidence-lifecycle/formal-successor review remains pending;
-purchase and execution are unauthorized**. Attempt22 is the current local
-calibration and Attempt03 is the current local fault receipt. Formal plan
-Attempt23 freezes 2,880 Build11-bound configs with a fresh absent raw root and
-passes structural preflight. Pre-cloud Attempt05 remains
+performance, fault/prefix, and runtime-estimate gates are complete; the Build11
+review packet is machine-verified, but the external independent
+evidence-lifecycle/formal-successor decision remains pending; purchase and
+execution are unauthorized**. Attempt22 is the current local calibration,
+Attempt03 is the current local fault receipt, and review-packet Attempt08 is
+machine-only evidence. Formal plan Attempt23 freezes 2,880 Build11-bound configs
+with a fresh absent raw root and passes structural preflight. Pre-cloud Attempt05 remains
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; no procurement or execution
 authority is implied, and full-scope confidence intervals remain post-run
 Level 1 completion evidence.

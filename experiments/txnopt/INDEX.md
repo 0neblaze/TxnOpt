@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build11 local build/semantic/performance/bounded-exhaustive-fault/runtime gates complete; pre-cloud Attempt05 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration and fault Attempt03 retained; Attempt23 raw root absent/unexecuted | Build11 evidence-lifecycle and formal-successor review pending |
+| `txnopt-level1-protocol-v1` | Build11 local build/semantic/performance/bounded-exhaustive-fault/runtime gates complete; review packet machine-verified; pre-cloud Attempt05 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration and fault Attempt03 retained; Attempt23 raw root absent/unexecuted | Packet verification Attempt08 passes; external Build11 decision pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -189,6 +189,13 @@ build, semantic, representative performance, fault/prefix, and runtime gates,
 but remains
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; it authorizes neither procurement
 nor execution.
+
+Build11 review-packet verification Attempt08 binds the unchanged Attempt07
+request, all 16 source/artifact inputs, the installed Build11 wheel, the sealed
+10-input formal receipt, producer/reviewer import independence, and 46/46
+lifecycle/refinement tests. Its machine status is
+`MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING`: it does not supply a reviewer
+identity or decision and therefore does not unblock pre-cloud Attempt05.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

@@ -118,3 +118,28 @@ def test_packet_receipt_cannot_claim_an_independent_decision(tmp_path: Path) -> 
     )
     with pytest.raises(ValueError, match="overstates"):
         verify_packet_receipt(receipt_path)
+
+
+def test_tracked_packet_verification_remains_machine_only() -> None:
+    root = Path(__file__).resolve().parents[2]
+    path = (
+        root
+        / "formal/reviews/txnopt_build11_review_packet_verification_attempt08.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING"
+    assert manifest["review_request"]["bound_input_count"] == 16
+    assert manifest["machine_gates"]["lifecycle_refinement_tests"] == (
+        "PASS_46_OF_46"
+    )
+    assert manifest["claim_boundary"]["external_independent_review_completed"] is False
+    assert manifest["claim_boundary"]["review_decision"] is None
+    assert manifest["claim_boundary"]["precloud_gate_unblocked"] is False
+    assert manifest["claim_boundary"]["procurement_authorized"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False

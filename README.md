@@ -83,6 +83,12 @@ python tools/verify_txnopt_formal.py \
 Model-check success is not presented as a complete mathematical proof or an
 independent review.
 
+The Build11 evidence-lifecycle review packet can be machine-checked with
+`tools/verify_txnopt_build11_review_packet.py`. This verifies the request,
+bound source and artifact identities, installed wheel, sealed formal receipt,
+import independence, and request-scoped tests; it deliberately emits no
+independent review decision.
+
 Level 1 matrix materialization, cloud-window estimation, and the native
 resource soak are separate tools under `tools/`. They write signed receipts,
 never start a cloud server, and fail closed on incomplete catalogs,
