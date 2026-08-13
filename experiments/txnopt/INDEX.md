@@ -2,13 +2,30 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build11 local gates retained; independent Attempt09 found three major evidence-identity defects; successor correction and new clean build required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration, static Attempt01, and fault Attempt03 retained without promotion; Attempt23 raw root absent/unexecuted | Attempt09 `NEEDS_WORK`; successor review pending a new anchored build |
+| `txnopt-level1-protocol-v1` | Build14 anchored-evidence review passes; Attempt24 plan-v2 preflight passes structurally; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt24 has 2,880 configs and prebound identities; raw root and launch claim are absent | Attempt11 `PASS_BUILD14_ANCHORED_EVIDENCE_NOT_LEVEL1_READY`; Level 1 completion gates remain open |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
 `level1-protocol.json` and its SHA-256 sidecar are the immutable case-set
 identity for new Level 1 runs. Creating the protocol does not authorize cloud
 purchase, benchmark launch, holdout access, or a readiness claim.
+
+Build13 is retained as a complete but rejected internal artifact. Independent
+Review Attempt10 found one major gap: interrupted or aborted native exact work
+could omit its native receipt. Build14 supersedes it for new planning, requires
+native receipt work ledgers to cover every committed, aborted, interrupted, or
+T4-positive work path, and rejects missing, zero-work, and multi-stream
+under-covered receipts. Build14's wheel-installed 287-test suite, five property
+suites, Ruff, strict mypy, wheel RECORD, legacy verifier, ASan/UBSan, TSan,
+protected-history comparison, and 100,000-round resource soak pass. Independent
+Review Attempt11 reports zero critical, major, or minor findings while keeping
+Level 1, purchase, cloud, formal execution, publication, and Level 2 closed.
+
+External formal plan-v2 Attempt24 binds Build14, 2,880 canonical configs, and
+2,880 pre-run expected identities through separate config and identity tree
+digests. Independent full-plan review found no findings. Its preflight is
+`PASS_NOT_AUTHORIZED_TO_EXECUTE`; the raw root, atomic launch claim, and target
+processes are absent.
 
 The prior internal build identity is recorded in
 `manifests/txnopt_level1_build_attempt02.json`. Its status is deliberately
