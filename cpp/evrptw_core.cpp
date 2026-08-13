@@ -12995,7 +12995,10 @@ public:
                 checked_data<std::int64_t>(initial_budget_state)
                     + initial_budget_state.size());
         }
-        initial_control_journal.protocol_flags = {0, 0, 0, 0, 0};
+        // Warm-start initialization is ranked but intentionally outside one
+        // ALNS iteration's round budget, matching the Python candidate runtime.
+        initial_control_journal.protocol_flags = {0, 1, 0, 0, 0};
+        initial_control_journal.budget_skip_receipts = {0, 0, 0, 0, 0};
         append_control_journal_causal(
             std::list<ControlJournalBatch>{initial_control_journal});
         control_journal_.push_back(std::move(initial_control_journal));
@@ -21841,9 +21844,14 @@ public:
                 "full native control journal is not at a committed boundary");
         }
         py::tuple batches(control_journal_.size());
-        std::string evidence("stage05.2-native-control-journal-v4");
+        std::string evidence("stage05.2-native-control-journal-v6");
         py::ssize_t ordinal = 0;
         for (const auto& batch : control_journal_) {
+            if (batch.budget_skip_receipts.size()
+                != batch.decision_codes.size() * 5) {
+                throw std::logic_error(
+                    "full native control budget-skip receipt shape is invalid");
+            }
             const auto integer_array = [](const auto& values) {
                 py::array_t<std::int64_t> output(values.size());
                 std::copy(values.begin(), values.end(), checked_data(output));
@@ -21890,6 +21898,13 @@ public:
             auto cache_statistics = integer_array(batch.cache_statistics);
             auto budget_state = integer_array(batch.budget_state);
             auto protocol_flags = integer_array(batch.protocol_flags);
+            py::array_t<std::int64_t> budget_skip_receipts(
+                {static_cast<py::ssize_t>(batch.decision_codes.size()),
+                 py::ssize_t(5)});
+            std::copy(
+                batch.budget_skip_receipts.begin(),
+                batch.budget_skip_receipts.end(),
+                checked_data(budget_skip_receipts));
             auto batch_payload = py::make_tuple(
                 std::move(context), std::move(transaction_id),
                 std::move(plan_offsets),
@@ -21903,7 +21918,8 @@ public:
                 std::move(cache_entry_bytes),
                 std::move(cache_statistics),
                 std::move(budget_state), std::move(protocol_flags),
-                std::move(objective_integer), std::move(objective_float));
+                std::move(objective_integer), std::move(objective_float),
+                std::move(budget_skip_receipts));
             append_nested_evidence(evidence, batch_payload);
             batches[ordinal++] = std::move(batch_payload);
         }
@@ -22295,6 +22311,9 @@ private:
         std::vector<std::int64_t> cache_statistics;
         std::vector<std::int64_t> budget_state;
         std::vector<std::int64_t> protocol_flags;
+        // Row-major (requested, granted, round remaining, exact remaining,
+        // available), one row per plan.
+        std::vector<std::int64_t> budget_skip_receipts;
     };
 
     struct ScreeningJournalRow {
@@ -23499,6 +23518,8 @@ private:
             execution.result.route_resolutions.size(), 0);
         control.cache_entry_bytes.assign(
             execution.result.route_resolutions.size(), -1);
+        control.budget_skip_receipts.assign(
+            execution.result.statuses.size() * 5, 0);
         for (const auto& plan_trace : execution.trace.plans) {
             if (plan_trace.plan_id < 0
                 || static_cast<std::size_t>(plan_trace.plan_id + 1)
@@ -23507,6 +23528,11 @@ private:
                     "full native control trace has an invalid plan identity");
             }
             const auto plan = static_cast<std::size_t>(plan_trace.plan_id);
+            std::copy(
+                plan_trace.budget_skip_receipt.begin(),
+                plan_trace.budget_skip_receipt.end(),
+                control.budget_skip_receipts.begin()
+                    + static_cast<std::ptrdiff_t>(plan * 5));
             const auto first_route = static_cast<std::size_t>(
                 execution.result.plan_offsets[plan]);
             const auto last_route = static_cast<std::size_t>(
@@ -23589,6 +23615,53 @@ private:
                 : execution.trace.attempted_flags[plan] != 0 ? 1
                 : selected.contains(static_cast<std::int64_t>(plan)) ? 2
                 : 3);
+            const auto* receipt = control.budget_skip_receipts.data() + plan * 5;
+            const auto expected_available = receipt[3] < 0
+                ? std::min(receipt[2], receipt[0])
+                : std::min(receipt[2], receipt[3]);
+            const auto has_budget_skip = receipt[0] > 0
+                && receipt[1] == 0
+                && receipt[2] >= 0
+                && receipt[3] >= -1
+                && receipt[4] == expected_available
+                && receipt[0] > receipt[4];
+            const auto internal_prefix_skip =
+                (control.protocol_flags[0] != 0
+                 || control.protocol_flags[3] != 0)
+                && execution.result.statuses[plan] == 3
+                && std::all_of(receipt, receipt + 5, [](const auto value) {
+                    return value == 0;
+                });
+            if ((execution.result.statuses[plan] == 3) != has_budget_skip
+                && !internal_prefix_skip) {
+                std::ostringstream message;
+                message << "full native budget-skip status and receipt disagree"
+                        << ": plan=" << plan
+                        << ", status=" << execution.result.statuses[plan]
+                        << ", protocol_flags=[";
+                for (std::size_t flag = 0; flag < control.protocol_flags.size(); ++flag) {
+                    if (flag != 0) {
+                        message << ',';
+                    }
+                    message << control.protocol_flags[flag];
+                }
+                message << "], receipt=[";
+                for (std::size_t field = 0; field < 5; ++field) {
+                    if (field != 0) {
+                        message << ',';
+                    }
+                    message << receipt[field];
+                }
+                message << ']';
+                throw std::logic_error(message.str());
+            }
+            if (!has_budget_skip
+                && std::any_of(receipt, receipt + 5, [](const auto value) {
+                    return value != 0;
+                })) {
+                throw std::logic_error(
+                    "full native non-skipped plan has budget-skip evidence");
+            }
         }
         return control;
     }

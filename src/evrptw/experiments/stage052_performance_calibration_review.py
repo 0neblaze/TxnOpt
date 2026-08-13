@@ -58,6 +58,7 @@ from evrptw.experiments.stage052_performance_observation import (
     PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_EVIDENCE_SCHEMA_VERSION,
     RESOURCE_SUMMARY_ACCOUNTING_SOURCE,
+    TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
 )
 from evrptw.experiments.stage052_telemetry_overhead import (
     TELEMETRY_SAMPLE_SCHEMA_VERSION,
@@ -65,7 +66,10 @@ from evrptw.experiments.stage052_telemetry_overhead import (
 )
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
-from evrptw.runtime_envelope import DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS
+from evrptw.runtime_envelope import (
+    DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
+    TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+)
 from evrptw.stage052_atomic import publish_no_replace
 from evrptw.stage052_performance import (
     ExecutionTopology,
@@ -103,7 +107,10 @@ def _validate_resource_sample_interval(
 ) -> None:
     """Bind current resource evidence cadence to its producer role."""
 
-    if evidence.get("schema_version") != RESOURCE_EVIDENCE_SCHEMA_VERSION:
+    if evidence.get("schema_version") not in {
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }:
         return
     process_tree = _mapping(evidence.get("process_tree"), "resource process_tree")
     expected = (
@@ -1095,6 +1102,7 @@ def _review_io_accounting(
         elif schema_version in {
             PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
             PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
             RESOURCE_EVIDENCE_SCHEMA_VERSION,
         }:
             reported = _mapping(evidence.get("io_accounting"), "resource I/O accounting")
@@ -1111,6 +1119,7 @@ def _review_io_accounting(
     if schema_version not in {
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         raise CalibrationReviewError("raw resource legacy cgroup I/O is unavailable")
@@ -1153,6 +1162,228 @@ def _review_io_accounting(
     return reported
 
 
+def _review_worker_terminal_io(
+    *,
+    evidence: Mapping[str, object],
+    process_tree: Mapping[str, object],
+    run_root: Path,
+    axis_relative_paths: Sequence[str],
+) -> None:
+    """Bind every current outer worker to its live terminal I/O receipt."""
+
+    raw_core_receipts = _array(
+        process_tree.get("terminal_process_io_receipts"),
+        "resource terminal process I/O receipts",
+    )
+    raw_bound_receipts = _array(
+        evidence.get("worker_terminal_io_receipts"),
+        "resource worker terminal I/O receipts",
+    )
+    raw_scheduler_receipts = _array(
+        evidence.get("scheduler_terminal_io_receipts"),
+        "resource scheduler terminal I/O receipts",
+    )
+    if (
+        not raw_core_receipts
+        or len(raw_core_receipts) < len(axis_relative_paths)
+        or len(raw_bound_receipts) + len(raw_scheduler_receipts)
+        != len(raw_core_receipts)
+    ):
+        raise CalibrationReviewError("resource worker terminal I/O inventory is incomplete")
+    monitor_start = _number(
+        process_tree.get("monitor_start_monotonic"),
+        "resource monitor start",
+        positive=True,
+    )
+    monitor_end = _number(
+        process_tree.get("monitor_end_monotonic"),
+        "resource monitor end",
+        positive=True,
+    )
+    if monitor_end < monitor_start:
+        raise CalibrationReviewError("resource monitor interval is invalid")
+    root_process_id = _integer(
+        process_tree.get("root_process_id"),
+        "resource root process ID",
+    )
+
+    core_fields = {
+        "schema_version",
+        "pid",
+        "parent_pid",
+        "create_time",
+        "start_time_ticks",
+        "task_started_monotonic",
+        "captured_monotonic",
+        "read_bytes",
+        "write_bytes",
+    }
+    core_by_identity: dict[tuple[int, float], dict[str, object]] = {}
+    for index, raw_receipt in enumerate(raw_core_receipts):
+        receipt = dict(_mapping(raw_receipt, f"terminal process I/O receipts[{index}]"))
+        if (
+            set(receipt) != core_fields
+            or receipt.get("schema_version")
+            != TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION
+        ):
+            raise CalibrationReviewError("resource terminal process I/O schema is invalid")
+        pid = _integer(receipt.get("pid"), "terminal process I/O PID")
+        create_time = _number(
+            receipt.get("create_time"),
+            "terminal process I/O create_time",
+            positive=True,
+        )
+        start_time_ticks = _integer(
+            receipt.get("start_time_ticks"),
+            "terminal process I/O start_time_ticks",
+        )
+        task_started = _number(
+            receipt.get("task_started_monotonic"),
+            "terminal process I/O task start",
+            positive=True,
+        )
+        captured = _number(
+            receipt.get("captured_monotonic"),
+            "terminal process I/O capture time",
+            positive=True,
+        )
+        if (
+            pid <= 0
+            or _integer(receipt.get("parent_pid"), "terminal process I/O parent PID") <= 0
+            or create_time <= 0.0
+            or start_time_ticks < _integer(
+                process_tree.get("monitor_start_boot_time_ticks"),
+                "resource monitor start boot ticks",
+            )
+            or task_started < monitor_start
+            or captured < task_started
+            or captured > monitor_end
+        ):
+            raise CalibrationReviewError("resource terminal process I/O identity is invalid")
+        for name in ("read_bytes", "write_bytes"):
+            _integer(receipt.get(name), f"terminal process I/O {name}")
+        identity = (pid, create_time)
+        if identity in core_by_identity:
+            raise CalibrationReviewError("resource terminal process I/O identity is duplicated")
+        core_by_identity[identity] = receipt
+
+    metrics = _array(process_tree.get("process_metrics"), "resource process_metrics")
+    metric_by_identity: dict[tuple[int, float], Mapping[str, object]] = {}
+    metric_pids: set[int] = set()
+    for index, raw_metric in enumerate(metrics):
+        metric = _mapping(raw_metric, f"resource process_metrics[{index}]")
+        identity = (
+            _integer(metric.get("pid"), "resource process PID"),
+            _number(metric.get("create_time"), "resource process create_time", positive=True),
+        )
+        metric_pids.add(identity[0])
+        metric_by_identity[identity] = metric
+    final_sample_index = (
+        _integer(process_tree.get("sample_count"), "resource sample count") - 1
+    )
+    if (
+        process_tree.get("process_io_terminal_status") != "available"
+        or process_tree.get("process_io_uncovered_identities") != []
+        or final_sample_index < 0
+    ):
+        raise CalibrationReviewError("resource terminal process I/O coverage is unavailable")
+    for identity, metric in metric_by_identity.items():
+        terminal_evidence = metric.get("terminal_io_evidence")
+        if terminal_evidence == "cooperative_receipt":
+            if identity not in core_by_identity:
+                raise CalibrationReviewError("resource cooperative terminal I/O row is unbound")
+        elif terminal_evidence == "monitor_end_sample":
+            if metric.get("last_sample_index") != final_sample_index:
+                raise CalibrationReviewError("resource monitor-end terminal I/O row is invalid")
+        else:
+            raise CalibrationReviewError("resource process terminal I/O evidence is invalid")
+    for identity, receipt in core_by_identity.items():
+        worker_metric = metric_by_identity.get(identity)
+        if worker_metric is None:
+            raise CalibrationReviewError("terminal process I/O worker row is unavailable")
+        counters = _mapping(
+            worker_metric.get("counters"),
+            "terminal process I/O worker counters",
+        )
+        if any(counters.get(name) != receipt[name] for name in ("read_bytes", "write_bytes")):
+            raise CalibrationReviewError("terminal process I/O counters do not bind worker row")
+        if (
+            receipt["parent_pid"] not in metric_pids | {root_process_id}
+            or
+            worker_metric.get("parent_pid") != receipt["parent_pid"]
+            or worker_metric.get("start_time_ticks") != receipt["start_time_ticks"]
+            or worker_metric.get("cpu_baseline_source") != "process_create_time"
+            or worker_metric.get("terminal_io_evidence") != "cooperative_receipt"
+        ):
+            raise CalibrationReviewError("terminal process I/O identity does not bind worker row")
+
+    expected_paths = set(axis_relative_paths)
+    observed_paths: set[str] = set()
+    observed_identities: set[tuple[int, float]] = set()
+    for index, raw_receipt in enumerate(raw_bound_receipts):
+        receipt = dict(_mapping(raw_receipt, f"worker terminal I/O receipts[{index}]"))
+        if set(receipt) != core_fields | {"axis_relative_path", "axis_sha256"}:
+            raise CalibrationReviewError("resource bound terminal I/O schema is invalid")
+        relative_path = _text(receipt.get("axis_relative_path"), "terminal I/O axis path")
+        declared_sha256 = receipt.get("axis_sha256")
+        identity = (
+            _integer(receipt.get("pid"), "bound terminal process I/O PID"),
+            _number(
+                receipt.get("create_time"),
+                "bound terminal process I/O create_time",
+                positive=True,
+            ),
+        )
+        core = {name: receipt[name] for name in core_fields}
+        if (
+            relative_path not in expected_paths
+            or identity in observed_identities
+            or core_by_identity.get(identity) != core
+            or not _is_sha256(declared_sha256)
+            or _sha256_file(run_root / Path(*PurePosixPath(relative_path).parts))
+            != declared_sha256
+        ):
+            raise CalibrationReviewError("resource bound terminal I/O receipt does not replay")
+        observed_paths.add(relative_path)
+        observed_identities.add(identity)
+    scheduler_identities: set[tuple[int, float]] = set()
+    for index, raw_receipt in enumerate(raw_scheduler_receipts):
+        receipt = dict(_mapping(raw_receipt, f"scheduler terminal I/O receipts[{index}]"))
+        identity = (
+            _integer(receipt.get("pid"), "scheduler terminal process I/O PID"),
+            _number(
+                receipt.get("create_time"),
+                "scheduler terminal process I/O create_time",
+                positive=True,
+            ),
+        )
+        if (
+            set(receipt) != core_fields
+            or identity in scheduler_identities
+            or core_by_identity.get(identity) != receipt
+        ):
+            raise CalibrationReviewError("resource scheduler terminal I/O does not replay")
+        scheduler_identities.add(identity)
+    scheduler_process_id = evidence.get("scheduler_process_id")
+    if (
+        scheduler_process_id is None
+        and scheduler_identities
+        or isinstance(scheduler_process_id, bool)
+        or scheduler_process_id is not None
+        and (
+            not isinstance(scheduler_process_id, int)
+            or {identity[0] for identity in scheduler_identities}
+            != {scheduler_process_id}
+        )
+    ):
+        raise CalibrationReviewError("resource scheduler terminal I/O identity is invalid")
+    if (
+        observed_paths != expected_paths
+        or observed_identities | scheduler_identities != set(core_by_identity)
+    ):
+        raise CalibrationReviewError("resource bound terminal I/O inventory differs")
+
+
 def _derive_resource_summary(
     evidence: Mapping[str, object],
     *,
@@ -1164,6 +1395,7 @@ def _derive_resource_summary(
         LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         raise CalibrationReviewError("raw resource evidence schema is invalid")
@@ -1186,11 +1418,13 @@ def _derive_resource_summary(
         require_complete=schema_version
         not in {
             PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
             RESOURCE_EVIDENCE_SCHEMA_VERSION,
         },
     )
     if schema_version in {
         PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         if (
@@ -1231,7 +1465,10 @@ def _derive_resource_summary(
         or process_tree.get("actual_affinity_union") != list(topology.cpu_ids)
     ):
         raise CalibrationReviewError("raw resource CPU/affinity budget is invalid")
-    if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+    if schema_version in {
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        RESOURCE_EVIDENCE_SCHEMA_VERSION,
+    }:
         _validate_current_resource_cpu_budget(
             process_tree,
             elapsed_seconds=elapsed,
@@ -1286,6 +1523,18 @@ def _derive_resource_summary(
             raise CalibrationReviewError("raw resource axis is not in the signed inventory")
         payloads.append(_load_reconciled_raw_axis(path))
         normalized_paths.append(raw_relative)
+    if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION:
+        _review_worker_terminal_io(
+            evidence=evidence,
+            process_tree=process_tree,
+            run_root=run_root,
+            axis_relative_paths=normalized_paths,
+        )
+    elif (
+        "worker_terminal_io_receipts" in evidence
+        or "terminal_process_io_receipts" in process_tree
+    ):
+        raise CalibrationReviewError("historical resource evidence has terminal I/O fields")
     raw_axis_timings = _array(evidence.get("axis_timings"), "resource axis timings")
     axis_timings: dict[str, tuple[float, float, float]] = {}
     for index, raw_timing in enumerate(raw_axis_timings):
@@ -1344,6 +1593,7 @@ def _derive_resource_summary(
     )
     use_process_accounting = schema_version in {
         PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }
     schedstat = _mapping(
@@ -1367,13 +1617,18 @@ def _derive_resource_summary(
             schema_version
             in {
                 PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+                TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
                 RESOURCE_EVIDENCE_SCHEMA_VERSION,
             }
         ),
     )
     normalized_cpu_seconds = (
         min(cpu_seconds, elapsed * compute_limit)
-        if schema_version == RESOURCE_EVIDENCE_SCHEMA_VERSION
+        if schema_version
+        in {
+            TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+            RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        }
         else cpu_seconds
     )
     summary = RuntimeResourceSummaryV2(

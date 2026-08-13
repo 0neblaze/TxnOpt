@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from evrptw.experiments.stage052_native_architecture_review import (
+    _CURRENT_TERMINAL_PROCESS_IO_FIELDS,
     _RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS,
     _RESOURCE_TELEMETRY_DISABLED_TOPOLOGY_FIELDS,
     ReviewRecord,
@@ -17,6 +18,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
 from evrptw.experiments.stage052_native_architectures import (
     PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
     PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+    TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
     ArchitectureMode,
 )
 from evrptw.experiments.stage052_performance_calibration_review import (
@@ -717,7 +719,7 @@ def test_prior_profile_resource_schema_does_not_require_new_worker_sample_counte
         "cpu_quantization_lane_count",
         "worker_descendant_pss_complete_sample_count",
         "worker_descendant_pss_incomplete_sample_count",
-    }
+    } - _CURRENT_TERMINAL_PROCESS_IO_FIELDS
     topology = {
         field: None
         for field in (_RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | prior_statistics_fields)
@@ -745,7 +747,7 @@ def test_process_profile_resource_schema_does_not_require_cpu_tick_frequency() -
     process_statistics_fields = PROCESS_TREE_STATISTICS_FIELDS - {
         "cpu_clock_tick_hz",
         "cpu_quantization_lane_count",
-    }
+    } - _CURRENT_TERMINAL_PROCESS_IO_FIELDS
     topology = {
         field: None
         for field in (_RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | process_statistics_fields)
@@ -766,6 +768,33 @@ def test_process_profile_resource_schema_does_not_require_cpu_tick_frequency() -
         mode=ArchitectureMode.CURRENT_STAGE052,
         expected_resource_telemetry=True,
         comparison_schema=PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+    ) is not None
+
+
+def test_tick_profile_resource_schema_does_not_require_terminal_io_receipts() -> None:
+    tick_statistics_fields = (
+        PROCESS_TREE_STATISTICS_FIELDS - _CURRENT_TERMINAL_PROCESS_IO_FIELDS
+    )
+    topology = {
+        field: None
+        for field in (_RESOURCE_TELEMETRY_BASE_TOPOLOGY_FIELDS | tick_statistics_fields)
+    }
+
+    assert (
+        _resource_telemetry_topology_error(
+            topology,
+            mode=ArchitectureMode.CURRENT_STAGE052,
+            expected_resource_telemetry=True,
+            comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
+        is None
+    )
+    topology["terminal_process_io_receipts"] = []
+    assert _resource_telemetry_topology_error(
+        topology,
+        mode=ArchitectureMode.CURRENT_STAGE052,
+        expected_resource_telemetry=True,
+        comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
     ) is not None
 
 

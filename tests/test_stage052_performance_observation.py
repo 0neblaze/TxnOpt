@@ -651,7 +651,12 @@ def test_io_accounting_uses_explicit_process_tree_source_when_io_controller_abse
     assert observation_module._io_accounting_evidence(  # noqa: SLF001
         {"io": "unavailable"},
         {"io": "unavailable"},
-        {"process_tree_read_bytes": 123, "process_tree_write_bytes": 456},
+        {
+            "process_tree_read_bytes": 123,
+            "process_tree_write_bytes": 456,
+            "process_io_terminal_status": "available",
+            "process_io_uncovered_identities": [],
+        },
     ) == {
         "source": "process_tree_proc_io",
         "read_bytes": 123,

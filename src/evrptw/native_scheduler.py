@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy.typing as npt
+import psutil  # type: ignore[import-untyped]
 
+from evrptw.runtime_envelope import TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION
 from evrptw.stage052_physical_telemetry import (
     validate_native_work_task_receipt_stream,
 )
@@ -52,6 +54,22 @@ class NativeHostScheduler:
     _run_nonce: str | None = None
     _runtime_statistics: dict[str, object] | None = None
     _task_receipt_output_path: Path | None = None
+    _task_started_monotonic: float | None = None
+    _process_create_time: float | None = None
+    _process_start_time_ticks: int | None = None
+    _terminal_process_io_receipt: dict[str, object] | None = None
+
+    @staticmethod
+    def _process_start_ticks(pid: int) -> int:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="strict")
+        _comm, suffix = raw.rsplit(")", 1)
+        fields = suffix.split()
+        if len(fields) <= 19:
+            raise RuntimeError("native scheduler process start identity is unavailable")
+        ticks = int(fields[19])
+        if ticks < 0:
+            raise RuntimeError("native scheduler process start identity is invalid")
+        return ticks
 
     def _validated_cpu_affinity(self) -> tuple[int, ...] | None:
         affinity = self.cpu_affinity
@@ -134,6 +152,7 @@ class NativeHostScheduler:
             command.append("--enable-fault-injection")
         if self.production_fault is not None:
             command.append(f"--production-fault={self.production_fault}")
+        task_started_monotonic = time.monotonic()
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -144,7 +163,15 @@ class NativeHostScheduler:
         self._process = process
         self._run_nonce = run_nonce
         self._runtime_statistics = None
+        self._terminal_process_io_receipt = None
         self._task_receipt_output_path = task_receipt_path
+        try:
+            self._task_started_monotonic = task_started_monotonic
+            self._process_create_time = float(psutil.Process(process.pid).create_time())
+            self._process_start_time_ticks = self._process_start_ticks(process.pid)
+        except (OSError, ValueError, psutil.Error) as error:
+            self.close(force=True)
+            raise RuntimeError("native scheduler process identity is unavailable") from error
         deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -265,6 +292,26 @@ class NativeHostScheduler:
                             "host scheduler runtime request-thread receipt differs "
                             "from configuration"
                         )
+                    terminal_io = runtime_statistics["terminal_process_io"]
+                    if not isinstance(terminal_io, dict):
+                        raise RuntimeError("native scheduler terminal I/O is unavailable")
+                    if (
+                        self._task_started_monotonic is None
+                        or self._process_create_time is None
+                        or self._process_start_time_ticks is None
+                    ):
+                        raise RuntimeError("native scheduler terminal I/O identity is unavailable")
+                    self._terminal_process_io_receipt = {
+                        "schema_version": TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+                        "pid": process.pid,
+                        "parent_pid": os.getpid(),
+                        "create_time": self._process_create_time,
+                        "start_time_ticks": self._process_start_time_ticks,
+                        "task_started_monotonic": self._task_started_monotonic,
+                        "captured_monotonic": time.monotonic(),
+                        "read_bytes": terminal_io["read_bytes"],
+                        "write_bytes": terminal_io["write_bytes"],
+                    }
         finally:
             self._process = None
             self.socket_path.unlink(missing_ok=True)
@@ -297,11 +344,20 @@ class NativeHostScheduler:
             "request_queue",
             "work_queue",
             "task_receipts",
+            "terminal_process_io",
         }
         if set(decoded) != expected_keys:
             raise RuntimeError("host scheduler runtime statistics fields are invalid")
-        if decoded["schema_version"] != "stage05.2-native-scheduler-runtime-v3":
+        if decoded["schema_version"] != "stage05.2-native-scheduler-runtime-v4":
             raise RuntimeError("host scheduler runtime statistics schema is invalid")
+        terminal_io = decoded["terminal_process_io"]
+        if not isinstance(terminal_io, dict) or set(terminal_io) != {
+            "read_bytes",
+            "write_bytes",
+        }:
+            raise RuntimeError("host scheduler terminal I/O fields are invalid")
+        for field in ("read_bytes", "write_bytes"):
+            self._require_nonnegative_integer(terminal_io[field], f"terminal_process_io.{field}")
         for field in (
             "worker_threads",
             "request_threads",
@@ -503,6 +559,16 @@ class NativeHostScheduler:
         if self._runtime_statistics is None:
             raise RuntimeError("host scheduler runtime statistics are unavailable")
         return dict(self._runtime_statistics)
+
+    @property
+    def terminal_process_io_receipt(self) -> dict[str, object]:
+        """Return the scheduler's cooperative final cumulative I/O receipt."""
+
+        if self._process is not None:
+            raise RuntimeError("host scheduler is still running")
+        if self._terminal_process_io_receipt is None:
+            raise RuntimeError("host scheduler terminal I/O receipt is unavailable")
+        return dict(self._terminal_process_io_receipt)
 
     def __enter__(self) -> NativeHostScheduler:
         self.start()

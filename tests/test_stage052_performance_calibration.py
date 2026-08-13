@@ -37,6 +37,7 @@ from evrptw.experiments.stage052_performance_calibration_review import (
     _raw_projection,
     _resource_pss_components,
     _review_io_accounting,
+    _review_worker_terminal_io,
     _validate_live_memory_admission,
     _validate_resource_evidence,
     _validate_resource_process_tree,
@@ -124,6 +125,71 @@ def _process_tree_io(*, read_bytes: int, write_bytes: int) -> dict[str, object]:
             }
         ],
     }
+
+
+def test_calibration_reviewer_binds_terminal_io_to_axis_and_process_row(
+    tmp_path: Path,
+) -> None:
+    axis = tmp_path / "axis.json"
+    axis.write_bytes(b"axis\n")
+    axis_sha256 = hashlib.sha256(axis.read_bytes()).hexdigest()
+    core = {
+        "schema_version": "stage05.2-terminal-process-io-v1",
+        "pid": 10,
+        "parent_pid": 9,
+        "create_time": 11.0,
+        "start_time_ticks": 101,
+        "task_started_monotonic": 21.0,
+        "captured_monotonic": 25.0,
+        "read_bytes": 123,
+        "write_bytes": 456,
+    }
+    process_tree = {
+        "monitor_start_wall_time": 10.0,
+        "monitor_start_monotonic": 20.0,
+        "monitor_start_boot_time_ticks": 100,
+        "monitor_end_monotonic": 30.0,
+        "sample_count": 2,
+        "root_process_id": 9,
+        "process_io_terminal_status": "available",
+        "process_io_uncovered_identities": [],
+        "terminal_process_io_receipts": [core],
+        "process_metrics": [
+            {
+                "pid": 10,
+                "create_time": 11.0,
+                "parent_pid": 9,
+                "start_time_ticks": 101,
+                "terminal_io_evidence": "cooperative_receipt",
+                "last_sample_index": 0,
+                "cpu_baseline_source": "process_create_time",
+                "counters": {"read_bytes": 123, "write_bytes": 456},
+            }
+        ],
+    }
+    evidence = {
+        "scheduler_process_id": None,
+        "scheduler_terminal_io_receipts": [],
+        "worker_terminal_io_receipts": [
+            {"axis_relative_path": "axis.json", "axis_sha256": axis_sha256, **core}
+        ]
+    }
+
+    _review_worker_terminal_io(
+        evidence=evidence,
+        process_tree=process_tree,
+        run_root=tmp_path,
+        axis_relative_paths=("axis.json",),
+    )
+
+    evidence["worker_terminal_io_receipts"][0]["axis_sha256"] = "0" * 64
+    with pytest.raises(CalibrationReviewError, match="does not replay"):
+        _review_worker_terminal_io(
+            evidence=evidence,
+            process_tree=process_tree,
+            run_root=tmp_path,
+            axis_relative_paths=("axis.json",),
+        )
 
 
 def test_calibration_reviewer_replays_process_tree_io_provider() -> None:

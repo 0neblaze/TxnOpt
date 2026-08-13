@@ -12,13 +12,17 @@ import os
 import re
 import resource
 import shutil
+import signal
 import subprocess
 import time
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
+from multiprocessing.connection import Connection
+from multiprocessing.connection import wait as wait_for_connections
+from multiprocessing.process import BaseProcess
 from pathlib import Path, PurePosixPath
 from typing import Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
@@ -42,6 +46,8 @@ from evrptw.repository import repository_root
 from evrptw.runtime_envelope import (
     DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS,
     ProcessTreeMonitor,
+    capture_current_process_terminal_io_receipt,
+    drain_descendant_terminal_process_io_receipts,
 )
 from evrptw.stage04 import Stage04Config
 from evrptw.stage052_atomic import publish_no_replace
@@ -72,7 +78,8 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v12"
+SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v13"
+TICK_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v12"
 PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v11"
 PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v10"
 LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION = "stage05.2-native-architecture-comparison-v9"
@@ -87,6 +94,10 @@ AXIS_NAMES = ("fixed_work", "wall_clock_30")
 SHARD_PROCESSES = 6
 THREADS_PER_SHARD = 4
 TOTAL_COMPUTE_THREADS = 24
+WALL_CLOCK_AXIS_SECONDS = 30.0
+AXIS_PARENT_TIMEOUT_MULTIPLIER = 2.0
+AXIS_PARENT_TERMINAL_GRACE_SECONDS = 120.0
+AXIS_PROCESS_EXIT_GRACE_SECONDS = 5.0
 WORKLOAD_CLASSES = ("c5", "100-customer")
 WARM_START_SCHEMA_VERSION = "stage05.2-native-architecture-warm-start-v2"
 CALIBRATION_REVIEW_SCHEMA_VERSION = (
@@ -94,9 +105,9 @@ CALIBRATION_REVIEW_SCHEMA_VERSION = (
 )
 CALIBRATION_REVIEW_QUALIFICATION = "QUALIFIED_FOR_ATTEMPT08"
 CALIBRATION_RESOURCE_EVIDENCE_SCHEMA_VERSION = (
-    "stage05.2-calibration-resource-evidence-v4"
+    "stage05.2-calibration-resource-evidence-v5"
 )
-PAIRED_REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v12"
+PAIRED_REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v13"
 PAIRED_REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
 PAIRED_REVIEW_EXECUTION_SCHEMA_VERSION = "experiment-review-execution-v1"
 PAIRED_REVIEWER_MODULE_NAME = "evrptw.experiments.stage052_native_architecture_review"
@@ -180,6 +191,18 @@ class ArchitectureAxisExecutionFailed(RuntimeError):
         return f"{self.error_type}: {self.error} (failed axis: {self.axis_path})"
 
 
+class ArchitectureAxisWorkerFailed(RuntimeError):
+    """Pickle-independent parent representation of a pre-axis worker failure."""
+
+    def __init__(self, error_type: str, error: str) -> None:
+        self.error_type = error_type
+        self.error = error
+        super().__init__(error_type, error)
+
+    def __str__(self) -> str:
+        return f"{self.error_type}: {self.error}"
+
+
 @dataclass(frozen=True, slots=True)
 class ArchitectureAxisTask:
     scope: str
@@ -211,6 +234,661 @@ class ArchitectureAxisTask:
     fixed_work_max_iterations: int = 1000
     fixed_work_watchdog_seconds: float = 120.0
     exact_batch_size: int = 128
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshAxisOutcome:
+    task: ArchitectureAxisTask
+    parent_terminal_seconds: float
+    result: tuple[str, list[dict[str, object]]] | None
+    error: BaseException | None
+
+
+def _axis_parent_timeout_seconds(task: ArchitectureAxisTask) -> float:
+    """Return one hard parent deadline including terminal publication headroom."""
+
+    if task.axis == "fixed_work":
+        solver_budget = task.fixed_work_watchdog_seconds
+    elif task.axis == "wall_clock_30":
+        solver_budget = WALL_CLOCK_AXIS_SECONDS
+    else:
+        raise ValueError(f"unsupported architecture axis: {task.axis}")
+    if (
+        isinstance(solver_budget, bool)
+        or not isinstance(solver_budget, int | float)
+        or not math.isfinite(float(solver_budget))
+        or float(solver_budget) <= 0.0
+    ):
+        raise ValueError("architecture axis parent timeout budget is invalid")
+    return (
+        float(solver_budget) * AXIS_PARENT_TIMEOUT_MULTIPLIER
+        + AXIS_PARENT_TERMINAL_GRACE_SECONDS
+    )
+
+
+def _process_group_is_alive(process_group_id: int | None) -> bool:
+    if process_group_id is None or process_group_id <= 0:
+        return False
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # ``killpg(..., 0)`` also succeeds for a group containing only zombies.
+    # Zombies cannot execute or retain writers, so inspect /proc before treating
+    # the group as an active cleanup failure.
+    proc_root = Path("/proc")
+    try:
+        process_entries = tuple(proc_root.iterdir())
+    except OSError:
+        return True
+    for entry in process_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw_stat = (entry / "stat").read_text(encoding="ascii")
+            fields = raw_stat[raw_stat.rfind(")") + 2 :].split()
+            state = fields[0]
+            observed_group_id = int(fields[2])
+        except FileNotFoundError:
+            continue
+        except (IndexError, OSError, ValueError):
+            return True
+        if observed_group_id == process_group_id and state != "Z":
+            return True
+    return False
+
+
+def _stop_spawned_axis_process(
+    worker_process: BaseProcess,
+    *,
+    process_group_id: int | None,
+) -> bool:
+    """Stop one stuck axis process and every descendant in its private group."""
+
+    expected_group_id = worker_process.pid
+    group_id = process_group_id if process_group_id is not None else expected_group_id
+    group_is_safe = (
+        group_id is not None
+        and group_id > 0
+        and group_id == expected_group_id
+        and group_id != os.getpgrp()
+    )
+    safe_group_id = group_id if group_is_safe else None
+    group_signalled = False
+    if safe_group_id is not None:
+        try:
+            os.killpg(safe_group_id, signal.SIGTERM)
+            group_signalled = True
+        except ProcessLookupError:
+            pass
+        except OSError:
+            group_signalled = False
+    if worker_process.is_alive() and not group_signalled:
+        with suppress(OSError, ValueError):
+            worker_process.terminate()
+    worker_process.join(timeout=AXIS_PROCESS_EXIT_GRACE_SECONDS)
+    group_alive = _process_group_is_alive(safe_group_id)
+    if worker_process.is_alive() or group_alive:
+        if safe_group_id is not None:
+            try:
+                os.killpg(safe_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+        if worker_process.is_alive():
+            with suppress(OSError, ValueError):
+                worker_process.kill()
+        worker_process.join(timeout=AXIS_PROCESS_EXIT_GRACE_SECONDS)
+    return not worker_process.is_alive() and not _process_group_is_alive(
+        safe_group_id
+    )
+
+
+def _stop_spawned_axis_processes(
+    processes: tuple[tuple[int, BaseProcess, int | None], ...],
+) -> dict[int, bool]:
+    """Broadcast stop signals and drain all private groups under shared deadlines."""
+
+    if not processes:
+        return {}
+
+    def safe_group_id(worker_process: BaseProcess, group_id: int | None) -> int | None:
+        worker_pid = worker_process.pid
+        candidate = group_id if group_id is not None else worker_pid
+        if (
+            candidate is None
+            or candidate <= 0
+            or candidate != worker_pid
+            or candidate == os.getpgrp()
+        ):
+            return None
+        return candidate
+
+    groups = {
+        index: safe_group_id(worker_process, group_id)
+        for index, worker_process, group_id in processes
+    }
+
+    def broadcast(
+        items: tuple[tuple[int, BaseProcess, int | None], ...],
+        sig: signal.Signals,
+    ) -> None:
+        for index, worker_process, _group_id in items:
+            group = groups[index]
+            group_signalled = False
+            if group is not None:
+                try:
+                    os.killpg(group, sig)
+                    group_signalled = True
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    group_signalled = False
+            if worker_process.is_alive() and not group_signalled:
+                with suppress(OSError, ValueError):
+                    if sig == signal.SIGTERM:
+                        worker_process.terminate()
+                    else:
+                        worker_process.kill()
+
+    def drained(index: int, worker_process: BaseProcess) -> bool:
+        worker_process.join(timeout=0.0)
+        return not worker_process.is_alive() and not _process_group_is_alive(groups[index])
+
+    def wait_shared(
+        items: tuple[tuple[int, BaseProcess, int | None], ...],
+    ) -> dict[int, bool]:
+        deadline = time.monotonic() + AXIS_PROCESS_EXIT_GRACE_SECONDS
+        states = {
+            index: drained(index, worker_process)
+            for index, worker_process, _group_id in items
+        }
+        while not all(states.values()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+            states = {
+                index: drained(index, worker_process)
+                for index, worker_process, _group_id in items
+            }
+        return states
+
+    broadcast(processes, signal.SIGTERM)
+    states = wait_shared(processes)
+    survivors = tuple(item for item in processes if not states[item[0]])
+    if not survivors:
+        return states
+    broadcast(survivors, signal.SIGKILL)
+    killed_states = wait_shared(survivors)
+    states.update(killed_states)
+    return states
+
+
+class _AxisEnvelopeDeadlineExceeded(TimeoutError):
+    """The worker pipe did not yield one complete envelope before its deadline."""
+
+
+def _receive_axis_envelope(
+    connection: Connection,
+    *,
+    deadline: float,
+) -> object:
+    """Receive one complete pipe frame without escaping the parent axis deadline."""
+
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0.0:
+        raise _AxisEnvelopeDeadlineExceeded("spawned axis result envelope timed out")
+    previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+    if previous_delay > 0.0 or previous_interval > 0.0:
+        raise RuntimeError("spawned axis receiver cannot replace an active interval timer")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_handler(_signum: int, _frame: object) -> None:
+        raise _AxisEnvelopeDeadlineExceeded(
+            "spawned axis result envelope timed out"
+        )
+
+    signal.signal(signal.SIGALRM, deadline_handler)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    try:
+        return connection.recv()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _fresh_axis_process_entry(
+    connection: Connection,
+    task: ArchitectureAxisTask,
+    mode: ArchitectureMode,
+) -> None:
+    """Execute one axis in one non-daemon spawned process and return a typed envelope."""
+
+    try:
+        os.setsid()
+        process_group_id = os.getpgrp()
+        if process_group_id != os.getpid():
+            raise RuntimeError("spawned axis process group identity is invalid")
+        connection.send(
+            {
+                "status": "started",
+                "process_group_id": process_group_id,
+            }
+        )
+        path, receipts = _run_mode_with_terminal_io(task, mode)
+    except ArchitectureAxisExecutionFailed as error:
+        message: dict[str, object] = {
+            "status": "axis_failed",
+            "axis_path": error.axis_path,
+            "error_type": error.error_type,
+            "error": error.error,
+        }
+    except BaseException as error:
+        message = {
+            "status": "worker_failed",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    else:
+        message = {
+            "status": "completed",
+            "path": path,
+            "terminal_io_receipts": receipts,
+        }
+    try:
+        connection.send(message)
+    finally:
+        connection.close()
+
+
+def _run_fresh_spawn_axis_batch(
+    tasks: tuple[ArchitectureAxisTask, ...],
+    mode: ArchitectureMode,
+    *,
+    scheduler_process_id: int | None,
+) -> tuple[_FreshAxisOutcome, ...]:
+    """Run exactly one task per spawned process without idle replacements."""
+
+    if not tasks:
+        return ()
+    context = multiprocessing.get_context("spawn")
+    started: list[
+        tuple[int, ArchitectureAxisTask, float, Connection, BaseProcess]
+    ] = []
+    try:
+        for index, task in enumerate(tasks):
+            parent_connection, child_connection = context.Pipe(duplex=False)
+            submitted = time.perf_counter()
+            process = context.Process(
+                target=_fresh_axis_process_entry,
+                args=(
+                    child_connection,
+                    replace(task, scheduler_process_id=scheduler_process_id),
+                    mode,
+                ),
+            )
+            process.daemon = False
+            try:
+                process.start()
+            except BaseException:
+                parent_connection.close()
+                child_connection.close()
+                raise
+            started.append((index, task, submitted, parent_connection, process))
+            child_connection.close()
+    except BaseException as start_error:
+        for _index, _task, _submitted, connection, _worker_process in started:
+            connection.close()
+        cleanup_states = _stop_spawned_axis_processes(
+            tuple(
+                (index, worker_process, None)
+                for index, _task, _submitted, _connection, worker_process in started
+            )
+        )
+        if not all(cleanup_states.values()):
+            raise RuntimeError(
+                "spawned axis startup failed and process groups were not drained"
+            ) from start_error
+        raise
+
+    messages: dict[int, tuple[float, Mapping[str, object]]] = {}
+    pending = {connection: index for index, _task, _submitted, connection, _process in started}
+    process_by_index = {
+        index: worker_process
+        for index, _task, _submitted, _connection, worker_process in started
+    }
+    process_group_by_index: dict[int, int] = {}
+    deadlines = {
+        index: submitted + _axis_parent_timeout_seconds(task)
+        for index, task, submitted, _connection, _process in started
+    }
+    forced_failures: set[int] = set()
+    abort_source_index: int | None = None
+    while pending:
+        now = time.perf_counter()
+        next_deadline = min(deadlines[index] for index in pending.values())
+        wait_seconds = max(0.0, next_deadline - now)
+        try:
+            ready_connections = (
+                wait_for_connections(tuple(pending), timeout=wait_seconds)
+                if wait_seconds > 0.0
+                else ()
+            )
+        except BaseException:
+            for connection in pending:
+                connection.close()
+            cleanup_states = _stop_spawned_axis_processes(
+                tuple(
+                    (
+                        index,
+                        worker_process,
+                        process_group_by_index.get(index),
+                    )
+                    for index, _task, _submitted, _connection, worker_process in started
+                )
+            )
+            if not all(cleanup_states.values()):
+                raise RuntimeError(
+                    "spawned axis wait failed and process groups were not drained"
+                ) from None
+            raise
+        failure_indices: list[int] = []
+        for ready_object in ready_connections:
+            connection = cast(Connection, ready_object)
+            index = pending[connection]
+            receive_deadline = min(deadlines[pending_index] for pending_index in pending.values())
+            try:
+                raw_message = _receive_axis_envelope(
+                    connection,
+                    deadline=receive_deadline,
+                )
+            except _AxisEnvelopeDeadlineExceeded:
+                raw_message = {
+                    "status": "worker_failed",
+                    "error_type": "WorkerTimeout",
+                    "error": "spawned axis result envelope exceeded its parent deadline",
+                }
+            except EOFError:
+                raw_message = {
+                    "status": "worker_failed",
+                    "error_type": "WorkerPipeClosed",
+                    "error": "spawned axis process exited without a result envelope",
+                }
+            except BaseException as receive_error:
+                raw_message = {
+                    "status": "worker_failed",
+                    "error_type": type(receive_error).__name__,
+                    "error": str(receive_error),
+                }
+            completed = time.perf_counter()
+            if not isinstance(raw_message, Mapping):
+                raw_message = {
+                    "status": "worker_failed",
+                    "error_type": "InvalidWorkerEnvelope",
+                    "error": "spawned axis result envelope is invalid",
+                }
+            status = raw_message.get("status")
+            if status == "started":
+                process_group_id = raw_message.get("process_group_id")
+                worker_pid = process_by_index[index].pid
+                if (
+                    isinstance(process_group_id, bool)
+                    or not isinstance(process_group_id, int)
+                    or process_group_id <= 0
+                    or process_group_id != worker_pid
+                    or index in process_group_by_index
+                ):
+                    raw_message = {
+                        "status": "worker_failed",
+                        "error_type": "InvalidWorkerProcessGroup",
+                        "error": "spawned axis process group envelope is invalid",
+                    }
+                else:
+                    process_group_by_index[index] = process_group_id
+                    continue
+            pending.pop(connection)
+            connection.close()
+            messages[index] = (completed, raw_message)
+            if raw_message.get("status") in {"axis_failed", "worker_failed"}:
+                failure_indices.append(index)
+        if failure_indices:
+            abort_source_index = min(failure_indices)
+            pending_items = tuple(pending.items())
+            for connection, _index in pending_items:
+                pending.pop(connection)
+                connection.close()
+            cleanup_states = _stop_spawned_axis_processes(
+                tuple(
+                    (
+                        index,
+                        process_by_index[index],
+                        process_group_by_index.get(index),
+                    )
+                    for _connection, index in pending_items
+                )
+            )
+            cleanup_failures = [
+                index for _connection, index in pending_items if not cleanup_states[index]
+            ]
+            completed = time.perf_counter()
+            for _connection, index in pending_items:
+                stopped = cleanup_states[index]
+                messages[index] = (
+                    completed,
+                    {
+                        "status": "worker_failed",
+                        "error_type": (
+                            "SiblingCancelled" if stopped else "WorkerTerminationError"
+                        ),
+                        "error": (
+                            "spawned axis process was cancelled after a sibling failed"
+                            if stopped
+                            else "spawned axis process group could not be drained"
+                        ),
+                    },
+                )
+                forced_failures.add(index)
+            if cleanup_failures:
+                raise RuntimeError(
+                    "spawned axis sibling process groups were not drained: "
+                    + ",".join(str(index) for index in cleanup_failures)
+                )
+            break
+        expired_at = time.perf_counter()
+        expired_indices = [
+            index for index in pending.values() if expired_at >= deadlines[index]
+        ]
+        if expired_indices:
+            abort_source_index = min(
+                expired_indices,
+                key=lambda index: (deadlines[index], index),
+            )
+            pending_items = tuple(pending.items())
+            for connection, _index in pending_items:
+                pending.pop(connection)
+                connection.close()
+            cleanup_states = _stop_spawned_axis_processes(
+                tuple(
+                    (
+                        index,
+                        process_by_index[index],
+                        process_group_by_index.get(index),
+                    )
+                    for _connection, index in pending_items
+                )
+            )
+            timeout_cleanup_failures = [
+                index for _connection, index in pending_items if not cleanup_states[index]
+            ]
+            completed = time.perf_counter()
+            for _connection, index in pending_items:
+                stopped = cleanup_states[index]
+                is_timeout_source = index == abort_source_index
+                messages[index] = (
+                    completed,
+                    {
+                        "status": "worker_failed",
+                        "error_type": (
+                            "WorkerTimeout"
+                            if is_timeout_source and stopped
+                            else "SiblingCancelled"
+                            if stopped
+                            else "WorkerTerminationError"
+                        ),
+                        "error": (
+                            "spawned axis process exceeded its parent deadline"
+                            if is_timeout_source and stopped
+                            else "spawned axis process was cancelled after a sibling timed out"
+                            if stopped
+                            else "spawned axis process group could not be drained"
+                        ),
+                    },
+                )
+                forced_failures.add(index)
+            if timeout_cleanup_failures:
+                raise RuntimeError(
+                    "timed-out spawned axis process groups were not drained: "
+                    + ",".join(str(index) for index in timeout_cleanup_failures)
+                )
+            break
+
+    cleanup_candidates: list[tuple[int, BaseProcess, int | None]] = []
+    for index, _task, _submitted, _connection, worker_process in started:
+        worker_process.join(timeout=0.0)
+        if worker_process.is_alive() or _process_group_is_alive(
+            process_group_by_index.get(index)
+        ):
+            cleanup_candidates.append(
+                (index, worker_process, process_group_by_index.get(index))
+            )
+    cleanup_states = _stop_spawned_axis_processes(tuple(cleanup_candidates))
+    for index, _worker_process, _group_id in cleanup_candidates:
+        stopped = cleanup_states[index]
+        if not stopped:
+            raise RuntimeError(
+                f"spawned axis process group {index} was not drained"
+            )
+        completed = time.perf_counter()
+        existing_message = messages.get(index)
+        existing_status = (
+            existing_message[1].get("status") if existing_message is not None else None
+        )
+        if existing_status == "completed" or existing_message is None:
+            messages[index] = (
+                completed,
+                {
+                    "status": "worker_failed",
+                    "error_type": "WorkerExitTimeout",
+                    "error": (
+                        "spawned axis process group remained active after sending "
+                        "its result envelope"
+                    ),
+                },
+            )
+            forced_failures.add(index)
+
+    undrained = [
+        index
+        for index, _task, _submitted, _connection, worker_process in started
+        if worker_process.is_alive()
+        or _process_group_is_alive(process_group_by_index.get(index))
+    ]
+    if undrained:
+        raise RuntimeError(
+            "spawned axis process groups remain active after cleanup: "
+            + ",".join(str(index) for index in undrained)
+        )
+
+    outcomes: list[_FreshAxisOutcome] = []
+    outcome_indices = list(range(len(started)))
+    if abort_source_index is not None:
+        outcome_indices.remove(abort_source_index)
+        outcome_indices.insert(0, abort_source_index)
+    started_by_index = {item[0]: item for item in started}
+    for index in outcome_indices:
+        _index, task, submitted, _connection, worker_process = started_by_index[index]
+        completed, message = messages[index]
+        status = message.get("status")
+        if index in forced_failures:
+            forced_error_type = message.get("error_type")
+            forced_error_text = message.get("error")
+            if not isinstance(forced_error_type, str) or not isinstance(
+                forced_error_text, str
+            ):
+                raise RuntimeError("forced spawned worker failure envelope is invalid")
+            outcome = _FreshAxisOutcome(
+                task=task,
+                parent_terminal_seconds=completed - submitted,
+                result=None,
+                error=ArchitectureAxisWorkerFailed(
+                    forced_error_type,
+                    forced_error_text,
+                ),
+            )
+        elif worker_process.exitcode != 0 and status == "completed":
+            outcome = _FreshAxisOutcome(
+                task=task,
+                parent_terminal_seconds=completed - submitted,
+                result=None,
+                error=ArchitectureAxisWorkerFailed(
+                    "WorkerExitError",
+                    f"spawned axis process exit code is {worker_process.exitcode}",
+                ),
+            )
+        elif status == "completed":
+            path = message.get("path")
+            raw_receipts = message.get("terminal_io_receipts")
+            if not isinstance(path, str) or not isinstance(raw_receipts, list) or any(
+                not isinstance(receipt, dict) for receipt in raw_receipts
+            ):
+                raise RuntimeError("completed spawned axis result is invalid")
+            outcome = _FreshAxisOutcome(
+                task=task,
+                parent_terminal_seconds=completed - submitted,
+                result=(path, cast(list[dict[str, object]], raw_receipts)),
+                error=None,
+            )
+        elif status == "axis_failed":
+            axis_path = message.get("axis_path")
+            axis_error_type = message.get("error_type")
+            axis_error_text = message.get("error")
+            if (
+                not isinstance(axis_path, str)
+                or not isinstance(axis_error_type, str)
+                or not isinstance(axis_error_text, str)
+            ):
+                raise RuntimeError("spawned axis failure envelope is invalid")
+            outcome = _FreshAxisOutcome(
+                task=task,
+                parent_terminal_seconds=completed - submitted,
+                result=None,
+                error=ArchitectureAxisExecutionFailed(
+                    axis_path,
+                    axis_error_type,
+                    axis_error_text,
+                ),
+            )
+        elif status == "worker_failed":
+            worker_error_type = message.get("error_type")
+            worker_error_text = message.get("error")
+            if not isinstance(worker_error_type, str) or not isinstance(
+                worker_error_text, str
+            ):
+                raise RuntimeError("spawned worker failure envelope is invalid")
+            outcome = _FreshAxisOutcome(
+                task=task,
+                parent_terminal_seconds=completed - submitted,
+                result=None,
+                error=ArchitectureAxisWorkerFailed(
+                    worker_error_type,
+                    worker_error_text,
+                ),
+            )
+        else:
+            raise RuntimeError("spawned axis result status is invalid")
+        outcomes.append(outcome)
+    return tuple(outcomes)
 
 
 def workload_class_for_instance(instance_name: str) -> str:
@@ -1619,6 +2297,11 @@ def _runtime_io_accounting(
         or cgroup_after.get("io") != "unavailable"
     ):
         raise RuntimeError("runtime cgroup I/O accounting is invalid")
+    if (
+        process_tree.get("process_io_terminal_status") != "available"
+        or process_tree.get("process_io_uncovered_identities") != []
+    ):
+        raise RuntimeError("runtime process-tree terminal I/O evidence is unavailable")
     values: dict[str, int] = {}
     for target, source in (
         ("read_bytes", "process_tree_read_bytes"),
@@ -1734,6 +2417,16 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
         }
     if canonical.get("event_type") == "candidate_control_budget":
         canonical.pop("accounting", None)
+        for field in (
+            "candidate_id",
+            "transaction_status_code",
+            "implementation_internal",
+            "round_remaining",
+            "exact_remaining",
+            "available",
+            "native_transaction_id",
+        ):
+            canonical.pop(field, None)
         context = canonical.get("context")
         if isinstance(context, str) and context.endswith(":native_candidate_round"):
             canonical["context"] = (
@@ -1746,6 +2439,8 @@ def _canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
     if canonical.get("event_type") == "candidate_plan_decision":
         canonical.pop("batch_ordinal", None)
         canonical.pop("transaction_status_code", None)
+        canonical.pop("implementation_internal", None)
+        canonical.pop("native_transaction_id", None)
     if canonical.get("event_type") == "cache_event":
         operation = canonical.get("operation")
         if operation in {"lookup", "store", "evict", "reconcile", "oversize_not_cached"}:
@@ -2822,6 +3517,50 @@ def _run_mode(
     return terminal_path
 
 
+def _run_mode_with_terminal_io(
+    task: ArchitectureAxisTask,
+    mode: ArchitectureMode,
+) -> tuple[str, list[dict[str, object]]]:
+    """Run one outer shard and capture its live terminal I/O counters."""
+
+    if drain_descendant_terminal_process_io_receipts():
+        raise RuntimeError("outer worker terminal-I/O registry was not empty at task start")
+    task_started_monotonic = time.monotonic()
+    path = _run_mode(task, mode)
+    try:
+        receipt = capture_current_process_terminal_io_receipt(
+            task_started_monotonic=task_started_monotonic,
+        )
+    except BaseException as error:
+        raise ArchitectureAxisExecutionFailed(
+            path,
+            type(error).__name__,
+            str(error),
+        ) from error
+    descendants = list(drain_descendant_terminal_process_io_receipts())
+    return path, [receipt, *descendants]
+
+
+def _reconcile_mode_wave_terminal_io(
+    monitor: ProcessTreeMonitor,
+    *,
+    terminal_io_receipts: list[dict[str, object]],
+    bound_terminal_io_receipts: list[dict[str, object]],
+    scheduler_terminal_io_receipts: list[dict[str, object]],
+    expected_count: int,
+) -> None:
+    """Apply exact core receipts while separately auditing axis bindings."""
+
+    if (
+        len(terminal_io_receipts) < expected_count
+        or len(bound_terminal_io_receipts) != len(terminal_io_receipts)
+    ):
+        raise RuntimeError("mode-wave worker terminal I/O inventory is incomplete")
+    monitor.apply_terminal_process_io_receipts(
+        [*terminal_io_receipts, *scheduler_terminal_io_receipts]
+    )
+
+
 def _run_group(task: ArchitectureAxisTask) -> list[str]:
     """Run one legacy test group; production campaigns use global mode waves."""
 
@@ -3225,6 +3964,9 @@ def run_experiment(
             )
             scheduler_process_ids: list[int] = []
             axis_parent_terminal_timings: list[dict[str, object]] = []
+            terminal_io_receipts: list[dict[str, object]] = []
+            worker_terminal_io_receipts: list[dict[str, object]] = []
+            scheduler_terminal_io_receipts: list[dict[str, object]] = []
             mode_scheduler_startup = 0.0
             mode_scheduler_shutdown = 0.0
             mode_started = time.perf_counter()
@@ -3286,7 +4028,13 @@ def run_experiment(
                     scheduler_observations_by_pid[scheduler.process_id] = observation
                     return scheduler
 
-                def stop_scheduler(scheduler: NativeHostScheduler) -> None:
+                def stop_scheduler(
+                    scheduler: NativeHostScheduler,
+                    *,
+                    terminal_receipts: list[dict[str, object]] = (
+                        scheduler_terminal_io_receipts
+                    ),
+                ) -> None:
                     nonlocal mode_scheduler_shutdown, scheduler_shutdown_seconds
                     scheduler_pid = scheduler.process_id
                     shutdown_started = time.perf_counter()
@@ -3295,94 +4043,97 @@ def run_experiment(
                     mode_scheduler_shutdown += shutdown
                     scheduler_shutdown_seconds += shutdown
                     observation = scheduler_observations_by_pid[scheduler_pid]
+                    scheduler_terminal_io = scheduler.terminal_process_io_receipt
+                    terminal_receipts.append(scheduler_terminal_io)
+                    observation["terminal_process_io_receipt"] = scheduler_terminal_io
                     observation["runtime_statistics"] = _scheduler_runtime_summary(
                         scheduler.runtime_statistics
                     )
                     observation["shutdown_seconds"] = shutdown
 
-                with ProcessPoolExecutor(
-                    max_workers=topology.shard_count,
-                    mp_context=multiprocessing.get_context("spawn"),
-                    max_tasks_per_child=1,
-                ) as executor:
-                    if mode is ArchitectureMode.HOST_SCHEDULER and lifecycle == "mode-block":
-                        shared_scheduler = start_scheduler(-1)
-                    try:
-                        for subwave_index, task_batch in enumerate(task_batches):
-                            scheduler = shared_scheduler
-                            if mode is ArchitectureMode.HOST_SCHEDULER and lifecycle == "per-wave":
-                                scheduler = start_scheduler(subwave_index)
-                            scheduler_process_id = (
-                                None if scheduler is None else scheduler.process_id
+                if mode is ArchitectureMode.HOST_SCHEDULER and lifecycle == "mode-block":
+                    shared_scheduler = start_scheduler(-1)
+                try:
+                    for subwave_index, task_batch in enumerate(task_batches):
+                        scheduler = shared_scheduler
+                        if mode is ArchitectureMode.HOST_SCHEDULER and lifecycle == "per-wave":
+                            scheduler = start_scheduler(subwave_index)
+                        scheduler_process_id = None if scheduler is None else scheduler.process_id
+                        try:
+                            outcomes = _run_fresh_spawn_axis_batch(
+                                task_batch,
+                                mode,
+                                scheduler_process_id=scheduler_process_id,
                             )
-                            try:
-                                futures: dict[
-                                    Future[str],
-                                    tuple[float, ArchitectureAxisTask],
-                                ] = {}
-                                for task in task_batch:
-                                    submitted = time.perf_counter()
-                                    future = executor.submit(
-                                        _run_mode,
-                                        replace(
-                                            task,
-                                            scheduler_process_id=scheduler_process_id,
+                            failure: BaseException | None = None
+                            for outcome in outcomes:
+                                task = outcome.task
+                                if outcome.error is not None:
+                                    if failure is None:
+                                        failure = outcome.error
+                                    if isinstance(outcome.error, ArchitectureAxisExecutionFailed):
+                                        written.append(outcome.error.axis_path)
+                                    continue
+                                if outcome.result is None:
+                                    raise AssertionError("successful campaign axis has no result")
+                                path, axis_terminal_io = outcome.result
+                                written.append(path)
+                                terminal_io_receipts.extend(axis_terminal_io)
+                                worker_terminal_io_receipts.extend(
+                                    {
+                                        "repeat": task.repeat,
+                                        "axis": task.axis,
+                                        "instance": task.instance_name,
+                                        "seed": task.seed,
+                                        **terminal_io,
+                                    }
+                                    for terminal_io in axis_terminal_io
+                                )
+                                axis_parent_terminal_timings.append(
+                                    {
+                                        "repeat": task.repeat,
+                                        "axis": task.axis,
+                                        "instance": task.instance_name,
+                                        "seed": task.seed,
+                                        "subwave_index": subwave_index,
+                                        "producer_parent_terminal_seconds": (
+                                            outcome.parent_terminal_seconds
                                         ),
-                                        mode,
-                                    )
-                                    futures[future] = (submitted, task)
-                                try:
-                                    for future in as_completed(futures):
-                                        submitted, task = futures[future]
-                                        path = future.result()
-                                        written.append(path)
-                                        axis_parent_terminal_timings.append(
-                                            {
-                                                "repeat": task.repeat,
-                                                "axis": task.axis,
-                                                "instance": task.instance_name,
-                                                "seed": task.seed,
-                                                "subwave_index": subwave_index,
-                                                "producer_parent_terminal_seconds": (
-                                                    time.perf_counter() - submitted
-                                                ),
-                                            }
-                                        )
-                                except BaseException as error:
-                                    if isinstance(error, ArchitectureAxisExecutionFailed):
-                                        written.append(error.axis_path)
-                                    for pending in futures:
-                                        pending.cancel()
-                                    # Keep the shared scheduler alive while already-running
-                                    # clients finish their bounded rollback/publication path.
-                                    # No later subwave or mode is submitted after this point.
-                                    executor.shutdown(wait=True, cancel_futures=True)
-                                    _publish_campaign_failure_receipts(
-                                        scope=scope,
-                                        attempt=attempt,
-                                        output_root=output_root,
-                                        labels=labels,
-                                        revision=revision,
-                                        performance_profile_sha256=(
-                                            performance_profile.canonical_sha256
-                                        ),
-                                        written=written,
-                                        block_index=block_index,
-                                        mode=mode,
-                                        subwave_index=subwave_index,
-                                        failure=error,
-                                    )
-                                    raise RuntimeError(
-                                        "native architecture campaign stopped at the first "
-                                        "failed axis"
-                                    ) from error
-                            finally:
-                                if scheduler is not None and scheduler is not shared_scheduler:
-                                    stop_scheduler(scheduler)
-                    finally:
-                        if shared_scheduler is not None:
-                            stop_scheduler(shared_scheduler)
+                                    }
+                                )
+                            if failure is not None:
+                                _publish_campaign_failure_receipts(
+                                    scope=scope,
+                                    attempt=attempt,
+                                    output_root=output_root,
+                                    labels=labels,
+                                    revision=revision,
+                                    performance_profile_sha256=(
+                                        performance_profile.canonical_sha256
+                                    ),
+                                    written=written,
+                                    block_index=block_index,
+                                    mode=mode,
+                                    subwave_index=subwave_index,
+                                    failure=failure,
+                                )
+                                raise RuntimeError(
+                                    "native architecture campaign stopped at the first failed axis"
+                                ) from failure
+                        finally:
+                            if scheduler is not None and scheduler is not shared_scheduler:
+                                stop_scheduler(scheduler)
+                finally:
+                    if shared_scheduler is not None:
+                        stop_scheduler(shared_scheduler)
             mode_elapsed = time.perf_counter() - mode_started
+            _reconcile_mode_wave_terminal_io(
+                mode_monitor,
+                terminal_io_receipts=terminal_io_receipts,
+                bound_terminal_io_receipts=worker_terminal_io_receipts,
+                scheduler_terminal_io_receipts=scheduler_terminal_io_receipts,
+                expected_count=len(identity_block),
+            )
             mode_resource_statistics = mode_monitor.statistics(
                 elapsed_seconds=mode_elapsed,
                 compute_thread_limit=len(topology.cpu_ids),
@@ -3492,6 +4243,22 @@ def run_experiment(
                             cast(str, row["axis"]),
                             cast(str, row["instance"]),
                             cast(int, row["seed"]),
+                        ),
+                    ),
+                    "worker_terminal_io_receipts": sorted(
+                        worker_terminal_io_receipts,
+                        key=lambda row: (
+                            cast(int, row["repeat"]),
+                            cast(str, row["axis"]),
+                            cast(str, row["instance"]),
+                            cast(int, row["seed"]),
+                        ),
+                    ),
+                    "scheduler_terminal_io_receipts": sorted(
+                        scheduler_terminal_io_receipts,
+                        key=lambda item: (
+                            cast(int, item["pid"]),
+                            cast(float, item["create_time"]),
                         ),
                     ),
                     "elapsed_seconds": mode_elapsed,

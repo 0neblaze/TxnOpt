@@ -2785,14 +2785,27 @@ class _Evaluator:
         )
         if cached is not None:
             return cached
+        exact_remaining: int | None = None
+        if (
+            self.exact_call_controller is not None
+            and self.exact_call_controller.budget is not None
+        ):
+            exact_remaining = max(
+                0,
+                self.exact_call_controller.budget
+                - self.exact_call_controller.started_calls,
+            )
         if self.candidate_control_runtime is not None:
-            granted = self.candidate_control_runtime.reserve(
-                1,
-                atomic=True,
-                context=f"{self.lane}:{self.operator}:single_route",
+            granted, budget_skip_reason = (
+                self.candidate_control_runtime.reserve_atomic_with_exact_limit(
+                    1,
+                    exact_remaining=exact_remaining,
+                    context=f"{self.lane}:{self.operator}:single_route",
+                )
             )
             if granted == 0:
-                return _candidate_control_skip_result("round_budget_exhausted")
+                assert budget_skip_reason is not None
+                return _candidate_control_skip_result(budget_skip_reason)
         reservation = (
             self.exact_call_controller.reserve(1)
             if self.exact_call_controller is not None
@@ -3034,7 +3047,13 @@ class _Evaluator:
             charging = self.route_batch(clean, route_change_status="changed")
         elif precomputed_routes is not None and self.candidate_control_runtime is not None:
             missing = tuple(sequence for sequence in clean if sequence not in precomputed_routes)
-            missing_results = iter(self.route_batch(missing, route_change_status="changed"))
+            missing_results = iter(
+                self.route_batch(
+                    missing,
+                    route_change_status="changed",
+                    stop_after_candidate_budget_skip=True,
+                )
+            )
             charging = tuple(
                 self._precomputed_route(sequence, precomputed_routes[sequence])
                 if sequence in precomputed_routes
@@ -3089,6 +3108,7 @@ class _Evaluator:
         *,
         route_change_status: str = "changed",
         candidate_pool: bool = False,
+        stop_after_candidate_budget_skip: bool = False,
     ) -> tuple[ChargingSubproblemResult, ...]:
         """Evaluate ordered routes while batching CPU cache misses."""
 
@@ -3109,14 +3129,31 @@ class _Evaluator:
         pending_indices: list[int] = []
         pending_set: set[tuple[str, ...]] = set()
         cache_available = self.route_cache is not None or self.local_cache_enabled
+        candidate_budget_skip_reason: str | None = None
 
         def flush_pending() -> None:
+            nonlocal candidate_budget_skip_reason
             if not pending_sequences:
                 return
             batch_results = self._solve_uncached_batch(
                 tuple(pending_sequences),
                 route_change_status,
             )
+            if stop_after_candidate_budget_skip:
+                budget_skip_reasons = {
+                    result.failure_reason.removeprefix("candidate_control:")
+                    for result in batch_results
+                    if result.failure_reason.startswith("candidate_control:")
+                }
+                if budget_skip_reasons:
+                    if len(budget_skip_reasons) != 1 or any(
+                        not result.failure_reason.startswith("candidate_control:")
+                        for result in batch_results
+                    ):
+                        raise RuntimeError(
+                            "candidate miss group mixed budget skips with exact results"
+                        )
+                    candidate_budget_skip_reason = next(iter(budget_skip_reasons))
             for request_index, result in zip(
                 pending_indices,
                 batch_results,
@@ -3162,6 +3199,11 @@ class _Evaluator:
             )
             if cached is not None:
                 resolved[index] = cached
+                continue
+            if candidate_budget_skip_reason is not None:
+                resolved[index] = _candidate_control_skip_result(
+                    candidate_budget_skip_reason
+                )
                 continue
             pending_sequences.append(sequence)
             pending_indices.append(index)
@@ -3219,9 +3261,19 @@ class _Evaluator:
                 resolved[index] = cached
             else:
                 selected_misses.append(index)
-        granted = runtime.reserve(
+        exact_remaining: int | None = None
+        if (
+            self.exact_call_controller is not None
+            and self.exact_call_controller.budget is not None
+        ):
+            exact_remaining = max(
+                0,
+                self.exact_call_controller.budget
+                - self.exact_call_controller.started_calls,
+            )
+        granted, budget_skip_reason = runtime.reserve_atomic_with_exact_limit(
             len(selected_misses),
-            atomic=True,
+            exact_remaining=exact_remaining,
             context=f"{self.lane}:{self.operator}:candidate_pool",
         )
         active_indices = tuple(selected_misses[:granted])
@@ -3240,7 +3292,7 @@ class _Evaluator:
             if resolved[index] is not None:
                 continue
             reason = (
-                "round_budget_exhausted"
+                (budget_skip_reason or "round_budget_exhausted")
                 if index in top_k_set and index not in selected_set
                 else "not_selected"
             )
@@ -3262,39 +3314,29 @@ class _Evaluator:
 
         if not sequences:
             return ()
+        exact_remaining: int | None = None
+        if (
+            self.exact_call_controller is not None
+            and self.exact_call_controller.budget is not None
+        ):
+            exact_remaining = max(
+                0,
+                self.exact_call_controller.budget
+                - self.exact_call_controller.started_calls,
+            )
         if self.candidate_control_runtime is not None and not candidate_control_reserved:
-            granted = self.candidate_control_runtime.reserve(
-                len(sequences),
-                atomic=True,
-                context=f"{self.lane}:{self.operator}:complete_candidate",
+            granted, budget_skip_reason = (
+                self.candidate_control_runtime.reserve_atomic_with_exact_limit(
+                    len(sequences),
+                    exact_remaining=exact_remaining,
+                    context=f"{self.lane}:{self.operator}:complete_candidate",
+                )
             )
             if granted == 0:
+                assert budget_skip_reason is not None
                 return tuple(
-                    _candidate_control_skip_result("round_budget_exhausted") for _ in sequences
+                    _candidate_control_skip_result(budget_skip_reason) for _ in sequences
                 )
-        if (
-            self.candidate_control_runtime is not None
-            and self.exact_call_controller is not None
-            and self.exact_call_controller.budget is not None
-            and self.exact_call_controller.budget - self.exact_call_controller.started_calls
-            < len(sequences)
-        ):
-            self.candidate_control_runtime.events.append(
-                {
-                    "event_type": "candidate_control_budget",
-                    "status": "global_budget_atomic_skip",
-                    "context": f"{self.lane}:{self.operator}:complete_candidate",
-                    "requested": len(sequences),
-                    "granted": 0,
-                    "remaining": (
-                        self.exact_call_controller.budget - self.exact_call_controller.started_calls
-                    ),
-                    "iteration": self.iteration,
-                }
-            )
-            return tuple(
-                _candidate_control_skip_result("global_budget_atomic_skip") for _ in sequences
-            )
         if time.perf_counter() >= self.deadline:
             self._discard_pending_candidate_cache("deadline_before_exact_batch")
             raise _TimeLimitReached(sequences[0])
@@ -6737,12 +6779,16 @@ def _solve_full_native_alns(
         )
     completed_rounds = native_result.counters["iterations"]
     round_budget = config.candidate_control_config.max_exact_calls_per_round
-    budget_skips = sum(
-        event.get("event_type") == "candidate_plan_decision"
-        and event.get("status") == "selected"
-        and event.get("transaction_status_code") == 3
+    budget_skip_events = tuple(
+        event
         for event in native_result.control_journal_events
+        if event.get("event_type") == "candidate_control_budget"
+        and event.get("status") == "budget_skipped"
+        and event.get("implementation_internal") is not True
     )
+    budget_skips = len(budget_skip_events)
+    if native_result.control_journal_statistics.get("budget_skips") != budget_skips:
+        raise RuntimeError("full native budget-skip statistics do not match typed receipts")
     candidate_control_statistics = {
         "enabled": True,
         "schema_version": config.candidate_control_config.schema_version,
@@ -7032,7 +7078,11 @@ def _solve_full_native_alns(
                         event.get("requested", event.get("requested_calls", 0)),
                     )
                 )
-                status_code, flags = (1, 0) if event_code == 5 else (subject, 1)
+                status_code, flags = (
+                    (int(status_text == "reserved"), 0)
+                    if event_code == 5
+                    else (subject, 1)
+                )
             elif event_code in {7, 9}:
                 ordinal_key = (event_code, transaction_id)
                 subject = projection_ordinal_counters.get(ordinal_key, 0)
@@ -7305,14 +7355,21 @@ def _solve_full_native_alns(
                 return
             events = control_events_by_transaction[transaction_id]
             for raw_event in events:
-                if raw_event.get("event_type") != "candidate_plan_decision":
+                event_type = raw_event.get("event_type")
+                if event_type not in {
+                    "candidate_plan_decision",
+                    "candidate_control_budget",
+                }:
                     continue
-                if raw_event.get("lane") == "initialization":
+                if (
+                    event_type == "candidate_plan_decision"
+                    and raw_event.get("lane") == "initialization"
+                ):
                     continue
                 event = {
                     key: value
                     for key, value in raw_event.items()
-                    if key not in {"native_transaction_id", "batch_ordinal"}
+                    if key != "batch_ordinal"
                 }
                 append_runtime_projection(("candidate_transaction", event), native_backed=False)
             control_decisions_emitted.add(transaction_id)
@@ -7356,6 +7413,10 @@ def _solve_full_native_alns(
                         "lane": raw_event.get("lane"),
                         "iteration": raw_event.get("iteration"),
                         "operator": raw_event.get("operator"),
+                        "candidate_id": raw_event.get("candidate_id"),
+                        "native_transaction_id": raw_event.get(
+                            "native_transaction_id"
+                        ),
                         "current_entries": len(cache_state),
                         "current_bytes": cache_replay_statistics[8],
                     },
@@ -7458,6 +7519,7 @@ def _solve_full_native_alns(
                                 "lane": raw_event.get("lane"),
                                 "iteration": raw_event.get("iteration"),
                                 "operator": raw_event.get("operator"),
+                                "candidate_id": raw_event.get("candidate_id"),
                                 "native_transaction_id": transaction_id,
                                 "reason": "lru_capacity_or_memory",
                                 "current_entries": len(cache_state),
@@ -7477,6 +7539,7 @@ def _solve_full_native_alns(
                             "lane": raw_event.get("lane"),
                             "iteration": raw_event.get("iteration"),
                             "operator": raw_event.get("operator"),
+                            "candidate_id": raw_event.get("candidate_id"),
                             "native_transaction_id": transaction_id,
                             "reason": (
                                 "stored"

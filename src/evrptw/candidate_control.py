@@ -6,10 +6,13 @@ import hashlib
 import json
 import math
 import multiprocessing
+import multiprocessing.util
 import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
+from multiprocessing.synchronize import Lock as ProcessLock
 from typing import Any, Literal
 
 from evrptw.charging import ChargingSubproblemResult
@@ -21,6 +24,10 @@ from evrptw.cpu_batch import (
     solve_exact_charging_batch,
 )
 from evrptw.models import Instance
+from evrptw.runtime_envelope import (
+    capture_current_process_terminal_io_receipt,
+    register_descendant_terminal_process_io_receipts,
+)
 
 CANDIDATE_CONTROL_SCHEMA_VERSION = "stage034-control-parallel-v1"
 ExecutorModel = Literal["process_spawn"]
@@ -92,6 +99,33 @@ class CandidateParallelExecutionError(RuntimeError):
     """Parallel exact work failed and must not fall back to another backend."""
 
 
+def _write_candidate_worker_terminal_io_receipt(
+    send_connection: Connection,
+    send_lock: ProcessLock,
+    task_started_monotonic: float,
+) -> None:
+    """Finalize one persistent candidate worker before multiprocessing exits."""
+
+    receipt = capture_current_process_terminal_io_receipt(
+        task_started_monotonic=task_started_monotonic,
+    )
+    with send_lock:
+        send_connection.send(receipt)
+
+
+def _initialize_candidate_worker_terminal_io(
+    send_connection: Connection,
+    send_lock: ProcessLock,
+) -> None:
+    task_started_monotonic = time.monotonic()
+    multiprocessing.util.Finalize(
+        None,
+        _write_candidate_worker_terminal_io_receipt,
+        args=(send_connection, send_lock, task_started_monotonic),
+        exitpriority=0,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateControlProtocolSnapshot:
     """O(changes) rollback boundary for one external worker protocol call."""
@@ -112,6 +146,16 @@ class CandidateControlRuntime:
     _round_key: tuple[str, int] | None = None
     _round_used: int = 0
     _pool: ProcessPoolExecutor | None = field(default=None, init=False, repr=False)
+    _terminal_io_receive_connection: Connection | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _terminal_io_send_connection: Connection | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _submission_serial: int = 0
     _candidate_work: list[dict[str, object]] = field(default_factory=list)
     _route_results: list[dict[str, object]] = field(default_factory=list)
@@ -199,6 +243,10 @@ class CandidateControlRuntime:
             return self.config.max_exact_calls_per_round
         return max(0, self.config.max_exact_calls_per_round - self._round_used)
 
+    @property
+    def round_active(self) -> bool:
+        return self._round_key is not None
+
     def reserve(self, requested: int, *, atomic: bool, context: str) -> int:
         if requested <= 0:
             return 0
@@ -223,6 +271,47 @@ class CandidateControlRuntime:
             }
         )
         return granted
+
+    def reserve_atomic_with_exact_limit(
+        self,
+        requested: int,
+        *,
+        exact_remaining: int | None,
+        context: str,
+    ) -> tuple[int, str | None]:
+        """Reserve a complete miss surface without consuming either budget on skip."""
+
+        if requested <= 0:
+            return 0, None
+        if exact_remaining is not None and exact_remaining < 0:
+            raise ValueError("exact_remaining must be non-negative when bounded")
+        round_remaining = self.round_remaining if self.round_active else requested
+        available = min(
+            round_remaining,
+            requested if exact_remaining is None else exact_remaining,
+        )
+        if requested <= available:
+            return self.reserve(requested, atomic=True, context=context), None
+        self.events.append(
+            {
+                "event_type": "candidate_control_budget",
+                "status": "budget_skipped",
+                "context": context,
+                "requested": requested,
+                "granted": 0,
+                "remaining": round_remaining,
+                "round_remaining": round_remaining,
+                "exact_remaining": -1 if exact_remaining is None else exact_remaining,
+                "available": available,
+                "iteration": None if self._round_key is None else self._round_key[1],
+            }
+        )
+        reason = (
+            "global_budget_atomic_skip"
+            if exact_remaining is not None and exact_remaining < round_remaining
+            else "round_budget_exhausted"
+        )
+        return 0, reason
 
     def record_native_work(
         self,
@@ -694,9 +783,21 @@ class CandidateControlRuntime:
 
     def _ensure_pool(self) -> ProcessPoolExecutor:
         if self._pool is None:
+            if (
+                self._terminal_io_receive_connection is not None
+                or self._terminal_io_send_connection is not None
+            ):
+                raise RuntimeError("candidate worker terminal-I/O channel is already active")
+            context = multiprocessing.get_context("spawn")
+            receive_connection, send_connection = context.Pipe(duplex=False)
+            send_lock = context.Lock()
+            self._terminal_io_receive_connection = receive_connection
+            self._terminal_io_send_connection = send_connection
             self._pool = ProcessPoolExecutor(
                 max_workers=self.config.worker_count,
-                mp_context=multiprocessing.get_context("spawn"),
+                mp_context=context,
+                initializer=_initialize_candidate_worker_terminal_io,
+                initargs=(send_connection, send_lock),
             )
         return self._pool
 
@@ -709,8 +810,34 @@ class CandidateControlRuntime:
         self.finish_round()
         if self._pool is None:
             return
-        self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
-        self._pool = None
+        receive_connection = self._terminal_io_receive_connection
+        send_connection = self._terminal_io_send_connection
+        try:
+            self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+            if wait:
+                if receive_connection is None or send_connection is None:
+                    raise RuntimeError("candidate worker terminal-I/O channel is unavailable")
+                send_connection.close()
+                receipts: list[dict[str, object]] = []
+                while True:
+                    try:
+                        payload = receive_connection.recv()
+                    except EOFError:
+                        break
+                    if not isinstance(payload, dict):
+                        raise RuntimeError("candidate worker terminal-I/O receipt is invalid")
+                    receipts.append(payload)
+                if not receipts:
+                    raise RuntimeError("candidate worker terminal-I/O receipts are unavailable")
+                register_descendant_terminal_process_io_receipts(receipts)
+        finally:
+            self._pool = None
+            self._terminal_io_receive_connection = None
+            self._terminal_io_send_connection = None
+            if receive_connection is not None:
+                receive_connection.close()
+            if send_connection is not None:
+                send_connection.close()
 
     @property
     def candidate_work_hash(self) -> str:

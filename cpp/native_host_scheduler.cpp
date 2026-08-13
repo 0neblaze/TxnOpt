@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
@@ -58,6 +59,36 @@ namespace protocol = evrptw::native_protocol;
 namespace kernels = evrptw::native_kernels;
 
 namespace {
+
+struct ProcessIoCounters {
+    std::uint64_t read_bytes{};
+    std::uint64_t write_bytes{};
+};
+
+ProcessIoCounters read_terminal_process_io() {
+    std::ifstream stream("/proc/self/io");
+    if (!stream) {
+        throw std::runtime_error("native scheduler terminal I/O is unavailable");
+    }
+    ProcessIoCounters counters;
+    bool read_seen = false;
+    bool write_seen = false;
+    std::string key;
+    std::uint64_t value = 0;
+    while (stream >> key >> value) {
+        if (key == "read_bytes:") {
+            counters.read_bytes = value;
+            read_seen = true;
+        } else if (key == "write_bytes:") {
+            counters.write_bytes = value;
+            write_seen = true;
+        }
+    }
+    if (!stream.eof() || !read_seen || !write_seen) {
+        throw std::runtime_error("native scheduler terminal I/O is invalid");
+    }
+    return counters;
+}
 
 std::atomic<std::uint64_t> segment_counter{0};
 std::string scheduler_run_nonce;
@@ -1614,9 +1645,10 @@ void emit_runtime_statistics(
     const SchedulerConcurrencySnapshot concurrency,
     const std::int64_t worker_threads,
     const std::int64_t request_threads,
-    const TaskReceiptFileDescriptor& task_receipts) {
+    const TaskReceiptFileDescriptor& task_receipts,
+    const ProcessIoCounters terminal_io) {
     std::cout << std::setprecision(17)
-        << "{\"schema_version\":\"stage05.2-native-scheduler-runtime-v3\""
+        << "{\"schema_version\":\"stage05.2-native-scheduler-runtime-v4\""
         << ",\"worker_threads\":" << worker_threads
         << ",\"request_threads\":" << request_threads
         << ",\"receipt_writer_threads\":1"
@@ -1651,7 +1683,10 @@ void emit_runtime_statistics(
     write_json_array(work.wait_histogram);
     std::cout << ",\"service_histogram\":";
     write_json_array(work.service_histogram);
-    std::cout << "},\"task_receipts\":{\"schema_version\":"
+    std::cout << "},\"terminal_process_io\":{\"read_bytes\":"
+        << terminal_io.read_bytes
+        << ",\"write_bytes\":" << terminal_io.write_bytes
+        << "},\"task_receipts\":{\"schema_version\":"
         << "\"stage05.2-native-work-task-receipts-v3\""
         << ",\"path\":\"" << task_receipts.path << "\""
         << ",\"sha256\":\"" << task_receipts.sha256 << "\""
@@ -1911,10 +1946,11 @@ int main(int argc, char** argv) {
         const auto task_receipts = task_receipt_spool.finalize(
             work_statistics.completed_tasks,
             work_statistics.task_receipt_dropped_count);
+        const auto terminal_io = read_terminal_process_io();
         emit_runtime_statistics(
             work_statistics, queue.statistics(),
             concurrency_telemetry.snapshot(), worker_threads,
-            request_thread_count, task_receipts);
+            request_thread_count, task_receipts, terminal_io);
         ::close(listener);
         listener = -1;
         ::unlink(socket_path.c_str());

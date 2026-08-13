@@ -2634,19 +2634,14 @@ def decode_native_three_lane_semantic_stream(
                     )
                 )
             else:
-                # At a fixed-work boundary Python keeps the proposal-level
-                # repair reason in the neighborhood event, while its legacy
-                # operator statistics classify the enclosing interruption as
-                # a refinement time-limit failure.  Preserve both projections.
-                refinement_failure_code = (
-                    1
-                    if int(termination[0]) == 1 and int(refinement_metadata[0]) != 0
-                    else {
-                        "refinement_not_better": 2,
-                        "no_existing_route_insertion": 3,
-                        "evaluation_budget_exhausted": 4,
-                    }[refinement_reason]
-                )
+                # The Python path preserves the concrete repair outcome even
+                # when the enclosing iteration reaches a fixed-work boundary.
+                # Keep the native replay on that same semantic projection.
+                refinement_failure_code = {
+                    "refinement_not_better": 2,
+                    "no_existing_route_insertion": 3,
+                    "evaluation_budget_exhausted": 4,
+                }[refinement_reason]
                 operator_replay_events.append(
                     event(
                         "vehicle_reduction_refinement",
@@ -14163,7 +14158,7 @@ def _decode_full_native_control_journal(
     ) = screening_payload
     if not isinstance(batches_value, tuple):
         raise RuntimeError("full native control journal batches are invalid")
-    evidence = _StreamingSHA256Evidence(b"stage05.2-native-control-journal-v4")
+    evidence = _StreamingSHA256Evidence(b"stage05.2-native-control-journal-v6")
     lane_names = ("initialization", "legacy", "quality_shadow", "constraint_lane")
     operator_names = (
         "initial_solution",
@@ -14198,9 +14193,10 @@ def _decode_full_native_control_journal(
     decision_count = 0
     selected_count = 0
     skipped_count = 0
+    budget_skip_count = 0
     final_cache_statistics: npt.NDArray[np.int64] | None = None
     for batch_ordinal, batch_value in enumerate(batches_value):
-        if not isinstance(batch_value, tuple) or len(batch_value) != 21:
+        if not isinstance(batch_value, tuple) or len(batch_value) != 22:
             raise RuntimeError("full native control journal batch is invalid")
         _append_native_nested_evidence(evidence, batch_value)
         context = cast(
@@ -14323,9 +14319,18 @@ def _decode_full_native_control_journal(
                 name="control objective float metrics",
             ),
         )
+        budget_skip_receipts = cast(
+            npt.NDArray[np.int64],
+            _require_array(
+                batch_value[21],
+                dtype=np.dtype(np.int64),
+                shape=(plan_count, 5),
+                name="control budget skip receipts",
+            ),
+        )
         if np.any((protocol_flags != 0) & (protocol_flags != 1)):
             raise RuntimeError("full native control protocol flags are invalid")
-        implementation_internal = bool(protocol_flags[0])
+        implementation_internal = bool(protocol_flags[0] or protocol_flags[3])
         reference_distance_resolution = bool(protocol_flags[4])
         if reference_distance_resolution and not implementation_internal:
             raise RuntimeError(
@@ -14365,6 +14370,70 @@ def _decode_full_native_control_journal(
         selected_set = {int(value) for value in selected}
         if selected_set != {plan for plan, code in enumerate(decisions) if int(code) == 2}:
             raise RuntimeError("full native control selection and decisions disagree")
+        route_plan_ids = [0] * route_count
+        for plan in range(plan_count):
+            for route in range(int(plan_offsets[plan]), int(plan_offsets[plan + 1])):
+                route_plan_ids[route] = plan
+        for plan in range(plan_count):
+            requested, granted, round_remaining, exact_remaining, available = (
+                int(value) for value in budget_skip_receipts[plan]
+            )
+            skipped = int(statuses[plan]) == 3
+            if skipped:
+                receipt_empty = all(
+                    value == 0
+                    for value in (
+                        requested,
+                        granted,
+                        round_remaining,
+                        exact_remaining,
+                        available,
+                    )
+                )
+                expected_available = min(
+                    round_remaining,
+                    requested if exact_remaining < 0 else exact_remaining,
+                )
+                plan_routes = slice(
+                    int(plan_offsets[plan]),
+                    int(plan_offsets[plan + 1]),
+                )
+                if receipt_empty and implementation_internal:
+                    continue
+                if (
+                    plan not in selected_set
+                    or reference_distance_resolution
+                    or requested <= 0
+                    or granted != 0
+                    or round_remaining < 0
+                    or exact_remaining < -1
+                    or available < 0
+                    or available != expected_available
+                    or requested <= available
+                    or requested
+                    != int(np.count_nonzero(cache_lookup_flags[plan_routes] == 0))
+                    or np.any(cache_store_statuses[plan_routes] >= 0)
+                ):
+                    raise RuntimeError(
+                        "full native budget skip receipt is invalid: "
+                        f"plan={plan},internal={implementation_internal},"
+                        f"reference={reference_distance_resolution},"
+                        "receipt="
+                        f"{(requested, granted, round_remaining, exact_remaining, available)},"
+                        f"misses={int(np.count_nonzero(cache_lookup_flags[plan_routes] == 0))},"
+                        f"stores={cache_store_statuses[plan_routes].tolist()}"
+                    )
+            elif any(
+                value != 0
+                for value in (
+                    requested,
+                    granted,
+                    round_remaining,
+                    exact_remaining,
+                    available,
+                )
+            ):
+                raise RuntimeError("full native non-skipped plan has budget evidence")
         routes = tuple(
             tuple(
                 node_names[int(index)]
@@ -14402,6 +14471,7 @@ def _decode_full_native_control_journal(
                     "customer_sequences": [list(sequence) for sequence in routes],
                     "proposal_ordinal": 0,
                     "transaction_status_code": int(statuses[0]),
+                    "implementation_internal": False,
                     "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
                 }
@@ -14426,18 +14496,60 @@ def _decode_full_native_control_journal(
                         "customer_sequences": [list(sequence) for sequence in sequences],
                         "proposal_ordinal": plan,
                         "transaction_status_code": int(statuses[plan]),
+                        "implementation_internal": False,
                         "native_transaction_id": transaction_id,
                         "batch_ordinal": batch_ordinal,
                     }
                 )
+            for raw_plan in selected:
+                plan = int(raw_plan)
+                if int(statuses[plan]) != 3:
+                    continue
+                (
+                    requested,
+                    granted,
+                    round_remaining,
+                    exact_remaining,
+                    available,
+                ) = (
+                    int(value) for value in budget_skip_receipts[plan]
+                )
+                events.append(
+                    {
+                        "event_type": "candidate_control_budget",
+                        "status": "budget_skipped",
+                        "context": f"{lane}:{operator}:candidate_pool",
+                        "candidate_id": plan,
+                        "transaction_status_code": int(statuses[plan]),
+                        "implementation_internal": False,
+                        "requested": requested,
+                        "granted": granted,
+                        "remaining": round_remaining,
+                        "round_remaining": round_remaining,
+                        "exact_remaining": exact_remaining,
+                        "available": available,
+                        "iteration": iteration,
+                        "native_transaction_id": transaction_id,
+                        "batch_ordinal": batch_ordinal,
+                    }
+                )
+                budget_skip_count += 1
         elif reference_distance_resolution:
             if plan_count != 1 or route_count != 1:
                 raise RuntimeError("full native reference-distance receipt has an invalid shape")
-            feasible = int(statuses[0]) == 5
+            transaction_status = int(statuses[0])
+            feasible = transaction_status == 5
+            status = (
+                "budget_skipped"
+                if transaction_status == 3
+                else "feasible"
+                if feasible
+                else "infeasible"
+            )
             events.append(
                 {
                     "event_type": "reference_distance_resolution",
-                    "status": "feasible" if feasible else "infeasible",
+                    "status": status,
                     "lane": lane,
                     "iteration": public_iteration,
                     "operator": operator,
@@ -14446,11 +14558,57 @@ def _decode_full_native_control_journal(
                     "charging_count": int(objective_integer[0, 1]),
                     "reference_distance": (float(objective_float[0, 0]) if feasible else None),
                     "reference_charging_time": (float(objective_float[0, 1]) if feasible else None),
-                    "transaction_status_code": int(statuses[0]),
+                    "transaction_status_code": transaction_status,
                     "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
                 }
             )
+        elif implementation_internal:
+            for plan in range(plan_count):
+                if int(statuses[plan]) != 3:
+                    continue
+                (
+                    requested,
+                    granted,
+                    round_remaining,
+                    exact_remaining,
+                    available,
+                ) = (int(value) for value in budget_skip_receipts[plan])
+                if requested == 0:
+                    continue
+                events.append(
+                    {
+                        "event_type": "candidate_plan_decision",
+                        "status": "selected",
+                        "lane": lane,
+                        "iteration": public_iteration,
+                        "operator": operator,
+                        "candidate_id": plan,
+                        "transaction_status_code": 3,
+                        "implementation_internal": True,
+                        "native_transaction_id": transaction_id,
+                        "batch_ordinal": batch_ordinal,
+                    }
+                )
+                events.append(
+                    {
+                        "event_type": "candidate_control_budget",
+                        "status": "budget_skipped",
+                        "context": f"{lane}:{operator}:candidate_pool",
+                        "candidate_id": plan,
+                        "transaction_status_code": 3,
+                        "implementation_internal": True,
+                        "requested": requested,
+                        "granted": granted,
+                        "remaining": round_remaining,
+                        "round_remaining": round_remaining,
+                        "exact_remaining": exact_remaining,
+                        "available": available,
+                        "iteration": public_iteration,
+                        "native_transaction_id": transaction_id,
+                        "batch_ordinal": batch_ordinal,
+                    }
+                )
         lookup_rows = range(route_count * 2) if warm_start else range(route_count)
         for lookup_row in lookup_rows:
             lookup_flag = int(cache_lookup_flags[lookup_row])
@@ -14465,6 +14623,7 @@ def _decode_full_native_control_journal(
                     "lane": lane,
                     "iteration": public_iteration,
                     "operator": operator,
+                    "candidate_id": route_plan_ids[route],
                     "customer_sequence": list(routes[route]),
                     "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
@@ -14484,6 +14643,7 @@ def _decode_full_native_control_journal(
                     "lane": lane,
                     "iteration": public_iteration,
                     "operator": operator,
+                    "candidate_id": route_plan_ids[route],
                     "customer_sequence": list(routes[route]),
                     "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
@@ -14503,6 +14663,7 @@ def _decode_full_native_control_journal(
                 "budget_state": budget_state.tolist(),
                 "native_transaction_id": transaction_id,
                 "implementation_internal": implementation_internal,
+                "round_budget_suppressed": bool(protocol_flags[1]),
                 "reference_distance_resolution": reference_distance_resolution,
                 "batch_ordinal": batch_ordinal,
             }
@@ -14701,6 +14862,7 @@ def _decode_full_native_control_journal(
             "candidate_decisions": decision_count,
             "selected_candidates": selected_count,
             "skipped_candidates": skipped_count,
+            "budget_skips": budget_skip_count,
         },
         {name: int(final_cache_statistics[index]) for index, name in enumerate(cache_names)},
         {

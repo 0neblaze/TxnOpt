@@ -125,6 +125,11 @@ struct CandidatePlanExecutionTraceV2 final {
     std::vector<std::int64_t> exact_batch_sizes;
     std::vector<std::int64_t> exact_physical_task_counts;
     std::array<std::int64_t, 3> budget_reservation{};
+    // requested, granted, round remaining, exact remaining, and the limiting
+    // available budget for one atomic budget skip.  exact remaining == -1
+    // denotes an unlimited exact-call budget.  An all-zero row means that this
+    // plan was not budget-skipped.
+    std::array<std::int64_t, 5> budget_skip_receipt{};
     native_kernels::ExactBatchOutput exact;
     std::vector<std::int64_t> cache_store_statuses;
     std::vector<std::int64_t> cache_eviction_counts;
@@ -132,6 +137,25 @@ struct CandidatePlanExecutionTraceV2 final {
 
 inline void validate_candidate_plan_execution_trace_v2(
     const CandidatePlanExecutionTraceV2& plan) {
+    const auto requested = plan.budget_skip_receipt[0];
+    const auto granted = plan.budget_skip_receipt[1];
+    const auto round_remaining = plan.budget_skip_receipt[2];
+    const auto exact_remaining = plan.budget_skip_receipt[3];
+    const auto available = plan.budget_skip_receipt[4];
+    const auto budget_skip_empty = std::all_of(
+        plan.budget_skip_receipt.begin(), plan.budget_skip_receipt.end(),
+        [](const auto value) { return value == 0; });
+    const auto expected_available = exact_remaining < 0
+        ? std::min(round_remaining, requested)
+        : std::min(round_remaining, exact_remaining);
+    const auto budget_skip_valid = budget_skip_empty
+        || (requested > 0
+            && granted == 0
+            && round_remaining >= 0
+            && exact_remaining >= -1
+            && available >= 0
+            && available == expected_available
+            && requested > available);
     if (std::any_of(
             plan.cache_hit_flags.begin(), plan.cache_hit_flags.end(),
             [](const auto value) { return value != 0 && value != 1; })
@@ -149,6 +173,15 @@ inline void validate_candidate_plan_execution_trace_v2(
         exact_rows += batch_size;
     }
     const auto exact_row_count = static_cast<std::size_t>(exact_rows);
+    const auto atomic_budget_skip_valid = budget_skip_empty
+        || (exact_rows == 0
+            && std::ranges::all_of(
+                plan.budget_reservation,
+                [](const auto value) { return value == 0; })
+            && plan.missing_local_rows.empty()
+            && plan.exact.statuses.empty()
+            && plan.cache_store_statuses.empty()
+            && plan.cache_eviction_counts.empty());
     if (plan.budget_reservation[0] != exact_rows
         || plan.budget_reservation[1] != exact_rows
         || plan.budget_reservation[2] != exact_rows
@@ -169,13 +202,20 @@ inline void validate_candidate_plan_execution_trace_v2(
             != static_cast<std::int64_t>(
                 plan.exact.physical_task_receipts.size())
         || plan.cache_store_statuses.size() != exact_row_count
-        || plan.cache_eviction_counts.size() != exact_row_count) {
+        || plan.cache_eviction_counts.size() != exact_row_count
+        || !budget_skip_valid
+        || !atomic_budget_skip_valid) {
         throw std::logic_error(
             "native candidate plan trace shapes are invalid: exact_rows="
             + std::to_string(exact_rows)
             + ",budget=" + std::to_string(plan.budget_reservation[0])
             + "/" + std::to_string(plan.budget_reservation[1])
             + "/" + std::to_string(plan.budget_reservation[2])
+            + ",budget_skip=" + std::to_string(plan.budget_skip_receipt[0])
+            + "/" + std::to_string(plan.budget_skip_receipt[1])
+            + "/" + std::to_string(plan.budget_skip_receipt[2])
+            + "/" + std::to_string(plan.budget_skip_receipt[3])
+            + "/" + std::to_string(plan.budget_skip_receipt[4])
             + ",missing=" + std::to_string(plan.missing_local_rows.size())
             + ",statuses=" + std::to_string(plan.exact.statuses.size())
             + ",reasons=" + std::to_string(plan.exact.reasons.size())
@@ -440,6 +480,7 @@ inline CandidateTransactionTraceWireV2 encode_candidate_transaction_trace_v2(
         add_integer(plan.exact_batch_sizes);
         add_integer(plan.exact_physical_task_counts);
         add_integer(plan.budget_reservation);
+        add_integer(plan.budget_skip_receipt);
         add_integer(plan.exact.path_offsets);
         add_integer(plan.exact.path_indices);
         add_integer(plan.exact.statuses);
@@ -487,7 +528,7 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
         return std::vector<double>(values.begin(), values.end());
     };
     const auto plan_ids = integer_field(18);
-    if (wire.integer_offsets.size() != 20 + plan_ids.size() * 16
+    if (wire.integer_offsets.size() != 20 + plan_ids.size() * 17
         || wire.double_offsets.size() != 4 + plan_ids.size()) {
         throw std::runtime_error(
             "native candidate trace wire plan field count is invalid");
@@ -543,7 +584,7 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
     trace.ranking_float = copy_double(0);
     trace.plans.reserve(plan_ids.size());
     for (std::size_t plan = 0; plan < plan_ids.size(); ++plan) {
-        const auto base = 19 + plan * 16;
+        const auto base = 19 + plan * 17;
         CandidatePlanExecutionTraceV2 decoded;
         decoded.plan_id = plan_ids[plan];
         decoded.cache_hit_flags = copy_integer(base);
@@ -558,17 +599,25 @@ inline CandidateTransactionTraceV2 decode_candidate_transaction_trace_v2(
         std::copy(
             reservation.begin(), reservation.end(),
             decoded.budget_reservation.begin());
-        decoded.exact.path_offsets = copy_integer(base + 5);
-        decoded.exact.path_indices = copy_integer(base + 6);
-        decoded.exact.statuses = copy_integer(base + 7);
-        decoded.exact.reasons = copy_integer(base + 8);
-        decoded.exact.label_counters = copy_integer(base + 9);
-        decoded.exact.batch_counters = copy_integer(base + 10);
-        decoded.exact.completion_order = copy_integer(base + 11);
-        decoded.exact.physical_completion_order = copy_integer(base + 12);
-        decoded.exact.physical_task_receipts = copy_integer(base + 13);
-        decoded.cache_store_statuses = copy_integer(base + 14);
-        decoded.cache_eviction_counts = copy_integer(base + 15);
+        const auto budget_skip = integer_field(base + 5);
+        if (budget_skip.size() != decoded.budget_skip_receipt.size()) {
+            throw std::runtime_error(
+                "native candidate trace wire budget skip receipt is invalid");
+        }
+        std::copy(
+            budget_skip.begin(), budget_skip.end(),
+            decoded.budget_skip_receipt.begin());
+        decoded.exact.path_offsets = copy_integer(base + 6);
+        decoded.exact.path_indices = copy_integer(base + 7);
+        decoded.exact.statuses = copy_integer(base + 8);
+        decoded.exact.reasons = copy_integer(base + 9);
+        decoded.exact.label_counters = copy_integer(base + 10);
+        decoded.exact.batch_counters = copy_integer(base + 11);
+        decoded.exact.completion_order = copy_integer(base + 12);
+        decoded.exact.physical_completion_order = copy_integer(base + 13);
+        decoded.exact.physical_task_receipts = copy_integer(base + 14);
+        decoded.cache_store_statuses = copy_integer(base + 15);
+        decoded.cache_eviction_counts = copy_integer(base + 16);
         decoded.exact.metrics = copy_double(3 + plan);
         validate_candidate_plan_execution_trace_v2(decoded);
         trace.plans.push_back(std::move(decoded));
@@ -1285,11 +1334,38 @@ private:
             };
             std::vector<PendingExactStore> pending_exact_stores;
             bool plan_budget_skipped = false;
+            // Public complete-candidate transactions reserve the complete miss
+            // surface atomically before launching any exact work.  Internal
+            // repair/probe paths retain their audited prefix semantics.
+            const auto commit_legacy_exact_prefix =
+                options.suppress_attempted_plan_journal
+                || options.allow_partial_customer_coverage;
+            const auto public_missing_count = static_cast<std::int64_t>(
+                std::count(cached.hit_flags.begin(), cached.hit_flags.end(), 0));
+            if (!commit_legacy_exact_prefix && public_missing_count > 0) {
+                const auto exact_remaining = budget_.exact_remaining();
+                const auto round_remaining = options.suppress_round_budget
+                    ? public_missing_count
+                    : budget_.round_remaining();
+                const auto available_exact = std::min<std::int64_t>(
+                    round_remaining,
+                    exact_remaining < 0 ? public_missing_count : exact_remaining);
+                if (public_missing_count > available_exact) {
+                    plan_budget_skipped = true;
+                    plan_trace.budget_skip_receipt = {
+                        public_missing_count, 0, round_remaining,
+                        exact_remaining, available_exact};
+                    require_before_deadline(
+                        started, round.deadline_remaining,
+                        CandidateTransactionDeadlinePhaseV2::budget_skip,
+                        "atomic budget skip");
+                }
+            }
             const auto execute_missing_group = [
                 &, this](const std::vector<std::size_t>& missing_rows) {
                 const auto requested_exact = static_cast<std::int64_t>(
                     missing_rows.size());
-                if (requested_exact == 0) {
+                if (requested_exact == 0 || plan_budget_skipped) {
                     return;
                 }
                 const auto exact_remaining = budget_.exact_remaining();
@@ -1301,6 +1377,11 @@ private:
                     exact_remaining < 0 ? requested_exact : exact_remaining);
                 if (requested_exact > available_exact) {
                     plan_budget_skipped = true;
+                    if (!commit_legacy_exact_prefix) {
+                        plan_trace.budget_skip_receipt = {
+                            requested_exact, 0, round_remaining,
+                            exact_remaining, available_exact};
+                    }
                     require_before_deadline(
                         started, round.deadline_remaining,
                         CandidateTransactionDeadlinePhaseV2::budget_skip,
@@ -1490,9 +1571,6 @@ private:
             // suppress the public attempted-plan journal or allow partial
             // customer coverage.  Public complete-candidate transactions keep
             // the v2 atomic rollback contract.
-            const auto commit_legacy_exact_prefix =
-                options.suppress_attempted_plan_journal
-                || options.allow_partial_customer_coverage;
             if (!plan_budget_skipped || commit_legacy_exact_prefix) {
                 for (auto& pending_store : pending_exact_stores) {
                     const auto store = exact_cache_.begin_store_exact_many_atomic(

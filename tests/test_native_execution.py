@@ -3671,7 +3671,7 @@ def test_native_search_engine_plan_transaction_matches_python_across_rounds(
 
 
 def test_native_split_miss_budget_skip_rolls_back_prefix_cache() -> None:
-    """A skipped miss-hit-miss plan charges work but never leaks prefix cache."""
+    """A skipped miss-hit-miss plan launches no exact work and leaks no cache."""
 
     from evrptw import _core as native_core
 
@@ -3751,7 +3751,7 @@ def test_native_split_miss_budget_skip_rolls_back_prefix_cache() -> None:
     assert primed[1].tolist() == [5]
     before_cache, before_budget, before_attempted, _before_negative = engine.state()
 
-    for ordinal, iteration in enumerate((7, 8), start=1):
+    for iteration in (7, 8):
         result = engine.evaluate_plans(
             plan_offsets,
             route_offsets,
@@ -3766,11 +3766,7 @@ def test_native_split_miss_budget_skip_rolls_back_prefix_cache() -> None:
         assert result[11].tolist() == []
         cache, budget, attempted, _negative = engine.state()
         assert cache.tolist()[3:10] == before_cache.tolist()[3:10]
-        assert budget.tolist()[5:8] == [
-            before_budget.tolist()[5] + ordinal,
-            before_budget.tolist()[6] + ordinal,
-            before_budget.tolist()[7],
-        ]
+        assert budget.tolist()[5:8] == before_budget.tolist()[5:8]
         assert attempted == before_attempted
 
 
@@ -10575,6 +10571,92 @@ def test_full_native_bootstrap_mid_round_budget_is_atomic() -> None:
     )
 
 
+def test_full_native_budget_skips_have_typed_canonical_receipts() -> None:
+    """Native atomic skips must replay as the same budget rows as Python control."""
+
+    solve_kwargs = _full_native_solve_kwargs()
+    solve_kwargs["initial_customer_sequences"] = (
+        ("C1", "C2", "C3"),
+        ("C4",),
+    )
+    solve_kwargs["stage04_config"] = replace(
+        solve_kwargs["stage04_config"],  # type: ignore[arg-type]
+        auto_temperature=False,
+    )
+    result = solve_alns(
+        _candidate_plan_fixture(),
+        seed=2014,
+        max_iterations=8,
+        time_limit_seconds=30.0,
+        termination_mode="fixed_work",
+        exact_deadline_config=ExactDeadlineConfig.fixed_exact_calls(
+            100,
+            watchdog_seconds=30.0,
+        ),
+        measurement_config=MeasurementConfig(record_runtime_semantic_events=True),
+        **solve_kwargs,  # type: ignore[arg-type]
+        native_execution_config=_native_config("full_native_alns"),
+    )
+
+    trace = result.measurement_trace
+    assert trace is not None
+    budget_events = [
+        event
+        for event in trace.runtime_semantic_events
+        if event.get("event_type") == "candidate_control_budget"
+        and event.get("implementation_internal") is not True
+    ]
+    skipped = [event for event in budget_events if event.get("status") == "budget_skipped"]
+    raw_control_events = result.native_control_journal_events
+    assert skipped
+    assert result.candidate_control_statistics["budget_events"] == len(budget_events)
+    assert result.candidate_control_statistics["budget_skips"] == len(skipped)
+    for event in skipped:
+        requested = event.get("requested")
+        round_remaining = event.get("round_remaining")
+        exact_remaining = event.get("exact_remaining")
+        available = event.get("available")
+        candidate_id = event.get("candidate_id")
+        assert isinstance(requested, int) and requested > 0
+        assert event.get("granted") == 0
+        assert event.get("remaining") == round_remaining
+        assert isinstance(round_remaining, int) and round_remaining >= 0
+        assert isinstance(exact_remaining, int) and exact_remaining >= -1
+        assert isinstance(available, int) and available >= 0
+        assert available == min(
+            round_remaining,
+            requested if exact_remaining < 0 else exact_remaining,
+        )
+        assert requested > available
+        assert isinstance(candidate_id, int) and candidate_id >= 0
+        assert event.get("transaction_status_code") == 3
+        assert str(event.get("context", "")).endswith(":candidate_pool")
+        identity = (event.get("native_transaction_id"), candidate_id)
+        matching_plans = [
+            row
+            for row in raw_control_events
+            if row.get("event_type") == "candidate_plan_decision"
+            and (row.get("native_transaction_id"), row.get("candidate_id")) == identity
+        ]
+        assert len(matching_plans) == 1
+        assert matching_plans[0].get("status") == "selected"
+        assert matching_plans[0].get("transaction_status_code") == 3
+        matching_misses = [
+            row
+            for row in raw_control_events
+            if row.get("event_type") == "cache_event"
+            and row.get("operation") == "lookup"
+            and row.get("result") == "miss"
+            and (row.get("native_transaction_id"), row.get("candidate_id")) == identity
+        ]
+        assert len(matching_misses) == requested
+        assert not any(
+            row.get("event_type") == "cache_store_receipt"
+            and (row.get("native_transaction_id"), row.get("candidate_id")) == identity
+            for row in raw_control_events
+        )
+
+
 def test_full_native_bootstrap_reheat_has_native_source_row() -> None:
     """A bootstrap reheat must close the native-row to rich-event projection."""
 
@@ -11384,10 +11466,18 @@ def test_host_scheduler_emits_bounded_drained_runtime_statistics(
         assert scheduler.observed_task_receipt_writer_thread_count() == 1
 
     statistics = scheduler.runtime_statistics
-    assert statistics["schema_version"] == ("stage05.2-native-scheduler-runtime-v3")
+    assert statistics["schema_version"] == ("stage05.2-native-scheduler-runtime-v4")
     assert statistics["worker_threads"] == 2
     assert statistics["request_threads"] == 2
     assert statistics["receipt_writer_threads"] == 1
+    terminal_io = statistics["terminal_process_io"]
+    assert isinstance(terminal_io, dict)
+    assert terminal_io["read_bytes"] >= 0
+    assert terminal_io["write_bytes"] >= 0
+    terminal_receipt = scheduler.terminal_process_io_receipt
+    assert terminal_receipt["pid"] > 0
+    assert terminal_receipt["read_bytes"] == terminal_io["read_bytes"]
+    assert terminal_receipt["write_bytes"] == terminal_io["write_bytes"]
     for queue_name in ("request_queue", "work_queue"):
         queue = statistics[queue_name]
         assert isinstance(queue, dict)
@@ -11458,7 +11548,7 @@ def test_host_scheduler_rejects_queue_gate_before_accepting_runtime_statistics(
     selected = request_queue if queue_name == "request_queue" else work_queue
     selected[counter_name] = 1
     payload = {
-        "schema_version": "stage05.2-native-scheduler-runtime-v3",
+        "schema_version": "stage05.2-native-scheduler-runtime-v4",
         "worker_threads": 1,
         "request_threads": 1,
         "receipt_writer_threads": 1,
@@ -11466,6 +11556,7 @@ def test_host_scheduler_rejects_queue_gate_before_accepting_runtime_statistics(
         "peak_distinct_client_pids": 0,
         "request_queue": request_queue,
         "work_queue": work_queue,
+        "terminal_process_io": {"read_bytes": 0, "write_bytes": 0},
         "task_receipts": {},
     }
 

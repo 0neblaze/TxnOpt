@@ -19,9 +19,10 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import psutil  # type: ignore[import-untyped]
 
@@ -30,6 +31,7 @@ _MAX_BOUNDED_SAMPLES = 256
 _MAX_CPU_STAT_CORES = 256
 _MAX_THREAD_OBSERVATIONS = 4096
 DEFAULT_PROCESS_TREE_SAMPLE_INTERVAL_SECONDS = 0.1
+TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION = "stage05.2-terminal-process-io-v1"
 PROCESS_TREE_STATISTICS_FIELDS = frozenset(
     {
         "sample_interval_seconds",
@@ -83,6 +85,9 @@ PROCESS_TREE_STATISTICS_FIELDS = frozenset(
         "actual_affinity_intersection_count",
         "affinity_status",
         "process_metrics",
+        "terminal_process_io_receipts",
+        "process_io_terminal_status",
+        "process_io_uncovered_identities",
         "thread_tree_status",
         "thread_tree",
         "thread_metrics",
@@ -135,6 +140,8 @@ _COUNTER_NAMES = (
 _CPU_STAT_DELTA_FIELDS = ("busy", "user", "system", "iowait", "steal")
 _PRESSURE_SOURCES = ("cpu", "memory", "io")
 _PRESSURE_STALLS = ("some", "full")
+_TERMINAL_IO_REGISTRY_LOCK = threading.Lock()
+_TERMINAL_IO_REGISTRY: list[dict[str, object]] = []
 _THREAD_COUNTER_NAMES = (
     "voluntary_context_switches",
     "involuntary_context_switches",
@@ -162,6 +169,8 @@ class _ProcessSample:
     rss_bytes: int
     pss_bytes: int | None
     thread_count: int | None
+    parent_pid: int | None
+    start_time_ticks: int | None
     counters: dict[str, int | None]
     affinity: tuple[int, ...] | None
 
@@ -182,6 +191,9 @@ class _ProcessObservation:
     last_pss_bytes: int | None
     last_thread_count: int | None
     last_affinity: tuple[int, ...] | None
+    parent_pid: int | None
+    process_start_time_ticks: int | None
+    last_sample_index: int
     sample_count: int = 1
     cpu_baseline_source: str = "monitor_start"
 
@@ -212,15 +224,18 @@ class _ThreadObservation:
     cpu_baseline_source: str = "monitor_start"
 
 
-def _read_proc_stat_faults(pid: int) -> dict[str, int | None]:
-    """Read process-only page-fault counters from ``/proc/<pid>/stat``."""
+def _read_proc_stat_identity_and_faults(
+    pid: int,
+) -> tuple[dict[str, int | None], int | None]:
+    """Read start-time identity and page faults from ``/proc/<pid>/stat``."""
 
     result: dict[str, int | None] = {
         "minor_faults": None,
         "major_faults": None,
     }
     if os.name != "posix":
-        return result
+        return result, None
+    start_time_ticks: int | None = None
     try:
         payload = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
         # ``comm`` may contain spaces and parentheses.  Splitting after the
@@ -229,12 +244,15 @@ def _read_proc_stat_faults(pid: int) -> dict[str, int | None]:
         values = fields.split()
         # The first value is field 3 (state); minflt is field 10 and majflt
         # field 12, hence indices 7 and 9 in this suffix.
-        if len(values) > 9:
+        if len(values) > 19:
             result["minor_faults"] = int(values[7])
             result["major_faults"] = int(values[9])
+            start_time_ticks = int(values[19])
     except (OSError, ValueError, UnicodeError):
-        return result
-    return result
+        return result, None
+    if start_time_ticks is not None and start_time_ticks < 0:
+        return result, None
+    return result, start_time_ticks
 
 
 def _read_proc_status_context_switches(pid: int) -> dict[str, int | None]:
@@ -565,6 +583,17 @@ def _read_process_sample(process: psutil.Process) -> _ProcessSample | None:
     except _PROCESS_ERRORS:
         return None
 
+    # Read cheap cumulative I/O counters before the comparatively expensive
+    # smaps/PSS query.  A one-task spawn worker may exit while smaps is being
+    # read; counters captured before that terminal race remain valid evidence.
+    counters: dict[str, int | None] = {name: None for name in _COUNTER_NAMES}
+    try:
+        io = process.io_counters()
+        counters["read_bytes"] = int(io.read_bytes)
+        counters["write_bytes"] = int(io.write_bytes)
+    except _PROCESS_ERRORS:
+        pass
+
     try:
         full_memory = process.memory_full_info()
         pss_raw = getattr(full_memory, "pss", None)
@@ -578,22 +607,16 @@ def _read_process_sample(process: psutil.Process) -> _ProcessSample | None:
     except _PROCESS_ERRORS:
         thread_count = None
 
-    counters: dict[str, int | None] = {name: None for name in _COUNTER_NAMES}
     try:
         context = process.num_ctx_switches()
         counters["voluntary_context_switches"] = int(context.voluntary)
         counters["involuntary_context_switches"] = int(context.involuntary)
     except _PROCESS_ERRORS:
         pass
-    try:
-        io = process.io_counters()
-        counters["read_bytes"] = int(io.read_bytes)
-        counters["write_bytes"] = int(io.write_bytes)
-    except _PROCESS_ERRORS:
-        pass
 
     pid = int(process.pid)
-    counters.update(_read_proc_stat_faults(pid))
+    proc_faults, start_time_ticks = _read_proc_stat_identity_and_faults(pid)
+    counters.update(proc_faults)
     counters.update(_read_proc_status_context_switches(pid))
     counters.update(_read_proc_schedstat(pid))
     counters["cpu_migrations"] = _read_proc_sched_migrations(pid)
@@ -602,6 +625,10 @@ def _read_process_sample(process: psutil.Process) -> _ProcessSample | None:
         affinity = tuple(sorted(int(cpu_id) for cpu_id in process.cpu_affinity()))
     except _PROCESS_ERRORS:
         affinity = None
+    try:
+        parent_pid = int(process.ppid())
+    except _PROCESS_ERRORS:
+        parent_pid = None
 
     return _ProcessSample(
         user_cpu_seconds=user_cpu_seconds,
@@ -609,6 +636,8 @@ def _read_process_sample(process: psutil.Process) -> _ProcessSample | None:
         rss_bytes=rss_bytes,
         pss_bytes=pss_bytes,
         thread_count=thread_count,
+        parent_pid=parent_pid,
+        start_time_ticks=start_time_ticks,
         counters=counters,
         affinity=affinity,
     )
@@ -669,6 +698,68 @@ def _sum_optional(values: list[int | None]) -> int | str:
     return sum(value for value in values if value is not None)
 
 
+def capture_current_process_terminal_io_receipt(
+    *,
+    task_started_monotonic: float,
+) -> dict[str, object]:
+    """Capture this live process's cumulative disk-I/O counters."""
+
+    if (
+        isinstance(task_started_monotonic, bool)
+        or not isinstance(task_started_monotonic, int | float)
+        or not math.isfinite(float(task_started_monotonic))
+        or float(task_started_monotonic) <= 0.0
+    ):
+        raise ValueError("terminal process I/O task start is invalid")
+    process = psutil.Process(os.getpid())
+    try:
+        create_time = float(process.create_time())
+        io = process.io_counters()
+        read_bytes = int(io.read_bytes)
+        write_bytes = int(io.write_bytes)
+    except _PROCESS_ERRORS as error:
+        raise RuntimeError("terminal process I/O counters are unavailable") from error
+    _faults, start_time_ticks = _read_proc_stat_identity_and_faults(os.getpid())
+    if (
+        not math.isfinite(create_time)
+        or create_time <= 0.0
+        or start_time_ticks is None
+        or read_bytes < 0
+        or write_bytes < 0
+    ):
+        raise RuntimeError("terminal process I/O counters are invalid")
+    return {
+        "schema_version": TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "create_time": create_time,
+        "start_time_ticks": start_time_ticks,
+        "task_started_monotonic": float(task_started_monotonic),
+        "captured_monotonic": time.monotonic(),
+        "read_bytes": read_bytes,
+        "write_bytes": write_bytes,
+    }
+
+
+def register_descendant_terminal_process_io_receipts(
+    receipts: Iterable[Mapping[str, object]],
+) -> None:
+    """Register cooperative descendant receipts in the current outer worker."""
+
+    normalized = [dict(receipt) for receipt in receipts]
+    with _TERMINAL_IO_REGISTRY_LOCK:
+        _TERMINAL_IO_REGISTRY.extend(normalized)
+
+
+def drain_descendant_terminal_process_io_receipts() -> tuple[dict[str, object], ...]:
+    """Atomically take descendant receipts produced by one isolated axis."""
+
+    with _TERMINAL_IO_REGISTRY_LOCK:
+        receipts = tuple(dict(receipt) for receipt in _TERMINAL_IO_REGISTRY)
+        _TERMINAL_IO_REGISTRY.clear()
+    return receipts
+
+
 def _quantile(values: list[float], probability: float) -> float | str:
     if not values:
         return _UNAVAILABLE
@@ -703,6 +794,10 @@ class ProcessTreeMonitor:
     _worker_descendant_classification_epoch: int = field(default=0, init=False)
     _observations: dict[tuple[int, float], _ProcessObservation] = field(
         default_factory=dict,
+        init=False,
+    )
+    _terminal_process_io_receipts: tuple[dict[str, object], ...] = field(
+        default=(),
         init=False,
     )
     _thread_observations: dict[tuple[int, float, int, int], _ThreadObservation] = field(
@@ -945,6 +1040,12 @@ class ProcessTreeMonitor:
             )
             for name in _COUNTER_NAMES
         }
+        terminal_receipt_identities = {
+            (cast(int, receipt["pid"]), cast(float, receipt["create_time"]))
+            for receipt in self._terminal_process_io_receipts
+        }
+        final_sample_index = self._sample_count - 1
+        uncovered_process_io_identities: list[dict[str, object]] = []
         process_metrics: list[dict[str, object]] = []
         for identity, observation in sorted(self._observations.items()):
             deltas = {
@@ -957,10 +1058,35 @@ class ProcessTreeMonitor:
             reported_counters = {
                 name: value if value is not None else _UNAVAILABLE for name, value in deltas.items()
             }
+            terminal_io_evidence = (
+                "cooperative_receipt"
+                if identity in terminal_receipt_identities
+                else (
+                    "monitor_end_sample"
+                    if observation.last_sample_index == final_sample_index
+                    else _UNAVAILABLE
+                )
+            )
+            if terminal_io_evidence == _UNAVAILABLE:
+                uncovered_process_io_identities.append(
+                    {"pid": identity[0], "create_time": identity[1]}
+                )
             process_metrics.append(
                 {
                     "pid": identity[0],
                     "create_time": identity[1],
+                    "parent_pid": (
+                        observation.parent_pid
+                        if observation.parent_pid is not None
+                        else _UNAVAILABLE
+                    ),
+                    "start_time_ticks": (
+                        observation.process_start_time_ticks
+                        if observation.process_start_time_ticks is not None
+                        else _UNAVAILABLE
+                    ),
+                    "last_sample_index": observation.last_sample_index,
+                    "terminal_io_evidence": terminal_io_evidence,
                     "sample_count": observation.sample_count,
                     "user_cpu_seconds": max(
                         0.0,
@@ -1163,6 +1289,13 @@ class ProcessTreeMonitor:
             "actual_affinity_intersection_count": affinity_intersection_count,
             "affinity_status": "available" if self._affinity_available else _UNAVAILABLE,
             "process_metrics": process_metrics,
+            "terminal_process_io_receipts": [
+                dict(receipt) for receipt in self._terminal_process_io_receipts
+            ],
+            "process_io_terminal_status": (
+                "available" if not uncovered_process_io_identities else _UNAVAILABLE
+            ),
+            "process_io_uncovered_identities": uncovered_process_io_identities,
             "thread_tree_status": thread_statistics["status"],
             "thread_tree": thread_statistics,
             "thread_metrics": thread_statistics["threads"],
@@ -1203,6 +1336,138 @@ class ProcessTreeMonitor:
         if set(statistics) != PROCESS_TREE_STATISTICS_FIELDS:
             raise AssertionError("process-tree statistics schema differs from its public field set")
         return statistics
+
+    def apply_terminal_process_io_receipts(
+        self,
+        receipts: Iterable[Mapping[str, object]],
+    ) -> None:
+        """Reconcile cumulative worker I/O captured immediately before exit.
+
+        Sampling alone cannot prove the final cumulative ``/proc/<pid>/io``
+        counters of a one-task worker: the process may finish between the last
+        monitor turn and the executor collecting its result.  Current Stage
+        5.2 process-tree I/O evidence therefore applies one cooperative
+        terminal receipt per outer worker after the monitor has stopped and
+        before statistics are emitted.  Only workers created after monitor
+        entry are eligible, so their trustworthy counter baseline is zero.
+        """
+
+        if self._thread is None or self._thread.is_alive() or self._monitor_end_monotonic is None:
+            raise RuntimeError("terminal process I/O receipts require a completed monitor")
+        if self._terminal_process_io_receipts:
+            raise RuntimeError("terminal process I/O receipts were already applied")
+        if (
+            self._monitor_start_wall_time is None
+            or self._monitor_start_monotonic is None
+            or self._monitor_start_boot_time_ticks is None
+        ):
+            raise RuntimeError("process-tree monitor identity is unavailable")
+
+        normalized: list[dict[str, object]] = []
+        identities: set[tuple[int, float]] = set()
+        observed_pids = {identity[0] for identity in self._observations}
+        for index, raw_receipt in enumerate(receipts):
+            receipt = dict(raw_receipt)
+            if set(receipt) != {
+                "schema_version",
+                "pid",
+                "parent_pid",
+                "create_time",
+                "start_time_ticks",
+                "task_started_monotonic",
+                "captured_monotonic",
+                "read_bytes",
+                "write_bytes",
+            }:
+                raise RuntimeError(f"terminal process I/O receipt {index} schema is invalid")
+            if receipt.get("schema_version") != TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION:
+                raise RuntimeError(f"terminal process I/O receipt {index} version is invalid")
+            pid = receipt.get("pid")
+            parent_pid = receipt.get("parent_pid")
+            create_time = receipt.get("create_time")
+            start_time_ticks = receipt.get("start_time_ticks")
+            task_started_monotonic = receipt.get("task_started_monotonic")
+            captured_monotonic = receipt.get("captured_monotonic")
+            if (
+                isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid <= 0
+                or isinstance(parent_pid, bool)
+                or not isinstance(parent_pid, int)
+                or parent_pid not in observed_pids | {os.getpid()}
+                or isinstance(create_time, bool)
+                or not isinstance(create_time, int | float)
+                or not math.isfinite(float(create_time))
+                or isinstance(start_time_ticks, bool)
+                or not isinstance(start_time_ticks, int)
+                or start_time_ticks < self._monitor_start_boot_time_ticks
+                or isinstance(task_started_monotonic, bool)
+                or not isinstance(task_started_monotonic, int | float)
+                or not math.isfinite(float(task_started_monotonic))
+                or float(task_started_monotonic) < self._monitor_start_monotonic
+                or isinstance(captured_monotonic, bool)
+                or not isinstance(captured_monotonic, int | float)
+                or not math.isfinite(float(captured_monotonic))
+                or float(captured_monotonic) < float(task_started_monotonic)
+                or float(captured_monotonic) > self._monitor_end_monotonic
+            ):
+                raise RuntimeError(
+                    "terminal process I/O receipt identity is invalid: "
+                    f"index={index}, pid={pid!r}, parent_pid={parent_pid!r}, "
+                    f"create_time={create_time!r}, "
+                    f"task_started_monotonic={task_started_monotonic!r}, "
+                    f"captured_monotonic={captured_monotonic!r}, "
+                    f"monitor_interval=({self._monitor_start_monotonic!r}, "
+                    f"{self._monitor_end_monotonic!r})"
+                )
+            identity = (pid, float(create_time))
+            if identity in identities:
+                raise RuntimeError("terminal process I/O receipt identity is duplicated")
+            identities.add(identity)
+            observation = self._observations.get(identity)
+            if observation is None:
+                raise RuntimeError(
+                    "terminal process I/O receipt has no matching worker observation"
+                )
+            if (
+                observation.parent_pid != parent_pid
+                or observation.process_start_time_ticks != start_time_ticks
+                or observation.cpu_baseline_source != "process_create_time"
+            ):
+                raise RuntimeError(
+                    "terminal process I/O receipt does not bind a fresh worker observation"
+                )
+            for name in ("read_bytes", "write_bytes"):
+                value = receipt.get(name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise RuntimeError(f"terminal process I/O receipt {index} {name} is invalid")
+                previous = observation.last_counters.get(name)
+                if previous is not None and value < previous:
+                    raise RuntimeError("terminal process I/O receipt counters are not monotonic")
+                observation.first_counters[name] = 0
+                observation.last_counters[name] = value
+            normalized.append(
+                {
+                    "schema_version": TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+                    "pid": pid,
+                    "parent_pid": parent_pid,
+                    "create_time": float(create_time),
+                    "start_time_ticks": start_time_ticks,
+                    "task_started_monotonic": float(task_started_monotonic),
+                    "captured_monotonic": float(captured_monotonic),
+                    "read_bytes": receipt["read_bytes"],
+                    "write_bytes": receipt["write_bytes"],
+                }
+            )
+        self._terminal_process_io_receipts = tuple(
+            sorted(
+                normalized,
+                key=lambda item: (
+                    cast(int, item["pid"]),
+                    cast(float, item["create_time"]),
+                ),
+            )
+        )
 
     def _run(self) -> None:
         while not self._stop.wait(self.sample_interval_seconds):
@@ -1629,8 +1894,9 @@ class ProcessTreeMonitor:
 
             observation = self._observations.get(identity)
             created_during_monitor = (
-                self._monitor_start_wall_time is not None
-                and identity[1] >= self._monitor_start_wall_time
+                self._monitor_start_boot_time_ticks is not None
+                and sample.start_time_ticks is not None
+                and sample.start_time_ticks >= self._monitor_start_boot_time_ticks
             )
             if observation is None:
                 baseline_source = (
@@ -1655,6 +1921,9 @@ class ProcessTreeMonitor:
                     last_pss_bytes=sample.pss_bytes,
                     last_thread_count=sample.thread_count,
                     last_affinity=sample.affinity,
+                    parent_pid=sample.parent_pid,
+                    process_start_time_ticks=sample.start_time_ticks,
+                    last_sample_index=self._sample_count,
                     cpu_baseline_source=baseline_source,
                 )
             else:
@@ -1674,6 +1943,9 @@ class ProcessTreeMonitor:
                 observation.last_pss_bytes = sample.pss_bytes
                 observation.last_thread_count = sample.thread_count
                 observation.last_affinity = sample.affinity
+                observation.parent_pid = sample.parent_pid
+                observation.process_start_time_ticks = sample.start_time_ticks
+                observation.last_sample_index = self._sample_count
                 observation.sample_count += 1
             self._sample_process_threads(identity, detailed=detailed_threads)
 
@@ -1746,4 +2018,11 @@ class ProcessTreeMonitor:
                 self._peak_worker_descendant_pss_processes = normalized
 
 
-__all__ = ("PROCESS_TREE_STATISTICS_FIELDS", "ProcessTreeMonitor")
+__all__ = (
+    "PROCESS_TREE_STATISTICS_FIELDS",
+    "TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION",
+    "ProcessTreeMonitor",
+    "capture_current_process_terminal_io_receipt",
+    "drain_descendant_terminal_process_io_receipts",
+    "register_descendant_terminal_process_io_receipts",
+)

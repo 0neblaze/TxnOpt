@@ -365,6 +365,8 @@ def test_exited_worker_with_missing_pss_retains_observed_cpu_and_rss(
         rss_bytes=1000,
         pss_bytes=800,
         thread_count=1,
+        parent_pid=os.getppid(),
+        start_time_ticks=100,
         counters={name: 0 for name in runtime_envelope._COUNTER_NAMES},  # noqa: SLF001
         affinity=(0,),
     )
@@ -676,3 +678,117 @@ def test_process_tree_monitor_can_exclude_a_persistent_child_root() -> None:
     finally:
         child.terminate()
         child.wait(timeout=5.0)
+
+
+def _terminal_io_monitor() -> tuple[ProcessTreeMonitor, tuple[int, float]]:
+    monitor = ProcessTreeMonitor()
+    monitor._thread = threading.Thread()  # noqa: SLF001
+    monitor._monitor_start_wall_time = 10.0  # noqa: SLF001
+    monitor._monitor_start_monotonic = 20.0  # noqa: SLF001
+    monitor._monitor_start_boot_time_ticks = 100  # noqa: SLF001
+    monitor._monitor_end_monotonic = 30.0  # noqa: SLF001
+    identity = (321, 11.0)
+    first: dict[str, int | None] = {  # noqa: SLF001
+        name: 0 for name in runtime_envelope._COUNTER_NAMES
+    }
+    last = dict(first)
+    last["read_bytes"] = 4
+    last["write_bytes"] = 5
+    monitor._observations[identity] = runtime_envelope._ProcessObservation(  # noqa: SLF001
+        first_user_cpu_seconds=0.0,
+        last_user_cpu_seconds=0.1,
+        first_system_cpu_seconds=0.0,
+        last_system_cpu_seconds=0.05,
+        first_counters=first,
+        last_counters=last,
+        maximum_rss_bytes=100,
+        maximum_pss_bytes=90,
+        last_rss_bytes=100,
+        last_pss_bytes=90,
+        last_thread_count=1,
+        last_affinity=(0,),
+        parent_pid=os.getpid(),
+        process_start_time_ticks=101,
+        last_sample_index=0,
+        cpu_baseline_source="process_create_time",
+    )
+    return monitor, identity
+
+
+def test_terminal_process_io_receipt_replaces_sampled_worker_counters() -> None:
+    monitor, identity = _terminal_io_monitor()
+    receipt = {
+        "schema_version": runtime_envelope.TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+        "pid": identity[0],
+        "parent_pid": os.getpid(),
+        "create_time": identity[1],
+        "start_time_ticks": 101,
+        "task_started_monotonic": 21.0,
+        "captured_monotonic": 25.0,
+        "read_bytes": 40,
+        "write_bytes": 50,
+    }
+
+    monitor.apply_terminal_process_io_receipts([receipt])
+
+    observation = monitor._observations[identity]  # noqa: SLF001
+    assert observation.last_counters["read_bytes"] == 40
+    assert observation.last_counters["write_bytes"] == 50
+    assert monitor._terminal_process_io_receipts == (receipt,)  # noqa: SLF001
+
+
+def test_terminal_process_io_receipt_rejects_unknown_or_nonmonotonic_worker() -> None:
+    monitor, identity = _terminal_io_monitor()
+    receipt = {
+        "schema_version": runtime_envelope.TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+        "pid": identity[0],
+        "parent_pid": os.getpid(),
+        "create_time": identity[1],
+        "start_time_ticks": 101,
+        "task_started_monotonic": 21.0,
+        "captured_monotonic": 25.0,
+        "read_bytes": 3,
+        "write_bytes": 50,
+    }
+    with pytest.raises(RuntimeError, match="not monotonic"):
+        monitor.apply_terminal_process_io_receipts([receipt])
+
+    unknown = dict(receipt, pid=999, read_bytes=40)
+    with pytest.raises(RuntimeError, match="no matching worker observation"):
+        monitor.apply_terminal_process_io_receipts([unknown])
+
+
+def test_process_tree_io_marks_every_nonterminal_process_row_uncovered() -> None:
+    monitor, identity = _terminal_io_monitor()
+    monitor._sample_count = 2  # noqa: SLF001
+
+    statistics = _statistics(
+        monitor,
+        elapsed_seconds=10.0,
+        compute_thread_limit=1,
+    )
+
+    assert statistics["process_io_terminal_status"] == "unavailable"
+    assert statistics["process_io_uncovered_identities"] == [
+        {"pid": identity[0], "create_time": identity[1]}
+    ]
+    assert statistics["process_metrics"][0]["terminal_io_evidence"] == "unavailable"
+
+
+def test_capture_current_process_terminal_io_receipt_has_live_identity() -> None:
+    task_started = time.monotonic()
+    receipt = runtime_envelope.capture_current_process_terminal_io_receipt(
+        task_started_monotonic=task_started,
+    )
+
+    assert receipt["schema_version"] == (
+        runtime_envelope.TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION
+    )
+    assert receipt["pid"] == os.getpid()
+    assert receipt["parent_pid"] == os.getppid()
+    assert cast(float, receipt["create_time"]) > 0.0
+    assert cast(int, receipt["start_time_ticks"]) >= 0
+    assert cast(float, receipt["task_started_monotonic"]) == task_started
+    assert cast(float, receipt["captured_monotonic"]) > 0.0
+    assert cast(int, receipt["read_bytes"]) >= 0
+    assert cast(int, receipt["write_bytes"]) >= 0

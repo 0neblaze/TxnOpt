@@ -13,7 +13,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections import OrderedDict, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import zip_longest
@@ -45,6 +45,7 @@ from evrptw.experiments.stage052_native_architectures import (
     PROCESS_TREE_IO_ACCOUNTING_SOURCE,
     SCHEMA_VERSION,
     SEEDS,
+    TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
     ArchitectureMode,
     _axis_persistence_receipt_path,
     expected_axis_count,
@@ -56,7 +57,10 @@ from evrptw.neighborhoods import screen_route_candidate
 from evrptw.objective import SolutionObjective
 from evrptw.parser import parse_schneider
 from evrptw.repository import repository_root
-from evrptw.runtime_envelope import PROCESS_TREE_STATISTICS_FIELDS
+from evrptw.runtime_envelope import (
+    PROCESS_TREE_STATISTICS_FIELDS,
+    TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION,
+)
 from evrptw.stage052_performance import FrozenPerformanceProfile
 from evrptw.stage052_physical_telemetry import (
     iter_verified_physical_telemetry,
@@ -79,7 +83,7 @@ from tools.native_build_attestation import (
     validate_scheduler_build_attestation,
 )
 
-REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v12"
+REVIEW_SCHEMA_VERSION = "stage05.2-native-architecture-review-v13"
 REVIEW_MANIFEST_SCHEMA_VERSION = "stage05.2-native-architecture-review-manifest-v2"
 REVIEW_EXECUTION_SCHEMA_VERSION = "experiment-review-execution-v1"
 REVIEWER_MODULE_NAME = "evrptw.experiments.stage052_native_architecture_review"
@@ -91,6 +95,7 @@ EXTERNAL_SEMANTIC_COMPARISON_SCHEMA_VERSIONS = frozenset(
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
 )
@@ -99,6 +104,7 @@ PROFILE_COMPARISON_SCHEMA_VERSIONS = frozenset(
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }
 )
@@ -140,8 +146,19 @@ _CURRENT_WORKER_PSS_SAMPLE_ACCOUNTING_FIELDS = frozenset(
 _CURRENT_CPU_QUANTIZATION_ACCOUNTING_FIELDS = frozenset(
     {"cpu_clock_tick_hz", "cpu_quantization_lane_count"}
 )
+_CURRENT_TERMINAL_PROCESS_IO_FIELDS = frozenset(
+    {
+        "terminal_process_io_receipts",
+        "process_io_terminal_status",
+        "process_io_uncovered_identities",
+    }
+)
+_TICK_PROFILE_PROCESS_TREE_STATISTICS_FIELDS = (
+    PROCESS_TREE_STATISTICS_FIELDS - _CURRENT_TERMINAL_PROCESS_IO_FIELDS
+)
 _PROCESS_PROFILE_PROCESS_TREE_STATISTICS_FIELDS = (
-    PROCESS_TREE_STATISTICS_FIELDS - _CURRENT_CPU_QUANTIZATION_ACCOUNTING_FIELDS
+    _TICK_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
+    - _CURRENT_CPU_QUANTIZATION_ACCOUNTING_FIELDS
 )
 _PRIOR_PROFILE_PROCESS_TREE_STATISTICS_FIELDS = (
     _PROCESS_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
@@ -199,7 +216,11 @@ def _mode_wave_affinity_matches_profile(
         return False
     return (
         comparison_schema
-        in {PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION, SCHEMA_VERSION}
+        in {
+            PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+            TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        }
         or wave.get("thread_affinity_union") == list(allowed_cpu_ids)
     )
 
@@ -225,6 +246,8 @@ def _resource_telemetry_topology_error(
             return "enabled process-tree telemetry has a disabled-status marker"
         if comparison_schema == SCHEMA_VERSION:
             statistics_fields = PROCESS_TREE_STATISTICS_FIELDS
+        elif comparison_schema == TICK_PROFILE_COMPARISON_SCHEMA_VERSION:
+            statistics_fields = _TICK_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
         elif comparison_schema == PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION:
             statistics_fields = _PROCESS_PROFILE_PROCESS_TREE_STATISTICS_FIELDS
         else:
@@ -892,9 +915,8 @@ def _review_scheduler_runtime_statistics(
 ) -> None:
     if not isinstance(value, dict):
         raise RuntimeError("scheduler runtime statistics are missing")
-    if (
-        set(value)
-        != {
+    schema_version = value.get("schema_version")
+    expected_fields = {
             "schema_version",
             "worker_threads",
             "request_threads",
@@ -906,9 +928,23 @@ def _review_scheduler_runtime_statistics(
             "latency_quantiles",
             "task_receipts",
         }
-        or value.get("schema_version") != "stage05.2-native-scheduler-runtime-v3"
-    ):
+    if schema_version == "stage05.2-native-scheduler-runtime-v4":
+        expected_fields.add("terminal_process_io")
+    elif schema_version != "stage05.2-native-scheduler-runtime-v3":
         raise RuntimeError("scheduler runtime statistics schema is invalid")
+    if set(value) != expected_fields:
+        raise RuntimeError("scheduler runtime statistics schema is invalid")
+    if schema_version == "stage05.2-native-scheduler-runtime-v4":
+        terminal_io = value.get("terminal_process_io")
+        if not isinstance(terminal_io, Mapping) or set(terminal_io) != {
+            "read_bytes",
+            "write_bytes",
+        }:
+            raise RuntimeError("scheduler terminal process I/O is invalid")
+        for name in ("read_bytes", "write_bytes"):
+            _review_nonnegative_integer(
+                terminal_io.get(name), f"scheduler terminal process I/O {name}"
+            )
     if (
         _review_nonnegative_integer(value["worker_threads"], "scheduler worker_threads")
         != worker_threads
@@ -1484,6 +1520,236 @@ def _review_process_tree_io(wave: Mapping[str, object]) -> dict[str, int]:
     return {field: totals[field] for field in ("read_bytes", "write_bytes")}
 
 
+def _review_worker_terminal_io(wave: Mapping[str, object]) -> None:
+    """Replay current mode-wave worker terminal I/O identities and counters."""
+
+    raw_core = wave.get("terminal_process_io_receipts")
+    raw_bound = wave.get("worker_terminal_io_receipts")
+    raw_scheduler = wave.get("scheduler_terminal_io_receipts")
+    raw_identities = wave.get("identities")
+    if (
+        not isinstance(raw_core, list)
+        or not isinstance(raw_bound, list)
+        or not isinstance(raw_scheduler, list)
+        or not isinstance(raw_identities, list)
+        or not raw_core
+        or len(raw_core) < len(raw_identities)
+        or len(raw_bound) + len(raw_scheduler) != len(raw_core)
+    ):
+        raise RuntimeError("campaign worker terminal I/O inventory is incomplete")
+    monitor_start_wall = _review_nonnegative_number(
+        wave.get("monitor_start_wall_time"),
+        "campaign monitor start wall time",
+    )
+    monitor_start = _review_nonnegative_number(
+        wave.get("monitor_start_monotonic"),
+        "campaign monitor start",
+    )
+    monitor_end = _review_nonnegative_number(
+        wave.get("monitor_end_monotonic"),
+        "campaign monitor end",
+    )
+    if min(monitor_start_wall, monitor_start) <= 0.0 or monitor_end < monitor_start:
+        raise RuntimeError("campaign terminal I/O monitor interval is invalid")
+    root_process_id = _review_nonnegative_integer(
+        wave.get("root_process_id"),
+        "campaign root process ID",
+    )
+    core_fields = {
+        "schema_version",
+        "pid",
+        "parent_pid",
+        "create_time",
+        "start_time_ticks",
+        "task_started_monotonic",
+        "captured_monotonic",
+        "read_bytes",
+        "write_bytes",
+    }
+    core_by_identity: dict[tuple[int, float], dict[str, object]] = {}
+    for index, raw_receipt in enumerate(raw_core):
+        if not isinstance(raw_receipt, Mapping):
+            raise RuntimeError("campaign terminal process I/O receipt is invalid")
+        receipt = dict(raw_receipt)
+        if (
+            set(receipt) != core_fields
+            or receipt.get("schema_version")
+            != TERMINAL_PROCESS_IO_RECEIPT_SCHEMA_VERSION
+        ):
+            raise RuntimeError("campaign terminal process I/O schema is invalid")
+        pid = _review_nonnegative_integer(
+            receipt.get("pid"),
+            f"campaign terminal process I/O PID {index}",
+        )
+        create_time = _review_nonnegative_number(
+            receipt.get("create_time"),
+            f"campaign terminal process I/O create_time {index}",
+        )
+        start_time_ticks = _review_nonnegative_integer(
+            receipt.get("start_time_ticks"),
+            f"campaign terminal process I/O start_time_ticks {index}",
+        )
+        task_started = _review_nonnegative_number(
+            receipt.get("task_started_monotonic"),
+            f"campaign terminal process I/O task start {index}",
+        )
+        captured = _review_nonnegative_number(
+            receipt.get("captured_monotonic"),
+            f"campaign terminal process I/O capture time {index}",
+        )
+        if (
+            pid <= 0
+            or _review_nonnegative_integer(
+                receipt.get("parent_pid"),
+                "campaign terminal process I/O parent PID",
+            )
+            <= 0
+            or create_time <= 0.0
+            or start_time_ticks
+            < _review_nonnegative_integer(
+                wave.get("monitor_start_boot_time_ticks"),
+                "campaign monitor start boot ticks",
+            )
+            or task_started < monitor_start
+            or captured < task_started
+            or captured > monitor_end
+        ):
+            raise RuntimeError("campaign terminal process I/O identity is invalid")
+        for name in ("read_bytes", "write_bytes"):
+            _review_nonnegative_integer(
+                receipt.get(name),
+                f"campaign terminal process I/O {name}",
+            )
+        identity = (pid, create_time)
+        if identity in core_by_identity:
+            raise RuntimeError("campaign terminal process I/O identity is duplicated")
+        core_by_identity[identity] = receipt
+
+    raw_metrics = wave.get("process_metrics")
+    if not isinstance(raw_metrics, list):
+        raise RuntimeError("campaign terminal process I/O rows are unavailable")
+    metrics: dict[tuple[int, float], Mapping[str, object]] = {}
+    metric_pids: set[int] = set()
+    for raw_metric in raw_metrics:
+        if not isinstance(raw_metric, Mapping):
+            raise RuntimeError("campaign terminal process I/O row is invalid")
+        identity = (
+            _review_nonnegative_integer(raw_metric.get("pid"), "campaign process PID"),
+            _review_nonnegative_number(
+                raw_metric.get("create_time"),
+                "campaign process create_time",
+            ),
+        )
+        metric_pids.add(identity[0])
+        metrics[identity] = raw_metric
+    final_sample_index = (
+        _review_nonnegative_integer(wave.get("sample_count"), "campaign sample count") - 1
+    )
+    if (
+        wave.get("process_io_terminal_status") != "available"
+        or wave.get("process_io_uncovered_identities") != []
+        or final_sample_index < 0
+    ):
+        raise RuntimeError("campaign terminal process I/O coverage is unavailable")
+    for identity, metric in metrics.items():
+        terminal_evidence = metric.get("terminal_io_evidence")
+        if terminal_evidence == "cooperative_receipt":
+            if identity not in core_by_identity:
+                raise RuntimeError("campaign cooperative terminal I/O row is unbound")
+        elif terminal_evidence == "monitor_end_sample":
+            if metric.get("last_sample_index") != final_sample_index:
+                raise RuntimeError("campaign monitor-end terminal I/O row is invalid")
+        else:
+            raise RuntimeError("campaign process terminal I/O evidence is invalid")
+    for identity, receipt in core_by_identity.items():
+        worker_metric = metrics.get(identity)
+        if worker_metric is None:
+            raise RuntimeError("campaign terminal process I/O worker row is unavailable")
+        counters = worker_metric.get("counters")
+        if not isinstance(counters, Mapping) or any(
+            counters.get(name) != receipt[name] for name in ("read_bytes", "write_bytes")
+        ):
+            raise RuntimeError("campaign terminal process I/O counters do not bind worker row")
+        if (
+            receipt["parent_pid"] not in metric_pids | {root_process_id}
+            or worker_metric.get("parent_pid") != receipt["parent_pid"]
+            or worker_metric.get("start_time_ticks") != receipt["start_time_ticks"]
+            or worker_metric.get("cpu_baseline_source") != "process_create_time"
+            or worker_metric.get("terminal_io_evidence") != "cooperative_receipt"
+        ):
+            raise RuntimeError("campaign terminal process I/O identity does not bind worker row")
+
+    expected_axes: set[tuple[int, str, str, int]] = set()
+    for raw_axis in raw_identities:
+        if not isinstance(raw_axis, Mapping):
+            raise RuntimeError("campaign terminal process I/O axis identity is invalid")
+        expected_axes.add(
+            (
+                _review_nonnegative_integer(raw_axis.get("repeat"), "campaign repeat"),
+                _string(raw_axis, "axis"),
+                _string(raw_axis, "instance"),
+                _review_nonnegative_integer(raw_axis.get("seed"), "campaign seed"),
+            )
+        )
+    observed_axes: set[tuple[int, str, str, int]] = set()
+    observed_processes: set[tuple[int, float]] = set()
+    for raw_receipt in raw_bound:
+        if not isinstance(raw_receipt, Mapping):
+            raise RuntimeError("campaign bound terminal process I/O receipt is invalid")
+        receipt = dict(raw_receipt)
+        if set(receipt) != core_fields | {"repeat", "axis", "instance", "seed"}:
+            raise RuntimeError("campaign bound terminal process I/O schema is invalid")
+        axis_identity = (
+            _review_nonnegative_integer(receipt.get("repeat"), "terminal I/O repeat"),
+            _string(receipt, "axis"),
+            _string(receipt, "instance"),
+            _review_nonnegative_integer(receipt.get("seed"), "terminal I/O seed"),
+        )
+        process_identity = (
+            _review_nonnegative_integer(receipt.get("pid"), "terminal I/O PID"),
+            _review_nonnegative_number(receipt.get("create_time"), "terminal I/O create_time"),
+        )
+        core = {name: receipt[name] for name in core_fields}
+        if (
+            axis_identity not in expected_axes
+            or process_identity in observed_processes
+            or core_by_identity.get(process_identity) != core
+        ):
+            raise RuntimeError("campaign bound terminal process I/O receipt does not replay")
+        observed_axes.add(axis_identity)
+        observed_processes.add(process_identity)
+    scheduler_processes: set[tuple[int, float]] = set()
+    for raw_receipt in raw_scheduler:
+        if not isinstance(raw_receipt, Mapping):
+            raise RuntimeError("campaign scheduler terminal process I/O receipt is invalid")
+        receipt = dict(raw_receipt)
+        process_identity = (
+            _review_nonnegative_integer(receipt.get("pid"), "scheduler terminal I/O PID"),
+            _review_nonnegative_number(
+                receipt.get("create_time"),
+                "scheduler terminal I/O create_time",
+            ),
+        )
+        if (
+            set(receipt) != core_fields
+            or process_identity in scheduler_processes
+            or core_by_identity.get(process_identity) != receipt
+        ):
+            raise RuntimeError("campaign scheduler terminal process I/O does not replay")
+        scheduler_processes.add(process_identity)
+    scheduler_pids = wave.get("scheduler_process_ids")
+    if not isinstance(scheduler_pids, list) or {
+        identity[0] for identity in scheduler_processes
+    } != set(scheduler_pids):
+        raise RuntimeError("campaign scheduler terminal process I/O identity differs")
+    if (
+        observed_axes != expected_axes
+        or observed_processes.intersection(scheduler_processes)
+        or observed_processes | scheduler_processes != set(core_by_identity)
+    ):
+        raise RuntimeError("campaign bound terminal process I/O inventory differs")
+
+
 def _review_current_cpu_budget(
     statistics: Mapping[str, object],
     *,
@@ -1593,6 +1859,7 @@ def _review_mode_wave_resources(
         raise RuntimeError("campaign worker process lifecycle is invalid")
     if comparison_schema in {
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         if (
@@ -1603,6 +1870,13 @@ def _review_mode_wave_resources(
         _review_process_tree_accounting(wave)
     elif "resource_summary_accounting_source" in wave:
         raise RuntimeError("campaign legacy resource summary provider is invalid")
+    if comparison_schema == SCHEMA_VERSION:
+        _review_worker_terminal_io(wave)
+    elif (
+        "worker_terminal_io_receipts" in wave
+        or "terminal_process_io_receipts" in wave
+    ):
+        raise RuntimeError("campaign historical resource evidence has terminal I/O fields")
     before = wave.get("cgroup_before")
     after = wave.get("cgroup_after")
     if not isinstance(before, Mapping) or not isinstance(after, Mapping):
@@ -1682,6 +1956,7 @@ def _review_mode_wave_resources(
             in {
                 PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
                 PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+                TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
                 SCHEMA_VERSION,
             }
             and set(reported_io) != {"source", *io_fields}
@@ -1856,6 +2131,7 @@ def _review_mode_wave_resources(
         unresolved_identities.add(unresolved_identity)
     if comparison_schema not in {
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     } and (missed_processes or unresolved):
         raise RuntimeError("campaign thread-tree sampling evidence is incomplete")
@@ -2786,9 +3062,10 @@ def _replay_raw_native_control_journal(
     descriptor = payload.get("canonical_semantic_journal")
     native_statistics = payload.get("native_execution_statistics")
     raw_cache = payload.get("cache_incremental_statistics")
+    raw_candidate_control = payload.get("candidate_control_statistics")
     if not isinstance(descriptor, dict) or not isinstance(native_statistics, dict):
         return "full-native control journal identity is missing"
-    if not isinstance(raw_cache, dict):
+    if not isinstance(raw_cache, dict) or not isinstance(raw_candidate_control, dict):
         return "full-native cache statistics are missing"
     raw_control_descriptor = descriptor.get("native_control_events")
     if not isinstance(raw_control_descriptor, dict) or raw_control_descriptor.get(
@@ -2817,8 +3094,39 @@ def _replay_raw_native_control_journal(
     oversize_count = 0
     aggregate_count = 0
     transaction_reference_distance_count = 0
+    transaction_reference_distance_skipped = False
+    transaction_budget_skip_count = 0
+    budget_skip_count = 0
     final_statistics: list[int] | None = None
     reference_exact_cache: dict[tuple[str, tuple[str, ...]], ChargingSubproblemResult] = {}
+    current_control_schema = payload.get("schema_version") == SCHEMA_VERSION
+    plan_decisions: dict[int, tuple[str, int, int, bool]] = {}
+    candidate_misses: Counter[int] = Counter()
+    candidate_exact_rows: Counter[int] = Counter()
+    candidate_stores: set[int] = set()
+    budget_skips: dict[int, tuple[int, int, int, int, int, bool]] = {}
+    previous_budget_state: list[int] | None = None
+    fixed_work = payload.get("fixed_work_budget")
+    if current_control_schema:
+        exact_budget = -1
+        if payload.get("axis") == "fixed_work":
+            if not isinstance(fixed_work, dict):
+                return "full-native fixed-work budget is missing"
+            raw_exact_budget = fixed_work.get("exact_calls")
+            if (
+                isinstance(raw_exact_budget, bool)
+                or not isinstance(raw_exact_budget, int)
+                or raw_exact_budget <= 0
+            ):
+                return "full-native fixed-work exact budget is invalid"
+            exact_budget = raw_exact_budget
+        round_budget = raw_candidate_control.get("max_exact_calls_per_round")
+        if (
+            isinstance(round_budget, bool)
+            or not isinstance(round_budget, int)
+            or round_budget <= 0
+        ):
+            return "full-native candidate round budget is invalid"
     try:
         for event in iter_verified_native_control_events(axis_path, descriptor):
             transaction_id = event.get("native_transaction_id")
@@ -2838,6 +3146,13 @@ def _replay_raw_native_control_journal(
                 active_transaction = transaction_id
                 lookup_count = hit_count = store_count = eviction_count = oversize_count = 0
                 transaction_reference_distance_count = 0
+                transaction_reference_distance_skipped = False
+                transaction_budget_skip_count = 0
+                plan_decisions = {}
+                candidate_misses = Counter()
+                candidate_exact_rows = Counter()
+                candidate_stores = set()
+                budget_skips = {}
             elif transaction_id != active_transaction or batch_ordinal != expected_batch_ordinal:
                 return "native control transaction rows are not contiguous"
             event_type = event.get("event_type")
@@ -2854,6 +3169,16 @@ def _replay_raw_native_control_journal(
                     return "native control cache lookup route is invalid"
                 lookup_count += 1
                 hit_count += int(event.get("result") == "hit")
+                if current_control_schema:
+                    candidate_id = event.get("candidate_id")
+                    if (
+                        isinstance(candidate_id, bool)
+                        or not isinstance(candidate_id, int)
+                        or candidate_id < 0
+                    ):
+                        return "native control cache lookup candidate is invalid"
+                    if event.get("result") == "miss":
+                        candidate_misses[candidate_id] += 1
             elif event_type == "cache_store_receipt":
                 status = event.get("status")
                 raw_evictions = event.get("eviction_count")
@@ -2873,9 +3198,21 @@ def _replay_raw_native_control_journal(
                 store_count += int(status == "store")
                 eviction_count += raw_evictions
                 oversize_count += int(status == "oversize_not_cached")
+                if current_control_schema:
+                    candidate_id = event.get("candidate_id")
+                    if (
+                        isinstance(candidate_id, bool)
+                        or not isinstance(candidate_id, int)
+                        or candidate_id < 0
+                    ):
+                        return "native control cache store candidate is invalid"
+                    candidate_stores.add(candidate_id)
+                    candidate_exact_rows[candidate_id] += 1
             elif event_type == "candidate_cache_transaction":
                 statistics_row = event.get("cache_statistics")
                 raw_reference_distance = event.get("reference_distance_resolution")
+                implementation_internal = event.get("implementation_internal")
+                round_budget_suppressed = event.get("round_budget_suppressed")
                 if (
                     event.get("status") != "committed"
                     or event.get("lookups") != lookup_count
@@ -2889,8 +3226,207 @@ def _replay_raw_native_control_journal(
                     )
                     or not isinstance(raw_reference_distance, bool)
                     or int(raw_reference_distance) != transaction_reference_distance_count
+                    or not isinstance(implementation_internal, bool)
+                    or current_control_schema
+                    and not isinstance(round_budget_suppressed, bool)
                 ):
                     return "native control cache transaction does not replay"
+                if current_control_schema:
+                    raw_budget_state = event.get("budget_state")
+                    if (
+                        not isinstance(raw_budget_state, list)
+                        or len(raw_budget_state) != 9
+                        or any(
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                            for value in raw_budget_state
+                        )
+                    ):
+                        return "native control budget state is invalid"
+                    budget_state = cast(list[int], raw_budget_state)
+                    round_active = budget_state[0] == 1
+                    expected_round_remaining = (
+                        max(0, cast(int, round_budget) - budget_state[3])
+                        if round_active
+                        else cast(int, round_budget)
+                    )
+                    expected_exact_exhausted = int(
+                        exact_budget >= 0 and budget_state[5] >= exact_budget
+                    )
+                    if (
+                        budget_state[0] not in {0, 1}
+                        or budget_state[3] < 0
+                        or budget_state[3] > cast(int, round_budget)
+                        or budget_state[4] != expected_round_remaining
+                        or budget_state[5] < 0
+                        or (exact_budget >= 0 and budget_state[5] > exact_budget)
+                        or budget_state[6] < 0
+                        or budget_state[7] < 0
+                        or budget_state[6] > budget_state[5]
+                        or budget_state[7] > budget_state[5] - budget_state[6]
+                        or budget_state[8] != expected_exact_exhausted
+                        or (
+                            round_active
+                            and (budget_state[1] < 0 or budget_state[2] < 0)
+                        )
+                        or (
+                            not round_active
+                            and budget_state[1:4] != [-1, -1, 0]
+                        )
+                    ):
+                        return "native control budget state does not match configured limits"
+                    skipped_candidates = {
+                        candidate_id
+                        for candidate_id, (
+                            _status,
+                            transaction_status,
+                            _rank,
+                            _internal,
+                        ) in plan_decisions.items()
+                        if transaction_status == 3
+                    }
+                    if skipped_candidates != set(budget_skips):
+                        return "native control budget skips do not bind selected plans"
+                    if budget_skips and (
+                        implementation_internal or raw_reference_distance
+                    ):
+                        return "implementation-internal transaction contains a budget skip"
+                    if raw_reference_distance and (
+                        not implementation_internal or plan_decisions or budget_skips
+                    ):
+                        return "native reference-distance transaction shape is invalid"
+                    if implementation_internal and plan_decisions:
+                        return "implementation-internal transaction contains plan decisions"
+                    prior_started = (
+                        0 if previous_budget_state is None else previous_budget_state[5]
+                    )
+                    prior_completed = (
+                        0 if previous_budget_state is None else previous_budget_state[6]
+                    )
+                    prior_interrupted = (
+                        0 if previous_budget_state is None else previous_budget_state[7]
+                    )
+                    transaction_exact_rows = sum(candidate_exact_rows.values())
+                    if (
+                        budget_state[5] != prior_started + transaction_exact_rows
+                        or budget_state[6] != prior_completed + transaction_exact_rows
+                        or budget_state[7] != prior_interrupted
+                    ):
+                        return "native control exact budget state does not replay"
+                    transaction_iteration = event.get("iteration")
+                    if not round_budget_suppressed and (
+                        isinstance(transaction_iteration, bool)
+                        or not isinstance(transaction_iteration, int)
+                        or transaction_iteration < 0
+                    ):
+                        return "native control accounted round identity is invalid"
+                    accounted_round = (
+                        not round_budget_suppressed
+                        and isinstance(transaction_iteration, int)
+                        and not isinstance(transaction_iteration, bool)
+                        and transaction_iteration >= 0
+                    )
+                    running_started = prior_started
+                    running_round_used = 0
+                    if (
+                        accounted_round
+                        and previous_budget_state is not None
+                        and previous_budget_state[0] == 1
+                        and previous_budget_state[2] == transaction_iteration
+                    ):
+                        running_round_used = previous_budget_state[3]
+                    selected_plans = sorted(
+                        (
+                            (rank, candidate_id)
+                            for candidate_id, (
+                                status,
+                                _transaction_status,
+                                rank,
+                                internal,
+                            ) in plan_decisions.items()
+                            if status == "selected" and internal == implementation_internal
+                        )
+                    )
+                    for _rank, candidate_id in selected_plans:
+                        receipt = budget_skips.get(candidate_id)
+                        exact_rows = candidate_exact_rows[candidate_id]
+                        if receipt is not None:
+                            (
+                                requested,
+                                granted,
+                                round_remaining,
+                                exact_remaining,
+                                available,
+                                receipt_internal,
+                            ) = receipt
+                            expected_exact_remaining = (
+                                -1
+                                if exact_budget < 0
+                                else max(0, exact_budget - running_started)
+                            )
+                            expected_round_remaining = max(
+                                0, cast(int, round_budget) - running_round_used
+                            )
+                            expected_available = min(
+                                expected_round_remaining,
+                                requested
+                                if expected_exact_remaining < 0
+                                else expected_exact_remaining,
+                            )
+                            if (
+                                plan_decisions.get(candidate_id)
+                                != ("selected", 3, _rank, False)
+                                or requested != candidate_misses[candidate_id]
+                                or granted != 0
+                                or round_remaining != expected_round_remaining
+                                or exact_remaining != expected_exact_remaining
+                                or available != expected_available
+                                or requested <= available
+                                or exact_rows != 0
+                                or candidate_id in candidate_stores
+                                or receipt_internal
+                            ):
+                                return "native control budget skip does not replay"
+                        running_started += exact_rows
+                        running_round_used += exact_rows
+                    if implementation_internal and accounted_round:
+                        running_round_used += transaction_exact_rows
+                    if accounted_round and (
+                        budget_state[0] != 1
+                        or budget_state[2] != transaction_iteration
+                        or budget_state[3] != running_round_used
+                        or budget_state[4]
+                        != max(0, cast(int, round_budget) - running_round_used)
+                    ):
+                        return "native control round budget state does not replay"
+                    if not accounted_round:
+                        if previous_budget_state is None:
+                            expected_suppressed_round_state = [
+                                0,
+                                -1,
+                                -1,
+                                0,
+                                cast(int, round_budget),
+                            ]
+                        else:
+                            expected_suppressed_round_state = previous_budget_state[:5]
+                        if budget_state[:5] != expected_suppressed_round_state:
+                            return "suppressed native control round state changed"
+                    if transaction_reference_distance_skipped:
+                        exact_budget_exhausted = (
+                            exact_budget >= 0 and budget_state[5] >= exact_budget
+                        )
+                        prior_round_exhausted = (
+                            accounted_round
+                            and previous_budget_state is not None
+                            and previous_budget_state[4] == 0
+                            and budget_state[:5] == previous_budget_state[:5]
+                        )
+                        if not exact_budget_exhausted and not prior_round_exhausted:
+                            return "native reference-distance budget skip is not justified"
+                    previous_budget_state = budget_state
+                if transaction_budget_skip_count and raw_reference_distance:
+                    return "reference-distance transaction contains a budget skip"
                 assert all(isinstance(value, int) for value in statistics_row)
                 statistics_values = cast(list[int], statistics_row)
                 if (
@@ -2923,6 +3459,19 @@ def _replay_raw_native_control_journal(
                     isinstance(customer, str) for customer in sequence
                 ):
                     return "native reference-distance route is invalid"
+                transaction_status_code = event.get("transaction_status_code")
+                if event.get("status") == "budget_skipped":
+                    if (
+                        transaction_status_code != 3
+                        or event.get("vehicle_count") != -1
+                        or event.get("charging_count") != -1
+                        or event.get("reference_distance") is not None
+                        or event.get("reference_charging_time") is not None
+                    ):
+                        return "native skipped reference-distance receipt is invalid"
+                    transaction_reference_distance_count += 1
+                    transaction_reference_distance_skipped = True
+                    continue
                 customer_sequence = tuple(sequence)
                 reference_key = (instance.name, customer_sequence)
                 exact = reference_exact_cache.get(reference_key)
@@ -2930,7 +3479,11 @@ def _replay_raw_native_control_journal(
                     exact = solve_exact_charging(instance, customer_sequence)
                     reference_exact_cache[reference_key] = exact
                 expected_status = "feasible" if exact.feasible else "infeasible"
-                if event.get("status") != expected_status:
+                expected_transaction_status = 5 if exact.feasible else 4
+                if (
+                    event.get("status") != expected_status
+                    or transaction_status_code != expected_transaction_status
+                ):
                     return "native reference-distance feasibility does not replay"
                 if exact.feasible:
                     charging_count = sum(
@@ -2967,7 +3520,96 @@ def _replay_raw_native_control_journal(
                 ):
                     return "native infeasible reference-distance receipt is invalid"
                 transaction_reference_distance_count += 1
-            elif event_type not in {"candidate_initial_solution", "candidate_plan_decision"}:
+            elif event_type == "candidate_control_budget":
+                raw_requested = event.get("requested")
+                raw_granted = event.get("granted")
+                raw_remaining = event.get("remaining")
+                raw_round_remaining = event.get("round_remaining")
+                raw_exact_remaining = event.get("exact_remaining")
+                raw_available = event.get("available")
+                raw_candidate_id = event.get("candidate_id")
+                raw_transaction_status = event.get("transaction_status_code")
+                raw_implementation_internal = event.get("implementation_internal")
+                context = event.get("context")
+                iteration = event.get("iteration")
+                if (
+                    event.get("status") != "budget_skipped"
+                    or isinstance(raw_requested, bool)
+                    or not isinstance(raw_requested, int)
+                    or raw_requested <= 0
+                    or isinstance(raw_granted, bool)
+                    or not isinstance(raw_granted, int)
+                    or raw_granted != 0
+                    or isinstance(raw_remaining, bool)
+                    or not isinstance(raw_remaining, int)
+                    or raw_remaining < 0
+                    or not isinstance(context, str)
+                    or len(context.split(":")) != 3
+                    or isinstance(iteration, bool)
+                    or not isinstance(iteration, int)
+                    or iteration < 0
+                ):
+                    return "native control budget-skip receipt is invalid"
+                if current_control_schema:
+                    if (
+                        isinstance(raw_candidate_id, bool)
+                        or not isinstance(raw_candidate_id, int)
+                        or raw_candidate_id < 0
+                        or raw_transaction_status != 3
+                        or not isinstance(raw_implementation_internal, bool)
+                        or raw_candidate_id in budget_skips
+                        or isinstance(raw_round_remaining, bool)
+                        or not isinstance(raw_round_remaining, int)
+                        or raw_round_remaining != raw_remaining
+                        or isinstance(raw_exact_remaining, bool)
+                        or not isinstance(raw_exact_remaining, int)
+                        or isinstance(raw_available, bool)
+                        or not isinstance(raw_available, int)
+                    ):
+                        return "native control typed budget-skip receipt is invalid"
+                    budget_skips[raw_candidate_id] = (
+                        raw_requested,
+                        raw_granted,
+                        raw_remaining,
+                        raw_exact_remaining,
+                        raw_available,
+                        raw_implementation_internal,
+                    )
+                budget_skip_count += int(raw_implementation_internal is not True)
+                transaction_budget_skip_count += 1
+            elif event_type == "candidate_plan_decision":
+                if current_control_schema:
+                    candidate_id = event.get("candidate_id")
+                    transaction_status = event.get("transaction_status_code")
+                    status = event.get("status")
+                    implementation_internal = event.get("implementation_internal")
+                    rank = event.get("rank")
+                    if (
+                        isinstance(candidate_id, bool)
+                        or not isinstance(candidate_id, int)
+                        or candidate_id < 0
+                        or candidate_id in plan_decisions
+                        or not isinstance(status, str)
+                        or isinstance(transaction_status, bool)
+                        or not isinstance(transaction_status, int)
+                        or not isinstance(implementation_internal, bool)
+                        or (
+                            implementation_internal is False
+                            and (
+                                isinstance(rank, bool)
+                                or not isinstance(rank, int)
+                                or rank <= 0
+                            )
+                        )
+                    ):
+                        return "native control plan decision identity is invalid"
+                    plan_decisions[candidate_id] = (
+                        status,
+                        transaction_status,
+                        0 if implementation_internal else cast(int, rank),
+                        implementation_internal,
+                    )
+            elif event_type != "candidate_initial_solution":
                 return "native control journal event type is invalid"
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         return f"native control journal replay failed: {error}"
@@ -2976,6 +3618,8 @@ def _replay_raw_native_control_journal(
     for index, name in enumerate(cache_names):
         if raw_cache.get(name) != final_statistics[index]:
             return f"native control cache {name} does not match the axis"
+    if raw_candidate_control.get("budget_skips") != budget_skip_count:
+        return "native control budget-skip count does not match the axis"
     return None
 
 
@@ -3111,6 +3755,23 @@ def _replay_canonical_journal(
     candidate_counts: dict[str, int] = defaultdict(int)
     rank_by_context: dict[tuple[object, object, object], list[int]] = defaultdict(list)
     candidate_ids_by_context: dict[tuple[object, object, object], set[int]] = defaultdict(set)
+    native_plan_statuses: dict[
+        tuple[tuple[object, object, object], int, int], tuple[str, int, int]
+    ] = {}
+    native_transaction_order: list[tuple[tuple[object, object, object], int]] = []
+    native_candidate_misses: Counter[
+        tuple[tuple[object, object, object], int, int]
+    ] = Counter()
+    native_candidate_writes: Counter[
+        tuple[tuple[object, object, object], int, int]
+    ] = Counter()
+    native_candidate_evictions: Counter[
+        tuple[tuple[object, object, object], int, int]
+    ] = Counter()
+    native_budget_skips: dict[
+        tuple[tuple[object, object, object], int, int],
+        tuple[int, int, int, int, int],
+    ] = {}
     active_rounds: dict[tuple[object, object], int] = {}
     exact_started = 0
     exact_completed = 0
@@ -3118,9 +3779,20 @@ def _replay_canonical_journal(
     cache_bytes_current = 0
     cache_entries_peak = 0
     cache_bytes_peak = 0
-    pending_evictions: list[tuple[str, int, tuple[int, int]]] = []
+    pending_evictions: list[
+        tuple[
+            str,
+            int,
+            tuple[int, int],
+            tuple[tuple[object, object, object], int, int] | None,
+        ]
+    ] = []
     native_event_id = 0
     native_canonical_projection = _NativeCanonicalProjectionHasher()
+    current_native_schema = (
+        payload.get("schema_version") == SCHEMA_VERSION
+        and payload.get("mode") in FULL_NATIVE_SEMANTIC_MODES
+    )
 
     def expected_cache_digest(route_key: str) -> str:
         sequence = _route_sequence_from_canonical_key(route_key)
@@ -3168,6 +3840,26 @@ def _replay_canonical_journal(
         if source_transaction_id is not None and source_transaction_id != transaction_id:
             raise ValueError("cache source/native transaction identities diverge")
         return _event_context(event), transaction_id
+
+    def native_candidate_key(
+        event: Mapping[str, object],
+    ) -> tuple[tuple[object, object, object], int, int] | None:
+        context, transaction_id = cache_transaction_identity(event)
+        candidate_id = event.get("candidate_id")
+        if transaction_id is None:
+            if current_native_schema and candidate_id is not None:
+                raise ValueError("native candidate transaction identity is missing")
+            return None
+        if (
+            isinstance(candidate_id, bool)
+            or not isinstance(candidate_id, int)
+            or candidate_id < 0
+        ):
+            raise ValueError("native cache candidate identity is invalid")
+        transaction_key = (context, transaction_id)
+        if transaction_key not in native_transaction_order:
+            native_transaction_order.append(transaction_key)
+        return context, transaction_id, candidate_id
 
     def replay_exact_result(
         sequence: tuple[str, ...],
@@ -3415,6 +4107,29 @@ def _replay_canonical_journal(
                 candidate_ids_by_context[context].add(candidate_id)
                 rank_by_context[context].append(rank)
                 status = event.get("status")
+                plan_context, plan_native_transaction = cache_transaction_identity(event)
+                if plan_native_transaction is not None:
+                    native_plan_key = (
+                        plan_context,
+                        plan_native_transaction,
+                        candidate_id,
+                    )
+                    transaction_status = event.get("transaction_status_code")
+                    if (
+                        native_plan_key in native_plan_statuses
+                        or not isinstance(status, str)
+                        or isinstance(transaction_status, bool)
+                        or not isinstance(transaction_status, int)
+                    ):
+                        return "native candidate-plan identity is duplicated"
+                    native_plan_statuses[native_plan_key] = (
+                        status,
+                        transaction_status,
+                        rank,
+                    )
+                    transaction_key = (plan_context, plan_native_transaction)
+                    if transaction_key not in native_transaction_order:
+                        native_transaction_order.append(transaction_key)
                 candidate_counts["candidate_decisions"] += 1
                 candidate_counts[
                     "selected_candidates" if status == "selected" else "skipped_candidates"
@@ -3443,8 +4158,69 @@ def _replay_canonical_journal(
                     return "candidate budget fields are invalid"
                 assert isinstance(requested, int)
                 assert isinstance(granted, int)
+                assert isinstance(remaining, int)
                 if granted > requested:
                     return "candidate budget grant exceeds request"
+                raw_native_transaction = event.get("native_transaction_id")
+                if (
+                    current_native_schema
+                    and event.get("status") == "budget_skipped"
+                    and raw_native_transaction is None
+                ):
+                    return "native candidate budget identity is missing"
+                if raw_native_transaction is not None:
+                    candidate_id = event.get("candidate_id")
+                    round_remaining = event.get("round_remaining")
+                    exact_remaining = event.get("exact_remaining")
+                    available = event.get("available")
+                    transaction_status = event.get("transaction_status_code")
+                    raw_budget_context = event.get("context")
+                    iteration = event.get("iteration")
+                    if (
+                        isinstance(raw_native_transaction, bool)
+                        or not isinstance(raw_native_transaction, int)
+                        or raw_native_transaction < 0
+                        or isinstance(candidate_id, bool)
+                        or not isinstance(candidate_id, int)
+                        or candidate_id < 0
+                        or round_remaining != remaining
+                        or isinstance(exact_remaining, bool)
+                        or not isinstance(exact_remaining, int)
+                        or exact_remaining < -1
+                        or isinstance(available, bool)
+                        or not isinstance(available, int)
+                        or available < 0
+                        or transaction_status != 3
+                        or not isinstance(raw_budget_context, str)
+                        or len(raw_budget_context.split(":")) != 3
+                        or isinstance(iteration, bool)
+                        or not isinstance(iteration, int)
+                        or iteration < 0
+                    ):
+                        return "native candidate budget identity is invalid"
+                    lane, operator, _scope = raw_budget_context.split(":")
+                    assert isinstance(exact_remaining, int)
+                    assert isinstance(available, int)
+                    native_plan_key = (
+                        (lane, iteration, operator),
+                        raw_native_transaction,
+                        candidate_id,
+                    )
+                    plan_status = native_plan_statuses.get(native_plan_key)
+                    if (
+                        event.get("status") != "budget_skipped"
+                        or plan_status is None
+                        or plan_status[:2] != ("selected", 3)
+                        or native_plan_key in native_budget_skips
+                    ):
+                        return "native candidate budget skip does not replay"
+                    native_budget_skips[native_plan_key] = (
+                        requested,
+                        granted,
+                        remaining,
+                        exact_remaining,
+                        available,
+                    )
                 candidate_counts["budget_events"] += 1
                 candidate_counts["budget_skips"] += int(event.get("status") == "budget_skipped")
             elif stream == "candidate_transaction" and event_type == "candidate_control_round":
@@ -3513,6 +4289,9 @@ def _replay_canonical_journal(
                     cache_bytes_current,
                 ):
                     return "cache lookup size telemetry does not replay"
+                native_key = native_candidate_key(event)
+                if native_key is not None and status == "miss":
+                    native_candidate_misses[native_key] += 1
             elif stream == "cache" and event_type == "cache_lifecycle":
                 route_key = event.get("route_key")
                 operation = event.get("status")
@@ -3552,11 +4331,11 @@ def _replay_canonical_journal(
                         return "cache store violates bounded LRU state"
                     pre_eviction_entries = len(cache_state) + len(pending_evictions)
                     pre_eviction_bytes = cache_bytes_current + sum(
-                        evicted_bytes for _, evicted_bytes, _ in pending_evictions
+                        evicted_bytes for _, evicted_bytes, _, _ in pending_evictions
                     )
                     remaining_entries = pre_eviction_entries
                     remaining_bytes = pre_eviction_bytes
-                    for _, evicted_bytes, _ in pending_evictions:
+                    for _, evicted_bytes, _, _ in pending_evictions:
                         if (
                             remaining_entries < max_entries
                             and remaining_bytes + entry_bytes <= max_memory_bytes
@@ -3577,8 +4356,15 @@ def _replay_canonical_journal(
                     cache_bytes_current += entry_bytes
                     cache_counts["cache_stores"] += 1
                     expected_size = (len(cache_state), cache_bytes_current)
+                    store_native_key = native_candidate_key(event)
+                    if any(
+                        eviction_native_key != store_native_key
+                        for _, _, _, eviction_native_key in pending_evictions
+                    ):
+                        return "cache eviction transaction does not match pending store"
                     if telemetry != expected_size or any(
-                        observed != expected_size for _, _, observed in pending_evictions
+                        observed != expected_size
+                        for _, _, observed, _ in pending_evictions
                     ):
                         return "cache store size telemetry does not replay"
                     pending_evictions.clear()
@@ -3592,7 +4378,12 @@ def _replay_canonical_journal(
                         return "cache eviction digest disagrees with stored entry"
                     cache_bytes_current -= stored_bytes
                     cache_counts["cache_evictions"] += 1
-                    pending_evictions.append((route_key, stored_bytes, telemetry))
+                    eviction_native_key = native_candidate_key(event)
+                    pending_evictions.append(
+                        (route_key, stored_bytes, telemetry, eviction_native_key)
+                    )
+                    if eviction_native_key is not None:
+                        native_candidate_evictions[eviction_native_key] += 1
                 elif operation == "reconcile":
                     if route_key not in cache_state:
                         return "cache reconciliation targets an absent route"
@@ -3657,6 +4448,9 @@ def _replay_canonical_journal(
                     cache_counts["cache_oversize_not_cached"] += 1
                 else:
                     return "cache lifecycle operation is invalid"
+                native_key = native_candidate_key(event)
+                if native_key is not None and operation != "evict":
+                    native_candidate_writes[native_key] += 1
                 cache_entries_peak = max(cache_entries_peak, len(cache_state))
                 cache_bytes_peak = max(cache_bytes_peak, cache_bytes_current)
         if payload.get("mode") in FULL_NATIVE_SEMANTIC_MODES:
@@ -3679,6 +4473,123 @@ def _replay_canonical_journal(
         for ranks in rank_by_context.values():
             if sorted(ranks) != list(range(1, len(ranks) + 1)):
                 return "candidate-plan ranks are not contiguous"
+        if current_native_schema:
+            raw_candidate_control = payload.get("candidate_control_statistics")
+            fixed_work_budget = payload.get("fixed_work_budget")
+            if not isinstance(raw_candidate_control, dict):
+                return "native candidate-control statistics are missing"
+            round_budget = raw_candidate_control.get("max_exact_calls_per_round")
+            if (
+                isinstance(round_budget, bool)
+                or not isinstance(round_budget, int)
+                or round_budget <= 0
+            ):
+                return "native candidate-control round budget is invalid"
+            exact_budget = -1
+            if payload.get("axis") == "fixed_work":
+                if not isinstance(fixed_work_budget, dict):
+                    return "native fixed-work budget is missing"
+                raw_exact_budget = fixed_work_budget.get("exact_calls")
+                if (
+                    isinstance(raw_exact_budget, bool)
+                    or not isinstance(raw_exact_budget, int)
+                    or raw_exact_budget <= 0
+                ):
+                    return "native fixed-work exact budget is invalid"
+                exact_budget = raw_exact_budget
+            skipped_plan_keys = {
+                key
+                for key, (status, transaction_status, _rank) in native_plan_statuses.items()
+                if status == "selected" and transaction_status == 3
+            }
+            if skipped_plan_keys != set(native_budget_skips):
+                return "native canonical budget skips do not bind selected plans"
+            replayed_exact_started = 0
+            round_used_by_iteration: dict[int, int] = defaultdict(int)
+            for transaction_context, transaction_id in native_transaction_order:
+                plan_rows = sorted(
+                    (
+                        (rank, candidate_id, status, transaction_status)
+                        for (
+                            plan_context,
+                            plan_transaction_id,
+                            candidate_id,
+                        ), (
+                            status,
+                            transaction_status,
+                            rank,
+                        ) in native_plan_statuses.items()
+                        if plan_context == transaction_context
+                        and plan_transaction_id == transaction_id
+                        and status == "selected"
+                    )
+                )
+                public_iteration = transaction_context[1]
+                for _rank, candidate_id, status, transaction_status in plan_rows:
+                    plan_key = (transaction_context, transaction_id, candidate_id)
+                    exact_rows = native_candidate_writes[plan_key]
+                    receipt = native_budget_skips.get(plan_key)
+                    if receipt is not None:
+                        (
+                            requested,
+                            granted,
+                            round_remaining,
+                            exact_remaining,
+                            available,
+                        ) = receipt
+                        expected_exact_remaining = (
+                            -1
+                            if exact_budget < 0
+                            else max(0, exact_budget - replayed_exact_started)
+                        )
+                        expected_round_remaining = (
+                            max(
+                                0,
+                                round_budget
+                                - round_used_by_iteration[public_iteration],
+                            )
+                            if isinstance(public_iteration, int)
+                            and not isinstance(public_iteration, bool)
+                            else round_budget
+                        )
+                        expected_available = min(
+                            expected_round_remaining,
+                            requested
+                            if expected_exact_remaining < 0
+                            else expected_exact_remaining,
+                        )
+                        if (
+                            (status, transaction_status) != ("selected", 3)
+                            or requested != native_candidate_misses[plan_key]
+                            or granted != 0
+                            or round_remaining != expected_round_remaining
+                            or exact_remaining != expected_exact_remaining
+                            or available != expected_available
+                            or requested <= available
+                            or exact_rows != 0
+                            or native_candidate_evictions[plan_key] != 0
+                        ):
+                            return "native canonical budget skip does not replay"
+                    replayed_exact_started += exact_rows
+                    if (
+                        isinstance(public_iteration, int)
+                        and not isinstance(public_iteration, bool)
+                    ):
+                        round_used_by_iteration[public_iteration] += exact_rows
+                plan_candidate_ids = {candidate_id for _, candidate_id, _, _ in plan_rows}
+                replayed_exact_started += sum(
+                    count
+                    for (
+                        write_context,
+                        write_transaction_id,
+                        write_candidate_id,
+                    ), count in native_candidate_writes.items()
+                    if write_context == transaction_context
+                    and write_transaction_id == transaction_id
+                    and write_candidate_id not in plan_candidate_ids
+                )
+            if replayed_exact_started != exact_started:
+                return "native canonical exact-work budget does not replay"
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         return f"canonical semantic replay failed: {error}"
     declared_candidate_work_hash = payload.get("candidate_work_hash")
@@ -3763,6 +4674,7 @@ def _replay_record(
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         raise RuntimeError(f"unsupported comparison schema: {record.path}")
@@ -3777,6 +4689,7 @@ def _replay_record(
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         if "semantic_trajectory" not in payload or payload.get("semantic_trajectory") is None:
@@ -3801,6 +4714,7 @@ def _replay_record(
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         if comparison_schema in EXTERNAL_SEMANTIC_COMPARISON_SCHEMA_VERSIONS:
@@ -5061,6 +5975,7 @@ def _comparison_semantic_events(payload: Mapping[str, object]) -> Sequence[objec
         LEGACY_PROFILE_COMPARISON_SCHEMA_VERSION,
         PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
         PROCESS_PROFILE_COMPARISON_SCHEMA_VERSION,
+        TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
         SCHEMA_VERSION,
     }:
         # First validate the complete, implementation-owned causal journal.

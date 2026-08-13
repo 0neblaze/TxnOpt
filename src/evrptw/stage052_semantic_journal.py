@@ -328,6 +328,9 @@ def canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
             }
         }
     if canonical.get("event_type") == "candidate_control_budget":
+        if canonical.get("implementation_internal") is True:
+            return {}
+        canonical.pop("implementation_internal", None)
         canonical.pop("accounting", None)
         context = canonical.get("context")
         if isinstance(context, str) and context.endswith(":native_candidate_round"):
@@ -337,9 +340,10 @@ def canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
     if canonical.get("event_type") == "exact_batch_started":
         canonical.pop("transaction_sha256", None)
     if canonical.get("event_type") == "candidate_plan_decision":
+        if canonical.get("implementation_internal") is True:
+            return {}
+        canonical.pop("implementation_internal", None)
         canonical.pop("batch_ordinal", None)
-        canonical.pop("transaction_status_code", None)
-        canonical.pop("native_transaction_id", None)
     if canonical.get("event_type") == "cache_event":
         operation = canonical.get("operation")
         if operation == "lookup":
@@ -356,6 +360,8 @@ def canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
                     "lane",
                     "iteration",
                     "operator",
+                    "candidate_id",
+                    "native_transaction_id",
                     "current_entries",
                     "current_bytes",
                     "semantic_event_id",
@@ -379,6 +385,7 @@ def canonical_trace_event(event: dict[str, object]) -> dict[str, object]:
                     "lane",
                     "iteration",
                     "operator",
+                    "candidate_id",
                     "native_transaction_id",
                     "reason",
                     "entry_bytes",

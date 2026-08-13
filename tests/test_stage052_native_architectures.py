@@ -4,9 +4,12 @@ import copy
 import gc
 import hashlib
 import json
+import os
 import pickle
 import struct
 import subprocess
+import sys
+import time
 import tracemalloc
 import zipfile
 from collections import Counter
@@ -48,6 +51,7 @@ from evrptw.experiments.stage052_native_architecture_review import (
     _review_build_attestation,
     _review_mode_wave_resources,
     _review_scheduler_runtime_statistics,
+    _review_worker_terminal_io,
     _RowEvidenceAccumulator,
     _scheduler_screening_occupancy,
     _semantic_trajectory,
@@ -68,9 +72,11 @@ from evrptw.experiments.stage052_native_architectures import (
     PRIOR_PROFILE_COMPARISON_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SEEDS,
+    TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
     WARM_START_SCHEMA_VERSION,
     ArchitectureAxisExecutionFailed,
     ArchitectureAxisTask,
+    ArchitectureAxisWorkerFailed,
     ArchitectureMode,
     _assert_axis_publication_namespace_empty,
     _assign_performance_topology,
@@ -83,9 +89,12 @@ from evrptw.experiments.stage052_native_architectures import (
     _load_qualified_paired_review,
     _performance_identity_blocks,
     _persist_axis_terminal_transaction,
+    _reconcile_mode_wave_terminal_io,
     _require_campaign_identity,
     _require_native_architecture_capabilities,
+    _run_fresh_spawn_axis_batch,
     _run_group,
+    _run_mode_with_terminal_io,
     _runtime_cgroup_snapshot,
     _runtime_io_accounting,
     _semantic_candidate_trajectory,
@@ -125,6 +134,50 @@ from tools.native_build_attestation import (
     committed_wheel_project_entries,
     committed_wheel_project_entry_sha256,
 )
+
+
+def _spawn_axis_with_stuck_descendant(
+    connection: object,
+    task: ArchitectureAxisTask,
+    _mode: ArchitectureMode,
+) -> None:
+    os.setsid()
+    process_group_id = os.getpgrp()
+    cast(Any, connection).send(
+        {"status": "started", "process_group_id": process_group_id}
+    )
+    descendant = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        close_fds=True,
+    )
+    (task.output_root / "stuck-descendant.pid").write_text(
+        str(descendant.pid),
+        encoding="ascii",
+    )
+    time.sleep(60)
+
+
+def _spawn_axis_failure_or_hang(
+    connection: object,
+    task: ArchitectureAxisTask,
+    _mode: ArchitectureMode,
+) -> None:
+    os.setsid()
+    process_group_id = os.getpgrp()
+    cast(Any, connection).send(
+        {"status": "started", "process_group_id": process_group_id}
+    )
+    if task.seed == 2014:
+        cast(Any, connection).send(
+            {
+                "status": "worker_failed",
+                "error_type": "InjectedAxisFailure",
+                "error": "injected first-axis failure",
+            }
+        )
+        cast(Any, connection).close()
+        return
+    time.sleep(60)
 
 
 def test_signed_json_writer_is_durable_atomic_and_non_overwriting(
@@ -326,6 +379,503 @@ def test_axis_failure_is_pickle_safe_for_process_pool_transport() -> None:
     assert restored.error_type == original.error_type
     assert restored.error == original.error
     assert str(restored) == str(original)
+
+
+def test_fresh_spawn_axis_batch_times_out_and_terminates_stalled_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    clock = [100.0]
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.daemon = True
+            self.pid = 98765
+            self.exitcode: int | None = None
+            self.terminated = False
+            self.killed = False
+            self.join_timeouts: list[float | None] = []
+
+        def start(self) -> None:
+            return
+
+        def is_alive(self) -> bool:
+            return self.exitcode is None
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.exitcode = -15
+
+        def kill(self) -> None:
+            self.killed = True
+            self.exitcode = -9
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.processes: list[FakeProcess] = []
+
+        def Pipe(self, *, duplex: bool) -> tuple[FakeConnection, FakeConnection]:
+            assert duplex is False
+            return FakeConnection(), FakeConnection()
+
+        def Process(self, **_kwargs: object) -> FakeProcess:
+            process = FakeProcess()
+            self.processes.append(process)
+            return process
+
+    context = FakeContext()
+
+    def bounded_wait(
+        _connections: tuple[object, ...],
+        timeout: float | None = None,
+    ) -> list[object]:
+        assert timeout is not None and timeout > 0.0, "spawn wait must be bounded"
+        clock[0] += timeout
+        return []
+
+    monkeypatch.setattr(architectures.multiprocessing, "get_context", lambda _name: context)
+    monkeypatch.setattr(architectures, "wait_for_connections", bounded_wait)
+    monkeypatch.setattr(architectures.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(
+        architectures,
+        "_axis_parent_timeout_seconds",
+        lambda _task: 0.25,
+        raising=False,
+    )
+    task = ArchitectureAxisTask(
+        scope="paired",
+        repeat=0,
+        axis="fixed_work",
+        instance_name="c101C5",
+        seed=2014,
+        benchmark_dir=tmp_path,
+        output_root=tmp_path,
+        run_labels=run_labels_for_scope("paired", 97),
+        scheduler_socket_path=str(tmp_path / "scheduler.sock"),
+        wheel_sha256="a" * 64,
+        native_sha256="b" * 64,
+        scheduler_sha256="c" * 64,
+        revision="d" * 40,
+        initial_customer_sequences=(),
+        initial_solution_provenance={},
+    )
+
+    (outcome,) = _run_fresh_spawn_axis_batch(
+        (task,),
+        ArchitectureMode.CURRENT_STAGE052,
+        scheduler_process_id=None,
+    )
+
+    assert isinstance(outcome.error, ArchitectureAxisWorkerFailed)
+    assert outcome.error.error_type == "WorkerTimeout"
+    assert context.processes[0].terminated is True
+    assert context.processes[0].join_timeouts
+
+
+def test_fresh_spawn_axis_batch_reaps_stalled_descendant_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    monkeypatch.setattr(
+        architectures,
+        "_fresh_axis_process_entry",
+        _spawn_axis_with_stuck_descendant,
+    )
+    monkeypatch.setattr(
+        architectures,
+        "_axis_parent_timeout_seconds",
+        lambda _task: 2.0,
+    )
+    task = ArchitectureAxisTask(
+        scope="paired",
+        repeat=0,
+        axis="fixed_work",
+        instance_name="c101C5",
+        seed=2014,
+        benchmark_dir=tmp_path,
+        output_root=tmp_path,
+        run_labels=run_labels_for_scope("paired", 96),
+        scheduler_socket_path=str(tmp_path / "scheduler.sock"),
+        wheel_sha256="a" * 64,
+        native_sha256="b" * 64,
+        scheduler_sha256="c" * 64,
+        revision="d" * 40,
+        initial_customer_sequences=(),
+        initial_solution_provenance={},
+    )
+
+    (outcome,) = _run_fresh_spawn_axis_batch(
+        (task,),
+        ArchitectureMode.CURRENT_STAGE052,
+        scheduler_process_id=None,
+    )
+
+    assert isinstance(outcome.error, ArchitectureAxisWorkerFailed)
+    assert outcome.error.error_type == "WorkerTimeout"
+    descendant_pid = int((tmp_path / "stuck-descendant.pid").read_text(encoding="ascii"))
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            raw_stat = Path(f"/proc/{descendant_pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            break
+        state = raw_stat[raw_stat.rfind(")") + 2 :].split()[0]
+        if state == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("stalled spawned-axis descendant remained active")
+
+
+def test_fresh_spawn_axis_batch_cancels_sibling_on_first_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    monkeypatch.setattr(
+        architectures,
+        "_fresh_axis_process_entry",
+        _spawn_axis_failure_or_hang,
+    )
+    monkeypatch.setattr(
+        architectures,
+        "_axis_parent_timeout_seconds",
+        lambda _task: 20.0,
+    )
+
+    def task(seed: int) -> ArchitectureAxisTask:
+        return ArchitectureAxisTask(
+            scope="paired",
+            repeat=0,
+            axis="fixed_work",
+            instance_name="c101C5",
+            seed=seed,
+            benchmark_dir=tmp_path,
+            output_root=tmp_path,
+            run_labels=run_labels_for_scope("paired", 95),
+            scheduler_socket_path=str(tmp_path / f"scheduler-{seed}.sock"),
+            wheel_sha256="a" * 64,
+            native_sha256="b" * 64,
+            scheduler_sha256="c" * 64,
+            revision="d" * 40,
+            initial_customer_sequences=(),
+            initial_solution_provenance={},
+        )
+
+    started = time.monotonic()
+    outcomes = _run_fresh_spawn_axis_batch(
+        (task(2014), task(2015)),
+        ArchitectureMode.CURRENT_STAGE052,
+        scheduler_process_id=None,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 10.0
+    assert outcomes[0].task.seed == 2014
+    assert isinstance(outcomes[0].error, ArchitectureAxisWorkerFailed)
+    assert outcomes[0].error.error_type == "InjectedAxisFailure"
+    assert isinstance(outcomes[1].error, ArchitectureAxisWorkerFailed)
+    assert outcomes[1].error.error_type == "SiblingCancelled"
+
+
+def test_spawned_axis_batch_cleanup_uses_shared_signal_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    class ResistantProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.terminated = False
+            self.killed = False
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+            self.alive = False
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout == 0.0
+
+    processes = tuple(ResistantProcess(900_000 + index) for index in range(8))
+    monkeypatch.setattr(architectures, "AXIS_PROCESS_EXIT_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(architectures, "_process_group_is_alive", lambda _group: False)
+
+    started = time.monotonic()
+    states = architectures._stop_spawned_axis_processes(  # noqa: SLF001
+        tuple(
+            (index, cast(Any, process), process.pid)
+            for index, process in enumerate(processes)
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert all(states.values())
+    assert all(process.terminated and process.killed for process in processes)
+    assert elapsed < 0.2
+
+
+def test_spawned_axis_envelope_read_obeys_parent_deadline() -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    class PartialEnvelope:
+        def recv(self) -> object:
+            time.sleep(1.0)
+            return {"status": "completed"}
+
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError, match="result envelope timed out"):
+        architectures._receive_axis_envelope(  # type: ignore[arg-type]  # noqa: SLF001
+            PartialEnvelope(),
+            deadline=started + 0.05,
+        )
+    assert time.perf_counter() - started < 0.2
+
+
+def test_spawned_axis_batch_receive_uses_earliest_pending_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    clock = [100.0]
+
+    class FakeConnection:
+        def __init__(self, ordinal: int) -> None:
+            self.ordinal = ordinal
+
+        def close(self) -> None:
+            return
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.exitcode: int | None = None
+
+        def start(self) -> None:
+            return
+
+        def is_alive(self) -> bool:
+            return self.exitcode is None
+
+        def terminate(self) -> None:
+            self.exitcode = -15
+
+        def kill(self) -> None:
+            self.exitcode = -9
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout == 0.0
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.parents: list[FakeConnection] = []
+            self.processes: list[FakeProcess] = []
+
+        def Pipe(self, *, duplex: bool) -> tuple[FakeConnection, FakeConnection]:
+            assert duplex is False
+            ordinal = len(self.parents)
+            parent = FakeConnection(ordinal)
+            self.parents.append(parent)
+            return parent, FakeConnection(ordinal)
+
+        def Process(self, **_kwargs: object) -> FakeProcess:
+            process = FakeProcess(90_000 + len(self.processes))
+            self.processes.append(process)
+            return process
+
+    context = FakeContext()
+    wait_call = 0
+
+    def wait(
+        _connections: tuple[object, ...],
+        timeout: float | None = None,
+    ) -> list[object]:
+        nonlocal wait_call
+        wait_call += 1
+        assert timeout is not None and timeout > 0.0
+        return list(context.parents) if wait_call == 1 else [context.parents[1]]
+
+    observed_deadlines: list[tuple[int, float]] = []
+    receives: Counter[int] = Counter()
+
+    def receive(connection: FakeConnection, *, deadline: float) -> object:
+        observed_deadlines.append((connection.ordinal, deadline))
+        receives[connection.ordinal] += 1
+        if receives[connection.ordinal] == 1:
+            return {
+                "status": "started",
+                "process_group_id": 90_000 + connection.ordinal,
+            }
+        clock[0] = 100.75
+        return {
+            "status": "worker_failed",
+            "error_type": "InjectedFailure",
+            "error": "stop",
+        }
+
+    monkeypatch.setattr(architectures.multiprocessing, "get_context", lambda _name: context)
+    monkeypatch.setattr(architectures, "wait_for_connections", wait)
+    monkeypatch.setattr(architectures, "_receive_axis_envelope", receive)
+    monkeypatch.setattr(architectures.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(
+        architectures,
+        "_axis_parent_timeout_seconds",
+        lambda task: 1.0 if task.seed == 2014 else 10.0,
+    )
+
+    def task(seed: int) -> ArchitectureAxisTask:
+        return ArchitectureAxisTask(
+            scope="paired",
+            repeat=0,
+            axis="fixed_work",
+            instance_name="c101C5",
+            seed=seed,
+            benchmark_dir=tmp_path,
+            output_root=tmp_path,
+            run_labels=run_labels_for_scope("paired", 94),
+            scheduler_socket_path=str(tmp_path / f"scheduler-{seed}.sock"),
+            wheel_sha256="a" * 64,
+            native_sha256="b" * 64,
+            scheduler_sha256="c" * 64,
+            revision="d" * 40,
+            initial_customer_sequences=(),
+            initial_solution_provenance={},
+        )
+
+    outcomes = _run_fresh_spawn_axis_batch(
+        (task(2014), task(2015)),
+        ArchitectureMode.CURRENT_STAGE052,
+        scheduler_process_id=None,
+    )
+
+    second_terminal_deadline = observed_deadlines[-1]
+    assert second_terminal_deadline == (1, 101.0)
+    assert outcomes[0].parent_terminal_seconds == pytest.approx(0.75)
+
+
+def test_run_mode_with_terminal_io_binds_task_start_and_axis_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architectures as architectures
+
+    task = cast(ArchitectureAxisTask, SimpleNamespace())
+    receipt = {
+        "schema_version": "stage05.2-terminal-process-io-v1",
+        "pid": 11,
+        "parent_pid": 10,
+        "create_time": 1.0,
+        "start_time_ticks": 101,
+        "task_started_monotonic": 20.0,
+        "captured_monotonic": 21.0,
+        "read_bytes": 3,
+        "write_bytes": 5,
+    }
+    monkeypatch.setattr(architectures.time, "monotonic", lambda: 20.0)
+    monkeypatch.setattr(
+        architectures,
+        "_run_mode",
+        lambda observed_task, mode: (
+            "/evidence/axis.json"
+            if observed_task is task and mode is ArchitectureMode.CURRENT_STAGE052
+            else pytest.fail("terminal-I/O wrapper changed the axis task identity")
+        ),
+    )
+
+    def capture(*, task_started_monotonic: float) -> dict[str, object]:
+        assert task_started_monotonic == 20.0
+        return receipt
+
+    monkeypatch.setattr(
+        architectures,
+        "capture_current_process_terminal_io_receipt",
+        capture,
+    )
+
+    assert _run_mode_with_terminal_io(
+        task,
+        ArchitectureMode.CURRENT_STAGE052,
+    ) == ("/evidence/axis.json", [receipt])
+
+
+def test_mode_wave_reconciles_core_terminal_io_separately_from_axis_binding() -> None:
+    applied: list[dict[str, object]] = []
+
+    class Monitor:
+        def apply_terminal_process_io_receipts(
+            self,
+            receipts: Iterable[dict[str, object]],
+        ) -> None:
+            applied.extend(receipts)
+
+    core = {
+        "schema_version": "stage05.2-terminal-process-io-v1",
+        "pid": 11,
+        "parent_pid": 10,
+        "create_time": 1.0,
+        "start_time_ticks": 101,
+        "task_started_monotonic": 20.0,
+        "captured_monotonic": 21.0,
+        "read_bytes": 3,
+        "write_bytes": 5,
+    }
+    bound = {
+        "repeat": 1,
+        "axis": "fixed_work",
+        "instance": "c101C5",
+        "seed": 2014,
+        **core,
+    }
+
+    _reconcile_mode_wave_terminal_io(
+        cast(Any, Monitor()),
+        terminal_io_receipts=[core],
+        bound_terminal_io_receipts=[bound],
+        scheduler_terminal_io_receipts=[],
+        expected_count=1,
+    )
+
+    assert applied == [core]
+    assert set(applied[0]) == {
+        "schema_version",
+        "pid",
+        "parent_pid",
+        "create_time",
+        "start_time_ticks",
+        "task_started_monotonic",
+        "captured_monotonic",
+        "read_bytes",
+        "write_bytes",
+    }
+    with pytest.raises(RuntimeError, match="inventory is incomplete"):
+        _reconcile_mode_wave_terminal_io(
+            cast(Any, Monitor()),
+            terminal_io_receipts=[core],
+            bound_terminal_io_receipts=[],
+            scheduler_terminal_io_receipts=[],
+            expected_count=1,
+        )
 
 
 def test_axis_end_to_end_uses_parent_terminal_and_independent_replay() -> None:
@@ -553,7 +1103,12 @@ def test_runtime_io_accounting_uses_process_tree_when_cgroup_io_is_unavailable()
     assert _runtime_io_accounting(
         {"io": "unavailable"},
         {"io": "unavailable"},
-        {"process_tree_read_bytes": 123, "process_tree_write_bytes": 456},
+        {
+            "process_tree_read_bytes": 123,
+            "process_tree_write_bytes": 456,
+            "process_io_terminal_status": "available",
+            "process_io_uncovered_identities": [],
+        },
     ) == {
         "source": "process_tree_proc_io",
         "read_bytes": 123,
@@ -903,12 +1458,15 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "thread_tree_minor_faults": 2,
         "thread_tree_major_faults": 0,
     }
-    _review_mode_wave_resources(wave)
+    _review_mode_wave_resources(
+        wave,
+        comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+    )
     current_metrics = _mode_wave_metrics(
         (
             ReviewRecord(
                 Path("current-axis.json"),
-                {"schema_version": SCHEMA_VERSION},
+                {"schema_version": TICK_PROFILE_COMPARISON_SCHEMA_VERSION},
                 wave,
             ),
         )
@@ -918,7 +1476,10 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
 
     wave["process_tree_context_switches"] = 8
     with pytest.raises(RuntimeError, match="process-tree aggregates do not replay"):
-        _review_mode_wave_resources(wave)
+        _review_mode_wave_resources(
+            wave,
+            comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
     wave["process_tree_context_switches"] = 7
 
     partial_thread_wave = copy.deepcopy(wave)
@@ -928,7 +1489,10 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
     partial_thread_tree["unresolved_thread_ids"] = [
         {"pid": 2, "process_create_time": 2.0, "tid": 3}
     ]
-    _review_mode_wave_resources(partial_thread_wave)
+    _review_mode_wave_resources(
+        partial_thread_wave,
+        comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+    )
 
     prior_wave = copy.deepcopy(wave)
     prior_wave.pop("resource_summary_accounting_source")
@@ -972,14 +1536,20 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
     counters = cast(dict[str, int], thread_tree["counters"])
     counters["cpu_migrations"] += 1
     with pytest.raises(RuntimeError, match="aggregates do not replay"):
-        _review_mode_wave_resources(wave)
+        _review_mode_wave_resources(
+            wave,
+            comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
     counters["cpu_migrations"] -= 1
 
     after = wave["cgroup_after"]
     assert isinstance(after, dict)
     after["memory_swap_peak_bytes"] = 1
     with pytest.raises(RuntimeError, match="swap gate"):
-        _review_mode_wave_resources(wave)
+        _review_mode_wave_resources(
+            wave,
+            comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
     after["memory_swap_peak_bytes"] = 0
 
     before = cast(dict[str, object], wave["cgroup_before"])
@@ -990,18 +1560,142 @@ def test_reviewer_independently_replays_cgroup_resource_gate() -> None:
         "read_bytes": 7,
         "write_bytes": 11,
     }
-    _review_mode_wave_resources(wave)
+    _review_mode_wave_resources(
+        wave,
+        comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+    )
     process_io = cast(dict[str, object], wave["io_accounting"])
     process_io["write_bytes"] = 12
     wave["process_tree_write_bytes"] = 12
     with pytest.raises(RuntimeError, match="aggregates do not replay"):
-        _review_mode_wave_resources(wave)
+        _review_mode_wave_resources(
+            wave,
+            comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
     process_io["write_bytes"] = 11
     wave["process_tree_write_bytes"] = 11
     before["io"] = io_before
     after["io"] = io_after
     with pytest.raises(RuntimeError, match="did not prefer cgroup"):
-        _review_mode_wave_resources(wave)
+        _review_mode_wave_resources(
+            wave,
+            comparison_schema=TICK_PROFILE_COMPARISON_SCHEMA_VERSION,
+        )
+
+
+def test_current_mode_wave_replays_worker_terminal_io_receipts() -> None:
+    core = {
+        "schema_version": "stage05.2-terminal-process-io-v1",
+        "pid": 41,
+        "parent_pid": 40,
+        "create_time": 11.0,
+        "start_time_ticks": 101,
+        "task_started_monotonic": 21.0,
+        "captured_monotonic": 25.0,
+        "read_bytes": 101,
+        "write_bytes": 202,
+    }
+    axis = {"repeat": 1, "axis": "fixed_work", "instance": "c101C5", "seed": 2014}
+    wave: dict[str, object] = {
+        "monitor_start_wall_time": 10.0,
+        "monitor_start_monotonic": 20.0,
+        "monitor_start_boot_time_ticks": 100,
+        "monitor_end_monotonic": 30.0,
+        "sample_count": 2,
+        "root_process_id": 40,
+        "process_io_terminal_status": "available",
+        "process_io_uncovered_identities": [],
+        "identities": [axis],
+        "scheduler_process_ids": [],
+        "terminal_process_io_receipts": [core],
+        "worker_terminal_io_receipts": [{**axis, **core}],
+        "scheduler_terminal_io_receipts": [],
+        "process_metrics": [
+            {
+                "pid": 41,
+                "create_time": 11.0,
+                "parent_pid": 40,
+                "start_time_ticks": 101,
+                "terminal_io_evidence": "cooperative_receipt",
+                "last_sample_index": 0,
+                "cpu_baseline_source": "process_create_time",
+                "counters": {"read_bytes": 101, "write_bytes": 202},
+            }
+        ],
+    }
+
+    _review_worker_terminal_io(wave)
+
+    cast(list[dict[str, object]], wave["worker_terminal_io_receipts"])[0][
+        "write_bytes"
+    ] = 203
+    with pytest.raises(RuntimeError, match="does not replay"):
+        _review_worker_terminal_io(wave)
+
+
+def test_current_host_scheduler_wave_partitions_terminal_io_receipts() -> None:
+    worker_core = {
+        "schema_version": "stage05.2-terminal-process-io-v1",
+        "pid": 41,
+        "parent_pid": 40,
+        "create_time": 11.0,
+        "start_time_ticks": 101,
+        "task_started_monotonic": 21.0,
+        "captured_monotonic": 25.0,
+        "read_bytes": 101,
+        "write_bytes": 202,
+    }
+    scheduler_core = {
+        "schema_version": "stage05.2-terminal-process-io-v1",
+        "pid": 42,
+        "parent_pid": 40,
+        "create_time": 12.0,
+        "start_time_ticks": 102,
+        "task_started_monotonic": 20.5,
+        "captured_monotonic": 26.0,
+        "read_bytes": 303,
+        "write_bytes": 404,
+    }
+    axis = {"repeat": 1, "axis": "fixed_work", "instance": "c101C5", "seed": 2014}
+    wave: dict[str, object] = {
+        "monitor_start_wall_time": 10.0,
+        "monitor_start_monotonic": 20.0,
+        "monitor_start_boot_time_ticks": 100,
+        "monitor_end_monotonic": 30.0,
+        "sample_count": 2,
+        "root_process_id": 40,
+        "process_io_terminal_status": "available",
+        "process_io_uncovered_identities": [],
+        "identities": [axis],
+        "scheduler_process_ids": [42],
+        "terminal_process_io_receipts": [dict(worker_core), dict(scheduler_core)],
+        "worker_terminal_io_receipts": [{**axis, **worker_core}],
+        "scheduler_terminal_io_receipts": [dict(scheduler_core)],
+        "process_metrics": [
+            {
+                "pid": receipt["pid"],
+                "create_time": receipt["create_time"],
+                "parent_pid": 40,
+                "start_time_ticks": receipt["start_time_ticks"],
+                "terminal_io_evidence": "cooperative_receipt",
+                "last_sample_index": 0,
+                "cpu_baseline_source": "process_create_time",
+                "counters": {
+                    "read_bytes": receipt["read_bytes"],
+                    "write_bytes": receipt["write_bytes"],
+                },
+            }
+            for receipt in (worker_core, scheduler_core)
+        ],
+    }
+
+    _review_worker_terminal_io(wave)
+
+    cast(list[dict[str, object]], wave["scheduler_terminal_io_receipts"])[0][
+        "pid"
+    ] = 41
+    with pytest.raises(RuntimeError, match="scheduler terminal process I/O"):
+        _review_worker_terminal_io(wave)
 
 
 def _streaming_evidence_digest(rows: Iterable[object]) -> dict[str, object]:
@@ -2372,31 +3066,47 @@ def test_reference_distance_replay_caches_each_unique_route(
     statistics = [0] * 11
     events: list[dict[str, object]] = []
     for batch_ordinal, transaction_id in enumerate((41, 42)):
-        events.extend(
-            (
+        events.append(
+            {
+                "event_type": "reference_distance_resolution",
+                "native_transaction_id": transaction_id,
+                "batch_ordinal": batch_ordinal,
+                "customer_sequence": list(sequence),
+                "status": "feasible",
+                "vehicle_count": 1,
+                "charging_count": charging_count,
+                "reference_distance": expected.distance,
+                "reference_charging_time": expected.charging_time,
+                "transaction_status_code": 5,
+            }
+        )
+        if batch_ordinal == 0:
+            events.append(
                 {
-                    "event_type": "reference_distance_resolution",
+                    "event_type": "candidate_control_budget",
                     "native_transaction_id": transaction_id,
                     "batch_ordinal": batch_ordinal,
-                    "customer_sequence": list(sequence),
-                    "status": "feasible",
-                    "vehicle_count": 1,
-                    "charging_count": charging_count,
-                    "reference_distance": expected.distance,
-                    "reference_charging_time": expected.charging_time,
-                },
-                {
-                    "event_type": "candidate_cache_transaction",
-                    "native_transaction_id": transaction_id,
-                    "batch_ordinal": batch_ordinal,
-                    "status": "committed",
-                    "lookups": 0,
-                    "hits": 0,
-                    "exact_stores": 0,
-                    "cache_statistics": statistics,
-                    "reference_distance_resolution": True,
-                },
+                    "status": "budget_skipped",
+                    "context": "quality_shadow:relocate:candidate_pool",
+                    "requested": 2,
+                    "granted": 0,
+                    "remaining": 1,
+                    "iteration": 0,
+                }
             )
+        events.append(
+            {
+                "event_type": "candidate_cache_transaction",
+                "native_transaction_id": transaction_id,
+                "batch_ordinal": batch_ordinal,
+                "status": "committed",
+                "lookups": 0,
+                "hits": 0,
+                "exact_stores": 0,
+                "cache_statistics": statistics,
+                "implementation_internal": True,
+                "reference_distance_resolution": True,
+            }
         )
     calls = 0
     real_solve = review.solve_exact_charging
@@ -2418,6 +3128,7 @@ def test_reference_distance_replay_caches_each_unique_route(
     payload = {
         "canonical_semantic_journal": {"native_control_events": {"native_source_sha256": "a" * 64}},
         "native_execution_statistics": {"control_journal_sha256": "a" * 64},
+        "candidate_control_statistics": {"budget_skips": 1},
         "cache_incremental_statistics": {
             name: 0
             for name in (
@@ -2436,6 +3147,123 @@ def test_reference_distance_replay_caches_each_unique_route(
         },
     }
 
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "reference-distance transaction contains a budget skip"
+    assert calls == 1
+
+
+def test_reference_distance_internal_prefix_skip_has_no_public_budget_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review
+
+    instance = parse_schneider(Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt")
+    reference = solve_exact_charging(instance, ("C30",))
+    assert reference.feasible
+    reference_charging_count = sum(
+        instance.by_name[node].kind.value == "f" for node in reference.route
+    )
+    events: list[dict[str, object]] = [
+        {
+            "event_type": "reference_distance_resolution",
+            "native_transaction_id": 40,
+            "batch_ordinal": 0,
+            "customer_sequence": ["C30"],
+            "status": "feasible",
+            "vehicle_count": 1,
+            "charging_count": reference_charging_count,
+            "reference_distance": reference.distance,
+            "reference_charging_time": reference.charging_time,
+            "transaction_status_code": 5,
+        },
+        {
+            "event_type": "cache_store_receipt",
+            "native_transaction_id": 40,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "status": "oversize_not_cached",
+            "eviction_count": 0,
+            "entry_bytes": 1,
+        },
+        {
+            "event_type": "candidate_cache_transaction",
+            "native_transaction_id": 40,
+            "batch_ordinal": 0,
+            "status": "committed",
+            "lookups": 0,
+            "hits": 0,
+            "exact_stores": 0,
+            "cache_statistics": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            "implementation_internal": True,
+            "round_budget_suppressed": False,
+            "reference_distance_resolution": True,
+            "iteration": 0,
+            "budget_state": [1, 0, 0, 1, 0, 1, 1, 0, 0],
+        },
+        {
+            "event_type": "reference_distance_resolution",
+            "native_transaction_id": 41,
+            "batch_ordinal": 1,
+            "customer_sequence": ["C30"],
+            "status": "budget_skipped",
+            "vehicle_count": -1,
+            "charging_count": -1,
+            "reference_distance": None,
+            "reference_charging_time": None,
+            "transaction_status_code": 3,
+        },
+        {
+            "event_type": "candidate_cache_transaction",
+            "native_transaction_id": 41,
+            "batch_ordinal": 1,
+            "status": "committed",
+            "lookups": 0,
+            "hits": 0,
+            "exact_stores": 0,
+            "cache_statistics": [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            "implementation_internal": True,
+            "round_budget_suppressed": False,
+            "reference_distance_resolution": True,
+            "iteration": 0,
+            "budget_state": [1, 0, 0, 1, 0, 1, 1, 0, 0],
+        },
+    ]
+    monkeypatch.setattr(
+        review,
+        "iter_verified_native_control_events",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "axis": "fixed_work",
+        "fixed_work_budget": {"exact_calls": 10},
+        "canonical_semantic_journal": {
+            "native_control_events": {"native_source_sha256": "a" * 64}
+        },
+        "native_execution_statistics": {"control_journal_sha256": "a" * 64},
+        "candidate_control_statistics": {
+            "budget_skips": 0,
+            "max_exact_calls_per_round": 1,
+        },
+        "cache_incremental_statistics": {
+            "cache_lookups": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "cache_stores": 0,
+            "cache_evictions": 0,
+            "cache_oversize_not_cached": 1,
+            "entries_current": 0,
+            "entries_peak": 0,
+            "bytes_current": 0,
+            "bytes_peak": 0,
+            "unique_route_evaluations": 1,
+        },
+    }
+
     assert (
         _replay_raw_native_control_journal(
             payload,
@@ -2444,7 +3272,801 @@ def test_reference_distance_replay_caches_each_unique_route(
         )
         is None
     )
-    assert calls == 1
+
+    transaction = events[4]
+    transaction["budget_state"] = [1, 0, 0, 0, 1, 1, 1, 0, 0]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control round budget state does not replay"
+
+    transaction["budget_state"] = [1, 0, 0, 0, 0, 1, 1, 0, 0]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control budget state does not match configured limits"
+
+    first_transaction = events[2]
+    events.insert(
+        0,
+        {
+            "event_type": "candidate_plan_decision",
+            "native_transaction_id": 40,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "rank": 0,
+            "status": "selected",
+            "transaction_status_code": 5,
+            "implementation_internal": True,
+        },
+    )
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native reference-distance transaction shape is invalid"
+    events.pop(0)
+
+    fixed_budget = payload["fixed_work_budget"]
+    assert isinstance(fixed_budget, dict)
+    fixed_budget["exact_calls"] = 1
+    first_transaction["round_budget_suppressed"] = True
+    first_transaction["iteration"] = None
+    first_transaction["budget_state"] = [0, -1, -1, 0, 1, 1, 1, 0, 1]
+    transaction["budget_state"] = [1, 0, 0, 0, 1, 1, 1, 0, 1]
+    assert (
+        _replay_raw_native_control_journal(
+            payload,
+            axis_path=tmp_path / "axis.json",
+            instance=instance,
+        )
+        is None
+    )
+
+    first_transaction["budget_state"] = [1, 0, 0, 1, 0, 1, 1, 0, 1]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "suppressed native control round state changed"
+
+    first_transaction["round_budget_suppressed"] = False
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control accounted round identity is invalid"
+
+    fixed_budget["exact_calls"] = 10
+    first_transaction["iteration"] = 0
+    payload["candidate_control_statistics"]["max_exact_calls_per_round"] = 2  # type: ignore[index]
+    first_transaction["budget_state"] = [1, 0, 0, 2, 0, 1, 1, 0, 0]
+    transaction["budget_state"] = [1, 0, 0, 2, 0, 1, 1, 0, 0]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control round budget state does not replay"
+
+    payload["candidate_control_statistics"]["max_exact_calls_per_round"] = 1  # type: ignore[index]
+    first_transaction["budget_state"] = [1, 0, 0, 1, 0, 1, 1, 0, 0]
+    transaction["budget_state"] = [1, 0, 0, 1, 0, 11, 11, 0, 1]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control budget state does not match configured limits"
+
+    transaction["budget_state"] = [0, -1, -1, 0, 0, 1, 1, 0, 0]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control budget state does not match configured limits"
+
+
+def test_non_reference_internal_exact_rows_replay_round_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review
+
+    instance = parse_schneider(Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt")
+    events: list[dict[str, object]] = [
+        {
+            "event_type": "cache_event",
+            "native_transaction_id": 42,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "operation": "lookup",
+            "result": "miss",
+            "customer_sequence": ["C30"],
+        },
+        {
+            "event_type": "cache_store_receipt",
+            "native_transaction_id": 42,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "status": "oversize_not_cached",
+            "eviction_count": 0,
+            "entry_bytes": 1,
+            "customer_sequence": ["C30"],
+        },
+        {
+            "event_type": "candidate_cache_transaction",
+            "native_transaction_id": 42,
+            "batch_ordinal": 0,
+            "status": "committed",
+            "lookups": 1,
+            "hits": 0,
+            "exact_stores": 0,
+            "cache_statistics": [1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1],
+            "implementation_internal": True,
+            "round_budget_suppressed": False,
+            "reference_distance_resolution": False,
+            "iteration": 0,
+            "budget_state": [1, 0, 0, 1, 0, 1, 1, 0, 0],
+        },
+    ]
+    monkeypatch.setattr(
+        review,
+        "iter_verified_native_control_events",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "axis": "fixed_work",
+        "fixed_work_budget": {"exact_calls": 10},
+        "canonical_semantic_journal": {
+            "native_control_events": {"native_source_sha256": "a" * 64}
+        },
+        "native_execution_statistics": {"control_journal_sha256": "a" * 64},
+        "candidate_control_statistics": {
+            "budget_skips": 0,
+            "max_exact_calls_per_round": 1,
+        },
+        "cache_incremental_statistics": {
+            "cache_lookups": 1,
+            "cache_hits": 0,
+            "cache_misses": 1,
+            "cache_stores": 0,
+            "cache_evictions": 0,
+            "cache_oversize_not_cached": 1,
+            "entries_current": 0,
+            "entries_peak": 0,
+            "bytes_current": 0,
+            "bytes_peak": 0,
+            "unique_route_evaluations": 1,
+        },
+    }
+
+    assert (
+        _replay_raw_native_control_journal(
+            payload,
+            axis_path=tmp_path / "axis.json",
+            instance=instance,
+        )
+        is None
+    )
+
+    transaction = events[-1]
+    transaction["budget_state"] = [1, 0, 0, 0, 1, 1, 1, 0, 0]
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control round budget state does not replay"
+
+    transaction["budget_state"] = [1, 0, 0, 1, 0, 1, 1, 0, 0]
+    events.insert(
+        0,
+        {
+            "event_type": "candidate_plan_decision",
+            "native_transaction_id": 42,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "rank": 1,
+            "status": "selected",
+            "transaction_status_code": 5,
+            "implementation_internal": True,
+        },
+    )
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "implementation-internal transaction contains plan decisions"
+
+
+def test_current_raw_native_budget_skip_replays_plan_misses_and_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review
+
+    instance = parse_schneider(Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt")
+    statistics = [2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2]
+    events: list[dict[str, object]] = [
+        {
+            "event_type": "candidate_plan_decision",
+            "native_transaction_id": 41,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "rank": 1,
+            "status": "selected",
+            "transaction_status_code": 3,
+            "implementation_internal": False,
+        },
+        *[
+            {
+                "event_type": "cache_event",
+                "native_transaction_id": 41,
+                "batch_ordinal": 0,
+                "candidate_id": 0,
+                "operation": "lookup",
+                "result": "miss",
+                "customer_sequence": [customer],
+            }
+            for customer in ("C1", "C2")
+        ],
+        {
+            "event_type": "candidate_control_budget",
+            "native_transaction_id": 41,
+            "batch_ordinal": 0,
+            "candidate_id": 0,
+            "transaction_status_code": 3,
+            "implementation_internal": False,
+            "status": "budget_skipped",
+            "context": "legacy:relocate:candidate_pool",
+            "requested": 2,
+            "granted": 0,
+            "remaining": 1,
+            "round_remaining": 1,
+            "exact_remaining": 10,
+            "available": 1,
+            "iteration": 0,
+        },
+        {
+            "event_type": "candidate_cache_transaction",
+            "native_transaction_id": 41,
+            "batch_ordinal": 0,
+            "status": "committed",
+            "lookups": 2,
+            "hits": 0,
+            "exact_stores": 0,
+            "cache_statistics": statistics,
+            "implementation_internal": False,
+            "round_budget_suppressed": False,
+            "reference_distance_resolution": False,
+            "iteration": 0,
+            "budget_state": [1, 0, 0, 0, 1, 0, 0, 0, 0],
+        },
+    ]
+    monkeypatch.setattr(
+        review,
+        "iter_verified_native_control_events",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "axis": "fixed_work",
+        "fixed_work_budget": {"exact_calls": 10},
+        "canonical_semantic_journal": {
+            "native_control_events": {"native_source_sha256": "a" * 64}
+        },
+        "native_execution_statistics": {"control_journal_sha256": "a" * 64},
+        "candidate_control_statistics": {
+            "budget_skips": 1,
+            "max_exact_calls_per_round": 1,
+        },
+        "cache_incremental_statistics": {
+            name: statistics[index]
+            for index, name in enumerate(
+                (
+                    "cache_lookups",
+                    "cache_hits",
+                    "cache_misses",
+                    "cache_stores",
+                    "cache_evictions",
+                    "cache_oversize_not_cached",
+                    "entries_current",
+                    "entries_peak",
+                    "bytes_current",
+                    "bytes_peak",
+                    "unique_route_evaluations",
+                )
+            )
+        },
+    }
+
+    assert (
+        _replay_raw_native_control_journal(
+            payload,
+            axis_path=tmp_path / "axis.json",
+            instance=instance,
+        )
+        is None
+    )
+
+    events[3]["requested"] = 1
+    assert _replay_raw_native_control_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "native control budget skip does not replay"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        (None, 0),
+        ("round_remaining", 2),
+        ("exact_remaining", 9),
+        ("available", 2),
+    ),
+)
+def test_current_canonical_budget_skip_replays_actual_round_and_exact_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str | None,
+    value: int,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review
+
+    instance = parse_schneider(
+        Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt"
+    )
+    charging_version = "test-charging-v1"
+    objective_version = "test-objective-v1"
+
+    def native(event_id: int, stream_code: int) -> dict[str, int]:
+        return {
+            "runtime_native_event_id": event_id,
+            "runtime_native_stream_code": stream_code,
+            "runtime_native_event_code": event_id,
+            "runtime_native_lane_id": 0,
+            "runtime_native_operator_id": 0,
+            "runtime_native_iteration": 0,
+            "runtime_native_transaction_id": 41,
+            "runtime_native_subject_id": 0,
+            "runtime_native_status_code": 0,
+            "runtime_native_flags": 0,
+        }
+
+    context = {"lane": "legacy", "iteration": 0, "operator": "relocate"}
+    events: list[dict[str, object]] = [
+        {
+            "semantic_stream": "candidate_transaction",
+            "event_type": "candidate_control_round",
+            "status": "started",
+            "lane": "all",
+            "iteration": 0,
+            "budget": 1,
+        },
+        {
+            "semantic_stream": "candidate_transaction",
+            "event_type": "candidate_plan_decision",
+            **context,
+            "candidate_id": 0,
+            "rank": 1,
+            "status": "selected",
+            "transaction_status_code": 3,
+            "native_transaction_id": 41,
+            "native_telemetry": native(1, 3),
+        },
+    ]
+    for event_id, customer in enumerate(("C1", "C2"), start=2):
+        sequence = (customer,)
+        route_key = canonical_route_key(sequence)
+        events.append(
+            {
+                "semantic_stream": "cache",
+                "event_type": "cache_lookup_result",
+                **context,
+                "candidate_id": 0,
+                "native_transaction_id": 41,
+                "route_key": route_key,
+                "cache_key_digest": RouteCacheKey(
+                    instance_hash=canonical_instance_hash(instance),
+                    customer_sequence=sequence,
+                    charging_configuration_version=charging_version,
+                    objective_schema_version=objective_version,
+                ).digest,
+                "status": "miss",
+                "cache_scope": "committed",
+                "current_entries": 0,
+                "current_bytes": 0,
+                "native_telemetry": native(event_id, 6),
+            }
+        )
+    budget_event: dict[str, object] = {
+        "semantic_stream": "candidate_transaction",
+        "event_type": "candidate_control_budget",
+        **context,
+        "context": "legacy:relocate:candidate_pool",
+        "candidate_id": 0,
+        "native_transaction_id": 41,
+        "transaction_status_code": 3,
+        "status": "budget_skipped",
+        "requested": 2,
+        "granted": 0,
+        "remaining": 1,
+        "round_remaining": 1,
+        "exact_remaining": 10,
+        "available": 1,
+        "native_telemetry": native(4, 3),
+    }
+    if field is not None:
+        budget_event[field] = value
+        if field == "round_remaining":
+            budget_event["remaining"] = value
+    events.extend(
+        [
+            budget_event,
+            {
+                "semantic_stream": "candidate_transaction",
+                "event_type": "candidate_control_round",
+                "status": "completed",
+                "lane": "all",
+                "iteration": 0,
+                "budget": 1,
+                "used": 0,
+                "remainder": 1,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        review,
+        "iter_verified_semantic_journal",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    monkeypatch.setattr(
+        review,
+        "_native_canonical_receipt_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        review,
+        "_replay_physical_telemetry",
+        lambda *_args, **_kwargs: None,
+    )
+    cache_metrics = {
+        "cache_lookups": 2,
+        "cache_hits": 0,
+        "cache_misses": 2,
+        "cache_stores": 0,
+        "cache_evictions": 0,
+        "cache_oversize_not_cached": 0,
+        "entries_current": 0,
+        "entries_peak": 0,
+        "bytes_current": 0,
+        "bytes_peak": 0,
+        "unique_route_evaluations": 2,
+    }
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "canonical_semantic_journal": {"schema_version": "test"},
+        "mode": "full_native_alns",
+        "axis": "fixed_work",
+        "fixed_work_budget": {"exact_calls": 10},
+        "candidate_work_hash": "",
+        "route_result_hash": "",
+        "exact_started_calls": 0,
+        "exact_completed_calls": 0,
+        "exact_interrupted_calls": 0,
+        "candidate_control_statistics": {
+            "enabled": True,
+            "max_exact_calls_per_round": 1,
+            "candidate_decisions": 1,
+            "selected_candidates": 1,
+            "skipped_candidates": 0,
+            "budget_events": 1,
+            "budget_skips": 1,
+            "completed_rounds": 1,
+            "maximum_exact_calls_per_round": 0,
+            "total_round_remainder": 1,
+        },
+        "cache_incremental_statistics": {
+            **cache_metrics,
+            "config": {
+                "enabled": True,
+                "eviction_policy": "lru",
+                "max_entries": 8,
+                "max_memory_bytes": 1_000_000,
+                "charging_configuration_version": charging_version,
+                "objective_schema_version": objective_version,
+                "instance_hash": canonical_instance_hash(instance),
+            },
+            "route_cache": {
+                **cache_metrics,
+                "eviction_policy": "lru",
+                "max_entries": 8,
+                "max_memory_bytes": 1_000_000,
+                "instance_hash": canonical_instance_hash(instance),
+            },
+        },
+    }
+
+    assert _replay_canonical_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == (None if field is None else "native canonical budget skip does not replay")
+
+
+def test_current_canonical_budget_skip_rejects_eviction_reassigned_to_another_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evrptw.experiments import stage052_native_architecture_review as review
+
+    instance = parse_schneider(
+        Path(__file__).resolve().parents[1] / "data/schneider/c101C5.txt"
+    )
+    charging_version = "test-charging-v1"
+    objective_version = "test-objective-v1"
+    first_sequence = ("C30",)
+    second_sequence = ("C12",)
+    first_exact = solve_exact_charging(instance, first_sequence)
+    second_exact = solve_exact_charging(instance, second_sequence)
+    assert first_exact.feasible and second_exact.feasible
+    first_key = canonical_route_key(first_sequence)
+    second_key = canonical_route_key(second_sequence)
+    first_bytes = review.estimate_cache_entry_bytes(first_exact)
+    second_bytes = review.estimate_cache_entry_bytes(second_exact)
+
+    def cache_digest(sequence: tuple[str, ...]) -> str:
+        return RouteCacheKey(
+            instance_hash=canonical_instance_hash(instance),
+            customer_sequence=sequence,
+            charging_configuration_version=charging_version,
+            objective_schema_version=objective_version,
+        ).digest
+
+    native_event_id = 0
+
+    def native(stream_code: int, transaction_id: int, subject_id: int = 0) -> dict[str, int]:
+        nonlocal native_event_id
+        native_event_id += 1
+        return {
+            "runtime_native_event_id": native_event_id,
+            "runtime_native_stream_code": stream_code,
+            "runtime_native_event_code": native_event_id,
+            "runtime_native_lane_id": 0,
+            "runtime_native_operator_id": 0,
+            "runtime_native_iteration": 0,
+            "runtime_native_transaction_id": transaction_id,
+            "runtime_native_subject_id": subject_id,
+            "runtime_native_status_code": 0,
+            "runtime_native_flags": 0,
+        }
+
+    context = {"lane": "legacy", "iteration": 0, "operator": "relocate"}
+    events: list[dict[str, object]] = [
+        {
+            "semantic_stream": "exact_work",
+            "event_type": "exact_batch_started",
+            **context,
+            "customer_sequences": [list(first_sequence)],
+            "requested_calls": 1,
+            "started_calls": 1,
+            "native_telemetry": native(4, 40),
+        },
+        {
+            "semantic_stream": "exact_result",
+            "event_type": "exact_route_result",
+            **context,
+            "route_key": first_key,
+            "exact_started": True,
+            "exact_completed": True,
+            "status": "completed",
+            "feasible": True,
+            "failure_reason": first_exact.failure_reason,
+            "native_telemetry": native(5, 40),
+        },
+        {
+            "semantic_stream": "cache",
+            "event_type": "cache_lifecycle",
+            **context,
+            "candidate_id": 0,
+            "native_transaction_id": 40,
+            "route_key": first_key,
+            "status": "store",
+            "cache_key_digest": cache_digest(first_sequence),
+            "entry_bytes": first_bytes,
+            "current_entries": 1,
+            "current_bytes": first_bytes,
+            "native_telemetry": native(6, 40),
+        },
+        {
+            "semantic_stream": "candidate_transaction",
+            "event_type": "candidate_control_round",
+            "status": "started",
+            "lane": "all",
+            "iteration": 0,
+            "budget": 1,
+        },
+        {
+            "semantic_stream": "candidate_transaction",
+            "event_type": "candidate_plan_decision",
+            **context,
+            "candidate_id": 0,
+            "rank": 1,
+            "status": "selected",
+            "transaction_status_code": 3,
+            "native_transaction_id": 41,
+            "native_telemetry": native(3, 41),
+        },
+    ]
+    for customer in ("C1", "C2"):
+        sequence = (customer,)
+        events.append(
+            {
+                "semantic_stream": "cache",
+                "event_type": "cache_lookup_result",
+                **context,
+                "candidate_id": 0,
+                "native_transaction_id": 41,
+                "route_key": canonical_route_key(sequence),
+                "cache_key_digest": cache_digest(sequence),
+                "status": "miss",
+                "cache_scope": "committed",
+                "current_entries": 1,
+                "current_bytes": first_bytes,
+                "native_telemetry": native(6, 41),
+            }
+        )
+    events.extend(
+        [
+            {
+                "semantic_stream": "candidate_transaction",
+                "event_type": "candidate_control_budget",
+                **context,
+                "context": "legacy:relocate:candidate_pool",
+                "candidate_id": 0,
+                "native_transaction_id": 41,
+                "transaction_status_code": 3,
+                "status": "budget_skipped",
+                "requested": 2,
+                "granted": 0,
+                "remaining": 1,
+                "round_remaining": 1,
+                "exact_remaining": 9,
+                "available": 1,
+                "native_telemetry": native(3, 41),
+            },
+            {
+                "semantic_stream": "candidate_transaction",
+                "event_type": "candidate_plan_decision",
+                **context,
+                "candidate_id": 1,
+                "rank": 2,
+                "status": "selected",
+                "transaction_status_code": 5,
+                "native_transaction_id": 41,
+                "native_telemetry": native(3, 41, 1),
+            },
+            {
+                "semantic_stream": "cache",
+                "event_type": "cache_lifecycle",
+                **context,
+                "candidate_id": 0,
+                "native_transaction_id": 41,
+                "route_key": first_key,
+                "status": "evict",
+                "cache_key_digest": cache_digest(first_sequence),
+                "current_entries": 1,
+                "current_bytes": second_bytes,
+                "native_telemetry": native(6, 41),
+            },
+            {
+                "semantic_stream": "exact_work",
+                "event_type": "exact_batch_started",
+                **context,
+                "customer_sequences": [list(second_sequence)],
+                "requested_calls": 1,
+                "started_calls": 1,
+                "native_telemetry": native(4, 41, 1),
+            },
+            {
+                "semantic_stream": "exact_result",
+                "event_type": "exact_route_result",
+                **context,
+                "route_key": second_key,
+                "exact_started": True,
+                "exact_completed": True,
+                "status": "completed",
+                "feasible": True,
+                "failure_reason": second_exact.failure_reason,
+                "native_telemetry": native(5, 41, 1),
+            },
+            {
+                "semantic_stream": "cache",
+                "event_type": "cache_lifecycle",
+                **context,
+                "candidate_id": 1,
+                "native_transaction_id": 41,
+                "route_key": second_key,
+                "status": "store",
+                "cache_key_digest": cache_digest(second_sequence),
+                "entry_bytes": second_bytes,
+                "current_entries": 1,
+                "current_bytes": second_bytes,
+                "native_telemetry": native(6, 41, 1),
+            },
+            {
+                "semantic_stream": "candidate_transaction",
+                "event_type": "candidate_control_round",
+                "status": "completed",
+                "lane": "all",
+                "iteration": 0,
+                "budget": 1,
+                "used": 1,
+                "remainder": 0,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        review,
+        "iter_verified_semantic_journal",
+        lambda *_args, **_kwargs: iter(events),
+    )
+    monkeypatch.setattr(review, "_native_canonical_receipt_error", lambda *_args: None)
+    monkeypatch.setattr(review, "_replay_physical_telemetry", lambda *_args: None)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "canonical_semantic_journal": {"schema_version": "test"},
+        "mode": "full_native_alns",
+        "axis": "fixed_work",
+        "fixed_work_budget": {"exact_calls": 10},
+        "candidate_work_hash": "",
+        "route_result_hash": "",
+        "exact_started_calls": 2,
+        "exact_completed_calls": 2,
+        "exact_interrupted_calls": 0,
+        "candidate_control_statistics": {
+            "enabled": True,
+            "max_exact_calls_per_round": 1,
+            "candidate_decisions": 2,
+            "selected_candidates": 2,
+            "skipped_candidates": 0,
+            "budget_events": 1,
+            "budget_skips": 1,
+            "completed_rounds": 1,
+            "maximum_exact_calls_per_round": 1,
+            "total_round_remainder": 0,
+        },
+        "cache_incremental_statistics": {
+            "cache_lookups": 2,
+            "cache_hits": 0,
+            "cache_misses": 2,
+            "cache_stores": 2,
+            "cache_evictions": 1,
+            "cache_oversize_not_cached": 0,
+            "entries_current": 1,
+            "entries_peak": 1,
+            "bytes_current": second_bytes,
+            "bytes_peak": max(first_bytes, second_bytes),
+            "unique_route_evaluations": 4,
+            "config": {
+                "enabled": True,
+                "eviction_policy": "lru",
+                "max_entries": 1,
+                "max_memory_bytes": 1_000_000,
+                "charging_configuration_version": charging_version,
+                "objective_schema_version": objective_version,
+                "instance_hash": canonical_instance_hash(instance),
+            },
+        },
+    }
+
+    assert _replay_canonical_journal(
+        payload,
+        axis_path=tmp_path / "axis.json",
+        instance=instance,
+    ) == "cache eviction transaction does not match pending store"
 
 
 @pytest.mark.parametrize("missing_stream", sorted(_REQUIRED_CAUSAL_STREAMS))
@@ -2872,7 +4494,7 @@ def test_campaign_gate_requires_signed_qualified_calibration_review(
         "raw_axis_schema_versions": [SCHEMA_VERSION],
         "telemetry_raw_axis_schema_versions": [SCHEMA_VERSION],
         "resource_evidence_schema_versions": [
-            "stage05.2-calibration-resource-evidence-v4"
+            "stage05.2-calibration-resource-evidence-v5"
         ],
         "reviewer_source_sha256": "3" * 64,
         "review_seconds": 1.0,

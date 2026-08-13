@@ -12,15 +12,13 @@ import argparse
 import hashlib
 import json
 import math
-import multiprocessing
 import os
 import re
 import statistics
 import subprocess
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
@@ -34,6 +32,7 @@ from evrptw.experiments.stage052_native_architectures import (
     _assign_performance_topology,
     _iter_semantic_candidate_trajectory,
     _row_evidence,
+    _run_fresh_spawn_axis_batch,
     _run_mode,
     _runtime_cgroup_snapshot,
     _runtime_io_accounting,
@@ -74,7 +73,10 @@ from evrptw.stage052_performance import (
 from evrptw.stage052_semantic_journal import evidence_json_value
 
 FAILURE_SCHEMA_VERSION: Final = "stage05.2-performance-observation-failure-v1"
-RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v4"
+RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = "stage05.2-calibration-resource-evidence-v5"
+TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
+    "stage05.2-calibration-resource-evidence-v4"
+)
 PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION: Final = (
     "stage05.2-calibration-resource-evidence-v3"
 )
@@ -313,6 +315,7 @@ def _process_tree_resource_statistics(
         LEGACY_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PREVIOUS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         PROCESS_RESOURCE_EVIDENCE_SCHEMA_VERSION,
+        TICK_RESOURCE_EVIDENCE_SCHEMA_VERSION,
         RESOURCE_EVIDENCE_SCHEMA_VERSION,
     }:
         raise PerformanceObservationError("resource evidence schema is invalid")
@@ -1046,9 +1049,11 @@ def execute_mode_block(
     if cgroup_before.get("status") != "available":
         raise PerformanceObservationError("calibration cgroup accounting is unavailable")
     scheduler_statistics: Mapping[str, object] | None = None
+    scheduler_terminal_io_receipts: list[dict[str, object]] = []
     scheduler_pid: int | None = None
     scheduler_task_receipt_path: Path | None = None
     paths: list[Path] = []
+    terminal_io_by_path: dict[Path, list[dict[str, object]]] = {}
     parent_terminal_seconds: dict[Path, float] = {}
     started = time.perf_counter()
     sample_interval_seconds = (
@@ -1075,49 +1080,65 @@ def execute_mode_block(
                 scheduler.start()
                 scheduler_pid = scheduler.process_id
                 monitor.register_additional_root(scheduler_pid)
-            with ProcessPoolExecutor(
-                max_workers=shard_count,
-                mp_context=multiprocessing.get_context("spawn"),
-                max_tasks_per_child=1,
-            ) as executor:
-                for wave_index in range(wave_count):
-                    wave_role = role if wave_count == 1 else f"{role}-wave{wave_index + 1}"
-                    tasks = tuple(
-                        _task(
-                            receipt=receipt,
-                            repeat=repeat,
-                            instance_name=instance_name,
-                            seed=seed,
-                            benchmark_dir=benchmark_dir,
-                            output_root=output_root,
-                            warm_start=warm_start,
-                            mode=mode,
-                            topology=topology,
-                            topology_id=topology_id,
-                            role=wave_role,
-                            shard_index=index,
-                            scheduler_socket_path=str(scheduler_socket),
-                        )
-                        for index in range(shard_count)
+            for wave_index in range(wave_count):
+                wave_role = role if wave_count == 1 else f"{role}-wave{wave_index + 1}"
+                tasks = tuple(
+                    _task(
+                        receipt=receipt,
+                        repeat=repeat,
+                        instance_name=instance_name,
+                        seed=seed,
+                        benchmark_dir=benchmark_dir,
+                        output_root=output_root,
+                        warm_start=warm_start,
+                        mode=mode,
+                        topology=topology,
+                        topology_id=topology_id,
+                        role=wave_role,
+                        shard_index=index,
+                        scheduler_socket_path=str(scheduler_socket),
                     )
-                    futures: dict[Future[str], float] = {}
-                    for task in tasks:
-                        submitted = time.perf_counter()
-                        future = executor.submit(
-                            _run_mode,
-                            replace(task, scheduler_process_id=scheduler_pid),
-                            mode,
+                    for index in range(shard_count)
+                )
+                outcomes = _run_fresh_spawn_axis_batch(
+                    tasks,
+                    mode,
+                    scheduler_process_id=scheduler_pid,
+                )
+                for outcome in outcomes:
+                    if outcome.error is not None:
+                        raise outcome.error
+                    if outcome.result is None:
+                        raise AssertionError("successful calibration axis has no result")
+                    raw_path, terminal_io = outcome.result
+                    path = Path(raw_path)
+                    if path in terminal_io_by_path:
+                        raise PerformanceObservationError(
+                            "calibration worker terminal I/O path is duplicated"
                         )
-                        futures[future] = submitted
-                    for future in as_completed(futures):
-                        path = Path(future.result())
-                        paths.append(path)
-                        parent_terminal_seconds[path] = time.perf_counter() - futures[future]
+                    paths.append(path)
+                    if not terminal_io:
+                        raise PerformanceObservationError(
+                            "calibration worker terminal I/O receipts are empty"
+                        )
+                    terminal_io_by_path[path] = terminal_io
+                    parent_terminal_seconds[path] = outcome.parent_terminal_seconds
         finally:
             if scheduler is not None:
                 scheduler.close()
+                scheduler_terminal_io_receipts.append(
+                    scheduler.terminal_process_io_receipt
+                )
                 scheduler_statistics = _scheduler_runtime_summary(scheduler.runtime_statistics)
     elapsed = time.perf_counter() - started
+    if len(terminal_io_by_path) != shard_count * wave_count:
+        raise PerformanceObservationError("calibration worker terminal I/O inventory is incomplete")
+    monitor.apply_terminal_process_io_receipts(
+        [
+            *(receipt for receipts in terminal_io_by_path.values() for receipt in receipts),
+            *scheduler_terminal_io_receipts,
+        ]
+    )
     resource_statistics = monitor.statistics(
         elapsed_seconds=elapsed,
         compute_thread_limit=len(topology.cpu_ids),
@@ -1134,6 +1155,7 @@ def execute_mode_block(
     payloads: list[Mapping[str, object]] = []
     inventory: list[Mapping[str, object]] = []
     axis_timings: list[dict[str, object]] = []
+    bound_terminal_io: list[dict[str, object]] = []
     replay_started = time.perf_counter()
     from evrptw.experiments.stage052_performance_calibration_review import (
         _review_raw_axis,
@@ -1167,6 +1189,14 @@ def execute_mode_block(
         enriched_payload["end_to_end_seconds"] = axis_end_to_end_seconds
         payloads.append(enriched_payload)
         inventory.append(item)
+        bound_terminal_io.extend(
+            {
+                "axis_relative_path": item["relative_path"],
+                "axis_sha256": item["sha256"],
+                **terminal_io,
+            }
+            for terminal_io in terminal_io_by_path[path]
+        )
         axis_timings.append(
             {
                 "relative_path": item["relative_path"],
@@ -1217,6 +1247,8 @@ def execute_mode_block(
         "worker_max_tasks_per_child": 1,
         "axis_relative_paths": [item["relative_path"] for item in inventory],
         "axis_timings": axis_timings,
+        "worker_terminal_io_receipts": bound_terminal_io,
+        "scheduler_terminal_io_receipts": scheduler_terminal_io_receipts,
     }
     return BlockExecution(
         elapsed,

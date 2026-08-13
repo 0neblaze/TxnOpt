@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
+import evrptw.alns as alns_module
 from evrptw.alns import solve_alns
 from evrptw.artifacts import (
     ArtifactBundleWriter,
@@ -13,13 +15,14 @@ from evrptw.artifacts import (
     ArtifactRunContext,
     verify_manifest,
 )
-from evrptw.cache_incremental import CacheIncrementalConfig
+from evrptw.cache_incremental import CacheIncrementalConfig, RouteEvaluationCache
 from evrptw.candidate_control import (
     CandidateControlConfig,
     CandidateControlRuntime,
     CandidateParallelExecutionError,
     CandidatePlan,
 )
+from evrptw.cpu_batch import ExactChargingBackend
 from evrptw.exact_deadline import ExactDeadlineConfig
 from evrptw.experiments.stage02_route_reduction import FORMAL_INSTANCES, FORMAL_SEEDS
 from evrptw.experiments.stage033_exact_deadline import persist_paired_diagnostic
@@ -40,6 +43,7 @@ from evrptw.experiments.stage034_control_parallel_review import (
 )
 from evrptw.measurement import CheapScreeningConfig, MeasurementConfig
 from evrptw.models import Instance, Node, NodeType, Vehicle
+from evrptw.runtime_envelope import drain_descendant_terminal_process_io_receipts
 
 
 def _instance() -> Instance:
@@ -88,6 +92,21 @@ def test_candidate_control_is_opt_in_and_requires_cpu_batch() -> None:
             candidate_control_config=config,
         )
 
+
+def test_candidate_pool_emits_one_terminal_io_receipt_per_started_worker() -> None:
+    assert drain_descendant_terminal_process_io_receipts() == ()
+    runtime = CandidateControlRuntime(CandidateControlConfig(worker_count=1))
+    pool = runtime._ensure_pool()  # noqa: SLF001
+    worker_pid = pool.submit(os.getpid).result(timeout=10.0)
+
+    runtime.close()
+
+    receipts = drain_descendant_terminal_process_io_receipts()
+    assert len(receipts) == 1
+    assert receipts[0]["pid"] == worker_pid
+    assert receipts[0]["parent_pid"] == os.getpid()
+    assert receipts[0]["read_bytes"] >= 0
+    assert receipts[0]["write_bytes"] >= 0
 
 def test_inherited_initial_solution_is_exactly_revalidated() -> None:
     initial = (("C1", "C3"), ("C2",))
@@ -216,6 +235,165 @@ def test_complete_plan_ranking_is_vehicle_first_and_budget_is_atomic() -> None:
     ) == (plans[0],)
     assert runtime.reserve(3, atomic=True, context="complete_candidate") == 0
     assert runtime.round_remaining == 2
+
+
+def test_atomic_exact_limit_skip_does_not_consume_round_budget() -> None:
+    runtime = CandidateControlRuntime(
+        CandidateControlConfig(
+            proposal_top_k=1,
+            max_exact_calls_per_round=2,
+            worker_count=1,
+        )
+    )
+    runtime.begin_round(7)
+    remaining_before = runtime.round_remaining
+
+    granted, reason = runtime.reserve_atomic_with_exact_limit(
+        1,
+        exact_remaining=0,
+        context="constraint:test:single_route",
+    )
+
+    assert granted == 0
+    assert reason == "global_budget_atomic_skip"
+    assert runtime.round_remaining == remaining_before
+    assert runtime.events[-1] == {
+        "event_type": "candidate_control_budget",
+        "status": "budget_skipped",
+        "context": "constraint:test:single_route",
+        "requested": 1,
+        "granted": 0,
+        "remaining": 2,
+        "round_remaining": 2,
+        "exact_remaining": 0,
+        "available": 0,
+        "iteration": 7,
+    }
+
+
+def test_single_route_atomic_skip_does_not_consume_either_budget() -> None:
+    exact_config = ExactDeadlineConfig.fixed_exact_calls(1, watchdog_seconds=10.0)
+    exact_controller = alns_module.ExactCallController(exact_config, started_calls=1)
+    runtime = CandidateControlRuntime(
+        CandidateControlConfig(
+            proposal_top_k=1,
+            max_exact_calls_per_round=2,
+            worker_count=1,
+        )
+    )
+    runtime.begin_round(7, lane="constraint")
+    evaluator = alns_module._Evaluator(
+        _instance(),
+        deadline=float("inf"),
+        exact_call_controller=exact_controller,
+        candidate_control_runtime=runtime,
+    )
+    evaluator.lane = "constraint"
+    evaluator.iteration = 7
+    evaluator.operator = "test"
+
+    result = evaluator.route(("C1",))
+
+    assert not result.feasible
+    assert result.failure_reason == "candidate_control:global_budget_atomic_skip"
+    assert runtime.round_remaining == 2
+    assert exact_controller.started_calls == 1
+    assert runtime.events[-1]["context"] == "constraint:test:single_route"
+    assert runtime.events[-1]["granted"] == 0
+
+
+def _candidate_prefix_evaluator(
+    *,
+    cached_sequence: tuple[str, ...],
+) -> tuple[
+    alns_module._Evaluator,
+    CandidateControlRuntime,
+    alns_module.ExactCallController,
+]:
+    instance = _instance()
+    cache_config = CacheIncrementalConfig(
+        enabled=True,
+        max_entries=64,
+        max_memory_bytes=1_000_000,
+    )
+    route_cache = RouteEvaluationCache(instance, cache_config)
+    prewarm = alns_module._Evaluator(
+        instance,
+        deadline=float("inf"),
+        cache_incremental_config=cache_config,
+        route_cache=route_cache,
+    )
+    assert prewarm.route(cached_sequence).feasible
+    exact_controller = alns_module.ExactCallController(
+        ExactDeadlineConfig.fixed_exact_calls(10, watchdog_seconds=10.0)
+    )
+    runtime = CandidateControlRuntime(
+        CandidateControlConfig(
+            proposal_top_k=1,
+            max_exact_calls_per_round=1,
+            worker_count=1,
+        )
+    )
+    runtime.begin_round(7, lane="legacy")
+    evaluator = alns_module._Evaluator(
+        instance,
+        deadline=float("inf"),
+        cache_incremental_config=cache_config,
+        route_cache=route_cache,
+        backend=ExactChargingBackend.CPU_BATCH,
+        exact_call_controller=exact_controller,
+        candidate_control_runtime=runtime,
+    )
+    evaluator.iteration = 7
+    evaluator.operator = "test"
+    return evaluator, runtime, exact_controller
+
+
+def test_internal_candidate_stops_after_first_budget_skipped_miss_group() -> None:
+    evaluator, runtime, exact_controller = _candidate_prefix_evaluator(
+        cached_sequence=("C3",),
+    )
+
+    result = evaluator.solution(
+        (("C1",), ("C2",), ("C3",), ("C1", "C2")),
+        precomputed_routes={},
+    )
+
+    assert not result.feasible
+    assert result.charging[0].failure_reason == "candidate_control:round_budget_exhausted"
+    assert result.charging[1].failure_reason == "candidate_control:round_budget_exhausted"
+    assert result.charging[2].feasible
+    assert result.charging[3].failure_reason == "candidate_control:round_budget_exhausted"
+    assert exact_controller.started_calls == 0
+    assert runtime.round_remaining == 1
+    assert runtime.candidate_work == ()
+
+
+def test_internal_candidate_commits_exact_prefix_before_later_budget_skip() -> None:
+    evaluator, runtime, exact_controller = _candidate_prefix_evaluator(
+        cached_sequence=("C2",),
+    )
+
+    result = evaluator.solution(
+        (("C1",), ("C2",), ("C1", "C2"), ("C3",)),
+        precomputed_routes={},
+    )
+
+    assert not result.feasible
+    assert result.charging[0].feasible
+    assert result.charging[1].feasible
+    assert result.charging[2].failure_reason == "candidate_control:round_budget_exhausted"
+    assert result.charging[3].failure_reason == "candidate_control:round_budget_exhausted"
+    assert exact_controller.started_calls == 1
+    assert runtime.round_remaining == 0
+    assert runtime.candidate_work == (
+        {
+            "lane": "legacy",
+            "iteration": 7,
+            "operator": "test",
+            "sequences": [["C1"]],
+        },
+    )
 
 
 def test_route_candidate_projection_is_pure_until_explicit_commit() -> None:
