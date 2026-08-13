@@ -53,6 +53,10 @@ cloud purchase, public alpha, or manuscript submission.
 - The 32-physical-core estimate for the provisional 1200-work/3-second matrix
   is about 4,387 seconds (1.22 hours), but this does not authorize purchase:
   the EVRPTW performance gate and final budget freeze remain open.
+- Independent T3/T4 review Attempt01 reports `NEEDS_WORK`. TLC continues to
+  support bounded T1/T2 safety only; the current T4 physical-window
+  interpretation undercounts completed but unpublished atomic-batch work, and
+  the per-candidate formal model lacks a proved mapping to the batch runtime.
 
 ## 3. Target repository and dependency structure
 

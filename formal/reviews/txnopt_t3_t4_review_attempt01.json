@@ -1,0 +1,77 @@
+{
+  "schema_version": "txnopt-formal-independent-review-v1",
+  "run_label": "txnopt_t3_t4_review_attempt01",
+  "status": "NEEDS_WORK",
+  "review_scope": {
+    "proofs_path": "formal/proofs.md",
+    "proofs_sha256": "2f0fa01f02dc4355a4e02109bc9cad852eb0d231ae3982a63779abee9f57ac01",
+    "mapping_path": "formal/refinement-mapping.md",
+    "mapping_sha256": "7c5e6154b47c524057d5a0d663134366a92e82ce899be6e3d3f46a1ecbc43947",
+    "model_receipt_path": "formal/model-check-receipt.json",
+    "model_receipt_sha256": "8137f6c2297bf9ef8735c64bbba14c072254329b7259a75a6067700733fba05b"
+  },
+  "classifications": {
+    "t3": "NEEDS_WORK",
+    "t4_arithmetic_under_assumptions": "PASS",
+    "t4_runtime_refinement": "FAIL_NEEDS_WORK",
+    "refinement_mapping": "NEEDS_WORK",
+    "model_check": "TLC_SAFETY_PASS_ONLY"
+  },
+  "findings": [
+    {
+      "id": "T3-PREDICATES",
+      "severity": "critical",
+      "summary": "T3 lacks formal predicates, quantifiers, and an exhaustive execution-model split"
+    },
+    {
+      "id": "T4-ATOMIC-WINDOW",
+      "severity": "critical",
+      "summary": "the physical speculation window undercounts completed but unpublished work in an atomic candidate batch"
+    },
+    {
+      "id": "T4-NATIVE-BATCH",
+      "severity": "critical",
+      "summary": "the native internal-parallel batch bypasses the Python ordered speculation window"
+    },
+    {
+      "id": "T4-PARAMETER-BINDING",
+      "severity": "critical",
+      "summary": "Qmax and Cmax are declared inputs rather than measured and receipt-bound runtime quantities"
+    },
+    {
+      "id": "REFINEMENT-GRANULARITY",
+      "severity": "critical",
+      "summary": "the per-candidate TLA model is not related to the aggregate Python CandidateTxn by a simulation proof"
+    },
+    {
+      "id": "TLC-LIVENESS",
+      "severity": "major",
+      "summary": "the checked configurations contain safety invariants but no liveness property or fairness assumption"
+    }
+  ],
+  "counterexample": {
+    "execution_mode": "ordered",
+    "workers": 4,
+    "speculation_window": 4,
+    "atomic_admission_limit": 64,
+    "work_units_per_candidate": 1,
+    "remaining_budget": 100,
+    "failure_candidate_index": 60,
+    "started_candidate_count": 61,
+    "claimed_window_bound_units": 4,
+    "result": "BOUND_VIOLATION_UNDER_PHYSICAL_WINDOW_INTERPRETATION"
+  },
+  "required_corrections": [
+    "define the T3 state generator, canonical serial trace, predicates, quantifiers, and allowed scheduler class",
+    "bind T4 W to the whole uncommitted transaction or enforce an admission/commit boundary that is no larger than W",
+    "measure and bind Qmax, Cmax, native batch size, and physical parallelism to receipts",
+    "supply a batch-to-candidate refinement relation or change the formal model to the runtime transaction granularity",
+    "bind the proof and mapping hashes in an independent successor review receipt"
+  ],
+  "claim_boundary": {
+    "t1_t2_bounded_safety_unchanged": true,
+    "t3_t4_gate_passed": false,
+    "level1_ready": false,
+    "level2_positive_entry_open": false
+  }
+}

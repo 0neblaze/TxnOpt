@@ -17,7 +17,10 @@ python tools/verify_txnopt_formal.py \
   --tla2tools /path/to/tla2tools.jar
 ```
 
-The bounded TLA+/PlusCal checks are complete for four candidates. The formal
-package is not independently accepted until a reviewer signs the refinement
-mapping and T1--T4 proof package. Measured `Qmax` and `Cmax` are also required
-before T4 may support a positive performance claim.
+The bounded TLA+/PlusCal safety checks are complete for four candidates. They
+do not check liveness or establish T3/T4. Independent review Attempt01 is
+retained under `formal/reviews/` with status `NEEDS_WORK`: it found a mismatch
+between the physical speculation window and the larger atomic batch rollback
+boundary, plus an unproved per-candidate-to-batch refinement. Measured `Qmax`
+and `Cmax` are also required before T4 may support a positive performance
+claim.

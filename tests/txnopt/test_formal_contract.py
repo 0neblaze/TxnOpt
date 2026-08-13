@@ -35,6 +35,24 @@ def test_formal_receipt_binds_checked_in_models_and_generated_translation() -> N
     assert receipt["model_check"]["pluscal"]["distinct_states"] == 16_480
 
 
+def test_first_independent_t3_t4_review_is_signed_and_fail_closed() -> None:
+    path = ROOT / "formal/reviews/txnopt_t3_t4_review_attempt01.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    review = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert review["status"] == "NEEDS_WORK"
+    assert review["classifications"]["model_check"] == "TLC_SAFETY_PASS_ONLY"
+    assert review["classifications"]["t4_runtime_refinement"] == "FAIL_NEEDS_WORK"
+    assert review["counterexample"]["started_candidate_count"] > (
+        review["counterexample"]["claimed_window_bound_units"]
+    )
+    assert review["claim_boundary"]["t3_t4_gate_passed"] is False
+
+
 def test_first_generation_protocol_identities_are_exact() -> None:
     assert (
         CONTRACT_VERSION,
