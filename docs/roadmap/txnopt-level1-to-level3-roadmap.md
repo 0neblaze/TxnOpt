@@ -60,11 +60,12 @@ cloud purchase, public alpha, or manuscript submission.
   four-worker geometric-mean speedup is 1.35x for EVRPTW and 2.13x for RCPSP;
   maximum one-worker overhead is 2.68%. These local gates pass, but Attempt17
   is not full Level 1 evidence and does not authorize cloud procurement.
-- The active post-Build09 source deepens `cpp/txnopt_core` with a prepared native
+- Clean Build10 freezes the post-Build09 source that deepens `cpp/txnopt_core` with a prepared native
   phase machine, complete-work reservation, atomic cache delta, and semantic
-  phase receipt. That changes the source/native identity. Build09, Attempt17,
-  and formal-plan Attempt18 remain immutable evidence but are not successor
-  evidence for this implementation.
+  phase receipt. Its build, installed-wheel, sanitizer, protected-history, and
+  100,000-round resource gates pass. Build09, Attempt17, and formal-plan
+  Attempt18 remain immutable evidence but are not successor evidence for this
+  implementation; Build10's additive refinement review remains pending.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -285,14 +286,15 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
-Current gate status: **successor build and pre-cloud evidence required; purchase
-and execution remain unauthorized**. Build09-bound calibration Attempt17 passed
+Current gate status: **Build10 is complete; successor formal review, calibration,
+and pre-cloud evidence remain required; purchase and execution are unauthorized**.
+Build09-bound calibration Attempt17 passed
 the representative EVRPTW and RCPSP performance thresholds at 1.35x and 2.13x
 with 100% fixed-work semantic/objective parity, zero fallback, and 2.68% maximum
-one-worker overhead. Those facts remain valid for Build09 only. The active
-native transaction source requires a new clean build, local calibration,
-runtime estimate, formal plan, and pre-cloud decision before procurement can be
-considered again.
+one-worker overhead. Those facts remain valid for Build09 only. Build10 now
+freezes the active native transaction source, but still requires an independent
+successor refinement review, new local calibration, runtime estimate, formal
+plan, and pre-cloud decision before procurement can be considered again.
 
 The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree

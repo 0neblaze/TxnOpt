@@ -38,6 +38,13 @@ a new formal identity, so Attempt18 may not be launched as successor evidence.
 Its analysis was preregistered in
 `level1-analysis-protocol-v1.json`. Structural preflight is read-only:
 
+Build10 now freezes that active solver source as
+`manifests/txnopt_level1_build_attempt10.json`. Build09 calibration Attempt17,
+formal plan Attempt18, and pre-cloud gate Attempt01 remain immutable but cannot
+authorize Build10. The Build10 prepared native-receipt refinement is explicitly
+pending independent review; its fresh calibration, formal plan, and pre-cloud
+receipt must use new attempt identities.
+
 ```bash
 python -m tools.run_txnopt_level1_campaign preflight \
   --plan-manifest /home/oneblaze/txnopt-plans/level1-formal-plan-attempt18/manifest.json \

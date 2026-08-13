@@ -273,3 +273,27 @@ def test_build08_calibration_is_complete_but_does_not_open_the_cloud_matrix() ->
         "PASS_REPRESENTATIVE_ONLY"
     )
     assert manifest["decision"]["formal_cloud_matrix_authorized"] is False
+
+
+def test_tenth_build_receipt_keeps_the_successor_formal_gate_open() -> None:
+    path = ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt10.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer"]["revision"].startswith("3e18b99")
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["validation"]["pytest_wheel_installed"]["passed"] == 174
+    assert manifest["validation"]["asan_ubsan"]["status"] == "PASS"
+    assert manifest["validation"]["tsan"]["status"] == "PASS"
+    assert manifest["formal_successor"]["prior_review_binding_status"] == (
+        "PRIOR_SOURCE_ONLY"
+    )
+    assert manifest["formal_successor"]["successor_status"] == (
+        "REVIEW_PENDING_BUILD10"
+    )
+    assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False

@@ -17,10 +17,10 @@ The earlier local EVRPTW roadmap remains ignored historical planning input.
   known unique failure; it is not a successful benchmark result.
 - TxnOpt Level 1 implementation is in progress on `codex/txnopt-level1`.
 - Clean Build Attempt09 and its Attempt17/Attempt18 pre-cloud chain remain
-  immutable prior evidence. The active source now deepens the native prepared
-  transaction/reservation/cache-delta/trace path, so that chain no longer
-  qualifies a future run of the active implementation. A clean successor build,
-  calibration, formal plan, and pre-cloud receipt are required.
+  immutable prior evidence. Clean Build10 now binds the active native prepared
+  transaction/reservation/cache-delta/trace path. Its additive refinement note
+  remains pending independent review, and a new calibration, formal plan, and
+  pre-cloud receipt are required.
 - The corrected aggregate T1/T2 and conditional T3/T4 package passes its current
   independent formal review. Legacy compatibility Attempt01 resolves the old
   timeout while retaining the immutable historical source-receipt mismatch.

@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | successor build/pre-cloud evidence required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration retained; Attempt18 raw root absent and plan superseded for active source | successor formal identity pending |
+| `txnopt-level1-protocol-v1` | Build10 complete; successor review/calibration/pre-cloud evidence required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration retained; Attempt18 raw root absent and superseded for active source | Build10 native-receipt refinement review pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -58,7 +58,7 @@ sanitizer, 100,000-round resource, formal replay, legacy, and protected-path
 gates pass. The correction is only `READY_FOR_INDEPENDENT_REVIEW`; measured
 finite `Cmax`, the EVRPTW speedup gate, and the Level 1 matrix remain open.
 
-Build Attempt08 is the current clean internal artifact. It adds a bounded,
+Build Attempt08 was the clean internal artifact for its source. It adds a bounded,
 solve-local cache for independently reconstructed EVRPTW route reports. The
 cache rejects cross-instance reuse, keeps solution-level customer coverage
 outside the cache, and changes only physical statistics. Its 117 tests, wheel,
@@ -128,6 +128,17 @@ The signed Build09 local decision is
 execution, holdout access, Level 1 readiness, and public release false. The
 post-Build09 native prepared-transaction change supersedes that procurement
 gate for the active source; the receipt itself remains immutable.
+
+Build Attempt10 is the current clean internal artifact. It binds the generic
+prepared transaction in `cpp/txnopt_core`, complete-work reservation, prepared
+cache-delta receipt, one-shot physical-trace drain, and independent native-round
+receipt replay to source revision `3e18b99`. Its installed-wheel tests (174),
+five property suites (600 generated examples), Ruff, strict mypy, wheel RECORD,
+legacy verifier, ASan/UBSan, TSan, protected-history comparison, and 100,000-round
+resource soak pass with zero fallback. The signed Attempt04/05 formal package is
+retained only for its prior source: the additive Build10 refinement note is
+`REVIEW_PENDING_BUILD10`. Therefore no local calibration, formal plan, pre-cloud
+gate, purchase, or Level 1 readiness is inherited from Build09.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
