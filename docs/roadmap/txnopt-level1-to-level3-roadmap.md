@@ -146,9 +146,11 @@ after proving equivalence to the canonical round stream.
 
 - [x] Establish the generic, case, evidence, and legacy Python namespaces and
   both C++ source roots. This is a structural boundary, not an active solver.
-- [ ] Migrate EVRPTW model, parser, objective, validator, charging, and
-  neighborhoods behind `txnopt_cases.evrptw` without duplicating the formal
+- [x] Migrate the EVRPTW model, parser, objective, validator, and exact-charging
+  oracle behind `txnopt_cases.evrptw` without duplicating the formal
   vehicle-first objective.
+- [ ] Migrate the active EVRPTW neighborhood surface after its incremental,
+  measurement, and native protocols have been separated from the old module.
 - [ ] Split producer-only runners from independent raw-only reviewers in
   `txnopt_evidence` and eliminate mutual imports.
 - [x] Freeze the old repository instructions under tracked legacy governance,
@@ -159,13 +161,13 @@ after proving equivalence to the canonical round stream.
 
 ### Weeks 3-4: Python runtime and EVRPTW adapter
 
-- [ ] Implement a single live `TxnRuntime` state owner around a deterministic
+- [x] Implement a single live `TxnRuntime` state owner around a deterministic
   random tape and canonical candidate order.
-- [ ] Centralize budget reservation/settlement, cache staging, commit, rollback,
+- [x] Centralize budget reservation/settlement, cache staging, commit, rollback,
   and trace emission in the runtime.
-- [ ] Implement serial, barrier, and ordered transaction modes against the same
+- [x] Implement serial, barrier, and ordered transaction modes against the same
   contract.
-- [ ] Keep EVRPTW objective and validation exclusively in the case adapter and
+- [x] Keep EVRPTW objective and validation exclusively in the case adapter and
   verify them differentially against the frozen implementation.
 
 ### Weeks 4-5: new native round ABI
@@ -182,11 +184,11 @@ after proving equivalence to the canonical round stream.
 
 ### Weeks 5-6: RCPSP and formal model
 
-- [ ] Represent RCPSP state as a precedence-feasible activity order plus mode
+- [x] Represent RCPSP state as a precedence-feasible activity order plus mode
   vector.
-- [ ] Implement safe precedence/resource lower-bound screening, block
+- [x] Implement safe precedence/resource lower-bound screening, block
   remove/reinsert, and mode change.
-- [ ] Use fixed-seed single-thread CP-SAT exact repair and reconstruct every
+- [x] Use fixed-seed single-thread CP-SAT exact repair and reconstruct every
   schedule in an independent validator; the objective is feasible makespan.
 - [ ] Complete T1/T2 proof and model checking. Produce independently reviewable
   T3/T4 proofs. Close the positive Level 2 entry if T3 fails or T4 is vacuous at

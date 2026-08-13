@@ -152,6 +152,12 @@ class Oracle[OracleCandidateT, OracleStateT, OracleObjectiveT](Protocol):
 
         ...
 
+    @property
+    def parallel_safe(self) -> bool:
+        """Declare whether independent batch calls may overlap safely."""
+
+        ...
+
     def stable_key(self, candidate: OracleCandidateT) -> str:
         """Return the canonical cache and deduplication key."""
 

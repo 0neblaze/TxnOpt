@@ -6,7 +6,8 @@ from collections.abc import Sequence
 import pytest
 
 from txnopt import RunConfig
-from txnopt.runtime import RuntimeContractError, SerialTxnRuntime
+from txnopt._internal.cache import CacheLookup, InMemoryCacheStore
+from txnopt.runtime import OracleWorkerError, RuntimeContractError, SerialTxnRuntime
 
 
 class IncrementKernel:
@@ -36,6 +37,7 @@ class IncrementKernel:
 
 class IntegerOracle:
     deterministic = True
+    parallel_safe = True
 
     def __init__(self) -> None:
         self.evaluated_batches: list[tuple[int, ...]] = []
@@ -187,3 +189,120 @@ def test_serial_runtime_rejects_unvalidated_kernel_state() -> None:
                 fixed_work=1,
             ),
         )
+
+
+def test_worker_failure_returns_only_the_last_committed_prefix() -> None:
+    class FailingOracle(IntegerOracle):
+        def evaluate_batch(
+            self,
+            candidates: Sequence[int],
+            *,
+            work_budget: int,
+            deadline_ns: int | None,
+        ) -> Sequence[int]:
+            if candidates == (2,):
+                raise OracleWorkerError("simulated worker crash")
+            return super().evaluate_batch(
+                candidates,
+                work_budget=work_budget,
+                deadline_ns=deadline_ns,
+            )
+
+    cache = InMemoryCacheStore[int]()
+    result = SerialTxnRuntime[int, int, int](cache_factory=lambda: cache).run(
+        0,
+        kernel=IncrementKernel(),
+        oracle=FailingOracle(),
+        config=RunConfig(
+            seed=0,
+            workers=1,
+            execution_mode="serial",
+            fixed_work=3,
+        ),
+    )
+
+    assert result.last_committed_state == 1
+    assert result.termination_reason == "worker_failure"
+    assert cache.lookup(("integer:1", "integer:2")).values == (1, None)
+
+
+def test_validation_failure_rolls_back_the_incomplete_round() -> None:
+    class InvalidResultOracle(IntegerOracle):
+        def evaluate_batch(
+            self,
+            candidates: Sequence[int],
+            *,
+            work_budget: int,
+            deadline_ns: int | None,
+        ) -> Sequence[int]:
+            if candidates == (2,):
+                return (-2,)
+            return super().evaluate_batch(
+                candidates,
+                work_budget=work_budget,
+                deadline_ns=deadline_ns,
+            )
+
+    cache = InMemoryCacheStore[int]()
+    result = SerialTxnRuntime[int, int, int](cache_factory=lambda: cache).run(
+        0,
+        kernel=IncrementKernel(),
+        oracle=InvalidResultOracle(),
+        config=RunConfig(
+            seed=0,
+            workers=1,
+            execution_mode="serial",
+            fixed_work=3,
+        ),
+    )
+
+    assert result.last_committed_state == 1
+    assert result.termination_reason == "validation_failure"
+    assert cache.lookup(("integer:1", "integer:2")).values == (1, None)
+
+
+def test_cache_write_failure_rolls_back_state_and_cache() -> None:
+    def reject(_entries: object) -> None:
+        raise OSError("simulated cache failure")
+
+    cache = InMemoryCacheStore[int](on_commit=reject)
+    result = SerialTxnRuntime[int, int, int](cache_factory=lambda: cache).run(
+        0,
+        kernel=IncrementKernel(),
+        oracle=IntegerOracle(),
+        config=RunConfig(
+            seed=0,
+            workers=1,
+            execution_mode="serial",
+            fixed_work=1,
+        ),
+    )
+
+    assert result.last_committed_state == 0
+    assert result.termination_reason == "cache_write_failure"
+    assert cache.snapshot() == (0, {})
+
+
+def test_stale_cache_snapshot_interrupts_before_evaluation() -> None:
+    class InterferingCache(InMemoryCacheStore[int]):
+        def lookup(self, keys: Sequence[str]) -> CacheLookup[int]:
+            external = self.begin()
+            self.commit(external)
+            return super().lookup(keys)
+
+    oracle = IntegerOracle()
+    result = SerialTxnRuntime[int, int, int](cache_factory=InterferingCache).run(
+        0,
+        kernel=IncrementKernel(),
+        oracle=oracle,
+        config=RunConfig(
+            seed=0,
+            workers=1,
+            execution_mode="serial",
+            fixed_work=1,
+        ),
+    )
+
+    assert result.last_committed_state == 0
+    assert result.termination_reason == "stale_snapshot"
+    assert oracle.evaluated_batches == []
