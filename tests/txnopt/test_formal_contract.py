@@ -18,6 +18,27 @@ from txnopt._internal.waste_bounds import WasteBoundViolation, audit_waste, boun
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_build10_native_round_review_request_is_signed_and_not_self_approved() -> None:
+    path = ROOT / (
+        "formal/reviews/txnopt_native_round_refinement_review_request_attempt06.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    request = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert request["status"] == "READY_FOR_EXTERNAL_INDEPENDENT_REVIEW"
+    assert request["review_completed"] is False
+    assert request["reviewer_identity"] is None
+    assert request["prior_review_boundary"]["binding"] == "PRIOR_SOURCE_ONLY"
+    assert len(request["bound_inputs"]) == 14
+    assert request["claim_boundary"]["precloud_gate_unblocked"] is False
+    assert request["claim_boundary"]["procurement_authorized"] is False
+    assert request["claim_boundary"]["level1_ready"] is False
+
+
 def test_formal_model_and_python_state_machine_name_the_same_phases() -> None:
     model = (ROOT / "formal/TxnOpt.tla").read_text(encoding="utf-8")
     for phase in TxnPhase:

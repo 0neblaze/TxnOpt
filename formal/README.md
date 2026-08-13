@@ -29,3 +29,10 @@ or turn the five-state quotient into a general-domain mechanized theorem.
 `txnopt-physical-trace-v1` now binds each observed run to a conservative elapsed
 transaction `Cmax`; Level 2 still requires independent review and full-scope
 measurements before any positive claim.
+
+Build10 adds a private prepared native-round receipt without changing the
+aggregate semantic trace. Its exact external review scope is frozen in
+`reviews/txnopt_native_round_refinement_review_request_attempt06.json`. That
+file is a request, not a review: until a separate reviewer returns a new signed
+attempt with zero critical and major findings, Build10 remains
+`REVIEW_PENDING_BUILD10` and Pre-cloud Attempt02 remains blocked.

@@ -1,0 +1,74 @@
+{
+  "schema_version": "txnopt-formal-independent-review-request-v1",
+  "run_label": "txnopt_native_round_refinement_review_request_attempt06",
+  "status": "READY_FOR_EXTERNAL_INDEPENDENT_REVIEW",
+  "review_completed": false,
+  "reviewer_identity": null,
+  "review_decision": null,
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt10.json",
+    "build_manifest_sha256": "f6547bce3d4c53c6becd1eb50450854683329743152062388adc0c07d4dd3f3d",
+    "source_revision": "3e18b99a52356a6fae503dcf9bb871643d1e8f03",
+    "source_tree": "5a75a5766f47ea1319df4bcf6305bd10afd38f5d",
+    "wheel_sha256": "401804165380c8dd48f38124784956a5b160ec1bf12d24e9e5f4b2f82f357f4b",
+    "native_sha256": "e7144890bcb03e1968b440b7f55e1d47352a178af5b42d422b125372bb784755"
+  },
+  "prior_review_boundary": {
+    "review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "binding": "PRIOR_SOURCE_ONLY",
+    "must_not_be_promoted_as_build10_review": true
+  },
+  "bound_inputs": [
+    {"path": "formal/native-round-prepared-receipt-refinement.md", "sha256": "cbd2ede49c31e3b6b53fd3eaea8718876a319bb6be535c524f0df6b259c6f2c6"},
+    {"path": "formal/refinement-mapping.md", "sha256": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135"},
+    {"path": "formal/proofs.md", "sha256": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da"},
+    {"path": "formal/model-check-receipt.json", "sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5"},
+    {"path": "cpp/txnopt_core/round_transaction.hpp", "sha256": "e4738adb1c02602c3770c6a78f7bc4a9857e98b1b08a91c6fcafd8ba73780c93"},
+    {"path": "cpp/evrptw_core.cpp", "sha256": "f7625e686580e0622862e0897e1d726c55be6692fe80a7dfa9af30579552f043"},
+    {"path": "src/txnopt/_native.pyi", "sha256": "a552a6e806c2290371d2c2754905db620ab5848b837ecba1469668d31e268919"},
+    {"path": "src/txnopt/runtime.py", "sha256": "aa6ad9b9dbc2264c11a6d771bfdd532c6890a102603129d9b72dab23596c6511"},
+    {"path": "src/txnopt_cases/evrptw/native_oracle.py", "sha256": "9174b6547d872c9fed7336220545dbaf6dafadb4b852106676dae1ca2912eb5b"},
+    {"path": "src/txnopt_evidence/reviewer.py", "sha256": "252b7408f49bf6f8f873e058a02eaa5e26e494bcbb0891fd9a03c8c87195d5c6"},
+    {"path": "tests/txnopt/test_native_round.py", "sha256": "4d249661e239bd1864f3eec7406aad01d559319f36d2d748c2a3bca92d17821b"},
+    {"path": "tests/txnopt/test_evidence_pipeline.py", "sha256": "b1ab92cad2248a6862a05f6c03ccabb9a5baf9a8d6b3a5b70a3048c29d1de731"},
+    {"path": "tests/txnopt/test_serial_runtime.py", "sha256": "51f4d150f4c9f829fc6b9f7f07ae7c5e75bb151f01c5e431afb16fe03dea849c"},
+    {"path": "tests/txnopt/test_parallel_runtime.py", "sha256": "efe312b6915b3ae6614a7923bab9c79f48fd7468f2a4331552138cdcdb9fcaf8"}
+  ],
+  "evidence_inputs": {
+    "build10_manifest_sha256": "f6547bce3d4c53c6becd1eb50450854683329743152062388adc0c07d4dd3f3d",
+    "local_calibration_manifest_path": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt20.json",
+    "local_calibration_manifest_sha256": "b353277ff6d6c2830d9b404a865cef8bd8c1e883056d56cd9636ea06168899c7",
+    "calibration_raw_review_pairs": 96,
+    "calibration_review_pass_count": 96,
+    "precloud_manifest_path": "experiments/txnopt/manifests/txnopt_level1_precloud_gate_attempt02.json",
+    "precloud_manifest_sha256": "b1b631e6e13d982b1cf2b1d41e84be5f4c591a81c56f64b6e3647494e618e734",
+    "precloud_status": "BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING"
+  },
+  "review_obligations": [
+    "verify every bound input hash against the exact Build10 source identity",
+    "decide whether the native PREPARED through VALIDATED or terminal phase trace is a private stuttering refinement of the aggregate TxnRuntime state",
+    "verify complete-work reservation and ordered task receipts before native evaluation",
+    "verify that prepared cache receipts have no publication power and are drained exactly once",
+    "verify that only TxnRuntime can publish incumbent, solve-wide budget, semantic digest, and cache state",
+    "verify that malformed phase, budget, worker, task, cache, or source receipts fail closed without fallback",
+    "report critical and major findings separately and refuse READY if either count is nonzero"
+  ],
+  "required_review_output": {
+    "new_attempt_label_required": true,
+    "allowed_statuses": ["PASS_BUILD10_NATIVE_ROUND_REFINEMENT", "NEEDS_WORK"],
+    "must_bind_this_request_sha256": true,
+    "must_bind_reviewer_revision_and_source_tree": true,
+    "must_record_critical_and_major_finding_counts": true,
+    "must_preserve_prior_attempts": true
+  },
+  "claim_boundary": {
+    "independent_review_completed": false,
+    "level1_formal_gate_passed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "level1_ready": false,
+    "level2_entry_authorized": false
+  }
+}
