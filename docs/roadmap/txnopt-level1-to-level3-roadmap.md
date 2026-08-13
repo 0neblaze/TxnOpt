@@ -172,13 +172,14 @@ after proving equivalence to the canonical round stream.
 
 ### Weeks 4-5: new native round ABI
 
-- [ ] Freeze every `stage05.2-*` ABI and introduce a separate
+- [x] Freeze every `stage05.2-*` ABI and introduce a separate
   `txnopt-native-round-v1` source identity.
-- [ ] Move only the active generic transaction, budget, cache, concurrency, and
-  trace path into `cpp/txnopt_core`.
-- [ ] Keep EVRPTW packing, screening, and exact charging in the case-native
-  adapter.
-- [ ] Require one contiguous SoA request and one typed receipt per round, with
+- [ ] Move the active generic transaction and trace path into `cpp/txnopt_core`;
+  the first slice reuses the frozen concurrency and exact-kernel headers behind
+  a new module identity while keeping budget/cache ownership in Python.
+- [x] Keep EVRPTW packing and exact charging in the case-native adapter;
+  case-native screening remains pending.
+- [x] Require one contiguous SoA request and one typed receipt per round, with
   identical fixed-work semantic digests for Python and native execution.
 - [ ] Do not implement a Level 1 multi-round full-native path.
 

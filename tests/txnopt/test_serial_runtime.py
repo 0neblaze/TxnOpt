@@ -38,6 +38,7 @@ class IncrementKernel:
 class IntegerOracle:
     deterministic = True
     parallel_safe = True
+    internal_parallelism = False
 
     def __init__(self) -> None:
         self.evaluated_batches: list[tuple[int, ...]] = []
@@ -47,6 +48,9 @@ class IntegerOracle:
 
     def state_digest(self, state: int) -> str:
         return hashlib.sha256(str(state).encode()).hexdigest()
+
+    def work_units(self, candidate: int) -> int:
+        return 1
 
     def screen(self, candidates: Sequence[int]) -> Sequence[bool]:
         return tuple(True for _candidate in candidates)

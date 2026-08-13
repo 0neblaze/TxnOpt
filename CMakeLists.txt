@@ -184,6 +184,13 @@ pybind11_add_module(
   "${EVRPTW_NATIVE_CPP_DIR}/evrptw_core.cpp"
 )
 target_include_directories(_core PRIVATE "${EVRPTW_NATIVE_CPP_DIR}")
+pybind11_add_module(
+  _native
+  MODULE
+  NO_EXTRAS
+  "${EVRPTW_NATIVE_CPP_DIR}/txnopt_core/python_module.cpp"
+)
+target_include_directories(_native PRIVATE "${EVRPTW_NATIVE_CPP_DIR}")
 if(UNIX AND NOT APPLE)
   add_executable(
     _native_host_scheduler
@@ -227,6 +234,7 @@ if(NOT EVRPTW_ALLOW_DIRTY_BUILD)
   )
 endif()
 add_dependencies(_core native_source_attestation_check)
+add_dependencies(_native native_source_attestation_check)
 if(TARGET _native_host_scheduler)
   add_dependencies(_native_host_scheduler native_source_attestation_check)
 endif()
@@ -266,6 +274,7 @@ function(evrptw_add_post_build_attestation target_name)
   endif()
 endfunction()
 evrptw_add_post_build_attestation(_core)
+evrptw_add_post_build_attestation(_native)
 if(TARGET _native_host_scheduler)
   evrptw_add_post_build_attestation(_native_host_scheduler)
 endif()
@@ -285,6 +294,7 @@ set(EVRPTW_BUILD_ATTESTATION_DEFINITIONS
   EVRPTW_BUILD_HOST_NATIVE=${EVRPTW_BUILD_HOST_NATIVE}
 )
 target_compile_definitions(_core PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS})
+target_compile_definitions(_native PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS})
 if(TARGET _native_host_scheduler)
   target_compile_definitions(
     _native_host_scheduler PRIVATE ${EVRPTW_BUILD_ATTESTATION_DEFINITIONS}
@@ -293,6 +303,7 @@ endif()
 
 if(EVRPTW_BUILD_INTERPROCEDURAL_OPTIMIZATION)
   set_property(TARGET _core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  set_property(TARGET _native PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   if(TARGET _native_host_scheduler)
     set_property(
       TARGET _native_host_scheduler
@@ -303,10 +314,13 @@ endif()
 
 if(MSVC)
   target_compile_options(_core PRIVATE /O2)
+  target_compile_options(_native PRIVATE /O2)
 else()
   target_compile_options(_core PRIVATE -O3 -Wall -Wextra -Wpedantic)
+  target_compile_options(_native PRIVATE -O3 -Wall -Wextra -Wpedantic)
   if(EVRPTW_BUILD_HOST_NATIVE)
     target_compile_options(_core PRIVATE -march=native)
+    target_compile_options(_native PRIVATE -march=native)
   endif()
   if(TARGET _native_host_scheduler)
     target_compile_options(
@@ -326,6 +340,10 @@ if(NOT EVRPTW_SANITIZER STREQUAL "none")
       _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
     )
     target_link_options(_core PRIVATE -fsanitize=address,undefined)
+    target_compile_options(
+      _native PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+    )
+    target_link_options(_native PRIVATE -fsanitize=address,undefined)
     if(TARGET _native_host_scheduler)
       target_compile_options(
         _native_host_scheduler
@@ -340,6 +358,10 @@ if(NOT EVRPTW_SANITIZER STREQUAL "none")
       _core PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
     )
     target_link_options(_core PRIVATE -fsanitize=thread)
+    target_compile_options(
+      _native PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+    )
+    target_link_options(_native PRIVATE -fsanitize=thread)
     if(TARGET _native_host_scheduler)
       target_compile_options(
         _native_host_scheduler
@@ -372,6 +394,7 @@ if(NOT EVRPTW_SANITIZER STREQUAL "none")
 endif()
 
 install(TARGETS _core DESTINATION evrptw)
+install(TARGETS _native DESTINATION txnopt)
 if(TARGET _native_host_scheduler)
   install(TARGETS _native_host_scheduler DESTINATION evrptw)
 endif()

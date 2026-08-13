@@ -57,6 +57,12 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             raise RuntimeContractError("oracle did not declare deterministic semantics")
         if config.execution_mode != "serial" and oracle.parallel_safe is not True:
             raise RuntimeContractError("oracle did not declare parallel-safe evaluation")
+        if oracle.internal_parallelism:
+            configured_workers = getattr(oracle, "worker_count", config.workers)
+            if configured_workers != config.workers:
+                raise RuntimeContractError(
+                    "internally parallel oracle worker count differs from RunConfig"
+                )
 
         oracle.validate(initial_state)
         state = initial_state
@@ -163,7 +169,11 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 )
                 if cached is None
             )
-            reservation = budget.reserve(len(missing))
+            missing_work = tuple(
+                self._validated_work_units(oracle, candidate)
+                for _index, _key, candidate in missing
+            )
+            reservation = budget.reserve(sum(missing_work))
             if not reservation.granted:
                 cache.rollback(cache_transaction)
                 transaction = transaction.transition(TxnPhase.INTERRUPTED)
@@ -196,6 +206,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                         candidates=tuple(
                             candidate for _index, _key, candidate in missing
                         ),
+                        work_units=missing_work,
                         budget=budget,
                         config=config,
                         deadline_ns=deadline_ns,
@@ -429,16 +440,18 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         *,
         oracle: Oracle[CandidateT, StateT, ObjectiveT],
         candidates: tuple[CandidateT, ...],
+        work_units: tuple[int, ...],
         budget: BudgetLedger,
         config: RunConfig,
         deadline_ns: int | None,
     ) -> tuple[StateT, ...]:
-        if config.execution_mode == "serial":
-            budget.start(len(candidates))
+        if config.execution_mode == "serial" or oracle.internal_parallelism:
+            work = sum(work_units)
+            budget.start(work)
             return tuple(
                 oracle.evaluate_batch(
                     candidates,
-                    work_budget=len(candidates),
+                    work_budget=work,
                     deadline_ns=deadline_ns,
                 )
             )
@@ -446,6 +459,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
             return PythonTxnRuntime._evaluate_barrier(
                 oracle=oracle,
                 candidates=candidates,
+                work_units=work_units,
                 budget=budget,
                 workers=config.workers,
                 deadline_ns=deadline_ns,
@@ -453,6 +467,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         return PythonTxnRuntime._evaluate_ordered(
             oracle=oracle,
             candidates=candidates,
+            work_units=work_units,
             budget=budget,
             workers=config.workers,
             speculation_window=config.speculation_window,
@@ -464,6 +479,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         *,
         oracle: Oracle[CandidateT, StateT, ObjectiveT],
         candidates: tuple[CandidateT, ...],
+        work_units: tuple[int, ...],
         budget: BudgetLedger,
         workers: int,
         deadline_ns: int | None,
@@ -476,19 +492,23 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         futures: list[Future[Sequence[StateT]]] = []
         try:
             for chunk in chunks:
+                first, last = chunk
+                candidate_chunk = candidates[first:last]
+                chunk_work = sum(work_units[first:last])
                 futures.append(
                     executor.submit(
                         oracle.evaluate_batch,
-                        chunk,
-                        work_budget=len(chunk),
+                        candidate_chunk,
+                        work_budget=chunk_work,
                         deadline_ns=deadline_ns,
                     )
                 )
-                budget.start(len(chunk))
+                budget.start(chunk_work)
             ordered: list[StateT] = []
             for chunk, future in zip(chunks, futures, strict=True):
+                first, last = chunk
                 values = tuple(future.result())
-                if len(values) != len(chunk):
+                if len(values) != last - first:
                     raise RuntimeContractError(
                         "parallel oracle chunk did not preserve its ordered shape"
                     )
@@ -507,6 +527,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         *,
         oracle: Oracle[CandidateT, StateT, ObjectiveT],
         candidates: tuple[CandidateT, ...],
+        work_units: tuple[int, ...],
         budget: BudgetLedger,
         workers: int,
         speculation_window: int,
@@ -527,10 +548,10 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 pending[index] = executor.submit(
                     oracle.evaluate_batch,
                     (candidates[index],),
-                    work_budget=1,
+                    work_budget=work_units[index],
                     deadline_ns=deadline_ns,
                 )
-                budget.start(1)
+                budget.start(work_units[index])
                 next_to_submit += 1
 
         try:
@@ -557,16 +578,26 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
     def _contiguous_chunks(
         candidates: tuple[CandidateT, ...],
         workers: int,
-    ) -> tuple[tuple[CandidateT, ...], ...]:
+    ) -> tuple[tuple[int, int], ...]:
         chunk_count = min(workers, len(candidates))
         quotient, remainder = divmod(len(candidates), chunk_count)
-        chunks: list[tuple[CandidateT, ...]] = []
+        chunks: list[tuple[int, int]] = []
         offset = 0
         for index in range(chunk_count):
             size = quotient + (1 if index < remainder else 0)
-            chunks.append(candidates[offset : offset + size])
+            chunks.append((offset, offset + size))
             offset += size
         return tuple(chunks)
+
+    @staticmethod
+    def _validated_work_units(
+        oracle: Oracle[CandidateT, StateT, ObjectiveT],
+        candidate: CandidateT,
+    ) -> int:
+        work = oracle.work_units(candidate)
+        if isinstance(work, bool) or not isinstance(work, int) or work <= 0:
+            raise RuntimeContractError("oracle work_units must be a positive integer")
+        return work
 
 
 class SerialTxnRuntime[StateT, CandidateT, ObjectiveT](

@@ -9,7 +9,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from txnopt_cases.evrptw.charging import solve_exact_charging
+from txnopt_cases.evrptw.charging import ChargingSubproblemResult, solve_exact_charging
 from txnopt_cases.evrptw.models import Instance, NodeType
 from txnopt_cases.evrptw.objective import SolutionObjective
 from txnopt_cases.evrptw.validation import validate_routes
@@ -49,6 +49,7 @@ class EVRPTWOracle:
 
     deterministic = True
     parallel_safe = True
+    internal_parallelism = False
 
     def __init__(self, instance: Instance) -> None:
         self._instance = instance
@@ -86,6 +87,9 @@ class EVRPTWOracle:
             ).encode()
         ).hexdigest()
 
+    def work_units(self, candidate: EVRPTWPlan) -> int:
+        return len(candidate.customer_routes)
+
     def screen(self, candidates: Sequence[EVRPTWPlan]) -> Sequence[bool]:
         return tuple(self._screen_one(candidate) for candidate in candidates)
 
@@ -96,7 +100,7 @@ class EVRPTWOracle:
         work_budget: int,
         deadline_ns: int | None,
     ) -> Sequence[EVRPTWSolution]:
-        if work_budget != len(candidates):
+        if work_budget != sum(self.work_units(candidate) for candidate in candidates):
             raise ValueError("EVRPTW work budget must cover the complete ordered batch")
         results: list[EVRPTWSolution] = []
         for candidate in candidates:
@@ -173,6 +177,13 @@ class EVRPTWOracle:
             solve_exact_charging(self._instance, route)
             for route in candidate.customer_routes
         )
+        return self._solution_from_exact(candidate, exact_results)
+
+    def _solution_from_exact(
+        self,
+        candidate: EVRPTWPlan,
+        exact_results: Sequence[ChargingSubproblemResult],
+    ) -> EVRPTWSolution:
         failures = tuple(
             f"route {index}: {result.failure_reason}"
             for index, result in enumerate(exact_results)

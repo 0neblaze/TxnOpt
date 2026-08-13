@@ -12,6 +12,7 @@ from txnopt_cases.evrptw.charging import (
 )
 from txnopt_cases.evrptw.kernel import EVRPTWSearchKernel
 from txnopt_cases.evrptw.models import Instance, Node, NodeType, Vehicle
+from txnopt_cases.evrptw.native_oracle import NativeEVRPTWOracle
 from txnopt_cases.evrptw.objective import (
     ObjectiveComparison,
     SolutionObjective,
@@ -35,6 +36,7 @@ __all__ = [
     "Instance",
     "Node",
     "NodeType",
+    "NativeEVRPTWOracle",
     "ObjectiveComparison",
     "RouteReport",
     "SolutionObjective",

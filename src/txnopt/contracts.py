@@ -158,8 +158,19 @@ class Oracle[OracleCandidateT, OracleStateT, OracleObjectiveT](Protocol):
 
         ...
 
+    @property
+    def internal_parallelism(self) -> bool:
+        """Declare that one batch call owns all configured worker parallelism."""
+
+        ...
+
     def stable_key(self, candidate: OracleCandidateT) -> str:
         """Return the canonical cache and deduplication key."""
+
+        ...
+
+    def work_units(self, candidate: OracleCandidateT) -> int:
+        """Return the bounded exact-request count for fixed-work accounting."""
 
         ...
 

@@ -23,6 +23,7 @@ class RCPSPOracle:
 
     deterministic = True
     parallel_safe = True
+    internal_parallelism = False
 
     def __init__(self, instance: RCPSPInstance, *, seed: int) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
@@ -56,6 +57,9 @@ class RCPSPOracle:
         return hashlib.sha256(
             json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
         ).hexdigest()
+
+    def work_units(self, candidate: RCPSPState) -> int:
+        return 1
 
     def screen(self, candidates: Sequence[RCPSPState]) -> Sequence[bool]:
         return tuple(self._screen_one(candidate) for candidate in candidates)
