@@ -80,3 +80,22 @@ def test_first_resource_soak_failure_is_signed_and_not_promoted() -> None:
     assert failure["status"] == "HARNESS_FAILED_BEFORE_RECEIPT"
     assert failure["raw_receipt_written"] is False
     assert failure["disposition"] == "FAILURE_RETAINED_NEW_ATTEMPT_REQUIRED"
+
+
+def test_second_build_receipt_binds_clean_resource_soak_without_readiness() -> None:
+    path = ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt02.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == (
+        "BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY"
+    )
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["artifacts"]["resource_soak"]["completed_rounds"] == 100000
+    assert manifest["artifacts"]["resource_soak"]["fallback_count"] == 0
+    assert manifest["failure_lineage"]["same_attempt_reused"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False

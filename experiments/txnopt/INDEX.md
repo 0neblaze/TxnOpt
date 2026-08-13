@@ -11,11 +11,16 @@ identity for new Level 1 runs. Creating the protocol does not authorize cloud
 purchase, benchmark launch, holdout access, or a readiness claim.
 
 The current internal build identity is recorded in
-`manifests/txnopt_level1_build_attempt01.json`. Its status is deliberately
-`BUILD_COMPLETE_NOT_LEVEL1_READY`: build success is not experiment readiness.
+`manifests/txnopt_level1_build_attempt02.json`. Its status is deliberately
+`BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY`: build and soak
+success are not experiment readiness. Attempt01 remains immutable.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in
 `manifests/txnopt_resource_soak_attempt01_failure.json`; a passing rerun must
 use a new attempt identity.
+
+Attempt02 drains physical task receipts at each native round boundary. Its
+100,000-round clean-source soak passed with zero thread/FD delta, 8 KiB RSS
+growth, and zero fallback.
