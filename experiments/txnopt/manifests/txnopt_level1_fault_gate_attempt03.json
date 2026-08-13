@@ -1,0 +1,94 @@
+{
+  "schema_version": "txnopt-level1-local-fault-gate-manifest-v1",
+  "run_label": "txnopt_level1_fault_gate_attempt03",
+  "status": "LOCAL_EXHAUSTIVE_FAULT_GATE_PASS_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T15:09:19Z",
+  "successor_of": "txnopt_level1_fault_gate_attempt02",
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854"
+  },
+  "orchestration_identity": {
+    "revision": "33a5670d952e34ee58526220806b34edb118e369",
+    "git_tree": "befa0cd59689b2841ac5eb9aaf0cb2067a17092a",
+    "source_dirty": false,
+    "tool_path": "tools/audit_txnopt_level1_fault_gate.py",
+    "tool_sha256": "4eca94eb6ff41c8a36cd6ba21253cb6cb15ea7f0e1ac9a29db88bf12450871a5",
+    "microstate_test_path": "tests/txnopt/test_level1_fault_microstates.py",
+    "microstate_test_sha256": "fc334abf2f59c307219c549aafd2fb5e879d2c6da4fb528378830e62869783e7",
+    "tool_test_path": "tests/txnopt/test_level1_fault_gate_tool.py",
+    "tool_test_sha256": "0dba5bdbc1df501fc45d33d4ebc4784f29e9c04692c96c51fec019bd7a41659e"
+  },
+  "formal_plan": {
+    "path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/manifest.json",
+    "sha256": "be5a2bbe98bfa6092188ba849eb64f01de8232e10fbb91c8919d90d250c59e1c",
+    "config_tree_sha256": "4a828f134d971172cd6ebdef15d45e14b8315be9dc7cf51e96ea00856d27e901",
+    "formal_matrix_started": false
+  },
+  "external_receipt": {
+    "path": "/home/oneblaze/txnopt-calibration/level1-local-fault-gate-build11-attempt03/receipt.json",
+    "sha256": "e7f12a11419f7187a64dc8d03f1472af6a903cd5c77dd0dbab61165b78b6530a",
+    "sidecar_verified": true,
+    "independent_verify_exit_code": 0,
+    "junit_sha256": "17f19a0e8d30a16076c19b17469ba0bb789e9ea864fe316aa066835b0843dcc4"
+  },
+  "matrix": {
+    "fault_category_count": 27,
+    "pytest_case_count": 75,
+    "producer_owned_case_count": 25,
+    "auditor_owned_exhaustive_microstate_case_count": 50,
+    "hypothesis_generated_example_budget": 600,
+    "passed": 75,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "fallback_count": 0
+  },
+  "exhaustive_microstates": {
+    "candidate_count": 3,
+    "completion_permutation_count": 6,
+    "execution_modes": [
+      "barrier",
+      "ordered"
+    ],
+    "completion_order_case_count": 12,
+    "worker_failure_candidate_positions": 3,
+    "worker_failure_cross_product_case_count": 36,
+    "runtime_deadline_checkpoint_count": 2,
+    "deadline_checkpoint_case_count": 2,
+    "all_cases_use_installed_build11_wheel": true
+  },
+  "gate_results": {
+    "all_small_completion_orders": "PASS",
+    "all_small_worker_failure_positions": "PASS",
+    "all_runtime_deadline_checkpoints": "PASS",
+    "deadline_and_worker_failure_prefix_safety": "PASS",
+    "budget_cache_and_snapshot_atomicity": "PASS",
+    "late_result_rollback": "PASS",
+    "unknown_commit_outcome_fail_closed": "PASS",
+    "t4_waste_bound": "PASS"
+  },
+  "immutability": {
+    "failed_attempt01_retained": true,
+    "representative_attempt02_retained": true,
+    "attempt02_scope_status": "PASS_RETAINED_SUPERSEDED_BY_EXHAUSTIVE_ATTEMPT03",
+    "build11_review_request_bound_input_count": 16,
+    "build11_review_request_hash_mismatch_count": 0,
+    "historical_stage_evidence_mutated": false
+  },
+  "claim_boundary": {
+    "local_fault_gate": "PASS",
+    "microstate_exhaustion_scope": "three candidates across all completion orders, failure positions, and runtime deadline checkpoints",
+    "general_unbounded_proof_claimed": false,
+    "build11_external_independent_review_completed": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "next_gate": "external independent Build11 evidence-lifecycle and formal-successor review"
+  }
+}

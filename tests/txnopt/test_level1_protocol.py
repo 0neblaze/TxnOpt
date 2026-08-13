@@ -426,3 +426,31 @@ def test_build11_precloud_receipt_passes_local_gates_but_blocks_procurement() ->
     assert manifest["execution_boundary"]["procurement_authorized"] is False
     assert manifest["execution_boundary"]["formal_matrix_started"] is False
     assert manifest["execution_boundary"]["level1_ready"] is False
+
+
+def test_third_build11_fault_gate_exhausts_bounded_runtime_microstates() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_fault_gate_attempt03.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "LOCAL_EXHAUSTIVE_FAULT_GATE_PASS_NOT_LEVEL1_READY"
+    assert manifest["matrix"]["fault_category_count"] == 27
+    assert manifest["matrix"]["pytest_case_count"] == 75
+    assert manifest["matrix"]["auditor_owned_exhaustive_microstate_case_count"] == 50
+    assert manifest["exhaustive_microstates"]["completion_permutation_count"] == 6
+    assert manifest["exhaustive_microstates"]["completion_order_case_count"] == 12
+    assert manifest["exhaustive_microstates"][
+        "worker_failure_cross_product_case_count"
+    ] == 36
+    assert manifest["exhaustive_microstates"]["deadline_checkpoint_case_count"] == 2
+    assert set(manifest["gate_results"].values()) == {"PASS"}
+    assert manifest["claim_boundary"]["general_unbounded_proof_claimed"] is False
+    assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
+    assert manifest["claim_boundary"]["formal_matrix_started"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False
