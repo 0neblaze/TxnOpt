@@ -71,6 +71,13 @@ cloud purchase, public alpha, or manuscript submission.
   predicts about 4,321 seconds (1.20 hours) on 32 physical cores at 80%
   scheduler efficiency. The ten-day runtime gate passes provisionally, while
   procurement remains separately unauthorized.
+- Legacy compatibility Attempt01 replaces the previous undiagnosed timeout with
+  a complete decision. The exact frozen wheel hash is reconstructed from the
+  freeze tag with unchanged payloads; package, CLI, and native ABI smoke checks
+  pass. File-isolated testing completes in under five minutes. Its sole retained
+  failure is the four-file mismatch against the older immutable
+  source-disposition receipt already declared by the freeze manifest; the
+  receipt remains unchanged rather than being falsified.
 - Independent T3/T4 review Attempt01 reports `NEEDS_WORK`. TLC continues to
   support bounded safety only. A successor correction now uses the complete
   uncommitted atomic transaction as T4's `W`, emits receipt-bound unit audits,
@@ -276,11 +283,10 @@ Attempt17 now passes the representative EVRPTW and RCPSP performance thresholds
 at 1.35x and 2.13x with 100% fixed-work semantic/objective parity, zero fallback,
 and 2.68% maximum one-worker overhead. The preregistered scope and thresholds
 remain unchanged. Procurement and the formal matrix are still blocked until the
-complete compatibility decision, conservative runtime estimate, full-scope
-confidence intervals, and all remaining Level 1 gates are independently closed.
-The Build09-bound estimate is now complete at about 1.20 hours, but it does not
-waive the remaining compatibility/evidence gates or the separate purchase
-authorization boundary.
+full-scope confidence intervals and all remaining Level 1 gates are
+independently closed. The compatibility decision and Build09-bound estimate are
+now complete; the latter is about 1.20 hours. Neither waives the remaining
+evidence gates or the separate purchase authorization boundary.
 
 ### Level 1 gate
 

@@ -91,10 +91,21 @@
     "runtime_estimate_gate": "PASS_PROVISIONAL_BUDGETS_ONLY",
     "purchase_authorized": false
   },
+  "legacy_compatibility": {
+    "manifest_path": "legacy/txnopt-legacy-compatibility-attempt01.json",
+    "manifest_sha256": "8fa31e2bdd8b0457bff628e6c190c96da8ef4b9d988b8c83335abdaf7240f38e",
+    "review_manifest_path": "legacy/txnopt-legacy-compatibility-review-attempt01.json",
+    "review_manifest_sha256": "d675babbf86167788d19e94ab63010e0ef0ccfaff38fa0bc16ced76589976a0c",
+    "independent_review_status": "PASS_WITH_IMMUTABLE_PROVENANCE_CAVEAT",
+    "decision_complete": true,
+    "functional_compatibility": true,
+    "immutable_provenance_mismatch_retained": true,
+    "timeout_resolved": true
+  },
   "decision": {
     "level1_ready": false,
     "formal_cloud_matrix_authorized": false,
-    "reason": "representative performance gates pass, but complete legacy compatibility, full-scope confidence intervals, and the preregistered Level 1 matrix remain incomplete",
-    "next_step": "finish the compatibility decision and generate a Build09-bound conservative cloud-window estimate before any separately authorized procurement"
+    "reason": "representative performance, compatibility-decision, and runtime-estimate gates pass, but full-scope confidence intervals and the preregistered Level 1 matrix remain incomplete",
+    "next_step": "obtain separate cloud procurement authorization, then execute the preregistered Level 1 matrix under the two-week window"
   }
 }

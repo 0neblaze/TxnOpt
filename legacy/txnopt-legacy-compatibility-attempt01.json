@@ -1,0 +1,97 @@
+{
+  "schema_version": "txnopt-legacy-compatibility-reconstruction-v1",
+  "run_label": "txnopt_legacy_compatibility_attempt01",
+  "status": "FUNCTIONAL_COMPATIBILITY_PASS_IMMUTABLE_PROVENANCE_MISMATCH_RETAINED",
+  "legacy_identity": {
+    "tag": "stage052-legacy-freeze-v1",
+    "revision": "3b0cf371759f3465c7264b85894d090004f3cf43",
+    "git_tree": "984b340e5062a3c6eb5cc16f8d25f96fff6baffe",
+    "freeze_manifest_path": "legacy/legacy-freeze-manifest.json",
+    "freeze_manifest_sha256": "d7d613f36e9e5b57f55c0e134d9e60259abe3f75666a0fc33cc08fa77961d16b"
+  },
+  "wheel_reconstruction": {
+    "external_path": "/home/oneblaze/txnopt-builds/legacy-freeze-3b0cf371/wheel-recovered/reproducible_evrptw-0.1.0-cp313-cp313-linux_x86_64.whl",
+    "expected_sha256": "c2d33b9ced6a711a91ac8b810ca5de91b0270ea5a320679fc81657f64f0a188a",
+    "reconstructed_sha256": "c2d33b9ced6a711a91ac8b810ca5de91b0270ea5a320679fc81657f64f0a188a",
+    "archive_entry_count": 118,
+    "payload_tree_sha256": "2b7b8752643b52288147a769695d5c082b5a15207e2e87eb96ecbc2833390a5f",
+    "zip_timestamp_epoch": 1786581266,
+    "zip_timestamp_utc": "2026-08-13T00:34:26Z",
+    "reconstruction_method": "clean tag build followed by finite two-second ZIP timestamp recovery within the tag-to-freeze-manifest interval; all 118 archive payload names and bytes were unchanged",
+    "original_binary_was_found_before_reconstruction": false,
+    "hash_identity_recovered": true
+  },
+  "native_abi_smoke": {
+    "distribution_version": "0.1.0",
+    "core_sha256": "ccdd35edfe42bdf9a488585849895b8a7efcf2f0fa345f68441331a5ce315379",
+    "host_scheduler_sha256": "0f93faa0e0ffeca69f464495214de0e4cac43e92b24987222864f166e7caab25",
+    "package_import": "PASS",
+    "environment_cli": "PASS",
+    "candidate_round_transaction_v2": "PASS",
+    "full_native_alns_v2": "PASS"
+  },
+  "isolated_legacy_suite": {
+    "external_junit_root": "/home/oneblaze/txnopt-builds/legacy-freeze-3b0cf371/compatibility-attempt01/junit",
+    "junit_file_count": 62,
+    "junit_tree_sha256": "b5e1ab45cbdfe87a09075c06970698b6a0dd16700aaeff41948d66b1669c0491",
+    "collected_test_count": 1936,
+    "passed_test_count": 1788,
+    "skipped_test_count": 147,
+    "failed_test_count": 1,
+    "error_count": 0,
+    "suite_time_seconds": 272.10699999999997,
+    "wall_time_seconds": 286.7,
+    "timeout": false,
+    "file_process_isolation": true,
+    "passing_file_count": 61,
+    "nonzero_file_count": 1,
+    "external_inputs": [
+      "data/schneider from the authority checkout",
+      "configs/stage052_storage_roots.local.toml from the authority checkout"
+    ],
+    "external_mappings_removed_after_run": true,
+    "legacy_worktree_clean_after_run": true
+  },
+  "immutable_provenance_failure": {
+    "test": "tests/test_publication_metadata.py::test_source_disposition_accounts_for_every_target_byte",
+    "source_disposition_path": "docs/provenance/source-file-disposition.csv",
+    "source_disposition_sha256": "2cc85c8e4f5b5a3bf26099be585819662c87aed82aba8fc3aa7a17cbe59ba7b6",
+    "mismatch_count": 4,
+    "mismatches": [
+      {
+        "path": "cpp/evrptw_core.cpp",
+        "receipt_sha256": "2fecce9c40b7bd27f34309dfda6212753f80907c93a275a21a491d3f26217ddc",
+        "freeze_sha256": "f7625e686580e0622862e0897e1d726c55be6692fe80a7dfa9af30579552f043"
+      },
+      {
+        "path": "src/evrptw/alns.py",
+        "receipt_sha256": "110cd18f4a449297f3e3c0e6b1b81f185f627b354d40ee636787fbdd2cf6f8dd",
+        "freeze_sha256": "bfbf709423b7b6253ee86b64a4d8b66cdf53dbc5478b81efc6a8bf92714c54d8"
+      },
+      {
+        "path": "src/evrptw/candidate_control.py",
+        "receipt_sha256": "de0f7b0dd96e6c3f4ac1b5e71ea2b4e2dd6a4e830c5784aeda021e1e1cdcef17",
+        "freeze_sha256": "459485f1df3ab78d57081978528ebdfccf8a123613c263a7516e292c6c534aca"
+      },
+      {
+        "path": "tests/test_stage034_control_parallel.py",
+        "receipt_sha256": "3bce630a66135cd982c1ca51e296cc32fe5c89995c1ee86eb20bf7c0372b317f",
+        "freeze_sha256": "a7f01320fea8e1caf0fe157ee2fbe7bb37004fd760928b9152d44b80f82a97f2"
+      }
+    ],
+    "disposition": "RETAIN_UNCHANGED",
+    "reason": "the historical receipt binds an older source snapshot; rewriting it would falsify provenance, and the freeze manifest already declares this mismatch"
+  },
+  "decision": {
+    "compatibility_decision_complete": true,
+    "functional_legacy_compatibility": true,
+    "historical_source_disposition_byte_identity": false,
+    "historical_receipts_mutated": false,
+    "legacy_timeout_resolved": true,
+    "level1_compatibility_blocking": false,
+    "level1_ready": false,
+    "formal_matrix_started": false,
+    "cloud_purchase_performed": false,
+    "reason": "the recovered wheel and isolated functional suite pass the frozen ABI boundary; the sole retained failure is the declared immutable historical receipt mismatch, while the Level 1 matrix and confidence-interval gates remain incomplete"
+  }
+}

@@ -15,6 +15,14 @@ The complete former root policy is preserved byte-for-byte at
 The freeze is intentionally not named `correctness`: the historical source
 disposition receipt describes an older snapshot and remains immutable.
 
+`txnopt-legacy-compatibility-attempt01.json` records the completed compatibility
+decision. The original wheel entity was absent locally, so it was reconstructed
+from the exact tag. A finite ZIP timestamp recovery reproduced the manifest's
+exact wheel SHA-256 without changing any of the 118 payload names or bytes. The
+file-isolated legacy suite has no timeout and passes the functional boundary;
+its sole retained failure is the already-declared four-file mismatch against the
+older immutable source-disposition receipt. That receipt is not rewritten.
+
 The Stage-era tests remain at their historical `tests/test_*.py` paths because
 some frozen manifests bind those names. They are not part of active TxnOpt
 test discovery and require the frozen tag and legacy wheel. The repository-root

@@ -105,6 +105,14 @@ preregistered Level 1 matrix remain open. A Build09-bound conservative
 32-physical-core estimate predicts about 4,321 seconds for the matrix, but no
 cloud purchase is authorized.
 
+Legacy compatibility Attempt01 resolves the earlier 1,200-second timeout. The
+exact frozen wheel hash was reconstructed from the freeze tag without payload
+changes, legacy package/CLI/native ABI smoke checks pass, and 61/62 isolated
+test files exit zero. The sole retained failing assertion is the declared
+four-file mismatch against an older immutable source-disposition receipt; all
+other 1,935 collected outcomes pass or skip as specified. The compatibility
+decision is complete without rewriting historical provenance.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

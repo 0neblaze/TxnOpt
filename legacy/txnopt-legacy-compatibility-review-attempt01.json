@@ -1,0 +1,51 @@
+{
+  "schema_version": "txnopt-legacy-compatibility-review-v1",
+  "run_label": "txnopt_legacy_compatibility_review_attempt01",
+  "status": "PASS_WITH_IMMUTABLE_PROVENANCE_CAVEAT",
+  "review_type": "independent_read_only_artifact_review",
+  "reviewed_manifest_path": "legacy/txnopt-legacy-compatibility-attempt01.json",
+  "reviewed_manifest_sha256": "8fa31e2bdd8b0457bff628e6c190c96da8ef4b9d988b8c83335abdaf7240f38e",
+  "verified_bindings": {
+    "legacy_freeze_revision": "3b0cf371759f3465c7264b85894d090004f3cf43",
+    "legacy_freeze_tree": "984b340e5062a3c6eb5cc16f8d25f96fff6baffe",
+    "reconstructed_wheel_sha256": "c2d33b9ced6a711a91ac8b810ca5de91b0270ea5a320679fc81657f64f0a188a",
+    "wheel_entry_count": 118,
+    "wheel_payload_tree_sha256": "2b7b8752643b52288147a769695d5c082b5a15207e2e87eb96ecbc2833390a5f",
+    "junit_file_count": 62,
+    "junit_tree_sha256": "b5e1ab45cbdfe87a09075c06970698b6a0dd16700aaeff41948d66b1669c0491",
+    "collected_test_count": 1936,
+    "passed_test_count": 1788,
+    "skipped_test_count": 147,
+    "failed_test_count": 1,
+    "error_count": 0,
+    "external_mappings_removed": true,
+    "legacy_worktree_clean": true
+  },
+  "findings": {
+    "critical": [],
+    "major": [],
+    "minor": [
+      {
+        "finding": "RECONSTRUCTED_NOT_ORIGINAL_BINARY",
+        "disposition": "ACCEPTED_CLAIM_BOUNDARY",
+        "detail": "the original wheel entity was absent; the exact hash was reconstructed from the exact tag and a finite ZIP timestamp search with all 118 payload names and bytes unchanged"
+      }
+    ]
+  },
+  "provenance_caveat": {
+    "classification": "NON_FUNCTIONAL_IMMUTABLE_HISTORICAL_RECEIPT_MISMATCH",
+    "mismatch_count": 4,
+    "historical_receipt_mutation_allowed": false,
+    "functional_compatibility_blocking": false
+  },
+  "decision": {
+    "wheel_reconstruction_verified": true,
+    "functional_legacy_compatibility_verified": true,
+    "legacy_timeout_resolved": true,
+    "compatibility_decision_complete": true,
+    "level1_compatibility_blocking": false,
+    "level1_ready": false,
+    "formal_matrix_started": false,
+    "cloud_purchase_performed": false
+  }
+}
