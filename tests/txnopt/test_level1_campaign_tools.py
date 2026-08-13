@@ -106,8 +106,8 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
     build_path = tmp_path / "build.json"
     build = {
         "schema_version": "txnopt-level1-build-manifest-v1",
-        "run_label": "txnopt_level1_build_attempt09",
-        "status": "BUILD_AND_FORMAL_PACKAGE_COMPLETE_NOT_LEVEL1_READY",
+        "run_label": "txnopt_level1_build_attempt13",
+        "status": "BUILD_COMPLETE_ANCHORED_EVIDENCE_REVIEW_PENDING_NOT_LEVEL1_READY",
         "producer": {
             "revision": "a" * 40,
             "git_tree": "b" * 40,
@@ -124,9 +124,11 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
             "wheel": {"sha256": "e" * 64},
             "resource_soak": {"status": "PASS", "fallback_count": 0},
         },
-        "formal_package": {
-            "unresolved_critical_formal_findings": 0,
-            "aggregate_refinement_replay": "PASS",
+        "formal_successor": {
+            "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+            "successor_status": "REVIEW_PENDING_BUILD13",
+            "independent_successor_review_completed": False,
+            "level1_formal_gate_passed": False,
         },
         "validation": {
             **{
@@ -136,9 +138,8 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
                     "strict_mypy",
                     "pytest_wheel_installed",
                     "property_based_tests",
-                    "wheel_surface",
+                    "wheel_surface_and_record",
                     "legacy_verify",
-                    "formal_replay",
                     "asan_ubsan",
                     "tsan",
                 )
@@ -365,18 +366,13 @@ def test_plan_loader_accepts_build10_only_with_its_pending_formal_boundary(
             },
         }
     )
-    build["validation"]["wheel_surface_and_record"] = build["validation"].pop(
-        "wheel_surface"
-    )
-    build["validation"].pop("formal_replay")
-    build.pop("formal_package")
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
     _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
 
-    loaded = load_campaign_plan(plan_path)
-    assert loaded.payload["attempt"] == 18
+    with pytest.raises(ValueError, match="cannot use a pre-Build13 producer"):
+        load_campaign_plan(plan_path)
 
     build["formal_successor"]["independent_successor_review_completed"] = True
     build_path.unlink()
@@ -408,18 +404,13 @@ def test_plan_loader_accepts_build11_only_with_its_pending_lifecycle_boundary(
             },
         }
     )
-    build["validation"]["wheel_surface_and_record"] = build["validation"].pop(
-        "wheel_surface"
-    )
-    build["validation"].pop("formal_replay")
-    build.pop("formal_package")
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
     _rebind_plan_to_build(plan_path, plan_payload, build_path, build_sha256)
 
-    loaded = load_campaign_plan(plan_path)
-    assert loaded.payload["attempt"] == 18
+    with pytest.raises(ValueError, match="cannot use a pre-Build13 producer"):
+        load_campaign_plan(plan_path)
 
     build["formal_successor"]["successor_status"] = "REVIEW_PENDING_BUILD10"
     build_path.unlink()
@@ -449,11 +440,6 @@ def test_plan_loader_accepts_build13_only_as_an_anchored_review_successor(
             },
         }
     )
-    build["validation"]["wheel_surface_and_record"] = build["validation"].pop(
-        "wheel_surface"
-    )
-    build["validation"].pop("formal_replay")
-    build.pop("formal_package")
     build_path.unlink()
     build_path.with_suffix(".json.sha256").unlink()
     build_sha256 = _write(build_path, build)
@@ -509,6 +495,41 @@ def test_plan_loader_rejects_an_expected_identity_resigned_after_planning(
     _write(plan_path, plan)
 
     with pytest.raises(ValueError, match="expected identity differs from plan inputs"):
+        load_campaign_plan(plan_path)
+
+
+def test_plan_loader_rejects_noncanonical_expected_identity_bytes(
+    tmp_path: Path,
+) -> None:
+    plan_path, _analysis_path = _campaign(tmp_path)
+    plan = json.loads(plan_path.read_bytes())
+    first = plan["entries"][0]
+    identity_path = plan_path.parent / first["expected_identity_path"]
+    identity = json.loads(identity_path.read_bytes())
+    noncanonical = json.dumps(identity, sort_keys=False).encode()
+    identity_path.write_bytes(noncanonical)
+    identity_digest = sha256_bytes(noncanonical)
+    identity_path.with_suffix(".json.sha256").write_text(
+        f"{identity_digest}  {identity_path.name}\n",
+        encoding="utf-8",
+    )
+    first["expected_identity_sha256"] = identity_digest
+    plan["expected_identity_tree_sha256"] = sha256_bytes(
+        canonical_json_bytes(
+            [
+                {
+                    "path": entry["expected_identity_path"],
+                    "sha256": entry["expected_identity_sha256"],
+                }
+                for entry in plan["entries"]
+            ]
+        )
+    )
+    plan_path.unlink()
+    plan_path.with_suffix(".json.sha256").unlink()
+    _write(plan_path, plan)
+
+    with pytest.raises(ValueError, match="canonical bytes"):
         load_campaign_plan(plan_path)
 
 

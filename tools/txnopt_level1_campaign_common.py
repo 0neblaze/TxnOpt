@@ -248,6 +248,11 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
         additional_gates = ()
     else:
         raise ValueError("campaign build identity is not an approved Level 1 producer")
+    if (
+        schema_version == "txnopt-level1-campaign-plan-v2"
+        and run_label != "txnopt_level1_build_attempt13"
+    ):
+        raise ValueError("campaign plan v2 cannot use a pre-Build13 producer")
     for gate in (
         "ruff",
         "strict_mypy",
@@ -356,9 +361,11 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
                 raise ValueError("campaign expected identity must be an in-plan file")
             if verify_sidecar(identity_path) != identity_sha256:
                 raise ValueError("campaign expected identity digest differs")
-            observed_identity = ExpectedEvidenceIdentity.from_payload(
-                json.loads(identity_path.read_bytes())
-            )
+            identity_bytes = identity_path.read_bytes()
+            identity_payload = json.loads(identity_bytes)
+            if identity_bytes != canonical_json_bytes(identity_payload, pretty=True):
+                raise ValueError("campaign expected identity must use canonical bytes")
+            observed_identity = ExpectedEvidenceIdentity.from_payload(identity_payload)
             derived_identity = ExpectedEvidenceIdentity.from_plan_inputs(
                 config_path,
                 build_manifest_path=build_manifest_path,
