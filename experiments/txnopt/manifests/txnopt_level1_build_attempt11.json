@@ -1,0 +1,136 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt11",
+  "status": "BUILD_COMPLETE_EVIDENCE_LIFECYCLE_REVIEW_PENDING_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T14:13:06Z",
+  "successor_of": "txnopt_level1_build_attempt10",
+  "producer": {
+    "revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "git_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "source_manifest_sha256": "1416e085a3c91dc75adc27b0f934e5161c67dfa087b9433b8855d137fbcde7c3",
+    "tracked_file_count": 1109,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot",
+    "performance_profile": "host-native-lto"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-6d28923/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+      "entry_count": 54,
+      "record_row_count": 54,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-6d28923/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "9dfa06a781ca9f7edc72a69c3e8d74972596fd8c13cc0cd09a70cd639c0e89bb",
+      "entry_count": 1161
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854",
+      "protocol": "txnopt-native-round-v1",
+      "prepared_receipt_trace": "txnopt-physical-trace-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-6d28923/resource-soak-attempt12.json",
+      "sha256": "714ead444706547590f987747456dc2ffc9bba595d4b4d5106800327e27d7794",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 0,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "runtime_change": {
+    "components": [
+      "txnopt_evidence.lifecycle.EvidenceLifecycle",
+      "txnopt_evidence.runner",
+      "txnopt_evidence.reviewer",
+      "tools.run_txnopt_level1_campaign",
+      "tools.review_txnopt_level1_campaign"
+    ],
+    "properties": [
+      "new producer bundles bind PLANNED, RUNNING, and SEALED in a canonical hash chain",
+      "independent replay appends REVIEWED using the raw-manifest digest",
+      "resigned lifecycle tampering fails closed",
+      "Build10 v1 raw and review bundles remain readable without retroactive lifecycle events",
+      "runner and reviewer remain independent and do not mutually import"
+    ],
+    "semantic_trace_changed": false,
+    "physical_trace_changed": false,
+    "raw_artifact_schema": "txnopt-raw-artifact-v2",
+    "failure_artifact_schema": "txnopt-failure-artifact-v2",
+    "review_artifact_schema": "txnopt-independent-review-v2",
+    "lifecycle_schema": "txnopt-evidence-lifecycle-v1",
+    "fallback_count": 0
+  },
+  "formal_successor": {
+    "prior_reviewed_correction_path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
+    "prior_reviewed_correction_sha256": "858bc5a3a5c0da6725b1df3bfeb0ca0c7bcf73d479fb7d3de885f1fb7e8d0d94",
+    "prior_independent_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "prior_independent_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "build10_review_request_path": "formal/reviews/txnopt_native_round_refinement_review_request_attempt06.json",
+    "build10_review_request_sha256": "318b59d0f64ea9b417d763497ccb31d8205c82d71308d9058c494d9c8a5d05e8",
+    "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+    "successor_status": "REVIEW_PENDING_BUILD11",
+    "independent_successor_review_completed": false,
+    "level1_formal_gate_passed": false
+  },
+  "superseded_active_evidence": {
+    "local_calibration": "txnopt_level1_local_calibration_attempt20",
+    "formal_plan": "level1-formal-plan-attempt21",
+    "precloud_gate": "txnopt_level1_precloud_gate_attempt02",
+    "binding_status": "IMMUTABLE_PRIOR_BUILD10_EVIDENCE_NOT_REBOUND_TO_BUILD11"
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 43},
+    "pytest_wheel_installed": {"exit_code": 0, "status": "PASS", "passed": 186},
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "maximum_generated_examples": 600
+    },
+    "wheel_surface_and_record": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "native_source_identity": {
+      "exit_code": 0,
+      "status": "PASS",
+      "revision_and_tree_match": true,
+      "phase_trace_match": true
+    },
+    "legacy_verify": {"exit_code": 0, "status": "PASS"},
+    "formal_model_receipt": {
+      "status": "SEALED_PRIOR_PACKAGE_UNCHANGED",
+      "live_tlc_rerun": "NOT_RUN_JAVA_UNAVAILABLE",
+      "successor_independent_review": "PENDING"
+    },
+    "asan_ubsan": {"exit_code": 0, "status": "PASS"},
+    "tsan": {"exit_code": 0, "status": "PASS"},
+    "historical_protected_paths": {
+      "exit_code": 0,
+      "status": "UNCHANGED",
+      "comparison_base_revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191"
+    }
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "complete an independent Build11 evidence-lifecycle and formal-successor review",
+      "complete a Build11-bound local calibration and independent review",
+      "freeze a new Build11 formal plan and pre-cloud decision",
+      "measure full-scope finite Cmax and both-domain confidence intervals",
+      "pass the preregistered EVRPTW and RCPSP speedup and one-worker overhead thresholds",
+      "complete the Level 1 raw matrix and independent replay"
+    ]
+  }
+}
