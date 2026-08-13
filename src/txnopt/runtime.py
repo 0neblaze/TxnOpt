@@ -468,6 +468,17 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
         if config.trace_policy == "semantic_and_physical":
             if self._physical_started_ns is None or self._physical_event_sink is None:
                 raise RuntimeContractError("physical trace owner is not initialized")
+            screening_statistics = getattr(oracle, "screening_statistics", {})
+            if not isinstance(screening_statistics, Mapping) or any(
+                not isinstance(key, str)
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for key, value in screening_statistics.items()
+            ):
+                raise RuntimeContractError(
+                    "oracle screening_statistics must contain non-negative integers"
+                )
             ended_ns = self._clock_ns()
             self._physical_event_sink(
                 (
@@ -480,6 +491,7 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                         "ended_ns": ended_ns,
                         "duration_ns": ended_ns - self._physical_started_ns,
                         "termination_reason": reason,
+                        **screening_statistics,
                     },
                 )
             )

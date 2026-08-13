@@ -99,3 +99,38 @@ def test_evrptw_initial_constructor_returns_an_exact_feasible_plan() -> None:
 
     assert state.feasible is True
     assert {name for route in plan.customer_routes for name in route} == {"C1", "C2"}
+
+
+def test_evrptw_safe_screen_cache_reuses_unchanged_routes() -> None:
+    oracle = EVRPTWOracle(_instance())
+    plan = EVRPTWPlan((("C1",), ("C2",)))
+
+    assert oracle.screen((plan,)) == (True,)
+    after_first = dict(oracle.screening_statistics)
+    assert oracle.screen((plan,)) == (True,)
+    after_second = dict(oracle.screening_statistics)
+
+    assert after_first == {
+        "route_screen_cache_hits": 0,
+        "route_screen_cache_misses": 2,
+        "route_screen_cache_size": 2,
+        "route_screen_cache_capacity": 65_536,
+        "route_screen_cache_evictions": 0,
+    }
+    assert after_second["route_screen_cache_hits"] == 2
+    assert after_second["route_screen_cache_misses"] == 2
+
+
+def test_evrptw_safe_screen_cache_is_bounded_and_evicts_lru_routes() -> None:
+    oracle = EVRPTWOracle(_instance(), route_screen_cache_capacity=2)
+
+    assert oracle.screen((EVRPTWPlan((("C1",), ("C2",))),)) == (True,)
+    assert oracle.screen((EVRPTWPlan((("C1", "C2"),)),)) == (True,)
+
+    assert dict(oracle.screening_statistics) == {
+        "route_screen_cache_hits": 0,
+        "route_screen_cache_misses": 3,
+        "route_screen_cache_size": 2,
+        "route_screen_cache_capacity": 2,
+        "route_screen_cache_evictions": 1,
+    }
