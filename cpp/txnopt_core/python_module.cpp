@@ -315,6 +315,22 @@ private:
 PYBIND11_MODULE(_native, module) {
     module.doc() = "TxnOpt native round protocol";
     module.attr("PROTOCOL_VERSION") = txnopt::native::protocol_version;
+    py::dict build_attestation;
+    build_attestation["schema_version"] = "txnopt-native-build-attestation-v1";
+    build_attestation["source_revision"] = TXNOPT_BUILD_GIT_REVISION;
+    build_attestation["source_tree"] = TXNOPT_BUILD_GIT_TREE;
+    build_attestation["source_manifest_sha256"] =
+        TXNOPT_BUILD_SOURCE_MANIFEST_SHA256;
+    build_attestation["tracked_file_count"] = TXNOPT_BUILD_TRACKED_FILE_COUNT;
+    build_attestation["source_dirty"] =
+        static_cast<bool>(TXNOPT_BUILD_SOURCE_DIRTY);
+    build_attestation["development_override"] =
+        static_cast<bool>(TXNOPT_BUILD_DEVELOPMENT_OVERRIDE);
+    build_attestation["cpp_source_kind"] = TXNOPT_BUILD_CPP_SOURCE_KIND;
+    build_attestation["performance_profile"] = TXNOPT_BUILD_PERFORMANCE_PROFILE;
+    build_attestation["compiler_id"] = TXNOPT_BUILD_COMPILER_ID;
+    build_attestation["compiler_version"] = TXNOPT_BUILD_COMPILER_VERSION;
+    module.attr("BUILD_ATTESTATION") = std::move(build_attestation);
     py::class_<txnopt::native::EVRPTWContext>(module, "EVRPTWContext")
         .def(
             py::init<

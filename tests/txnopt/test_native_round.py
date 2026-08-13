@@ -73,6 +73,11 @@ def test_native_round_is_one_typed_call_and_matches_python_exact_charging() -> N
     path_offsets, path_indices, statuses, reasons, metrics = output[:5]
     receipt = output[9]
     assert _native.PROTOCOL_VERSION == "txnopt-native-round-v1"
+    assert _native.BUILD_ATTESTATION["schema_version"] == (
+        "txnopt-native-build-attestation-v1"
+    )
+    assert receipt["source_revision"] == _native.BUILD_ATTESTATION["source_revision"]
+    assert receipt["source_tree"] == _native.BUILD_ATTESTATION["source_tree"]
     assert path_offsets.tolist() == [0, 3, 6]
     assert path_indices.tolist() == [0, 1, 0, 0, 2, 0]
     assert statuses.tolist() == [0, 0]
