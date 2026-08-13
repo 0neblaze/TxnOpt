@@ -36,6 +36,14 @@ performance optimization. Its build, sanitizer, and 100,000-round resource
 gates pass; Build05-bound calibration and all Level 1 experiment gates remain
 pending.
 
+Local calibration Attempt14 is the first complete Build05-bound representative
+sample: 96/96 raw runs passed 96/96 independent replays. Fixed-work semantic
+and objective parity are exact. RCPSP reaches 2.12x representative four-worker
+geometric-mean speedup, but EVRPTW reaches only 1.24x because the 5-customer
+case does not amortize worker scheduling. The formal cloud matrix is therefore
+blocked even though the provisional 32-core runtime estimate fits the ten-day
+window. This calibration is not Level 1 evidence and does not open a holdout.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

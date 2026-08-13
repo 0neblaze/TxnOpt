@@ -147,3 +147,25 @@ def test_fifth_build_receipt_binds_bounded_screen_cache_without_readiness() -> N
     assert manifest["change"]["capacity"] == 65_536
     assert manifest["change"]["semantic_effect"].startswith("none")
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_local_calibration_records_failed_evrptw_gate_without_procurement() -> None:
+    path = (
+        ROOT
+        / "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt14.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["calibration"]["raw_run_count"] == 96
+    assert manifest["calibration"]["independent_review_pass_count"] == 96
+    assert manifest["fixed_work_physical_results"]["evrptw"]["speedup_gate"] == "FAIL"
+    assert manifest["fixed_work_physical_results"]["rcpsp"]["speedup_gate"] == (
+        "PASS_REPRESENTATIVE_ONLY"
+    )
+    assert manifest["cloud_estimate"]["purchase_authorized"] is False
+    assert manifest["decision"]["formal_cloud_matrix_authorized"] is False

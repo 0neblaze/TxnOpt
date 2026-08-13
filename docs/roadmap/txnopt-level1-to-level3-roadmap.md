@@ -43,6 +43,16 @@ cloud purchase, public alpha, or manuscript submission.
   deadline/failure prefix safety, cross-domain adapters, and non-vacuous waste
   bounds, not as the invention of speculative simulated annealing or ordered
   transactions.
+- Clean Build Attempt05 passes Ruff, strict mypy, 98 TxnOpt tests, wheel/CLI
+  verification, ASan/UBSan, TSan, historical-path preservation, and a
+  100,000-round resource soak with zero fallback.
+- Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
+  independent replays. Fixed-work semantic/objective parity is 100%. Its
+  representative RCPSP four-worker geometric-mean speedup is 2.12x, while
+  EVRPTW is 1.24x and therefore below the 1.30x Level 1 gate.
+- The 32-physical-core estimate for the provisional 1200-work/3-second matrix
+  is about 4,387 seconds (1.22 hours), but this does not authorize purchase:
+  the EVRPTW performance gate and final budget freeze remain open.
 
 ## 3. Target repository and dependency structure
 
@@ -223,6 +233,11 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 32 physical cores and 128 GB RAM. The run window is at most 14 consecutive
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
+
+Current gate status: **blocked before procurement**. The local ten-day runtime
+estimate passes for provisional budgets, but representative EVRPTW fixed-work
+speedup is 1.24x rather than the required 1.30x. The preregistered scope and
+threshold remain unchanged; the formal matrix has not started.
 
 ### Level 1 gate
 
