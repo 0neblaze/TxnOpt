@@ -1,0 +1,238 @@
+{
+  "schema_version": "txnopt-level1-completion-audit-v1",
+  "run_label": "txnopt_level1_completion_audit_attempt01",
+  "status": "INCOMPLETE_EXTERNAL_REVIEW_AND_UNAUTHORIZED_FORMAL_MATRIX",
+  "created_at_utc": "2026-08-13T15:48:26Z",
+  "authority": {
+    "repository_root": "/home/oneblaze/work/Reproducible-EVRPTW",
+    "revision": "486634bfcc720609bdc84409d2c23fd5b36429a3",
+    "git_tree": "43f114178367a477f8a771c59b49df6a2fe741d5",
+    "branch": "codex/txnopt-level1",
+    "source_dirty": false,
+    "active_target_process_count": 0
+  },
+  "roadmap_identity": {
+    "path": "docs/roadmap/txnopt-level1-to-level3-roadmap.md",
+    "sha256": "f2fa03c90f115baa5b5ab714673185d4500a06011404fdab220912ab29c8db59",
+    "status": "Level 1 in progress",
+    "level2_mandatory": true,
+    "level3_mandatory": true
+  },
+  "evidence_bindings": {
+    "legacy_freeze": {
+      "path": "legacy/legacy-freeze-manifest.json",
+      "sha256": "d7d613f36e9e5b57f55c0e134d9e60259abe3f75666a0fc33cc08fa77961d16b",
+      "attempt16_lifecycle_state": "CLOSED",
+      "attempt16_retention_class": "unique_failure_full"
+    },
+    "legacy_compatibility_review": {
+      "path": "legacy/txnopt-legacy-compatibility-review-attempt01.json",
+      "sha256": "d675babbf86167788d19e94ab63010e0ef0ccfaff38fa0bc16ced76589976a0c",
+      "status": "PASS_WITH_IMMUTABLE_PROVENANCE_CAVEAT"
+    },
+    "build11": {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+      "sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+      "status": "BUILD_COMPLETE_EVIDENCE_LIFECYCLE_REVIEW_PENDING_NOT_LEVEL1_READY"
+    },
+    "local_calibration": {
+      "path": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt22.json",
+      "sha256": "9d751d77cc9c67d4373ecda32c938f4ffa61037c0a8624318d292eb692f36889",
+      "status": "LOCAL_CALIBRATION_COMPLETE_REPRESENTATIVE_PERFORMANCE_PASS_BUILD11_REVIEW_PENDING_NOT_LEVEL1_READY"
+    },
+    "fault_gate": {
+      "path": "experiments/txnopt/manifests/txnopt_level1_fault_gate_attempt03.json",
+      "sha256": "9b24bfeb888a97dc34ce9376279af5c117a39b98ab0a04f199312e965fc363a2",
+      "status": "LOCAL_EXHAUSTIVE_FAULT_GATE_PASS_NOT_LEVEL1_READY"
+    },
+    "static_gate": {
+      "path": "experiments/txnopt/manifests/txnopt_level1_static_gate_attempt01.json",
+      "sha256": "cc1aef7003fe3fd03a58b28bd2a619d5d85a9202de43833e9e50a6f96fbe0daa",
+      "status": "LOCAL_STATIC_GATE_PASS_NOT_LEVEL1_READY",
+      "external_receipt_path": "/home/oneblaze/txnopt-calibration/level1-local-static-gate-build11-attempt01/receipt.json",
+      "external_receipt_sha256": "9fbd8d50519b61985f86c2248caa8a676ff3646c339f77046eafacb6252b7115"
+    },
+    "prior_formal_review": {
+      "path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+      "sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+      "status": "FORMAL_PACKAGE_PASS_LEVEL1_NOT_READY",
+      "binding": "PRIOR_SOURCE_ONLY"
+    },
+    "build11_review_request": {
+      "path": "formal/reviews/txnopt_evidence_lifecycle_review_request_attempt07.json",
+      "sha256": "f09bd66ac7d4bc08ab3835199d0bf8925151df1f775abc8712c7d8de91f3a5e8",
+      "bound_input_count": 16,
+      "hash_mismatch_count": 0,
+      "status": "READY_FOR_EXTERNAL_INDEPENDENT_REVIEW"
+    },
+    "review_packet_verification": {
+      "path": "formal/reviews/txnopt_build11_review_packet_verification_attempt08.json",
+      "sha256": "0266f45ec22bbcdb782132f69de898b664529a80928ef5574cccf2a09612cf7f",
+      "external_receipt_path": "/home/oneblaze/txnopt-reviews/build11-review-packet-verification-attempt01/receipt.json",
+      "external_receipt_sha256": "febf6127f7309484ed7568189af2f992a50190e2a5f534c6336c9009ba011af9",
+      "status": "MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING",
+      "review_decision": null
+    },
+    "formal_plan": {
+      "path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/manifest.json",
+      "sha256": "be5a2bbe98bfa6092188ba849eb64f01de8232e10fbb91c8919d90d250c59e1c",
+      "analysis_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/analysis-protocol.json",
+      "analysis_sha256": "53ceebf854257add33b3ccb28c493818d1d96f0416fa5f343fd2c925e5a5442c",
+      "config_count": 2880,
+      "raw_root_absent": true,
+      "launch_claim_absent": true,
+      "formal_matrix_started": false
+    },
+    "precloud_decision": {
+      "path": "experiments/txnopt/manifests/txnopt_level1_precloud_gate_attempt06.json",
+      "sha256": "e78f6dc96412e597e7d12f3094bd24ded388bdb9b35f1433a6154980846a5066",
+      "status": "BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING"
+    }
+  },
+  "implementation_phase_audit": {
+    "week1_legacy_freeze_and_direction_lock": "PASS_COMPLETE",
+    "week2_structure_naming_and_evidence_lifecycle": "PASS_COMPLETE",
+    "weeks3_4_runtime_and_evrptw_adapter": "PASS_COMPLETE",
+    "weeks4_5_native_round_abi": "PASS_COMPLETE",
+    "weeks5_6_rcpsp_and_formal_package": "PASS_IMPLEMENTED_EXTERNAL_BUILD11_REVIEW_PENDING",
+    "weeks7_8_cloud_matrix": "NOT_STARTED_REQUIRES_EXTERNAL_REVIEW_AND_USER_PROCUREMENT_AUTHORIZATION"
+  },
+  "level1_predicate_audit": [
+    {
+      "predicate": "authority_clean",
+      "status": "PASS",
+      "evidence": "authority.source_dirty=false"
+    },
+    {
+      "predicate": "entrypoint_coverage == 1",
+      "status": "PASS",
+      "evidence": "static gate Attempt01"
+    },
+    {
+      "predicate": "core_import_cycles == 0",
+      "status": "PASS",
+      "evidence": "static gate Attempt01"
+    },
+    {
+      "predicate": "txnopt_reverse_dependencies == 0",
+      "status": "PASS",
+      "evidence": "static gate Attempt01"
+    },
+    {
+      "predicate": "fixed_work_semantic_digest_match == 1",
+      "status": "PASS_REPRESENTATIVE_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Attempt22 semantic_digest_match_rate=1.0 in both domains"
+    },
+    {
+      "predicate": "deadline_fault_prefix_safety == 1",
+      "status": "PASS_LOCAL_BOUNDED_EXHAUSTIVE_EXTERNAL_REVIEW_PENDING",
+      "evidence": "fault Attempt03: 75/75 cases"
+    },
+    {
+      "predicate": "validator_objective_cache_budget_raw_replay == 1",
+      "status": "PASS_REPRESENTATIVE_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Attempt22: 96/96 raw and independent reviews; fault Attempt03"
+    },
+    {
+      "predicate": "fallback_count == 0",
+      "status": "PASS_LOCAL_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Build11, Attempt22, fault Attempt03, and static Attempt01"
+    },
+    {
+      "predicate": "historical_path_and_byte_mutations == 0",
+      "status": "PASS",
+      "evidence": "static gate Attempt01"
+    },
+    {
+      "predicate": "single_worker_overhead <= 0.15",
+      "status": "PASS_REPRESENTATIVE_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Attempt22 maxima: EVRPTW 0.0807570494; RCPSP 0.0069765830"
+    },
+    {
+      "predicate": "evrptw_4_worker_geomean_speedup >= 1.30",
+      "status": "PASS_REPRESENTATIVE_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Attempt22 EVRPTW geomean=1.3528478852"
+    },
+    {
+      "predicate": "rcpsp_4_worker_geomean_speedup >= 1.30",
+      "status": "PASS_REPRESENTATIVE_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Attempt22 RCPSP geomean=2.1174914942"
+    },
+    {
+      "predicate": "both_95ci_lower_bounds > 1.05",
+      "status": "MISSING_REQUIRES_FORMAL_MATRIX",
+      "evidence": null
+    },
+    {
+      "predicate": "fixed_work_quality_regressions == 0",
+      "status": "PASS_REPRESENTATIVE_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "Attempt22 objective_match_rate=1.0 in both domains"
+    },
+    {
+      "predicate": "measured_waste <= T4_bound",
+      "status": "PASS_LOCAL_SCOPE_FORMAL_MATRIX_PENDING",
+      "evidence": "fault Attempt03 and Attempt22 measured-Cmax replay"
+    },
+    {
+      "predicate": "unresolved_critical_findings == 0",
+      "status": "UNPROVEN_BUILD11_EXTERNAL_REVIEW_PENDING",
+      "evidence": null
+    }
+  ],
+  "deliverable_audit": {
+    "internal_txnopt_0_1_0a1_wheel": "PASS_BUILD11",
+    "source_archive": "PASS_BUILD11",
+    "formal_model_and_refinement_mapping": "PASS_IMPLEMENTED_BUILD11_EXTERNAL_REVIEW_PENDING",
+    "local_raw_evidence": "PASS_ATTEMPT22_AND_FAULT_ATTEMPT03",
+    "full_level1_raw_evidence": "MISSING_FORMAL_MATRIX_NOT_STARTED",
+    "build11_external_independent_review": "MISSING_DECISION_NULL",
+    "full_matrix_independent_replay": "MISSING_FORMAL_MATRIX_NOT_STARTED",
+    "internal_level1_seal": "MISSING_GATES_NOT_SATISFIED"
+  },
+  "remaining_blockers": [
+    {
+      "id": "BUILD11_EXTERNAL_INDEPENDENT_REVIEW",
+      "owner": "separately identified external reviewer",
+      "required_state_change": "issue PASS_BUILD11_EVIDENCE_LIFECYCLE_REFINEMENT or NEEDS_WORK bound to request Attempt07",
+      "can_current_agent_self_approve": false
+    },
+    {
+      "id": "CLOUD_PROCUREMENT_AUTHORIZATION",
+      "owner": "user",
+      "required_state_change": "separately authorize purchase and execution against exact Attempt23 plan and Build11 identity",
+      "authorization_present": false
+    },
+    {
+      "id": "LEVEL1_FORMAL_MATRIX_AND_INDEPENDENT_REPLAY",
+      "owner": "authorized producer and separate reviewer",
+      "required_state_change": "run 2880 preregistered configs, independently replay raw evidence, compute full-scope Cmax and confidence intervals",
+      "prerequisites_satisfied": false
+    }
+  ],
+  "completion_decision": {
+    "all_local_implementation_deliverables_complete": true,
+    "all_local_precloud_gates_complete": true,
+    "level1_complete": false,
+    "level2_entry_authorized": false,
+    "level3_entry_authorized": false,
+    "next_authorized_action": "EXTERNAL_INDEPENDENT_REVIEW_ONLY",
+    "reason": "No unresolved local implementation gap remains. Level 1 cannot complete without an external Build11 review decision and a separately authorized formal cloud matrix with independent replay."
+  },
+  "claim_boundary": {
+    "external_independent_review_completed": false,
+    "review_decision": null,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "cloud_purchase_performed": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "internal_level1_seal_created": false,
+    "level2_entry_authorized": false,
+    "level3_entry_authorized": false,
+    "push_authorized": false,
+    "remote_rename_authorized": false,
+    "public_release_authorized": false
+  }
+}

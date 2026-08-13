@@ -540,3 +540,61 @@ def test_sixth_precloud_receipt_adds_static_evidence_but_stays_blocked() -> None
     assert manifest["execution_boundary"]["procurement_authorized"] is False
     assert manifest["execution_boundary"]["formal_matrix_started"] is False
     assert manifest["execution_boundary"]["level1_ready"] is False
+
+
+def test_level1_completion_audit_distinguishes_local_passes_from_missing_evidence() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_completion_audit_attempt01.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    audit = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert audit["status"] == (
+        "INCOMPLETE_EXTERNAL_REVIEW_AND_UNAUTHORIZED_FORMAL_MATRIX"
+    )
+    roadmap = ROOT / audit["roadmap_identity"]["path"]
+    assert hashlib.sha256(roadmap.read_bytes()).hexdigest() == (
+        audit["roadmap_identity"]["sha256"]
+    )
+    assert audit["evidence_bindings"]["legacy_freeze"][
+        "attempt16_lifecycle_state"
+    ] == "CLOSED"
+    phases = audit["implementation_phase_audit"]
+    assert phases["week1_legacy_freeze_and_direction_lock"] == "PASS_COMPLETE"
+    assert phases["weeks3_4_runtime_and_evrptw_adapter"] == "PASS_COMPLETE"
+    assert phases["weeks7_8_cloud_matrix"].startswith("NOT_STARTED")
+
+    predicates = {
+        item["predicate"]: item for item in audit["level1_predicate_audit"]
+    }
+    assert len(predicates) == 16
+    assert predicates["authority_clean"]["status"] == "PASS"
+    assert predicates["entrypoint_coverage == 1"]["status"] == "PASS"
+    assert predicates["core_import_cycles == 0"]["status"] == "PASS"
+    assert predicates["txnopt_reverse_dependencies == 0"]["status"] == "PASS"
+    assert predicates["both_95ci_lower_bounds > 1.05"]["status"] == (
+        "MISSING_REQUIRES_FORMAL_MATRIX"
+    )
+    assert predicates["unresolved_critical_findings == 0"]["status"] == (
+        "UNPROVEN_BUILD11_EXTERNAL_REVIEW_PENDING"
+    )
+    assert predicates["both_95ci_lower_bounds > 1.05"]["evidence"] is None
+    assert predicates["unresolved_critical_findings == 0"]["evidence"] is None
+
+    decision = audit["completion_decision"]
+    assert decision["all_local_implementation_deliverables_complete"] is True
+    assert decision["all_local_precloud_gates_complete"] is True
+    assert decision["level1_complete"] is False
+    assert decision["next_authorized_action"] == "EXTERNAL_INDEPENDENT_REVIEW_ONLY"
+    assert len(audit["remaining_blockers"]) == 3
+    boundary = audit["claim_boundary"]
+    assert boundary["external_independent_review_completed"] is False
+    assert boundary["procurement_authorized"] is False
+    assert boundary["formal_matrix_started"] is False
+    assert boundary["level1_ready"] is False
+    assert boundary["level2_entry_authorized"] is False
+    assert boundary["level3_entry_authorized"] is False

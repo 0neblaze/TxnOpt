@@ -337,6 +337,15 @@ supersedes Attempt05 and remains
 authority is implied, and full-scope confidence intervals remain post-run
 Level 1 completion evidence.
 
+Completion audit Attempt01 classifies all 16 Level 1 predicates. Static and
+local runtime predicates pass; representative semantic, quality, overhead,
+speedup, replay, fallback, and waste results remain explicitly scoped to local
+evidence. The two completion predicates that cannot yet be proven are the
+full-scope 95% confidence-interval bounds and zero unresolved Build11 findings.
+They require, respectively, the unstarted formal matrix and a separately
+identified external review decision. No further local implementation gap is
+known, but this is not a Level 1 readiness claim.
+
 The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree
 `c609613e00928708bbb69e5d22be417e99489cdf921d2f677759412ab16b8929`,
