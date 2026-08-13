@@ -264,9 +264,11 @@ for failed reruns. Sixty-four cores are used only if total cost is lower.
 Current gate status: **blocked before procurement**. The last clean calibration
 records representative EVRPTW fixed-work speedup of 1.19x, below 1.30x. A dirty
 developer probe reached 1.33x after adaptive native scheduling, but it is not
-evidence. The preregistered scope and threshold remain unchanged; a new clean
-build, independent calibration, confidence interval, and complete compatibility
-gate are required before the formal matrix may start.
+evidence. Build Attempt09 now binds the implementation to a clean wheel and
+passes local build, sanitizer, formal, legacy-freeze, and resource-soak checks.
+The preregistered scope and threshold remain unchanged; a Build09-bound
+independent calibration, confidence interval, and complete compatibility gate
+are still required before the formal matrix may start.
 
 ### Level 1 gate
 

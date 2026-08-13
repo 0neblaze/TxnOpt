@@ -92,6 +92,14 @@ build-bound successor calibration or confidence interval exists. A dirty
 developer probe reached 1.33x representative EVRPTW speedup and is retained only
 as a diagnostic, not as evidence or cloud authorization.
 
+Build Attempt09 is the first clean successor that binds those runtime,
+refinement, reviewer, and adaptive native-scheduling changes to an internal
+`txnopt 0.1.0a1` wheel. Wheel-installed tests, formal replay, legacy-freeze
+verification, ASan/UBSan, TSan, and the 100,000-round resource soak pass. It is
+still `NOT_LEVEL1_READY`: the 1.33x result remains an unbound dirty diagnostic,
+and Build09 requires a fresh clean local calibration, complete compatibility
+decision, full-scope Cmax/CI evidence, and the preregistered Level 1 matrix.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

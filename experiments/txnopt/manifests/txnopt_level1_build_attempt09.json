@@ -1,0 +1,125 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt09",
+  "status": "BUILD_AND_FORMAL_PACKAGE_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T10:02:32Z",
+  "successor_of": "txnopt_level1_build_attempt08",
+  "producer": {
+    "revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191",
+    "git_tree": "7ccb8af498db354aab9ae3b3c5f5010c4035efb4",
+    "source_manifest_sha256": "bfa5d9354225e199850948992d5df7c34b41b9ffb53ac21e0ac83a99205b3fbf",
+    "tracked_file_count": 1081,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-80d6cab/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "3bf15fb5508cfff9c602602258f98346ef42c9973f4f8d2f1454e2a301536732",
+      "entry_count": 53,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-80d6cab/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "b9f87a78bb5d46d3374141a49ef6d890c75797683879cad0cea6b305879a9936"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "e142dfabecf85a43f247db87e184e0eb9b802454f63b5e0c540c105bfca283d3",
+      "protocol": "txnopt-native-round-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-80d6cab/resource-soak-attempt10.json",
+      "sha256": "378349c606b2b1867714b7b7d991b3f297e96125cae6a4ea73e9b7670f3160a1",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 4,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "runtime_change": {
+    "components": [
+      "txnopt.runtime.PythonTxnRuntime",
+      "txnopt_evidence.refinement.replay_aggregate_refinement",
+      "txnopt_cases.evrptw.EVRPTWOracle",
+      "txnopt-native-round-v1"
+    ],
+    "properties": [
+      "single owner commit and rollback receipts",
+      "fail-fast unknown cache outcome evidence",
+      "independently recomputed T4 unit and measured Cmax bounds",
+      "bounded EVRPTW screening admission",
+      "serial-small-batch native scheduling"
+    ],
+    "semantic_trace_changed": true,
+    "fallback_count": 0,
+    "development_probe_combined_evrptw_geomean_speedup": 1.33041449,
+    "development_probe_status": "UNBOUND_DIRTY_DEVELOPER_DIAGNOSTIC_NOT_EVIDENCE"
+  },
+  "formal_package": {
+    "correction_path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
+    "correction_sha256": "858bc5a3a5c0da6725b1df3bfeb0ca0c7bcf73d479fb7d3de885f1fb7e8d0d94",
+    "independent_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "independent_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "status": "FORMAL_PACKAGE_PASS_LEVEL1_NOT_READY",
+    "t3_scope": "SCHEDULER_RELATIVE_CONDITIONAL_THEOREM",
+    "t4_scope": "UNIT_AND_OBSERVED_RUN_CMAX_PASS_CONDITIONAL",
+    "aggregate_refinement_replay": "PASS",
+    "unresolved_critical_formal_findings": 0,
+    "full_scope_cmax_reviewed": false
+  },
+  "predecessor_calibration": {
+    "build_manifest": "experiments/txnopt/manifests/txnopt_level1_build_attempt08.json",
+    "calibration_manifest": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt16.json",
+    "binding_status": "NOT_REBOUND_TO_BUILD09",
+    "evrptw_four_worker_geomean_speedup": 1.1942724797328426,
+    "evrptw_speedup_gate": "FAIL",
+    "formal_matrix_authorized": false
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 42},
+    "pytest_wheel_installed": {"exit_code": 0, "status": "PASS", "passed": 152},
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "maximum_generated_examples": 600
+    },
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "legacy_verify": {"exit_code": 0, "status": "PASS"},
+    "formal_replay": {
+      "exit_code": 0,
+      "status": "PASS",
+      "primary_distinct_states": 22,
+      "pluscal_distinct_states": 8134,
+      "t3_distinct_states": 5
+    },
+    "asan_ubsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "tsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "historical_protected_paths": {
+      "exit_code": 0,
+      "status": "UNCHANGED",
+      "comparison_base_revision": "98433c4346868ebcdbebce7647feb04c586bd977"
+    }
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "complete a Build09-bound clean local calibration and independent review",
+      "resolve or honestly retain the complete legacy compatibility timeout",
+      "measure full-scope finite Cmax and both-domain confidence intervals",
+      "pass the preregistered EVRPTW and RCPSP speedup and one-worker overhead thresholds",
+      "freeze final Level 1 work and time parameters",
+      "complete the Level 1 raw matrix and independent replay"
+    ]
+  }
+}
