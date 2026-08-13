@@ -78,7 +78,7 @@ def canonical_neighborhood_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ..
     """Return the de-duplicated canonical relocate/swap/merge plan order."""
 
     return tuple(
-        dict.fromkeys((*relocate_plans(routes), *swap_plans(routes), *merge_plans(routes)))
+        dict.fromkeys((*merge_plans(routes), *relocate_plans(routes), *swap_plans(routes)))
     )
 
 

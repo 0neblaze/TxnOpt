@@ -151,7 +151,15 @@ def test_rcpsp_kernel_generates_block_reinsertions_and_mode_changes() -> None:
         )
     )
 
-    assert candidates
+    bounded = RCPSPSearchKernel(instance, max_candidates=4).propose(
+        initial,
+        round_id=0,
+        random_tape=(7,),
+    )
+
+    assert len(bounded) <= 16
+    assert RCPSPSearchKernel(instance, max_candidates=4).admission_limit == 4
+    assert len(candidates) <= 64
     assert any(
         candidate.activity_order != initial_state.activity_order
         for candidate in candidates

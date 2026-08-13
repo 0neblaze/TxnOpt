@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from txnopt_cases.evrptw import Instance, parse_schneider
+from txnopt_cases.evrptw import Instance, construct_initial_plan, parse_schneider
 from txnopt_cases.rcpsp import (
     RCPSPInstance,
     parse_psplib_sm,
@@ -35,11 +35,23 @@ def materialize_level1_plan(
     fixed_work: int,
     fixed_time_seconds: float,
     max_rounds: int,
+    evrptw_max_candidates: int,
+    rcpsp_max_candidates: int,
     attempt: int = 1,
 ) -> Path:
     """Create signed run configs for the protocol; never execute or buy resources."""
 
-    if min(fixed_work, max_rounds, attempt) <= 0 or fixed_time_seconds <= 0.0:
+    if (
+        min(
+            fixed_work,
+            max_rounds,
+            evrptw_max_candidates,
+            rcpsp_max_candidates,
+            attempt,
+        )
+        <= 0
+        or fixed_time_seconds <= 0.0
+    ):
         raise ValueError("campaign budgets, rounds, and attempt must be positive")
     protocol_source = protocol_path.resolve(strict=True)
     catalog_source = catalog_path.resolve(strict=True)
@@ -81,7 +93,11 @@ def materialize_level1_plan(
     configs_dir.mkdir(parents=True, exist_ok=False)
     raw_root = raw_output_root.resolve()
     entries: list[dict[str, str]] = []
-    case_payloads = _load_cases(catalog_paths)
+    case_payloads = _load_cases(
+        catalog_paths,
+        evrptw_max_candidates=evrptw_max_candidates,
+        rcpsp_max_candidates=rcpsp_max_candidates,
+    )
     for domain in ("evrptw", "rcpsp"):
         for case_id in expected[domain]:
             case_payload = case_payloads[domain][case_id]
@@ -133,6 +149,10 @@ def materialize_level1_plan(
         "fixed_work": fixed_work,
         "fixed_time_seconds": fixed_time_seconds,
         "max_rounds": max_rounds,
+        "max_candidates": {
+            "evrptw": evrptw_max_candidates,
+            "rcpsp": rcpsp_max_candidates,
+        },
         "attempt": attempt,
         "holdout_opened": False,
         "cloud_purchase_authorized": False,
@@ -163,26 +183,44 @@ def _expected_case_ids(protocol: Mapping[str, Any]) -> dict[str, tuple[str, ...]
 
 def _load_cases(
     paths: Mapping[str, Mapping[str, Path]],
+    *,
+    evrptw_max_candidates: int,
+    rcpsp_max_candidates: int,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     evrptw = {
-        case_id: _evrptw_case(parse_schneider(path), path)
+        case_id: _evrptw_case(
+            parse_schneider(path),
+            path,
+            max_candidates=evrptw_max_candidates,
+        )
         for case_id, path in paths["evrptw"].items()
     }
     rcpsp = {
-        case_id: _rcpsp_case(parse_psplib_sm(path), path)
+        case_id: _rcpsp_case(
+            parse_psplib_sm(path),
+            path,
+            max_candidates=rcpsp_max_candidates,
+        )
         for case_id, path in paths["rcpsp"].items()
     }
     return {"evrptw": evrptw, "rcpsp": rcpsp}
 
 
-def _evrptw_case(instance: Instance, source: Path) -> dict[str, Any]:
+def _evrptw_case(
+    instance: Instance,
+    source: Path,
+    *,
+    max_candidates: int,
+) -> dict[str, Any]:
+    initial_plan = construct_initial_plan(instance)
     return {
         "domain": "evrptw",
         "backend": "native",
-        "max_candidates": 64,
+        "max_candidates": max_candidates,
         "source_instance_path": str(source),
         "source_instance_sha256": _sha256_file(source),
-        "initial_plan": [[customer.name] for customer in instance.customers],
+        "initialization_policy": "ortools-vrptw-vehicle-first-exact-split-v1",
+        "initial_plan": initial_plan.customer_routes,
         "instance": {
             "name": instance.name,
             "nodes": [
@@ -209,11 +247,17 @@ def _evrptw_case(instance: Instance, source: Path) -> dict[str, Any]:
     }
 
 
-def _rcpsp_case(instance: RCPSPInstance, source: Path) -> dict[str, Any]:
+def _rcpsp_case(
+    instance: RCPSPInstance,
+    source: Path,
+    *,
+    max_candidates: int,
+) -> dict[str, Any]:
     initial = precedence_feasible_initial_state(instance)
     return {
         "domain": "rcpsp",
         "max_block_size": 3,
+        "max_candidates": max_candidates,
         "source_instance_path": str(source),
         "source_instance_sha256": _sha256_file(source),
         "initial_state": {

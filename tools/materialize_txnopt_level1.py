@@ -17,6 +17,8 @@ def main() -> int:
     parser.add_argument("--fixed-work", type=int, required=True)
     parser.add_argument("--fixed-time-seconds", type=float, required=True)
     parser.add_argument("--max-rounds", type=int, required=True)
+    parser.add_argument("--evrptw-max-candidates", type=int, required=True)
+    parser.add_argument("--rcpsp-max-candidates", type=int, required=True)
     parser.add_argument("--attempt", type=int, default=1)
     arguments = parser.parse_args()
     manifest = materialize_level1_plan(
@@ -27,6 +29,8 @@ def main() -> int:
         fixed_work=arguments.fixed_work,
         fixed_time_seconds=arguments.fixed_time_seconds,
         max_rounds=arguments.max_rounds,
+        evrptw_max_candidates=arguments.evrptw_max_candidates,
+        rcpsp_max_candidates=arguments.rcpsp_max_candidates,
         attempt=arguments.attempt,
     )
     print(manifest)

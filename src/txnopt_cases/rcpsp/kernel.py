@@ -10,15 +10,32 @@ from txnopt_cases.rcpsp.model import RCPSPInstance, RCPSPSchedule, RCPSPState
 class RCPSPSearchKernel:
     """Generate activity-block reinsertion and mode-change candidates."""
 
-    def __init__(self, instance: RCPSPInstance, *, max_block_size: int = 3) -> None:
+    def __init__(
+        self,
+        instance: RCPSPInstance,
+        *,
+        max_block_size: int = 3,
+        max_candidates: int = 64,
+    ) -> None:
         if (
             isinstance(max_block_size, bool)
             or not isinstance(max_block_size, int)
             or max_block_size <= 0
         ):
             raise ValueError("max_block_size must be a positive integer")
+        if (
+            isinstance(max_candidates, bool)
+            or not isinstance(max_candidates, int)
+            or max_candidates <= 0
+        ):
+            raise ValueError("max_candidates must be a positive integer")
         self._instance = instance
         self._max_block_size = max_block_size
+        self._max_candidates = max_candidates
+
+    @property
+    def admission_limit(self) -> int:
+        return self._max_candidates
 
     def propose(
         self,
@@ -65,7 +82,8 @@ class RCPSPSearchKernel:
         if not unique:
             return ()
         offset = (random_tape[0] + round_id) % len(unique)
-        return (*unique[offset:], *unique[:offset])
+        rotated = (*unique[offset:], *unique[:offset])
+        return rotated[: self._max_candidates * 4]
 
     def decide(
         self,

@@ -6,10 +6,13 @@ from txnopt_cases.evrptw import (
     EVRPTWOracle,
     EVRPTWPlan,
     EVRPTWSearchKernel,
+    EVRPTWSolution,
     Instance,
     Node,
     NodeType,
+    SolutionObjective,
     Vehicle,
+    construct_initial_plan,
 )
 
 
@@ -66,12 +69,33 @@ def test_evrptw_kernel_reduces_vehicle_count_through_each_runtime_mode() -> None
     }
 
 
-def test_evrptw_exact_infeasibility_is_a_valid_noncommittable_result() -> None:
+def test_evrptw_safe_energy_infeasibility_is_filtered_before_exact_work() -> None:
     oracle = EVRPTWOracle(_instance(battery=1.5))
     plan = EVRPTWPlan((("C1", "C2"),))
-    result = oracle.evaluate_batch((plan,), work_budget=1, deadline_ns=None)[0]
 
-    oracle.validate(result)
-    assert result.feasible is False
-    assert result.routes == ()
-    assert result.failure_reasons
+    assert oracle.screen((plan,)) == (False,)
+
+
+def test_evrptw_replay_accepts_the_canonical_objective_key() -> None:
+    oracle = EVRPTWOracle(_instance())
+    original = oracle.solve_initial(EVRPTWPlan((("C1", "C2"),)))
+    assert original.objective_value is not None
+    canonical = SolutionObjective(*original.objective_value.key)
+    replayed = EVRPTWSolution(
+        plan=original.plan,
+        routes=original.routes,
+        feasible=True,
+        objective_value=canonical,
+    )
+
+    oracle.validate(replayed)
+    assert oracle.objective(replayed).key == original.objective_value.key
+
+
+def test_evrptw_initial_constructor_returns_an_exact_feasible_plan() -> None:
+    instance = _instance()
+    plan = construct_initial_plan(instance)
+    state = EVRPTWOracle(instance).solve_initial(plan)
+
+    assert state.feasible is True
+    assert {name for route in plan.customer_routes for name in route} == {"C1", "C2"}

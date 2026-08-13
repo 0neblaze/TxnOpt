@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Final
+from typing import Final, Protocol, runtime_checkable
 
 from txnopt._internal.budget import BudgetLedger
 from txnopt._internal.cache import (
@@ -31,6 +31,12 @@ class RuntimeContractError(RuntimeError):
 
 class OracleWorkerError(RuntimeError):
     """Controlled worker failure that refines to the last commit prefix."""
+
+
+@runtime_checkable
+class _AdmissionLimitedKernel(Protocol):
+    @property
+    def admission_limit(self) -> int: ...
 
 
 class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
@@ -128,13 +134,36 @@ class PythonTxnRuntime[StateT, CandidateT, ObjectiveT]:
                 not isinstance(admitted, bool) for admitted in admitted_mask
             ):
                 raise RuntimeContractError("oracle screening decisions must be ordered booleans")
-            admitted = tuple(
+            screened = tuple(
                 candidate
                 for candidate, keep in zip(unique_candidates, admitted_mask, strict=True)
                 if keep
             )
-            admitted_keys = tuple(
+            screened_keys = tuple(
                 key for key, keep in zip(candidate_keys, admitted_mask, strict=True) if keep
+            )
+            admission_limit = len(screened)
+            if isinstance(kernel, _AdmissionLimitedKernel):
+                admission_limit = kernel.admission_limit
+                if (
+                    isinstance(admission_limit, bool)
+                    or not isinstance(admission_limit, int)
+                    or admission_limit <= 0
+                ):
+                    raise RuntimeContractError(
+                        "kernel admission_limit must be a positive integer"
+                    )
+            admitted = screened[:admission_limit]
+            admitted_keys = screened_keys[:admission_limit]
+            semantic_events.append(
+                {
+                    "event": "candidate_screening",
+                    "proposed_count": len(candidates),
+                    "unique_count": len(unique_candidates),
+                    "screened_admissible_count": len(screened),
+                    "admitted_count": len(admitted),
+                    "admission_limit": admission_limit,
+                }
             )
             if not admitted:
                 semantic_events.append(

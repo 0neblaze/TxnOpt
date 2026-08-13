@@ -5,6 +5,7 @@ from txnopt_cases.evrptw.charging import (
     ChargingSubproblemResult,
     solve_exact_charging,
 )
+from txnopt_cases.evrptw.initialization import construct_initial_plan
 from txnopt_cases.evrptw.kernel import EVRPTWSearchKernel
 from txnopt_cases.evrptw.models import Instance, Node, NodeType, Vehicle
 from txnopt_cases.evrptw.objective import (
@@ -26,6 +27,7 @@ __all__ = [
     "EVRPTWOracle",
     "EVRPTWPlan",
     "EVRPTWSearchKernel",
+    "construct_initial_plan",
     "EVRPTWSolution",
     "Instance",
     "Node",

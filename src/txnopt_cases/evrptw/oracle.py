@@ -120,7 +120,8 @@ class EVRPTWOracle:
         if not report.feasible:
             raise ValueError(f"invalid EVRPTW solution: {report.violations}")
         objective = SolutionObjective.from_report(self._instance, report)
-        if objective != state.objective_value:
+        claimed_objective = state.objective_value
+        if claimed_objective is None or objective.key != claimed_objective.key:
             raise ValueError("EVRPTW objective differs from independent reconstruction")
         customer_routes = tuple(
             tuple(
@@ -167,6 +168,8 @@ class EVRPTWOracle:
                 sum(by_name[name].demand for name in route)
                 > self._instance.vehicle.load_capacity + 1e-9
             ):
+                return False
+            if not _screen_route_safely(self._instance, route):
                 return False
         return True
 
@@ -235,6 +238,92 @@ def _instance_digest(instance: Instance) -> str:
     return hashlib.sha256(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
     ).hexdigest()
+
+
+def _screen_route_safely(instance: Instance, route: tuple[str, ...]) -> bool:
+    """Mirror the native optimistic screening contract without another ABI call."""
+
+    epsilon = 1e-9
+    by_name = instance.by_name
+    chain = (instance.depot.name, *route, instance.depot.name)
+    current_time = max(0.0, instance.depot.ready_time)
+    earliest: dict[str, float] = {}
+    min_slack = float("inf")
+    for origin, destination in zip(chain, chain[1:], strict=False):
+        node = by_name[destination]
+        current_time += instance.distance(origin, destination) / instance.vehicle.average_velocity
+        current_time = max(current_time, node.ready_time)
+        slack = node.due_date - current_time
+        min_slack = min(min_slack, slack)
+        if slack < -epsilon:
+            return False
+        if node.kind is NodeType.CUSTOMER:
+            earliest[destination] = current_time
+            current_time += node.service_time
+
+    latest_departure = instance.depot.due_date
+    latest_arrivals: dict[str, float] = {}
+    for index in range(len(chain) - 2, -1, -1):
+        origin_node = by_name[chain[index]]
+        destination_node = by_name[chain[index + 1]]
+        if destination_node.kind is NodeType.CUSTOMER:
+            latest_arrival = min(
+                destination_node.due_date,
+                latest_departure - destination_node.service_time,
+            )
+            latest_arrivals[destination_node.name] = latest_arrival
+        else:
+            latest_arrival = min(destination_node.due_date, latest_departure)
+        latest_departure = latest_arrival - (
+            instance.distance(origin_node.name, destination_node.name)
+            / instance.vehicle.average_velocity
+        )
+    if any(latest_arrivals[name] - arrival < -epsilon for name, arrival in earliest.items()):
+        return False
+    if min_slack < -epsilon:
+        return False
+
+    if any(
+        not _energy_reachable_optimistically(instance, origin, destination, epsilon=epsilon)
+        for origin, destination in zip(chain, chain[1:], strict=False)
+    ):
+        return False
+    recharge_nodes = (instance.depot, *instance.stations)
+    structural_energy_lower_bound = max(
+        (
+            min(instance.distance(node.name, customer) for node in recharge_nodes)
+            + min(instance.distance(customer, node.name) for node in recharge_nodes)
+        )
+        * instance.vehicle.consumption_rate
+        for customer in route
+    )
+    return structural_energy_lower_bound <= instance.vehicle.battery_capacity + epsilon
+
+
+def _energy_reachable_optimistically(
+    instance: Instance,
+    origin: str,
+    destination: str,
+    *,
+    epsilon: float,
+) -> bool:
+    if origin == destination:
+        return True
+    capacity = instance.vehicle.battery_capacity
+    rate = instance.vehicle.consumption_rate
+    frontier = [origin]
+    visited_recharge_nodes: set[str] = set()
+    while frontier:
+        current = frontier.pop()
+        if instance.distance(current, destination) * rate <= capacity + epsilon:
+            return True
+        for station in instance.stations:
+            if station.name == current or station.name in visited_recharge_nodes:
+                continue
+            if instance.distance(current, station.name) * rate <= capacity + epsilon:
+                visited_recharge_nodes.add(station.name)
+                frontier.append(station.name)
+    return False
 
 
 __all__ = ["EVRPTWOracle", "EVRPTWPlan", "EVRPTWSolution"]

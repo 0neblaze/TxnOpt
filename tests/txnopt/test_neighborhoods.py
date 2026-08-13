@@ -13,7 +13,8 @@ def test_case_neighborhood_seam_is_canonical_and_domain_local() -> None:
     combined = canonical_neighborhood_plans(routes)
 
     assert combined == tuple(
-        dict.fromkeys((*relocate_plans(routes), *swap_plans(routes), *merge_plans(routes)))
+        dict.fromkeys((*merge_plans(routes), *relocate_plans(routes), *swap_plans(routes)))
     )
+    assert len(combined[0].customer_routes) == len(routes) - 1
     assert len(combined) == len(set(combined))
     assert any(len(plan.customer_routes) == 1 for plan in combined)

@@ -21,6 +21,10 @@ class EVRPTWSearchKernel:
             raise ValueError("max_candidates must be a positive integer")
         self._max_candidates = max_candidates
 
+    @property
+    def admission_limit(self) -> int:
+        return self._max_candidates
+
     def propose(
         self,
         snapshot: EVRPTWSolution,
@@ -37,7 +41,7 @@ class EVRPTWSearchKernel:
             return ()
         offset = (random_tape[0] + round_id) % len(unique)
         rotated = (*unique[offset:], *unique[:offset])
-        return rotated[: self._max_candidates]
+        return rotated[: self._max_candidates * 64]
 
     def decide(
         self,

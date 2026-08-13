@@ -164,6 +164,7 @@ def _execute_rcpsp(
         kernel=RCPSPSearchKernel(
             instance,
             max_block_size=_integer(case, "max_block_size", default=3),
+            max_candidates=_integer(case, "max_candidates", default=64),
         ),
         oracle=oracle,
         config=config,

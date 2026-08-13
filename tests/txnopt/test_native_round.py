@@ -191,3 +191,23 @@ def test_native_oracle_worker_topology_must_match_run_config() -> None:
                 max_rounds=1,
             ),
         )
+
+
+def test_python_and_native_oracles_share_safe_time_window_screening() -> None:
+    instance = Instance(
+        "screening-parity",
+        (
+            Node("D", NodeType.DEPOT, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0),
+            Node("C1", NodeType.CUSTOMER, 1.0, 0.0, 1.0, 0.0, 1.5, 0.0),
+            Node("C2", NodeType.CUSTOMER, 2.0, 0.0, 1.0, 0.0, 100.0, 0.0),
+        ),
+        Vehicle(100.0, 10.0, 1.0, 0.1, 1.0),
+        distance_backend="python",
+    )
+    feasible = EVRPTWPlan((("C1", "C2"),))
+    forward_infeasible = EVRPTWPlan((("C2", "C1"),))
+
+    python = EVRPTWOracle(instance)
+    native = NativeEVRPTWOracle(instance, worker_count=1)
+    assert python.screen((feasible, forward_infeasible)) == (True, False)
+    assert native.screen((feasible, forward_infeasible)) == (True, False)

@@ -82,6 +82,8 @@ def test_campaign_materializer_binds_every_axis_without_starting_runs(
         fixed_work=16,
         fixed_time_seconds=0.5,
         max_rounds=4,
+        evrptw_max_candidates=3,
+        rcpsp_max_candidates=5,
     )
     manifest = json.loads(manifest_path.read_bytes())
     sidecar_digest, sidecar_name = (
@@ -95,8 +97,17 @@ def test_campaign_materializer_binds_every_axis_without_starting_runs(
     assert manifest["config_count"] == 16
     assert manifest["holdout_opened"] is False
     assert manifest["cloud_purchase_authorized"] is False
+    assert manifest["max_candidates"] == {"evrptw": 3, "rcpsp": 5}
     assert len(list((tmp_path / "plan/configs").glob("*.json"))) == 16
     assert list((tmp_path / "plan/configs").glob("*tinyc5*"))
+    evrptw_config = json.loads(
+        next((tmp_path / "plan/configs").glob("*tinyc5*serial_1_fixed_work*.json")).read_bytes()
+    )
+    rcpsp_config = json.loads(
+        next((tmp_path / "plan/configs").glob("*tiny_rc*serial_1_fixed_work*.json")).read_bytes()
+    )
+    assert evrptw_config["case"]["max_candidates"] == 3
+    assert rcpsp_config["case"]["max_candidates"] == 5
     assert sidecar_name == "manifest.json"
     assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == sidecar_digest
     assert not (tmp_path / "raw").exists()
