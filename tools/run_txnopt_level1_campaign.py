@@ -354,10 +354,12 @@ def _run_one(
     manifest_sha256 = verify_sidecar(manifest_path)
     if output.get("manifest_sha256") != manifest_sha256:
         return {**base, "status": "FAILED", "error": "raw manifest digest differs"}
-    raw_manifest = read_signed_object(
-        manifest_path,
-        schema_version="txnopt-raw-artifact-v1",
-    )
+    raw_manifest = read_signed_object(manifest_path)
+    if raw_manifest.get("schema_version") not in {
+        "txnopt-raw-artifact-v1",
+        "txnopt-raw-artifact-v2",
+    }:
+        return {**base, "status": "FAILED", "error": "raw artifact schema differs"}
     bundle_config = manifest_path.parent / "config.json"
     if (
         raw_manifest.get("run_label") != entry.run_label

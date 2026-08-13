@@ -6,6 +6,11 @@ and independently reviewed summaries. Raw run output belongs under ignored
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
+Build11 and later raw/failure bundles use `txnopt-raw-artifact-v2` or
+`txnopt-failure-artifact-v2` with the hash-chained
+`txnopt-evidence-lifecycle-v1` contract. The producer seals
+`PLANNED -> RUNNING -> SEALED`; the independent replay appends `REVIEWED`.
+Build10 v1 bundles remain read-only and replayable without retroactive edits.
 
 The exact Level 1 case set, seeds, axes, and cloud envelope are bound by
 `level1-protocol.json` and its sidecar. `INDEX.md` is the current status view;

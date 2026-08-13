@@ -175,10 +175,16 @@ def _review_one(
     raw_bundle = entry.raw_output_root / entry.run_label
     manifest_path = raw_bundle / "manifest.json"
     manifest_sha256 = verify_sidecar(manifest_path)
-    raw_manifest = read_signed_object(
-        manifest_path,
-        schema_version="txnopt-raw-artifact-v1",
-    )
+    raw_manifest = read_signed_object(manifest_path)
+    if raw_manifest.get("schema_version") not in {
+        "txnopt-raw-artifact-v1",
+        "txnopt-raw-artifact-v2",
+    }:
+        return {
+            **_entry_identity(entry),
+            "status": "FAILED",
+            "error": "raw artifact schema differs",
+        }
     producer_identity = _object(
         raw_manifest.get("producer_identity"),
         "raw producer identity",
@@ -234,16 +240,19 @@ def _review_one(
     output = _object(json.loads(completed.stdout), "review command output")
     review_path = review_dir / "review.json"
     review_sha256 = verify_sidecar(review_path)
-    review = read_signed_object(
-        review_path,
-        schema_version="txnopt-independent-review-v1",
+    review = read_signed_object(review_path)
+    expected_review_schema = (
+        "txnopt-independent-review-v2"
+        if raw_manifest.get("schema_version") == "txnopt-raw-artifact-v2"
+        else "txnopt-independent-review-v1"
     )
     result = read_signed_object(raw_bundle / "result.json")
     semantic_events = read_event_stream(raw_bundle / "events.jsonl")
     physical_events = read_event_stream(raw_bundle / "physical.jsonl")
     observation = physical_events[0]
     if (
-        output.get("status") != "PASS"
+        review.get("schema_version") != expected_review_schema
+        or output.get("status") != "PASS"
         or review.get("status") != "PASS"
         or review.get("raw_manifest_sha256") != manifest_sha256
         or review.get("fallback_count") != 0

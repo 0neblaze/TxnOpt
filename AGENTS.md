@@ -72,6 +72,10 @@ txnopt -> never cases/evidence/legacy
 - Case adapters own domain semantics and may depend only inward on `txnopt`.
 - Runners produce raw artifacts only. Reviewers run independently and rebuild
   state from raw events; producer and reviewer modules must not mutually import.
+- New evidence uses the hash-chained `txnopt-evidence-lifecycle-v1` contract.
+  Producers may advance only through `PLANNED -> RUNNING -> SEALED`; an
+  independent reviewer appends `REVIEWED`. Legacy raw/review schemas remain
+  readable but never acquire retroactive lifecycle events or rewritten hashes.
 - `txnopt_legacy` is read-only. New active execution may not depend on it.
 - Break cycles by extracting immutable identities, DTOs, or ports. Do not hide
   an architectural cycle behind a local import.

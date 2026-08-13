@@ -22,6 +22,11 @@ from txnopt_evidence.codec import (
     write_signed_json,
 )
 from txnopt_evidence.contracts import RawArtifactRef
+from txnopt_evidence.lifecycle import (
+    EvidenceLifecycle,
+    EvidenceState,
+    lifecycle_evidence_sha256,
+)
 
 _RUN_LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{2,127}")
 
@@ -60,6 +65,10 @@ def run_config(
     if not isinstance(run_config_payload, dict) or not isinstance(case_payload, dict):
         raise ValueError("run_config and case must be objects")
     producer_identity = _producer_identity(payload.get("build_manifest"))
+    lifecycle = EvidenceLifecycle.start(run_label, evidence_sha256=input_sha256).advance(
+        EvidenceState.RUNNING,
+        evidence_sha256=lifecycle_evidence_sha256(producer_identity),
+    )
     config = parse_run_config(run_config_payload)
     normalized_config = canonical_json_bytes(dict(payload), pretty=True)
 
@@ -99,7 +108,7 @@ def run_config(
         retained_semantic = [stream for stream in captured if stream]
         retained_physical = [stream for stream in physical if stream]
         failure = {
-            "schema_version": "txnopt-run-failure-v1",
+            "schema_version": "txnopt-run-failure-v2",
             "run_label": run_label,
             "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
             "error_message": str(error),
@@ -119,8 +128,12 @@ def run_config(
         failure_artifacts.extend(
             _write_failure_streams(output_dir, "physical", retained_physical)
         )
+        failure_lifecycle = lifecycle.advance(
+            EvidenceState.SEALED,
+            evidence_sha256=lifecycle_evidence_sha256(failure_artifacts),
+        )
         failure_manifest = {
-            "schema_version": "txnopt-failure-artifact-v1",
+            "schema_version": "txnopt-failure-artifact-v2",
             "run_label": run_label,
             "input_config_sha256": input_sha256,
             "contract": "txnopt-contract-v1",
@@ -129,6 +142,7 @@ def run_config(
             "domain": case_payload.get("domain"),
             "producer_identity": producer_identity,
             "artifacts": failure_artifacts,
+            "lifecycle": failure_lifecycle.to_payload(),
             "runner_decision": "FAILED",
             "failure_artifact": "failure.json",
             "fallback_count": 0,
@@ -174,8 +188,12 @@ def run_config(
                 "terminal_event_sha256": terminal_physical_digest,
             }
         )
+    sealed_lifecycle = lifecycle.advance(
+        EvidenceState.SEALED,
+        evidence_sha256=lifecycle_evidence_sha256(artifacts),
+    )
     manifest = {
-        "schema_version": "txnopt-raw-artifact-v1",
+        "schema_version": "txnopt-raw-artifact-v2",
         "run_label": run_label,
         "input_config_sha256": input_sha256,
         "contract": "txnopt-contract-v1",
@@ -184,6 +202,7 @@ def run_config(
         "domain": case_payload.get("domain"),
         "producer_identity": producer_identity,
         "artifacts": artifacts,
+        "lifecycle": sealed_lifecycle.to_payload(),
         "runner_decision": None,
         "fallback_count": 0,
     }

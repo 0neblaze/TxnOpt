@@ -17,7 +17,18 @@ from txnopt_evidence.codec import (
     verify_sidecar,
     write_signed_json,
 )
+from txnopt_evidence.lifecycle import (
+    EvidenceLifecycle,
+    EvidenceState,
+    lifecycle_evidence_sha256,
+)
 from txnopt_evidence.refinement import replay_aggregate_refinement
+
+_RAW_ARTIFACT_SCHEMAS = {"txnopt-raw-artifact-v1", "txnopt-raw-artifact-v2"}
+_FAILURE_ARTIFACT_SCHEMAS = {
+    "txnopt-failure-artifact-v1",
+    "txnopt-failure-artifact-v2",
+}
 
 _TRANSITIONS = {
     "PREPARED": {"RESERVED", "ABORTED", "INTERRUPTED"},
@@ -40,7 +51,7 @@ _PHYSICAL_ONLY_FIELDS = {
 
 def verify_raw_manifest(manifest_path: Path) -> dict[str, Any]:
     manifest = read_signed_json(manifest_path)
-    if manifest.get("schema_version") != "txnopt-raw-artifact-v1":
+    if manifest.get("schema_version") not in _RAW_ARTIFACT_SCHEMAS:
         raise ValueError("unsupported raw artifact schema")
     if manifest.get("runner_decision") is not None or manifest.get("fallback_count") != 0:
         raise ValueError("raw producer crossed the decision or fallback boundary")
@@ -74,6 +85,7 @@ def verify_raw_manifest(manifest_path: Path) -> dict[str, Any]:
         {"config.json", "events.jsonl", "result.json", "physical.jsonl"},
     ):
         raise ValueError("raw manifest artifact identity set differs")
+    _validate_sealed_lifecycle(manifest)
     return manifest
 
 
@@ -81,7 +93,7 @@ def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
     """Verify a fail-fast producer bundle without promoting it to a passing run."""
 
     manifest = read_signed_json(manifest_path)
-    if manifest.get("schema_version") != "txnopt-failure-artifact-v1":
+    if manifest.get("schema_version") not in _FAILURE_ARTIFACT_SCHEMAS:
         raise ValueError("unsupported failure artifact schema")
     if manifest.get("runner_decision") != "FAILED" or manifest.get("fallback_count") != 0:
         raise ValueError("failure artifact decision or fallback boundary is invalid")
@@ -128,8 +140,13 @@ def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
     failure = read_signed_json(bundle / "failure.json")
     semantic_paths = sorted(path for path in seen if path.startswith("events"))
     physical_paths = sorted(path for path in seen if path.startswith("physical"))
+    expected_failure_schema = (
+        "txnopt-run-failure-v2"
+        if manifest.get("schema_version") == "txnopt-failure-artifact-v2"
+        else "txnopt-run-failure-v1"
+    )
     if (
-        failure.get("schema_version") != "txnopt-run-failure-v1"
+        failure.get("schema_version") != expected_failure_schema
         or failure.get("run_label") != manifest.get("run_label")
         or failure.get("fallback_count") != 0
         or failure.get("semantic_stream_count") != len(semantic_paths)
@@ -165,6 +182,7 @@ def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
             events,
             semantic_exact_work_started=semantic_exact_work_started,
         )
+    _validate_sealed_lifecycle(manifest)
     return manifest
 
 
@@ -186,9 +204,39 @@ def _validate_producer_identity(raw_identity: object) -> None:
             raise ValueError(f"bound producer identity lacks {key}")
 
 
+def _validate_sealed_lifecycle(manifest: Mapping[str, Any]) -> None:
+    schema = manifest.get("schema_version")
+    if schema in {"txnopt-raw-artifact-v1", "txnopt-failure-artifact-v1"}:
+        if "lifecycle" in manifest:
+            raise ValueError("v1 artifact cannot carry a v2 evidence lifecycle")
+        return
+    lifecycle = EvidenceLifecycle.from_payload(manifest.get("lifecycle"))
+    run_label = manifest.get("run_label")
+    input_sha256 = manifest.get("input_config_sha256")
+    producer_identity = manifest.get("producer_identity")
+    artifacts = manifest.get("artifacts")
+    if (
+        not isinstance(run_label, str)
+        or not isinstance(input_sha256, str)
+        or not isinstance(producer_identity, dict)
+        or not isinstance(artifacts, list)
+        or lifecycle.run_label != run_label
+        or lifecycle.state is not EvidenceState.SEALED
+        or len(lifecycle.events) != 3
+        or [event.state for event in lifecycle.events]
+        != [EvidenceState.PLANNED, EvidenceState.RUNNING, EvidenceState.SEALED]
+        or lifecycle.events[0].evidence_sha256 != input_sha256
+        or lifecycle.events[1].evidence_sha256
+        != lifecycle_evidence_sha256(producer_identity)
+        or lifecycle.events[2].evidence_sha256
+        != lifecycle_evidence_sha256(artifacts)
+    ):
+        raise ValueError("artifact evidence lifecycle differs from its bound content")
+
+
 def verify_manifest(manifest_path: Path) -> dict[str, Any]:
     payload = read_signed_json(manifest_path)
-    if payload.get("schema_version") == "txnopt-failure-artifact-v1":
+    if payload.get("schema_version") in _FAILURE_ARTIFACT_SCHEMAS:
         return verify_failure_manifest(manifest_path)
     return verify_raw_manifest(manifest_path)
 
@@ -197,6 +245,7 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"review directory already exists: {output_dir}")
     manifest = verify_raw_manifest(manifest_path)
+    raw_manifest_sha256 = verify_sidecar(manifest_path)
     bundle = manifest_path.resolve(strict=True).parent
     config = read_signed_json(bundle / "config.json")
     result = read_signed_json(bundle / "result.json")
@@ -261,10 +310,20 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
         event.get("event") == "candidate_transaction" and event.get("phase") == "COMMITTED"
         for event in events
     )
+    review_lifecycle: EvidenceLifecycle | None = None
+    if manifest.get("schema_version") == "txnopt-raw-artifact-v2":
+        review_lifecycle = EvidenceLifecycle.from_payload(manifest["lifecycle"]).advance(
+            EvidenceState.REVIEWED,
+            evidence_sha256=raw_manifest_sha256,
+        )
     review = {
-        "schema_version": "txnopt-independent-review-v1",
+        "schema_version": (
+            "txnopt-independent-review-v2"
+            if review_lifecycle is not None
+            else "txnopt-independent-review-v1"
+        ),
         "run_label": manifest.get("run_label"),
-        "raw_manifest_sha256": verify_sidecar(manifest_path),
+        "raw_manifest_sha256": raw_manifest_sha256,
         "producer_identity": manifest["producer_identity"],
         "status": "PASS",
         "semantic_digest": semantic_digest,
@@ -282,6 +341,11 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
         ),
         "fallback_count": 0,
         "readiness_decision": None,
+        **(
+            {"lifecycle": review_lifecycle.to_payload()}
+            if review_lifecycle is not None
+            else {}
+        ),
     }
     output_dir.mkdir(parents=True, exist_ok=False)
     write_signed_json(output_dir / "review.json", review)

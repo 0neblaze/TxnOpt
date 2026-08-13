@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from txnopt_evidence.cli import main
-from txnopt_evidence.codec import read_signed_json
+from txnopt_evidence.codec import read_signed_json, write_signed_json
+from txnopt_evidence.lifecycle import EvidenceLifecycle, EvidenceState
 from txnopt_evidence.reviewer import (
     _validate_event_stream,
     _validate_physical_trace,
@@ -140,16 +141,23 @@ def test_runner_writes_raw_only_and_reviewer_reconstructs_both_domains(
     raw = run_config_file(config_path)
 
     manifest = verify_raw_manifest(raw.manifest_path)
+    assert manifest["schema_version"] == "txnopt-raw-artifact-v2"
     assert manifest["runner_decision"] is None
     assert manifest["fallback_count"] == 0
     assert manifest["producer_identity"]["binding_status"] == "UNBOUND_TEST_ONLY"
+    sealed = EvidenceLifecycle.from_payload(manifest["lifecycle"])
+    assert sealed.state is EvidenceState.SEALED
     review = replay_manifest(raw.manifest_path, output_dir=tmp_path / "review")
+    assert review["schema_version"] == "txnopt-independent-review-v2"
     assert review["status"] == "PASS"
     assert review["prefix_safety"] == "PASS"
     assert review["case_replay"]["validator_status"] == "PASS"
     assert review["physical_event_count"] == 1
     assert review["aggregate_refinement_replay"] == "PASS"
     assert review["readiness_decision"] is None
+    reviewed = EvidenceLifecycle.from_payload(review["lifecycle"])
+    assert reviewed.state is EvidenceState.REVIEWED
+    assert reviewed.events[:3] == sealed.events
 
 
 def test_reviewer_detects_raw_tampering_before_replay(tmp_path: Path) -> None:
@@ -161,6 +169,41 @@ def test_reviewer_detects_raw_tampering_before_replay(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="differs"):
         verify_raw_manifest(raw.manifest_path)
+
+
+def test_reviewer_rejects_a_resigned_but_tampered_lifecycle(tmp_path: Path) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    manifest = read_signed_json(raw.manifest_path)
+    lifecycle = manifest["lifecycle"]
+    assert isinstance(lifecycle, dict)
+    events = lifecycle["events"]
+    assert isinstance(events, list) and isinstance(events[1], dict)
+    events[1]["evidence_sha256"] = "f" * 64
+    raw.manifest_path.unlink()
+    raw.manifest_path.with_suffix(".json.sha256").unlink()
+    write_signed_json(raw.manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="lifecycle"):
+        verify_raw_manifest(raw.manifest_path)
+
+
+def test_v1_raw_artifact_remains_replayable_without_a_lifecycle(tmp_path: Path) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    manifest = read_signed_json(raw.manifest_path)
+    manifest["schema_version"] = "txnopt-raw-artifact-v1"
+    del manifest["lifecycle"]
+    raw.manifest_path.unlink()
+    raw.manifest_path.with_suffix(".json.sha256").unlink()
+    write_signed_json(raw.manifest_path, manifest)
+
+    assert verify_raw_manifest(raw.manifest_path)["schema_version"] == "txnopt-raw-artifact-v1"
+    review = replay_manifest(raw.manifest_path, output_dir=tmp_path / "v1-review")
+    assert review["schema_version"] == "txnopt-independent-review-v1"
+    assert "lifecycle" not in review
 
 
 def test_run_and_verify_cli_are_live_without_fallback(
@@ -528,8 +571,12 @@ def test_runner_retains_a_signed_reviewable_bundle_for_fail_fast_errors(
 
     manifest_path = captured.value.manifest_path
     verified = verify_failure_manifest(manifest_path)
+    assert verified["schema_version"] == "txnopt-failure-artifact-v2"
     assert verified["runner_decision"] == "FAILED"
-    assert read_signed_json(manifest_path.parent / "failure.json")["fallback_count"] == 0
+    assert EvidenceLifecycle.from_payload(verified["lifecycle"]).state is EvidenceState.SEALED
+    failure = read_signed_json(manifest_path.parent / "failure.json")
+    assert failure["schema_version"] == "txnopt-run-failure-v2"
+    assert failure["fallback_count"] == 0
 
 
 @pytest.mark.parametrize(

@@ -213,6 +213,9 @@ after proving equivalence to the canonical round stream.
   measurement, and native protocols have been separated from the old module.
 - [x] Split producer-only runners from independent raw-only reviewers in
   `txnopt_evidence` and eliminate mutual imports.
+- [x] Add an append-only, hash-chained evidence lifecycle. New producers seal
+  `PLANNED -> RUNNING -> SEALED`, independent replay appends `REVIEWED`, and
+  legacy v1 bundles remain readable without retroactive mutation.
 - [x] Freeze the old repository instructions under tracked legacy governance,
   then replace the root instructions with current TxnOpt rules.
 - [x] Switch distribution, wheel contents, CMake project, native module, CLI,
