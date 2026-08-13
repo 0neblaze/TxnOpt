@@ -5,6 +5,21 @@ import numpy.typing as npt
 
 PROTOCOL_VERSION: Final[str]
 
+class NativeBuildAttestation(TypedDict):
+    schema_version: str
+    source_revision: str
+    source_tree: str
+    source_manifest_sha256: str
+    tracked_file_count: int
+    source_dirty: bool
+    development_override: bool
+    cpp_source_kind: str
+    performance_profile: str
+    compiler_id: str
+    compiler_version: str
+
+BUILD_ATTESTATION: Final[NativeBuildAttestation]
+
 class NativeRoundReceipt(TypedDict):
     protocol: str
     phase: str

@@ -1,9 +1,4 @@
-"""EVRPTW case boundary for TxnOpt.
-
-The active adapter is intentionally not wired in this first structural slice.
-Until objective/validator differential gates pass, importing this namespace
-must not activate the frozen ``evrptw`` solver or native ABI.
-"""
+"""EVRPTW model, parser, objective, validator, kernels, and Oracle boundary."""
 
 from txnopt_cases.evrptw.charging import (
     ChargingLabel,
@@ -22,7 +17,7 @@ from txnopt_cases.evrptw.oracle import EVRPTWOracle, EVRPTWPlan, EVRPTWSolution
 from txnopt_cases.evrptw.parser import parse_schneider
 from txnopt_cases.evrptw.validation import RouteReport, SolutionReport, validate_routes
 
-ADAPTER_STATUS = "model_parser_objective_validator_charging_migrated"
+ADAPTER_STATUS = "active_python_and_native_round_v1"
 
 __all__ = [
     "ADAPTER_STATUS",

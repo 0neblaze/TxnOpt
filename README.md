@@ -83,6 +83,11 @@ python tools/verify_txnopt_formal.py \
 Model-check success is not presented as a complete mathematical proof or an
 independent review.
 
+Level 1 matrix materialization, cloud-window estimation, and the native
+resource soak are separate tools under `tools/`. They write signed receipts,
+never start a cloud server, and fail closed on incomplete catalogs,
+calibrations, or existing output paths.
+
 ## Frozen EVRPTW history
 
 The pre-TxnOpt implementation is preserved at tag

@@ -1,0 +1,45 @@
+{
+  "schema_version": "txnopt-level1-case-catalog-v1",
+  "domains": {
+    "evrptw": {
+      "c101C5": "/absolute/path/to/schneider/c101C5.txt",
+      "r105C5": "/absolute/path/to/schneider/r105C5.txt",
+      "rc105C5": "/absolute/path/to/schneider/rc105C5.txt",
+      "c104C10": "/absolute/path/to/schneider/c104C10.txt",
+      "r103C10": "/absolute/path/to/schneider/r103C10.txt",
+      "rc102C10": "/absolute/path/to/schneider/rc102C10.txt",
+      "c106C15": "/absolute/path/to/schneider/c106C15.txt",
+      "r105C15": "/absolute/path/to/schneider/r105C15.txt",
+      "rc103C15": "/absolute/path/to/schneider/rc103C15.txt",
+      "c101_21": "/absolute/path/to/schneider/c101_21.txt",
+      "r101_21": "/absolute/path/to/schneider/r101_21.txt",
+      "rc101_21": "/absolute/path/to/schneider/rc101_21.txt"
+    },
+    "rcpsp": {
+      "j1201_1": "/absolute/path/to/psplib/j1201_1.sm",
+      "j1201_2": "/absolute/path/to/psplib/j1201_2.sm",
+      "j1201_3": "/absolute/path/to/psplib/j1201_3.sm",
+      "j1201_4": "/absolute/path/to/psplib/j1201_4.sm",
+      "j1202_1": "/absolute/path/to/psplib/j1202_1.sm",
+      "j1202_2": "/absolute/path/to/psplib/j1202_2.sm",
+      "j1202_3": "/absolute/path/to/psplib/j1202_3.sm",
+      "j1202_4": "/absolute/path/to/psplib/j1202_4.sm",
+      "j1203_1": "/absolute/path/to/psplib/j1203_1.sm",
+      "j1203_2": "/absolute/path/to/psplib/j1203_2.sm",
+      "j1203_3": "/absolute/path/to/psplib/j1203_3.sm",
+      "j1203_4": "/absolute/path/to/psplib/j1203_4.sm",
+      "j1204_1": "/absolute/path/to/psplib/j1204_1.sm",
+      "j1204_2": "/absolute/path/to/psplib/j1204_2.sm",
+      "j1204_3": "/absolute/path/to/psplib/j1204_3.sm",
+      "j1204_4": "/absolute/path/to/psplib/j1204_4.sm",
+      "j1205_1": "/absolute/path/to/psplib/j1205_1.sm",
+      "j1205_2": "/absolute/path/to/psplib/j1205_2.sm",
+      "j1205_3": "/absolute/path/to/psplib/j1205_3.sm",
+      "j1205_4": "/absolute/path/to/psplib/j1205_4.sm",
+      "j1206_1": "/absolute/path/to/psplib/j1206_1.sm",
+      "j1206_2": "/absolute/path/to/psplib/j1206_2.sm",
+      "j1206_3": "/absolute/path/to/psplib/j1206_3.sm",
+      "j1206_4": "/absolute/path/to/psplib/j1206_4.sm"
+    }
+  }
+}

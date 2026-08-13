@@ -51,3 +51,15 @@ def test_internal_build_manifest_is_signed_and_does_not_claim_readiness() -> Non
     assert manifest["claim_boundary"]["level1_ready"] is False
     assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
     assert manifest["claim_boundary"]["pending_gates"]
+
+
+def test_example_catalog_names_exactly_the_preregistered_cases() -> None:
+    protocol = json.loads((ROOT / "experiments/txnopt/level1-protocol.json").read_bytes())
+    catalog = json.loads(
+        (ROOT / "experiments/txnopt/case-catalog.example.json").read_bytes()
+    )
+
+    for domain in ("evrptw", "rcpsp"):
+        scope = protocol["domains"][domain]
+        expected = {*scope["pilot"], *scope["validation"]}
+        assert set(catalog["domains"][domain]) == expected

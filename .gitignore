@@ -142,6 +142,8 @@ secrets.*
 # Local evolving research roadmap (kept in the repository directory, not tracked)
 /docs/roadmap/evrptw-research-roadmap.local.md
 /docs/roadmap/txnopt-research-strategy.local.md
+/experiments/txnopt/case-catalog.local.json
+/experiments/txnopt/runtime-calibration.local.json
 # macOS AppleDouble metadata on non-APFS/external volumes
 ._*
 **/._*
