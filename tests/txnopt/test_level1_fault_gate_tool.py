@@ -26,8 +26,8 @@ def _write_junit(path: Path, *, tests: int, failures: int = 0) -> None:
 
 
 def test_fault_matrix_has_one_unique_category_per_declared_scenario() -> None:
-    assert len(REQUIRED_CATEGORIES) == 24
-    assert EXPECTED_CASES == 25
+    assert len(REQUIRED_CATEGORIES) == 27
+    assert EXPECTED_CASES == 75
 
 
 def test_junit_parser_rejects_a_partial_fault_matrix(tmp_path: Path) -> None:

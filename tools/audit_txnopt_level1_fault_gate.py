@@ -38,6 +38,7 @@ class FaultScenario:
     category: str
     node_id: str
     expected_cases: int = 1
+    source_identity: str = "producer"
 
 
 FAULT_SCENARIOS = (
@@ -162,6 +163,27 @@ FAULT_SCENARIOS = (
         "tests/txnopt/test_evidence_pipeline.py::"
         "test_aggregate_refinement_rejects_unknown_cache_outcome_on_commit",
     ),
+    FaultScenario(
+        "exhaustive_completion_orders",
+        "tests/txnopt/test_level1_fault_microstates.py::"
+        "test_all_completion_orders_preserve_the_committed_trace",
+        expected_cases=12,
+        source_identity="orchestration",
+    ),
+    FaultScenario(
+        "exhaustive_worker_failure_positions",
+        "tests/txnopt/test_level1_fault_microstates.py::"
+        "test_every_worker_failure_position_preserves_the_last_committed_prefix",
+        expected_cases=36,
+        source_identity="orchestration",
+    ),
+    FaultScenario(
+        "exhaustive_deadline_checkpoints",
+        "tests/txnopt/test_level1_fault_microstates.py::"
+        "test_every_runtime_deadline_checkpoint_returns_the_last_committed_prefix",
+        expected_cases=2,
+        source_identity="orchestration",
+    ),
 )
 
 EXPECTED_CASES = sum(scenario.expected_cases for scenario in FAULT_SCENARIOS)
@@ -178,7 +200,13 @@ def _git(root: Path, *arguments: str) -> str:
 
 
 def _producer_test_sources(root: Path, *, revision: str) -> list[dict[str, str]]:
-    paths = sorted({scenario.node_id.split("::", 1)[0] for scenario in FAULT_SCENARIOS})
+    paths = sorted(
+        {
+            scenario.node_id.split("::", 1)[0]
+            for scenario in FAULT_SCENARIOS
+            if scenario.source_identity == "producer"
+        }
+    )
     bindings: list[dict[str, str]] = []
     for relative in paths:
         current = (root / relative).read_bytes()
@@ -189,6 +217,29 @@ def _producer_test_sources(root: Path, *, revision: str) -> list[dict[str, str]]
         ).stdout
         if current != producer:
             raise RuntimeError(f"fault test differs from producer revision: {relative}")
+        bindings.append({"path": relative, "sha256": sha256_bytes(current)})
+    return bindings
+
+
+def _orchestration_test_sources(root: Path) -> list[dict[str, str]]:
+    paths = sorted(
+        {
+            scenario.node_id.split("::", 1)[0]
+            for scenario in FAULT_SCENARIOS
+            if scenario.source_identity == "orchestration"
+        }
+    )
+    bindings: list[dict[str, str]] = []
+    revision = _git(root, "rev-parse", "HEAD")
+    for relative in paths:
+        current = (root / relative).read_bytes()
+        committed = subprocess.run(
+            ["git", "-C", str(root), "show", f"{revision}:{relative}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        if current != committed:
+            raise RuntimeError(f"fault audit test is not committed: {relative}")
         bindings.append({"path": relative, "sha256": sha256_bytes(current)})
     return bindings
 
@@ -263,6 +314,7 @@ def run_fault_gate(
 
     runtime_identity = verify_runtime_installation(plan, python=python, wheel=wheel)
     test_sources = _producer_test_sources(root, revision=str(producer["revision"]))
+    audit_test_sources = _orchestration_test_sources(root)
     junit_path = output / "pytest-junit.xml"
     command = _pytest_command(python, junit_path)
     completed = run_isolated_process(command, cwd=root, timeout_seconds=900.0)
@@ -319,10 +371,12 @@ def run_fault_gate(
                     "category": scenario.category,
                     "node_id": scenario.node_id,
                     "expected_cases": scenario.expected_cases,
+                    "source_identity": scenario.source_identity,
                 }
                 for scenario in FAULT_SCENARIOS
             ],
             "producer_test_sources": test_sources,
+            "orchestration_test_sources": audit_test_sources,
         },
         "execution": {
             "returncode": completed.returncode,
