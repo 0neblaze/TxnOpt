@@ -299,7 +299,11 @@ physical results preserve 100% semantic/objective parity, measure 1.32x EVRPTW
 and 2.12x RCPSP representative four-worker geometric-mean speedup, and keep
 maximum one-worker overhead below 1.85%. The 32-physical-core estimate is 4,243
 seconds. These measurements do not replace the pending independent successor
-refinement review or the full-scope confidence interval.
+refinement review or the full-scope confidence interval. Post-calibration Formal
+plan Attempt21 freezes 2,880 Build10-bound configs and a fresh absent raw root;
+its structural preflight passes but Pre-cloud Attempt02 remains blocked by the
+same external independent review gate. No procurement or execution authority is
+implied.
 
 The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree

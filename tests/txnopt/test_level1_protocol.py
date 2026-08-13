@@ -326,3 +326,27 @@ def test_build10_calibration_passes_representative_gates_without_authorization()
     assert manifest["cloud_estimate"]["purchase_authorized"] is False
     assert manifest["decision"]["formal_cloud_matrix_authorized"] is False
     assert manifest["decision"]["level1_ready"] is False
+
+
+def test_build10_precloud_receipt_blocks_procurement_pending_review() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_precloud_gate_attempt02.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING"
+    assert manifest["formal_plan"]["config_count"] == 2880
+    assert manifest["formal_plan"]["raw_output_root_absent"] is True
+    assert manifest["analysis_preregistration"]["holdout_opened"] is False
+    assert manifest["clean_cli_preflight"]["status"] == (
+        "PASS_NOT_AUTHORIZED_TO_EXECUTE"
+    )
+    assert manifest["decision"]["precloud_gate"] == "BLOCKED"
+    assert manifest["execution_boundary"]["procurement_authorized"] is False
+    assert manifest["execution_boundary"]["formal_matrix_started"] is False
+    assert manifest["execution_boundary"]["level1_ready"] is False

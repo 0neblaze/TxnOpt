@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build10 calibration complete; successor review and fresh pre-cloud decision required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build10 Attempt20 calibration retained; prior Attempt18 and Attempt19 formal roots remain absent/unexecuted | Build10 native-receipt refinement review pending |
+| `txnopt-level1-protocol-v1` | Build10 calibration complete; pre-cloud Attempt02 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build10 Attempt20 calibration retained; Attempt21 raw root absent/unexecuted | Build10 native-receipt refinement review pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -145,6 +145,14 @@ speedups are 1.32x and 2.12x, while maximum one-worker overhead is 0.46% and
 for the matrix. These are representative calibration results only: no
 full-scope confidence interval exists, the successor review remains pending,
 and purchase, execution, holdout access, and Level 1 readiness are false.
+
+Formal plan Attempt21 is the fresh post-calibration Build10 identity. It fixes
+2,880 configs under config tree
+`7ecceafc45289f16fa3a5ec7d455fff22b914a766c50f113bde8221da4760d2a`
+and preregisters the exact paired bootstrap and T4/Cmax gates. Its structural
+preflight is `PASS_NOT_AUTHORIZED_TO_EXECUTE`; the raw root is absent. Pre-cloud
+Attempt02 deliberately records `BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING`, so it
+authorizes neither procurement nor execution.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

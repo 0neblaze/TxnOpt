@@ -1,0 +1,97 @@
+{
+  "schema_version": "txnopt-level1-precloud-gate-v1",
+  "run_label": "txnopt_level1_precloud_gate_attempt02",
+  "status": "BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING",
+  "created_at_utc": "2026-08-13T13:46:49Z",
+  "orchestration_identity": {
+    "revision": "5f79a05a4c2968887a420aa5404d5ea201b677ed",
+    "git_tree": "35f0d137a54a4278338be3c9f9309cb0796a4b1a",
+    "source_dirty": false,
+    "branch": "codex/txnopt-level1",
+    "producer_identity_separate": true
+  },
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt10.json",
+    "build_manifest_sha256": "f6547bce3d4c53c6becd1eb50450854683329743152062388adc0c07d4dd3f3d",
+    "source_revision": "3e18b99a52356a6fae503dcf9bb871643d1e8f03",
+    "source_tree": "5a75a5766f47ea1319df4bcf6305bd10afd38f5d",
+    "wheel_sha256": "401804165380c8dd48f38124784956a5b160ec1bf12d24e9e5f4b2f82f357f4b",
+    "native_sha256": "e7144890bcb03e1968b440b7f55e1d47352a178af5b42d422b125372bb784755"
+  },
+  "formal_plan": {
+    "manifest_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt21/manifest.json",
+    "manifest_sha256": "b545f013fcc69a792d0bcacb3b2faafcbd6ae5092942e4036909e9c5ae5a409a",
+    "config_count": 2880,
+    "config_tree_sha256": "7ecceafc45289f16fa3a5ec7d455fff22b914a766c50f113bde8221da4760d2a",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build10-attempt21",
+    "raw_output_root_absent": true,
+    "holdout_opened": false,
+    "formal_matrix_started": false
+  },
+  "analysis_preregistration": {
+    "path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt21/analysis-protocol.json",
+    "sha256": "6456a86b0b38a012c101666544cf4823800f4b6af45920ae869174bd6e015230",
+    "status": "PREREGISTERED_BEFORE_FORMAL_MATRIX",
+    "bootstrap_resamples": 20000,
+    "bootstrap_seed": 20260813,
+    "holdout_opened": false
+  },
+  "precloud_evidence": {
+    "tracked_calibration_manifest_path": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt20.json",
+    "tracked_calibration_manifest_sha256": "b353277ff6d6c2830d9b404a865cef8bd8c1e883056d56cd9636ea06168899c7",
+    "local_calibration_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt20.json",
+    "local_calibration_sha256": "1db91a0a48b6a2d81b1146e74dfc76d6543954472db21e2c65679cb9f246d83d",
+    "raw_review_pairs": 96,
+    "raw_review_pass_count": 96,
+    "fixed_work_semantic_and_objective_match_rate": 1.0,
+    "representative_speedup_gate": "PASS",
+    "cloud_estimate_path": "/home/oneblaze/txnopt-calibration/level1-cloud-estimate-attempt04.json",
+    "cloud_estimate_sha256": "48f254fae85d6e237d5c2633f21ce9209c4b84ece3b8123135131ddb6e7b7d33",
+    "cloud_estimate_status": "PURCHASE_GATE_PASS",
+    "estimated_32_physical_core_seconds": 4243.489474664974,
+    "maximum_purchase_window_days": 14,
+    "predicted_completion_within_ten_days": true
+  },
+  "formal_and_legacy_reviews": {
+    "prior_formal_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "prior_formal_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "prior_formal_review_binding": "PRIOR_SOURCE_ONLY",
+    "build10_successor_note_path": "formal/native-round-prepared-receipt-refinement.md",
+    "build10_successor_note_sha256": "cbd2ede49c31e3b6b53fd3eaea8718876a319bb6be535c524f0df6b259c6f2c6",
+    "build10_successor_review_status": "REVIEW_PENDING_BUILD10",
+    "build10_independent_successor_review_completed": false,
+    "legacy_compatibility_path": "legacy/txnopt-legacy-compatibility-attempt01.json",
+    "legacy_compatibility_sha256": "8fa31e2bdd8b0457bff628e6c190c96da8ef4b9d988b8c83335abdaf7240f38e",
+    "legacy_review_path": "legacy/txnopt-legacy-compatibility-review-attempt01.json",
+    "legacy_review_sha256": "d675babbf86167788d19e94ab63010e0ef0ccfaff38fa0bc16ced76589976a0c"
+  },
+  "clean_cli_preflight": {
+    "exit_code": 0,
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE",
+    "config_count": 2880,
+    "config_tree_sha256": "7ecceafc45289f16fa3a5ec7d455fff22b914a766c50f113bde8221da4760d2a",
+    "active_target_process_count": 0,
+    "atomic_launch_claim_absent": true,
+    "raw_output_root_absent": true,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false
+  },
+  "execution_boundary": {
+    "procurement_authorized": false,
+    "cloud_purchase_performed": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "internal_level1_seal_created": false,
+    "level2_entry_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false
+  },
+  "decision": {
+    "precloud_gate": "BLOCKED",
+    "blocking_gate": "BUILD10_EXTERNAL_INDEPENDENT_SUCCESSOR_REFINEMENT_REVIEW",
+    "next_required_authority": "NONE_WHILE_BLOCKED",
+    "authorized_next_action": "EXTERNAL_INDEPENDENT_REVIEW_ONLY",
+    "claim_boundary": "This receipt authorizes no purchase and no execution. It records that Attempt21 is structurally complete and unstarted while procurement remains blocked by the pending Build10 successor review."
+  }
+}
