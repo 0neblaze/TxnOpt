@@ -35,6 +35,7 @@ from tools.txnopt_level1_campaign_common import (
     verify_sidecar,
     write_signed_object,
 )
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
 
 
 class _WeightedTokens:
@@ -207,6 +208,7 @@ def execute_campaign(
             return _run_one(
                 entry,
                 python=python_path,
+                build_manifest_path=plan.build_manifest_path,
                 timeout_seconds=min(per_run_timeout_seconds, remaining_seconds),
             )
         finally:
@@ -283,6 +285,7 @@ def _run_one(
     entry: CampaignEntry,
     *,
     python: Path,
+    build_manifest_path: Path,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     started_at = _utc_now()
@@ -355,16 +358,19 @@ def _run_one(
     if output.get("manifest_sha256") != manifest_sha256:
         return {**base, "status": "FAILED", "error": "raw manifest digest differs"}
     raw_manifest = read_signed_object(manifest_path)
-    if raw_manifest.get("schema_version") not in {
-        "txnopt-raw-artifact-v1",
-        "txnopt-raw-artifact-v2",
-    }:
+    if raw_manifest.get("schema_version") != "txnopt-raw-artifact-v3":
         return {**base, "status": "FAILED", "error": "raw artifact schema differs"}
     bundle_config = manifest_path.parent / "config.json"
+    expected_identity = ExpectedEvidenceIdentity.from_plan_inputs(
+        entry.config_path,
+        build_manifest_path=build_manifest_path,
+    )
     if (
         raw_manifest.get("run_label") != entry.run_label
         or raw_manifest.get("input_config_sha256") != entry.config_sha256
-        or verify_sidecar(bundle_config) != entry.config_sha256
+        or verify_sidecar(bundle_config) != expected_identity.config_artifact_sha256
+        or raw_manifest.get("producer_identity")
+        != dict(expected_identity.producer_identity)
     ):
         return {
             **base,

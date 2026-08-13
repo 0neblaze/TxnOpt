@@ -40,17 +40,20 @@ class RunExecutionError(RuntimeError):
 
 
 def run_config_file(config_path: Path) -> RawArtifactRef:
-    input_bytes = config_path.resolve(strict=True).read_bytes()
+    candidate = config_path.expanduser().absolute()
+    if candidate.is_symlink():
+        raise ValueError("TxnOpt run config cannot be a symlink")
+    input_bytes = candidate.resolve(strict=True).read_bytes()
     payload: object = json.loads(input_bytes)
     if not isinstance(payload, dict):
         raise ValueError("TxnOpt run config must contain an object")
-    return run_config(payload, input_sha256=sha256_bytes(input_bytes))
+    return run_config(payload, input_config_bytes=input_bytes)
 
 
 def run_config(
     payload: Mapping[str, Any],
     *,
-    input_sha256: str,
+    input_config_bytes: bytes,
 ) -> RawArtifactRef:
     if payload.get("schema_version") != "txnopt-run-config-v1":
         raise ValueError("unsupported TxnOpt run config schema")
@@ -64,13 +67,15 @@ def run_config(
         raise ValueError("output_root must be a non-empty path string")
     if not isinstance(run_config_payload, dict) or not isinstance(case_payload, dict):
         raise ValueError("run_config and case must be objects")
+    if json.loads(input_config_bytes) != dict(payload):
+        raise ValueError("input config bytes differ from the parsed payload")
+    input_sha256 = sha256_bytes(input_config_bytes)
     producer_identity = _producer_identity(payload.get("build_manifest"))
     lifecycle = EvidenceLifecycle.start(run_label, evidence_sha256=input_sha256).advance(
         EvidenceState.RUNNING,
         evidence_sha256=lifecycle_evidence_sha256(producer_identity),
     )
     config = parse_run_config(run_config_payload)
-    normalized_config = canonical_json_bytes(dict(payload), pretty=True)
 
     output_dir = Path(output_root).expanduser().resolve() / run_label
     if output_dir.exists() or output_dir.is_symlink():
@@ -80,7 +85,9 @@ def run_config(
     captured: list[tuple[Mapping[str, object], ...]] = []
     physical: list[tuple[Mapping[str, object], ...]] = []
     config_path = output_dir / "config.json"
-    config_digest = write_exclusive(config_path, normalized_config)
+    config_digest = write_exclusive(config_path, input_config_bytes)
+    if config_digest != input_sha256:
+        raise RuntimeError("retained config digest differs from the input config")
     write_sidecar(config_path, config_digest)
     config_entry = _artifact_entry(config_path, config_digest)
     try:
@@ -108,7 +115,7 @@ def run_config(
         retained_semantic = [stream for stream in captured if stream]
         retained_physical = [stream for stream in physical if stream]
         failure = {
-            "schema_version": "txnopt-run-failure-v2",
+            "schema_version": "txnopt-run-failure-v3",
             "run_label": run_label,
             "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
             "error_message": str(error),
@@ -133,7 +140,7 @@ def run_config(
             evidence_sha256=lifecycle_evidence_sha256(failure_artifacts),
         )
         failure_manifest = {
-            "schema_version": "txnopt-failure-artifact-v2",
+            "schema_version": "txnopt-failure-artifact-v3",
             "run_label": run_label,
             "input_config_sha256": input_sha256,
             "contract": "txnopt-contract-v1",
@@ -193,7 +200,7 @@ def run_config(
         evidence_sha256=lifecycle_evidence_sha256(artifacts),
     )
     manifest = {
-        "schema_version": "txnopt-raw-artifact-v2",
+        "schema_version": "txnopt-raw-artifact-v3",
         "run_label": run_label,
         "input_config_sha256": input_sha256,
         "contract": "txnopt-contract-v1",
@@ -246,8 +253,8 @@ def _producer_identity(raw_binding: object) -> dict[str, object]:
     if raw_binding is None:
         return {
             "binding_status": "UNBOUND_TEST_ONLY",
-            "native_build_attestation": attestation,
             "installed_native_sha256": native_sha256,
+            "native_build_attestation": attestation,
         }
     if not isinstance(raw_binding, dict):
         raise ValueError("build_manifest binding must be an object")
@@ -294,11 +301,14 @@ def _producer_identity(raw_binding: object) -> dict[str, object]:
         raise ValueError("build manifest wheel SHA-256 is missing")
     return {
         "binding_status": "BOUND_CLEAN_BUILD",
-        "build_manifest_path": str(manifest_path),
         "build_manifest_sha256": actual_sha256,
+        "source_revision": attestation["source_revision"],
+        "source_tree": attestation["source_tree"],
+        "source_manifest_sha256": attestation["source_manifest_sha256"],
+        "tracked_file_count": attestation["tracked_file_count"],
         "wheel_sha256": wheel["sha256"],
         "installed_native_sha256": native_sha256,
-        "native_build_attestation": attestation,
+        "native_protocol": native["protocol"],
     }
 
 

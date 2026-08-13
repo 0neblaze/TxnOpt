@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
+
 
 @dataclass(frozen=True, slots=True)
 class RawArtifactRef:
@@ -35,4 +37,5 @@ class ReviewerPort(Protocol):
         *,
         manifest_path: Path,
         output_dir: Path,
+        expected_identity: ExpectedEvidenceIdentity,
     ) -> Mapping[str, object]: ...

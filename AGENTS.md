@@ -76,6 +76,11 @@ txnopt -> never cases/evidence/legacy
   Producers may advance only through `PLANNED -> RUNNING -> SEALED`; an
   independent reviewer appends `REVIEWED`. Legacy raw/review schemas remain
   readable but never acquire retroactive lifecycle events or rewritten hashes.
+- New formal evidence must use an externally anchored expected identity fixed
+  from the pre-run plan, exact config bytes, and clean build manifest. A raw
+  bundle or its SHA-256 sidecar is observed evidence, not its own trust root.
+  Unanchored v1/v2 replay is an explicit legacy-compatibility path and cannot
+  satisfy a formal readiness gate.
 - `txnopt_legacy` is read-only. New active execution may not depend on it.
 - Break cycles by extracting immutable identities, DTOs, or ports. Do not hide
   an architectural cycle behind a local import.

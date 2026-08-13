@@ -10,7 +10,14 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
-from txnopt_evidence.reviewer import replay_manifest, verify_manifest
+from txnopt_evidence.codec import read_signed_json
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
+from txnopt_evidence.reviewer import (
+    replay_legacy_manifest,
+    replay_manifest,
+    verify_legacy_manifest,
+    verify_manifest,
+)
 from txnopt_legacy import LegacyReceiptReader
 
 _VERSION: Final = "0.1.0a1"
@@ -26,10 +33,16 @@ def _parser() -> argparse.ArgumentParser:
 
     verify = commands.add_parser("verify")
     verify.add_argument("manifest", type=Path)
+    verify_identity = verify.add_mutually_exclusive_group()
+    verify_identity.add_argument("--expected-identity", type=Path)
+    verify_identity.add_argument("--legacy-compatibility", action="store_true")
 
     replay = commands.add_parser("replay")
     replay.add_argument("manifest", type=Path)
     replay.add_argument("--output-dir", type=Path, required=True)
+    replay_identity = replay.add_mutually_exclusive_group()
+    replay_identity.add_argument("--expected-identity", type=Path)
+    replay_identity.add_argument("--legacy-compatibility", action="store_true")
 
     commands.add_parser("env")
 
@@ -74,12 +87,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "fallback_count": 0,
             }
         elif arguments.command == "replay":
-            result = replay_manifest(
-                arguments.manifest,
-                output_dir=arguments.output_dir,
+            result = (
+                replay_legacy_manifest(
+                    arguments.manifest,
+                    output_dir=arguments.output_dir,
+                )
+                if arguments.legacy_compatibility
+                else replay_manifest(
+                    arguments.manifest,
+                    output_dir=arguments.output_dir,
+                    expected_identity=_expected_identity(arguments.expected_identity),
+                )
             )
         elif arguments.command == "verify":
-            payload = verify_manifest(arguments.manifest)
+            payload = (
+                verify_legacy_manifest(arguments.manifest)
+                if arguments.legacy_compatibility
+                else verify_manifest(
+                    arguments.manifest,
+                    expected_identity=_expected_identity(arguments.expected_identity),
+                )
+            )
             result = {
                 "schema_version": "txnopt-verification-v1",
                 "status": "verified",
@@ -105,6 +133,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _error(str(arguments.command), error)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _expected_identity(path: Path | None) -> ExpectedEvidenceIdentity:
+    if path is None:
+        raise ValueError("expected evidence identity is required")
+    return ExpectedEvidenceIdentity.from_payload(read_signed_json(path))
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from tools.txnopt_level1_campaign_common import (
     verify_sidecar,
     write_signed_object,
 )
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
 
 
 def review_campaign(
@@ -87,6 +88,8 @@ def review_campaign(
     if review_receipt_path.exists() or review_receipt_path.is_symlink():
         raise FileExistsError(f"campaign review receipt already exists: {review_receipt_path}")
     review_destination.mkdir(parents=True, exist_ok=False)
+    expected_identity_root = review_destination / ".expected-identities"
+    expected_identity_root.mkdir()
     started_at = _utc_now()
     started_ns = time.monotonic_ns()
     records: list[dict[str, Any] | None] = [None] * len(plan.entries)
@@ -97,10 +100,9 @@ def review_campaign(
             entry,
             python=executable_path(python),
             review_root=review_destination,
+            expected_identity_root=expected_identity_root,
             timeout_seconds=per_run_timeout_seconds,
-            expected_build_manifest_sha256=plan.build_manifest_sha256,
-            expected_wheel_sha256=str(runtime_identity["wheel_sha256"]),
-            expected_native_sha256=str(runtime_identity["native_sha256"]),
+            build_manifest_path=plan.build_manifest_path,
         )
 
     with ThreadPoolExecutor(max_workers=min(review_workers, len(plan.entries))) as executor:
@@ -167,43 +169,29 @@ def _review_one(
     *,
     python: Path,
     review_root: Path,
+    expected_identity_root: Path,
     timeout_seconds: float,
-    expected_build_manifest_sha256: str,
-    expected_wheel_sha256: str,
-    expected_native_sha256: str,
+    build_manifest_path: Path,
 ) -> dict[str, Any]:
     raw_bundle = entry.raw_output_root / entry.run_label
     manifest_path = raw_bundle / "manifest.json"
     manifest_sha256 = verify_sidecar(manifest_path)
     raw_manifest = read_signed_object(manifest_path)
-    if raw_manifest.get("schema_version") not in {
-        "txnopt-raw-artifact-v1",
-        "txnopt-raw-artifact-v2",
-    }:
+    if raw_manifest.get("schema_version") != "txnopt-raw-artifact-v3":
         return {
             **_entry_identity(entry),
             "status": "FAILED",
             "error": "raw artifact schema differs",
         }
-    producer_identity = _object(
-        raw_manifest.get("producer_identity"),
-        "raw producer identity",
+    expected_identity = ExpectedEvidenceIdentity.from_plan_inputs(
+        entry.config_path,
+        build_manifest_path=build_manifest_path,
     )
-    bundle_config = raw_bundle / "config.json"
-    if (
-        raw_manifest.get("run_label") != entry.run_label
-        or raw_manifest.get("input_config_sha256") != entry.config_sha256
-        or verify_sidecar(bundle_config) != entry.config_sha256
-        or producer_identity.get("binding_status") != "BOUND_CLEAN_BUILD"
-        or producer_identity.get("build_manifest_sha256") != expected_build_manifest_sha256
-        or producer_identity.get("wheel_sha256") != expected_wheel_sha256
-        or producer_identity.get("installed_native_sha256") != expected_native_sha256
-    ):
-        return {
-            **_entry_identity(entry),
-            "status": "FAILED",
-            "error": "raw producer identity differs from the campaign build",
-        }
+    expected_identity_path = expected_identity_root / f"{entry.run_label}.json"
+    expected_identity_sha256 = write_signed_object(
+        expected_identity_path,
+        expected_identity.to_payload(),
+    )
     review_dir = review_root / entry.run_label
     started_ns = time.monotonic_ns()
     completed = run_isolated_process(
@@ -216,6 +204,8 @@ def _review_one(
             str(manifest_path),
             "--output-dir",
             str(review_dir),
+            "--expected-identity",
+            str(expected_identity_path),
         ],
         cwd=raw_bundle,
         timeout_seconds=timeout_seconds,
@@ -224,6 +214,8 @@ def _review_one(
         **_entry_identity(entry),
         "raw_manifest_path": str(manifest_path),
         "raw_manifest_sha256": manifest_sha256,
+        "expected_identity_path": str(expected_identity_path),
+        "expected_identity_sha256": expected_identity_sha256,
         "review_elapsed_seconds": (time.monotonic_ns() - started_ns) / 1_000_000_000,
         "return_code": completed.returncode,
     }
@@ -241,11 +233,7 @@ def _review_one(
     review_path = review_dir / "review.json"
     review_sha256 = verify_sidecar(review_path)
     review = read_signed_object(review_path)
-    expected_review_schema = (
-        "txnopt-independent-review-v2"
-        if raw_manifest.get("schema_version") == "txnopt-raw-artifact-v2"
-        else "txnopt-independent-review-v1"
-    )
+    expected_review_schema = "txnopt-independent-review-v3"
     result = read_signed_object(raw_bundle / "result.json")
     semantic_events = read_event_stream(raw_bundle / "events.jsonl")
     physical_events = read_event_stream(raw_bundle / "physical.jsonl")

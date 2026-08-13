@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build11 local build/static/semantic/performance/bounded-exhaustive-fault/runtime gates complete; review packet machine-verified; pre-cloud Attempt06 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration, static Attempt01, and fault Attempt03 retained; Attempt23 raw root absent/unexecuted | Packet verification Attempt08 passes; external Build11 decision pending |
+| `txnopt-level1-protocol-v1` | Build11 local gates retained; independent Attempt09 found three major evidence-identity defects; successor correction and new clean build required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration, static Attempt01, and fault Attempt03 retained without promotion; Attempt23 raw root absent/unexecuted | Attempt09 `NEEDS_WORK`; successor review pending a new anchored build |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -198,6 +198,15 @@ lifecycle/refinement tests. Its machine status is
 identity or decision. Attempt08 did not unblock the then-current pre-cloud
 Attempt05; successor Attempt06 remains blocked for the same external decision.
 
+Independent review Attempt09 resolves that pending decision as `NEEDS_WORK`
+with zero critical, three major, and zero minor findings. The v2 reviewer could
+accept a fully re-signed producer identity, detached run label/input config, or
+self-rebound result metadata because the bundle sidecar was treated as a trust
+root. Build11 and Attempt23 remain immutable and unpromoted. The successor must
+use a new clean build plus a pre-run expected identity that binds the exact
+config bytes, producer source/tree/wheel/native identity, domain, execution
+mode, and result contract before independent replay.
+
 Static gate Attempt01 binds the unchanged Build11 implementation and installed
 wheel to 24/24 producer-owned contract, dependency, distribution, and CLI
 tests. It records entrypoint coverage 1, zero core import cycles, zero reverse
@@ -209,9 +218,10 @@ all purchase/execution boundaries.
 Completion audit Attempt01 maps every Level 1 predicate to its exact evidence.
 It records all local implementation and pre-cloud gates complete, but keeps
 Level 1 incomplete: full-scope confidence intervals and raw replay do not exist
-because Attempt23 has not started, and zero unresolved Build11 findings remains
-unproven until an external reviewer issues a decision. The only currently
-authorized next action is that external independent review.
+because Attempt23 has not started, and Attempt09 proves that zero unresolved
+Build11 findings is false. The only current implementation action is the
+anchored evidence-identity correction followed by a new clean build and a new
+independent review; procurement and formal execution remain unauthorized.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

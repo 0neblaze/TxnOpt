@@ -6,11 +6,18 @@ and independently reviewed summaries. Raw run output belongs under ignored
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
-Build11 and later raw/failure bundles use `txnopt-raw-artifact-v2` or
+Build11 raw/failure bundles use `txnopt-raw-artifact-v2` or
 `txnopt-failure-artifact-v2` with the hash-chained
 `txnopt-evidence-lifecycle-v1` contract. The producer seals
 `PLANNED -> RUNNING -> SEALED`; the independent replay appends `REVIEWED`.
 Build10 v1 bundles remain read-only and replayable without retroactive edits.
+Attempt09 independently rejected Build11's self-contained v2 evidence boundary:
+its sidecars proved internal consistency but did not anchor producer, config,
+run-label, and result identity to a pre-run trust root. The successor schema is
+`txnopt-raw-artifact-v3`/`txnopt-failure-artifact-v3`; formal replay requires a
+separate `txnopt-expected-evidence-identity-v1` derived from the frozen plan,
+exact config bytes, and clean build manifest. V1/v2 replay remains an explicit
+compatibility operation and cannot enter a formal readiness decision.
 
 The exact Level 1 case set, seeds, axes, and cloud envelope are bound by
 `level1-protocol.json` and its sidecar. `INDEX.md` is the current status view;
@@ -45,8 +52,10 @@ preflight is read-only:
 Build11 freezes the active solver source as
 `manifests/txnopt_level1_build_attempt11.json`. Build10 and all earlier
 calibrations, plans, and pre-cloud gates remain immutable but cannot authorize
-Build11. Build11 lifecycle/formal refinement is explicitly pending independent
-review; Attempt22 calibration and Attempt23 plan use fresh identities.
+Build11. Build11 lifecycle/formal refinement was independently reviewed as
+`NEEDS_WORK` in Attempt09. Attempt22 calibration and Attempt23 remain immutable,
+unpromoted Build11 evidence; the successor correction requires a new clean build
+and new plan identity before any formal execution can be considered.
 
 ```bash
 python -m tools.run_txnopt_level1_campaign preflight \
@@ -54,7 +63,8 @@ python -m tools.run_txnopt_level1_campaign preflight \
   --analysis-protocol /home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/analysis-protocol.json
 ```
 
-Attempt23 preflight status is `PASS_NOT_AUTHORIZED_TO_EXECUTE`.
+Attempt23 preflight status was `PASS_NOT_AUTHORIZED_TO_EXECUTE`; Attempt09's
+major findings keep it permanently unexecuted and unauthorized.
 The `run` subcommand
 also requires the exact plan-bound Build11 wheel, an isolated Python installation, host
 resource checks, and a separately signed

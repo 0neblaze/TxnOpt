@@ -189,6 +189,7 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
         raise ValueError("campaign build is not a clean TxnOpt native-round producer")
     run_label = build.get("run_label")
     status = build.get("status")
+    additional_gates: tuple[str, ...]
     if run_label == "txnopt_level1_build_attempt09":
         formal_package = _object(build.get("formal_package"), "build formal package")
         if (

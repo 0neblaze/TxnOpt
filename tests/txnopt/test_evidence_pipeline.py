@@ -8,14 +8,23 @@ from pathlib import Path
 
 import pytest
 
+from txnopt import _native
 from txnopt_evidence.cli import main
-from txnopt_evidence.codec import read_signed_json, write_signed_json
-from txnopt_evidence.lifecycle import EvidenceLifecycle, EvidenceState
+from txnopt_evidence.codec import read_signed_json, sha256_file, write_signed_json
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
+from txnopt_evidence.lifecycle import (
+    EvidenceLifecycle,
+    EvidenceState,
+    lifecycle_evidence_sha256,
+)
 from txnopt_evidence.reviewer import (
     _validate_event_stream,
     _validate_physical_trace,
+    replay_legacy_manifest,
     replay_manifest,
     verify_failure_manifest,
+    verify_legacy_failure_manifest,
+    verify_legacy_raw_manifest,
     verify_raw_manifest,
 )
 from txnopt_evidence.runner import RunExecutionError, run_config_file
@@ -130,6 +139,75 @@ def _write_config(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _expected_identity(config_path: Path, manifest_path: Path) -> ExpectedEvidenceIdentity:
+    manifest = read_signed_json(manifest_path)
+    return ExpectedEvidenceIdentity.for_unbound_test(
+        config_path,
+        producer_identity=manifest["producer_identity"],
+    )
+
+
+def _replace_signed_json(path: Path, payload: object) -> None:
+    path.unlink()
+    path.with_suffix(path.suffix + ".sha256").unlink()
+    write_signed_json(path, payload)
+
+
+def _resign_manifest(path: Path, manifest: dict[str, object]) -> None:
+    lifecycle = (
+        EvidenceLifecycle.start(
+            str(manifest["run_label"]),
+            evidence_sha256=str(manifest["input_config_sha256"]),
+        )
+        .advance(
+            EvidenceState.RUNNING,
+            evidence_sha256=lifecycle_evidence_sha256(manifest["producer_identity"]),
+        )
+        .advance(
+            EvidenceState.SEALED,
+            evidence_sha256=lifecycle_evidence_sha256(manifest["artifacts"]),
+        )
+    )
+    manifest["lifecycle"] = lifecycle.to_payload()
+    _replace_signed_json(path, manifest)
+
+
+def _bind_current_native_build(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> Path:
+    attestation = dict(_native.BUILD_ATTESTATION)
+    native_file = _native.__file__
+    assert isinstance(native_file, str)
+    build_path = tmp_path / "build-manifest.json"
+    build_digest = write_signed_json(
+        build_path,
+        {
+            "schema_version": "txnopt-level1-build-manifest-v1",
+            "producer": {
+                "revision": attestation["source_revision"],
+                "git_tree": attestation["source_tree"],
+                "source_manifest_sha256": attestation["source_manifest_sha256"],
+                "tracked_file_count": attestation["tracked_file_count"],
+                "source_dirty": False,
+                "development_override": False,
+            },
+            "artifacts": {
+                "wheel": {"sha256": "a" * 64},
+                "native_extension": {
+                    "sha256": sha256_file(Path(native_file).resolve(strict=True)),
+                    "protocol": "txnopt-native-round-v1",
+                },
+            },
+        },
+    )
+    payload["build_manifest"] = {
+        "path": str(build_path),
+        "sha256": build_digest,
+    }
+    return build_path
+
+
 @pytest.mark.parametrize("factory", [_rcpsp_config, _evrptw_config])
 def test_runner_writes_raw_only_and_reviewer_reconstructs_both_domains(
     tmp_path: Path,
@@ -139,16 +217,21 @@ def test_runner_writes_raw_only_and_reviewer_reconstructs_both_domains(
     payload = factory(tmp_path)  # type: ignore[operator]
     _write_config(config_path, payload)
     raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
 
-    manifest = verify_raw_manifest(raw.manifest_path)
-    assert manifest["schema_version"] == "txnopt-raw-artifact-v2"
+    manifest = verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+    assert manifest["schema_version"] == "txnopt-raw-artifact-v3"
     assert manifest["runner_decision"] is None
     assert manifest["fallback_count"] == 0
     assert manifest["producer_identity"]["binding_status"] == "UNBOUND_TEST_ONLY"
     sealed = EvidenceLifecycle.from_payload(manifest["lifecycle"])
     assert sealed.state is EvidenceState.SEALED
-    review = replay_manifest(raw.manifest_path, output_dir=tmp_path / "review")
-    assert review["schema_version"] == "txnopt-independent-review-v2"
+    review = replay_manifest(
+        raw.manifest_path,
+        output_dir=tmp_path / "review",
+        expected_identity=expected,
+    )
+    assert review["schema_version"] == "txnopt-independent-review-v3"
     assert review["status"] == "PASS"
     assert review["prefix_safety"] == "PASS"
     assert review["case_replay"]["validator_status"] == "PASS"
@@ -164,17 +247,19 @@ def test_reviewer_detects_raw_tampering_before_replay(tmp_path: Path) -> None:
     config_path = tmp_path / "run.json"
     _write_config(config_path, _rcpsp_config(tmp_path))
     raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
     events = raw.manifest_path.parent / "events.jsonl"
     events.write_bytes(events.read_bytes() + b"{}\n")
 
     with pytest.raises(ValueError, match="differs"):
-        verify_raw_manifest(raw.manifest_path)
+        verify_raw_manifest(raw.manifest_path, expected_identity=expected)
 
 
 def test_reviewer_rejects_a_resigned_but_tampered_lifecycle(tmp_path: Path) -> None:
     config_path = tmp_path / "run.json"
     _write_config(config_path, _rcpsp_config(tmp_path))
     raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
     manifest = read_signed_json(raw.manifest_path)
     lifecycle = manifest["lifecycle"]
     assert isinstance(lifecycle, dict)
@@ -186,7 +271,162 @@ def test_reviewer_rejects_a_resigned_but_tampered_lifecycle(tmp_path: Path) -> N
     write_signed_json(raw.manifest_path, manifest)
 
     with pytest.raises(ValueError, match="lifecycle"):
-        verify_raw_manifest(raw.manifest_path)
+        verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+
+
+def test_v3_public_verify_rejects_resigned_foreign_producer_identity(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
+    manifest = read_signed_json(raw.manifest_path)
+    forged = dict(manifest["producer_identity"])
+    forged.update(
+        {
+            "build_manifest_sha256": "f" * 64,
+            "wheel_sha256": "e" * 64,
+            "installed_native_sha256": "d" * 64,
+        }
+    )
+    manifest["producer_identity"] = forged
+    _resign_manifest(raw.manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="producer identity"):
+        verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+
+
+def test_v3_bound_identity_is_derived_from_pre_run_config_and_build(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "run.json"
+    payload = _rcpsp_config(tmp_path)
+    build_path = _bind_current_native_build(tmp_path, payload)
+    _write_config(config_path, payload)
+    expected = ExpectedEvidenceIdentity.from_plan_inputs(
+        config_path,
+        build_manifest_path=build_path,
+    )
+
+    raw = run_config_file(config_path)
+    manifest = verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+
+    assert manifest["producer_identity"] == dict(expected.producer_identity)
+    assert expected.producer_identity["binding_status"] == "BOUND_CLEAN_BUILD"
+
+
+def test_expected_identity_rejects_detached_retained_config_digest() -> None:
+    with pytest.raises(ValueError, match="retained config digest"):
+        ExpectedEvidenceIdentity(
+            run_label="txnopt_rcpsp_attempt01",
+            input_config_sha256="0" * 64,
+            config_artifact_sha256="1" * 64,
+            domain="rcpsp",
+            execution_mode="serial",
+            expected_oracle="txnopt_cases.rcpsp.oracle.RCPSPOracle",
+            producer_identity={
+                "binding_status": "UNBOUND_TEST_ONLY",
+                "installed_native_sha256": "2" * 64,
+            },
+        )
+
+
+def test_v3_public_verify_rejects_manifest_label_detached_from_retained_config(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
+    manifest = read_signed_json(raw.manifest_path)
+    manifest["run_label"] = "txnopt_rcpsp_resigned_attempt99"
+    _resign_manifest(raw.manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="run label"):
+        verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+
+
+def test_v3_public_verify_rejects_retained_config_detached_from_input_digest(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
+    manifest = read_signed_json(raw.manifest_path)
+    retained_path = raw.manifest_path.parent / "config.json"
+    retained = read_signed_json(retained_path)
+    retained["run_label"] = "txnopt_rcpsp_resigned_attempt99"
+    _replace_signed_json(retained_path, retained)
+    config_entry = next(
+        entry for entry in manifest["artifacts"] if entry["path"] == "config.json"
+    )
+    config_entry["sha256"] = retained_path.with_suffix(".json.sha256").read_text().split()[0]
+    config_entry["bytes"] = retained_path.stat().st_size
+    _resign_manifest(raw.manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="config"):
+        verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+
+
+def test_v3_public_verify_rejects_extra_artifact_entry_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
+    manifest = read_signed_json(raw.manifest_path)
+    manifest["artifacts"][0]["forged"] = "self-resigned"
+    _resign_manifest(raw.manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="artifact.*field"):
+        verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["schema", "domain", "provenance", "physical_ref", "extra"],
+)
+@pytest.mark.parametrize("entrypoint", ["verify", "replay"])
+def test_v3_public_entrypoints_reject_self_resigned_result_identity(
+    tmp_path: Path,
+    mutation: str,
+    entrypoint: str,
+) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    raw = run_config_file(config_path)
+    expected = _expected_identity(config_path, raw.manifest_path)
+    manifest = read_signed_json(raw.manifest_path)
+    result_path = raw.manifest_path.parent / "result.json"
+    result = read_signed_json(result_path)
+    if mutation == "schema":
+        result["schema_version"] = "forged-result-v99"
+    elif mutation == "domain":
+        result["domain"] = "evrptw"
+    elif mutation == "provenance":
+        result["provenance"] = {**result["provenance"], "oracle": "forged.Oracle"}
+    elif mutation == "physical_ref":
+        result["physical_artifact_ref"] = "forged-physical-reference"
+    else:
+        result["forged"] = True
+    _replace_signed_json(result_path, result)
+    result_entry = next(
+        entry for entry in manifest["artifacts"] if entry["path"] == "result.json"
+    )
+    result_entry["sha256"] = result_path.with_suffix(".json.sha256").read_text().split()[0]
+    result_entry["bytes"] = result_path.stat().st_size
+    _resign_manifest(raw.manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="result"):
+        if entrypoint == "verify":
+            verify_raw_manifest(raw.manifest_path, expected_identity=expected)
+        else:
+            replay_manifest(
+                raw.manifest_path,
+                output_dir=tmp_path / "review",
+                expected_identity=expected,
+            )
 
 
 def test_v1_raw_artifact_remains_replayable_without_a_lifecycle(tmp_path: Path) -> None:
@@ -200,8 +440,11 @@ def test_v1_raw_artifact_remains_replayable_without_a_lifecycle(tmp_path: Path) 
     raw.manifest_path.with_suffix(".json.sha256").unlink()
     write_signed_json(raw.manifest_path, manifest)
 
-    assert verify_raw_manifest(raw.manifest_path)["schema_version"] == "txnopt-raw-artifact-v1"
-    review = replay_manifest(raw.manifest_path, output_dir=tmp_path / "v1-review")
+    assert (
+        verify_legacy_raw_manifest(raw.manifest_path)["schema_version"]
+        == "txnopt-raw-artifact-v1"
+    )
+    review = replay_legacy_manifest(raw.manifest_path, output_dir=tmp_path / "v1-review")
     assert review["schema_version"] == "txnopt-independent-review-v1"
     assert "lifecycle" not in review
 
@@ -215,8 +458,21 @@ def test_run_and_verify_cli_are_live_without_fallback(
     assert main(["run", "--config", str(config_path)]) == 0
     run_output = json.loads(capsys.readouterr().out)
     assert run_output["fallback_count"] == 0
+    identity_path = tmp_path / "expected-identity.json"
+    raw_manifest_path = Path(run_output["manifest_path"])
+    write_signed_json(
+        identity_path,
+        _expected_identity(config_path, raw_manifest_path).to_payload(),
+    )
 
-    assert main(["verify", run_output["manifest_path"]]) == 0
+    assert main(
+        [
+            "verify",
+            run_output["manifest_path"],
+            "--expected-identity",
+            str(identity_path),
+        ]
+    ) == 0
     verify_output = json.loads(capsys.readouterr().out)
     assert verify_output["status"] == "verified"
     assert verify_output["fallback_count"] == 0
@@ -228,6 +484,11 @@ def test_cli_replay_runs_in_a_fresh_process_and_writes_signed_review(
     config_path = tmp_path / "run.json"
     _write_config(config_path, _rcpsp_config(tmp_path))
     raw = run_config_file(config_path)
+    identity_path = tmp_path / "expected-identity.json"
+    write_signed_json(
+        identity_path,
+        _expected_identity(config_path, raw.manifest_path).to_payload(),
+    )
     review_dir = tmp_path / "independent-review"
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(ROOT / "src")
@@ -240,6 +501,8 @@ def test_cli_replay_runs_in_a_fresh_process_and_writes_signed_review(
             str(raw.manifest_path),
             "--output-dir",
             str(review_dir),
+            "--expected-identity",
+            str(identity_path),
         ],
         cwd=ROOT,
         env=environment,
@@ -261,6 +524,18 @@ def test_runner_never_overwrites_an_existing_attempt(tmp_path: Path) -> None:
 
     with pytest.raises(FileExistsError, match="already exists"):
         run_config_file(config_path)
+
+
+def test_runner_rejects_a_symlinked_config_before_writing_raw(tmp_path: Path) -> None:
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path))
+    symlink = tmp_path / "linked-run.json"
+    symlink.symlink_to(config_path)
+
+    with pytest.raises(ValueError, match="symlink"):
+        run_config_file(symlink)
+
+    assert not (tmp_path / "raw").exists()
 
 
 def test_invalid_config_is_rejected_before_a_run_directory_is_created(tmp_path: Path) -> None:
@@ -357,12 +632,45 @@ def test_reviewer_replays_native_prepared_round_observations() -> None:
         "source_tree": "b" * 40,
     }
 
-    _validate_physical_trace((run, native), semantic_exact_work_started=True)
+    expected = ExpectedEvidenceIdentity(
+        run_label="txnopt_native_attempt01",
+        input_config_sha256="0" * 64,
+        config_artifact_sha256="0" * 64,
+        domain="evrptw",
+        execution_mode="barrier",
+        expected_oracle="txnopt_cases.evrptw.native_oracle.NativeEVRPTWOracle",
+        producer_identity={
+            "binding_status": "BOUND_CLEAN_BUILD",
+            "build_manifest_sha256": "0" * 64,
+            "source_revision": "a" * 40,
+            "source_tree": "b" * 40,
+            "source_manifest_sha256": "1" * 64,
+            "tracked_file_count": 1,
+            "wheel_sha256": "2" * 64,
+            "installed_native_sha256": "3" * 64,
+            "native_protocol": "txnopt-native-round-v1",
+        },
+    )
+    _validate_physical_trace(
+        (run, native),
+        semantic_exact_work_started=True,
+        expected_identity=expected,
+    )
+    native["source_revision"] = "c" * 40
+    with pytest.raises(ValueError, match="source identity differs"):
+        _validate_physical_trace(
+            (run, native),
+            semantic_exact_work_started=True,
+            expected_identity=expected,
+        )
+    native["source_revision"] = "a" * 40
     native["prepared_cache_write_count"] = 3
     with pytest.raises(ValueError, match="prepared delta"):
         _validate_physical_trace((run, native), semantic_exact_work_started=True)
     native["prepared_cache_write_count"] = 4
-    native["task_receipts"][1][2] = 3
+    task_receipts = native["task_receipts"]
+    assert isinstance(task_receipts, list) and isinstance(task_receipts[1], list)
+    task_receipts[1][2] = 3
     with pytest.raises(ValueError, match="task receipt is malformed"):
         _validate_physical_trace((run, native), semantic_exact_work_started=True)
 
@@ -570,13 +878,70 @@ def test_runner_retains_a_signed_reviewable_bundle_for_fail_fast_errors(
         run_config_file(config_path)
 
     manifest_path = captured.value.manifest_path
-    verified = verify_failure_manifest(manifest_path)
-    assert verified["schema_version"] == "txnopt-failure-artifact-v2"
+    verified = verify_failure_manifest(
+        manifest_path,
+        expected_identity=_expected_identity(config_path, manifest_path),
+    )
+    assert verified["schema_version"] == "txnopt-failure-artifact-v3"
     assert verified["runner_decision"] == "FAILED"
     assert EvidenceLifecycle.from_payload(verified["lifecycle"]).state is EvidenceState.SEALED
     failure = read_signed_json(manifest_path.parent / "failure.json")
-    assert failure["schema_version"] == "txnopt-run-failure-v2"
+    assert failure["schema_version"] == "txnopt-run-failure-v3"
     assert failure["fallback_count"] == 0
+
+    failure["forged"] = True
+    failure_path = manifest_path.parent / "failure.json"
+    _replace_signed_json(failure_path, failure)
+    manifest = read_signed_json(manifest_path)
+    failure_entry = next(
+        entry for entry in manifest["artifacts"] if entry["path"] == "failure.json"
+    )
+    failure_entry["sha256"] = failure_path.with_suffix(".json.sha256").read_text().split()[0]
+    failure_entry["bytes"] = failure_path.stat().st_size
+    _resign_manifest(manifest_path, manifest)
+    with pytest.raises(ValueError, match="failure receipt field set"):
+        verify_failure_manifest(
+            manifest_path,
+            expected_identity=_expected_identity(config_path, manifest_path),
+        )
+
+
+def test_v2_failure_artifact_remains_explicitly_verifiable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_case(
+        _case: object,
+        *,
+        config: object,
+        semantic_sink: object,
+        physical_sink: object,
+    ) -> object:
+        del config, semantic_sink, physical_sink
+        raise RuntimeError("legacy failure fixture")
+
+    monkeypatch.setattr("txnopt_evidence.runner.execute_case", fail_case)
+    config_path = tmp_path / "run.json"
+    _write_config(config_path, _rcpsp_config(tmp_path, run_label="txnopt_legacy_attempt01"))
+    with pytest.raises(RunExecutionError) as captured:
+        run_config_file(config_path)
+
+    manifest_path = captured.value.manifest_path
+    manifest = read_signed_json(manifest_path)
+    failure_path = manifest_path.parent / "failure.json"
+    failure = read_signed_json(failure_path)
+    manifest["schema_version"] = "txnopt-failure-artifact-v2"
+    failure["schema_version"] = "txnopt-run-failure-v2"
+    _replace_signed_json(failure_path, failure)
+    failure_entry = next(
+        entry for entry in manifest["artifacts"] if entry["path"] == "failure.json"
+    )
+    failure_entry["sha256"] = failure_path.with_suffix(".json.sha256").read_text().split()[0]
+    failure_entry["bytes"] = failure_path.stat().st_size
+    _resign_manifest(manifest_path, manifest)
+
+    verified = verify_legacy_failure_manifest(manifest_path)
+    assert verified["schema_version"] == "txnopt-failure-artifact-v2"
 
 
 @pytest.mark.parametrize(
@@ -623,7 +988,10 @@ def test_runner_preflight_faults_remain_reviewable(
     with pytest.raises(RunExecutionError) as caught:
         run_config_file(config_path)
 
-    manifest = verify_failure_manifest(caught.value.manifest_path)
+    manifest = verify_failure_manifest(
+        caught.value.manifest_path,
+        expected_identity=_expected_identity(config_path, caught.value.manifest_path),
+    )
     assert manifest["runner_decision"] == "FAILED"
 
 

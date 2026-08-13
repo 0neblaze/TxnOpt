@@ -17,6 +17,7 @@ from txnopt_evidence.codec import (
     verify_sidecar,
     write_signed_json,
 )
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.lifecycle import (
     EvidenceLifecycle,
     EvidenceState,
@@ -24,10 +25,15 @@ from txnopt_evidence.lifecycle import (
 )
 from txnopt_evidence.refinement import replay_aggregate_refinement
 
-_RAW_ARTIFACT_SCHEMAS = {"txnopt-raw-artifact-v1", "txnopt-raw-artifact-v2"}
+_RAW_ARTIFACT_SCHEMAS = {
+    "txnopt-raw-artifact-v1",
+    "txnopt-raw-artifact-v2",
+    "txnopt-raw-artifact-v3",
+}
 _FAILURE_ARTIFACT_SCHEMAS = {
     "txnopt-failure-artifact-v1",
     "txnopt-failure-artifact-v2",
+    "txnopt-failure-artifact-v3",
 }
 
 _TRANSITIONS = {
@@ -49,13 +55,53 @@ _PHYSICAL_ONLY_FIELDS = {
 }
 
 
-def verify_raw_manifest(manifest_path: Path) -> dict[str, Any]:
+def verify_raw_manifest(
+    manifest_path: Path,
+    *,
+    expected_identity: ExpectedEvidenceIdentity,
+) -> dict[str, Any]:
     manifest = read_signed_json(manifest_path)
-    if manifest.get("schema_version") not in _RAW_ARTIFACT_SCHEMAS:
-        raise ValueError("unsupported raw artifact schema")
+    if manifest.get("schema_version") != "txnopt-raw-artifact-v3":
+        raise ValueError("anchored replay requires txnopt-raw-artifact-v3")
+    return _verify_raw_manifest_payload(
+        manifest_path,
+        manifest,
+        expected_identity=expected_identity,
+    )
+
+
+def verify_legacy_raw_manifest(manifest_path: Path) -> dict[str, Any]:
+    """Read a v1/v2 bundle without promoting it into the anchored formal path."""
+
+    manifest = read_signed_json(manifest_path)
+    if manifest.get("schema_version") not in {
+        "txnopt-raw-artifact-v1",
+        "txnopt-raw-artifact-v2",
+    }:
+        raise ValueError("legacy compatibility requires a v1 or v2 raw artifact")
+    return _verify_raw_manifest_payload(
+        manifest_path,
+        manifest,
+        expected_identity=None,
+    )
+
+
+def _verify_raw_manifest_payload(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    *,
+    expected_identity: ExpectedEvidenceIdentity | None,
+) -> dict[str, Any]:
     if manifest.get("runner_decision") is not None or manifest.get("fallback_count") != 0:
         raise ValueError("raw producer crossed the decision or fallback boundary")
-    _validate_producer_identity(manifest.get("producer_identity"))
+    schema = manifest.get("schema_version")
+    if schema == "txnopt-raw-artifact-v3":
+        _validate_v3_manifest_fields(manifest, failure=False)
+        if expected_identity is None:
+            raise ValueError("v3 raw artifact requires an expected evidence identity")
+        _validate_expected_identity(manifest_path, manifest, expected_identity)
+    else:
+        _validate_legacy_producer_identity(manifest.get("producer_identity"))
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) not in {3, 4}:
         raise ValueError("raw manifest must bind three or four primary artifacts")
@@ -75,6 +121,8 @@ def verify_raw_manifest(manifest_path: Path) -> dict[str, Any]:
             or not isinstance(expected_bytes, int)
         ):
             raise ValueError("artifact manifest entry is malformed")
+        if schema == "txnopt-raw-artifact-v3":
+            _validate_artifact_entry_fields(raw_entry)
         seen.add(relative_path)
         artifact = resolve_bundle_file(bundle, relative_path)
         if artifact.stat().st_size != expected_bytes or sha256_file(artifact) != expected_digest:
@@ -85,19 +133,73 @@ def verify_raw_manifest(manifest_path: Path) -> dict[str, Any]:
         {"config.json", "events.jsonl", "result.json", "physical.jsonl"},
     ):
         raise ValueError("raw manifest artifact identity set differs")
+    if expected_identity is not None:
+        config = read_signed_json(bundle / "config.json")
+        result = read_signed_json(bundle / "result.json")
+        _validate_result_identity(
+            result,
+            config=config,
+            expected_identity=expected_identity,
+        )
+        if (result.get("physical_artifact_ref") is not None) != (
+            "physical.jsonl" in seen
+        ):
+            raise ValueError("result physical reference differs from the artifact set")
     _validate_sealed_lifecycle(manifest)
     return manifest
 
 
-def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
+def verify_failure_manifest(
+    manifest_path: Path,
+    *,
+    expected_identity: ExpectedEvidenceIdentity,
+) -> dict[str, Any]:
     """Verify a fail-fast producer bundle without promoting it to a passing run."""
 
     manifest = read_signed_json(manifest_path)
-    if manifest.get("schema_version") not in _FAILURE_ARTIFACT_SCHEMAS:
-        raise ValueError("unsupported failure artifact schema")
+    if manifest.get("schema_version") != "txnopt-failure-artifact-v3":
+        raise ValueError("anchored replay requires txnopt-failure-artifact-v3")
+    return _verify_failure_manifest_payload(
+        manifest_path,
+        manifest,
+        expected_identity=expected_identity,
+    )
+
+
+def verify_legacy_failure_manifest(manifest_path: Path) -> dict[str, Any]:
+    """Read a v1/v2 failure bundle without promoting it into formal review."""
+
+    manifest = read_signed_json(manifest_path)
+    if manifest.get("schema_version") not in {
+        "txnopt-failure-artifact-v1",
+        "txnopt-failure-artifact-v2",
+    }:
+        raise ValueError("legacy compatibility requires a v1 or v2 failure artifact")
+    return _verify_failure_manifest_payload(
+        manifest_path,
+        manifest,
+        expected_identity=None,
+    )
+
+
+def _verify_failure_manifest_payload(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    *,
+    expected_identity: ExpectedEvidenceIdentity | None,
+) -> dict[str, Any]:
     if manifest.get("runner_decision") != "FAILED" or manifest.get("fallback_count") != 0:
         raise ValueError("failure artifact decision or fallback boundary is invalid")
-    _validate_producer_identity(manifest.get("producer_identity"))
+    schema = manifest.get("schema_version")
+    if schema == "txnopt-failure-artifact-v3":
+        _validate_v3_manifest_fields(manifest, failure=True)
+        _validate_expected_identity(
+            manifest_path,
+            manifest,
+            _required_identity(expected_identity),
+        )
+    else:
+        _validate_legacy_producer_identity(manifest.get("producer_identity"))
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) < 2:
         raise ValueError("failure manifest does not bind its primary artifacts")
@@ -106,6 +208,8 @@ def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
     for raw_entry in artifacts:
         if not isinstance(raw_entry, dict):
             raise ValueError("failure artifact entry must be an object")
+        if schema == "txnopt-failure-artifact-v3":
+            _validate_artifact_entry_fields(raw_entry)
         relative_path = raw_entry.get("path")
         expected_digest = raw_entry.get("sha256")
         expected_bytes = raw_entry.get("bytes")
@@ -138,13 +242,15 @@ def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
     ):
         raise ValueError("failure manifest contains an unsupported artifact path")
     failure = read_signed_json(bundle / "failure.json")
+    if schema == "txnopt-failure-artifact-v3":
+        _validate_failure_receipt_fields(failure)
     semantic_paths = sorted(path for path in seen if path.startswith("events"))
     physical_paths = sorted(path for path in seen if path.startswith("physical"))
-    expected_failure_schema = (
-        "txnopt-run-failure-v2"
-        if manifest.get("schema_version") == "txnopt-failure-artifact-v2"
-        else "txnopt-run-failure-v1"
-    )
+    expected_failure_schema = {
+        "txnopt-failure-artifact-v1": "txnopt-run-failure-v1",
+        "txnopt-failure-artifact-v2": "txnopt-run-failure-v2",
+        "txnopt-failure-artifact-v3": "txnopt-run-failure-v3",
+    }[str(schema)]
     if (
         failure.get("schema_version") != expected_failure_schema
         or failure.get("run_label") != manifest.get("run_label")
@@ -181,12 +287,176 @@ def verify_failure_manifest(manifest_path: Path) -> dict[str, Any]:
         _validate_physical_trace(
             events,
             semantic_exact_work_started=semantic_exact_work_started,
+            expected_identity=expected_identity,
         )
     _validate_sealed_lifecycle(manifest)
     return manifest
 
 
-def _validate_producer_identity(raw_identity: object) -> None:
+def _validate_v3_manifest_fields(
+    manifest: Mapping[str, Any],
+    *,
+    failure: bool,
+) -> None:
+    expected = {
+        "schema_version",
+        "run_label",
+        "input_config_sha256",
+        "contract",
+        "semantic_trace",
+        "physical_trace",
+        "domain",
+        "producer_identity",
+        "artifacts",
+        "lifecycle",
+        "runner_decision",
+        "fallback_count",
+    }
+    if failure:
+        expected.add("failure_artifact")
+    if set(manifest) != expected:
+        raise ValueError("v3 artifact manifest field set differs")
+    expected_schema = (
+        "txnopt-failure-artifact-v3" if failure else "txnopt-raw-artifact-v3"
+    )
+    if (
+        manifest.get("schema_version") != expected_schema
+        or manifest.get("contract") != "txnopt-contract-v1"
+        or manifest.get("semantic_trace") != "txnopt-semantic-trace-v1"
+        or manifest.get("physical_trace") != "txnopt-physical-trace-v1"
+    ):
+        raise ValueError("v3 artifact protocol identity differs")
+
+
+def _validate_artifact_entry_fields(entry: Mapping[str, Any]) -> None:
+    path = entry.get("path")
+    base = {"path", "sha256", "bytes"}
+    expected = (
+        base | {"event_count", "terminal_event_sha256"}
+        if isinstance(path, str) and path.endswith(".jsonl")
+        else base
+    )
+    if set(entry) != expected:
+        raise ValueError("artifact entry field set differs")
+
+
+def _validate_expected_identity(
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    expected: ExpectedEvidenceIdentity,
+) -> None:
+    if manifest.get("schema_version") not in {
+        expected.ARTIFACT_SCHEMA,
+        "txnopt-failure-artifact-v3",
+    }:
+        raise ValueError("raw manifest differs from its expected evidence identity")
+    if manifest.get("run_label") != expected.run_label:
+        raise ValueError("raw manifest run label differs from the expected identity")
+    if (
+        manifest.get("input_config_sha256") != expected.input_config_sha256
+        or manifest.get("domain") != expected.domain
+    ):
+        raise ValueError("raw manifest config or domain differs from the expected identity")
+    if manifest.get("producer_identity") != dict(expected.producer_identity):
+        raise ValueError("raw producer identity differs from the expected build")
+    bundle = manifest_path.resolve(strict=True).parent
+    config_path = bundle / "config.json"
+    if (
+        verify_sidecar(config_path) != expected.config_artifact_sha256
+        or sha256_file(config_path) != expected.input_config_sha256
+    ):
+        raise ValueError("retained config differs from its expected config identity")
+    config = read_signed_json(config_path)
+    case = config.get("case")
+    run_config = config.get("run_config")
+    if (
+        config.get("schema_version") != "txnopt-run-config-v1"
+        or config.get("run_label") != expected.run_label
+        or not isinstance(case, dict)
+        or case.get("domain") != expected.domain
+        or not isinstance(run_config, dict)
+        or run_config.get("execution_mode") != expected.execution_mode
+    ):
+        raise ValueError("retained config run label, domain, or mode differs")
+    config_entry = next(
+        (
+            entry
+            for entry in manifest.get("artifacts", [])
+            if isinstance(entry, dict) and entry.get("path") == "config.json"
+        ),
+        None,
+    )
+    if (
+        not isinstance(config_entry, dict)
+        or config_entry.get("sha256") != expected.config_artifact_sha256
+    ):
+        raise ValueError("config artifact entry differs from the expected identity")
+
+
+def _validate_result_identity(
+    result: Mapping[str, Any],
+    *,
+    config: Mapping[str, Any],
+    expected_identity: ExpectedEvidenceIdentity,
+) -> None:
+    fields = {
+        "schema_version",
+        "domain",
+        "last_committed_state",
+        "objective",
+        "state_digest",
+        "termination_reason",
+        "semantic_digest",
+        "physical_artifact_ref",
+        "provenance",
+        "fallback_count",
+    }
+    if set(result) != fields or result.get("schema_version") != "txnopt-run-result-v1":
+        raise ValueError("result schema or field set differs")
+    if result.get("domain") != expected_identity.domain or result.get("fallback_count") != 0:
+        raise ValueError("result domain or fallback identity differs")
+    provenance = result.get("provenance")
+    expected_provenance = {
+        "contract": "txnopt-contract-v1",
+        "runtime": "txnopt.python-reference-v1",
+        "execution_mode": expected_identity.execution_mode,
+        "oracle": expected_identity.expected_oracle,
+    }
+    if provenance != expected_provenance:
+        raise ValueError("result provenance differs from the expected identity")
+    run_config = config.get("run_config")
+    if not isinstance(run_config, dict):
+        raise ValueError("retained run config is missing")
+    expected_physical_ref = (
+        "txnopt-physical-trace-v1:external"
+        if run_config.get("trace_policy") == "semantic_and_physical"
+        else None
+    )
+    if result.get("physical_artifact_ref") != expected_physical_ref:
+        raise ValueError("result physical artifact reference differs from the config")
+    case = config.get("case")
+    if not isinstance(case, dict) or case.get("domain") != result.get("domain"):
+        raise ValueError("result domain differs from the retained config")
+
+
+def _validate_failure_receipt_fields(failure: Mapping[str, Any]) -> None:
+    expected = {
+        "schema_version",
+        "run_label",
+        "error_type",
+        "error_message",
+        "semantic_stream_count",
+        "physical_stream_count",
+        "emitted_semantic_stream_count",
+        "emitted_physical_stream_count",
+        "traceback",
+        "fallback_count",
+    }
+    if set(failure) != expected:
+        raise ValueError("failure receipt field set differs")
+
+
+def _validate_legacy_producer_identity(raw_identity: object) -> None:
     if not isinstance(raw_identity, dict) or raw_identity.get("binding_status") not in {
         "BOUND_CLEAN_BUILD",
         "UNBOUND_TEST_ONLY",
@@ -234,17 +504,71 @@ def _validate_sealed_lifecycle(manifest: Mapping[str, Any]) -> None:
         raise ValueError("artifact evidence lifecycle differs from its bound content")
 
 
-def verify_manifest(manifest_path: Path) -> dict[str, Any]:
+def verify_manifest(
+    manifest_path: Path,
+    *,
+    expected_identity: ExpectedEvidenceIdentity,
+) -> dict[str, Any]:
     payload = read_signed_json(manifest_path)
     if payload.get("schema_version") in _FAILURE_ARTIFACT_SCHEMAS:
-        return verify_failure_manifest(manifest_path)
-    return verify_raw_manifest(manifest_path)
+        return verify_failure_manifest(manifest_path, expected_identity=expected_identity)
+    return verify_raw_manifest(manifest_path, expected_identity=expected_identity)
 
 
-def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
+def verify_legacy_manifest(manifest_path: Path) -> dict[str, Any]:
+    """Verify an explicitly requested v1/v2 raw or failure bundle."""
+
+    payload = read_signed_json(manifest_path)
+    if payload.get("schema_version") in {
+        "txnopt-failure-artifact-v1",
+        "txnopt-failure-artifact-v2",
+    }:
+        return verify_legacy_failure_manifest(manifest_path)
+    return verify_legacy_raw_manifest(manifest_path)
+
+
+def replay_manifest(
+    manifest_path: Path,
+    *,
+    output_dir: Path,
+    expected_identity: ExpectedEvidenceIdentity,
+) -> dict[str, Any]:
+    return _replay_manifest(
+        manifest_path,
+        output_dir=output_dir,
+        expected_identity=expected_identity,
+        legacy=False,
+    )
+
+
+def replay_legacy_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
+    """Replay v1/v2 evidence for compatibility, never formal readiness."""
+
+    return _replay_manifest(
+        manifest_path,
+        output_dir=output_dir,
+        expected_identity=None,
+        legacy=True,
+    )
+
+
+def _replay_manifest(
+    manifest_path: Path,
+    *,
+    output_dir: Path,
+    expected_identity: ExpectedEvidenceIdentity | None,
+    legacy: bool,
+) -> dict[str, Any]:
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"review directory already exists: {output_dir}")
-    manifest = verify_raw_manifest(manifest_path)
+    manifest = (
+        verify_legacy_raw_manifest(manifest_path)
+        if legacy
+        else verify_raw_manifest(
+            manifest_path,
+            expected_identity=_required_identity(expected_identity),
+        )
+    )
     raw_manifest_sha256 = verify_sidecar(manifest_path)
     bundle = manifest_path.resolve(strict=True).parent
     config = read_signed_json(bundle / "config.json")
@@ -280,6 +604,7 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
         _validate_physical_trace(
             physical_events,
             semantic_exact_work_started=_semantic_exact_work_started(events),
+            expected_identity=expected_identity,
         )
     has_physical_ref = result.get("physical_artifact_ref") is not None
     if has_physical_ref != bool(physical_events):
@@ -311,16 +636,23 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
         for event in events
     )
     review_lifecycle: EvidenceLifecycle | None = None
-    if manifest.get("schema_version") == "txnopt-raw-artifact-v2":
+    if manifest.get("schema_version") in {
+        "txnopt-raw-artifact-v2",
+        "txnopt-raw-artifact-v3",
+    }:
         review_lifecycle = EvidenceLifecycle.from_payload(manifest["lifecycle"]).advance(
             EvidenceState.REVIEWED,
             evidence_sha256=raw_manifest_sha256,
         )
     review = {
         "schema_version": (
-            "txnopt-independent-review-v2"
-            if review_lifecycle is not None
-            else "txnopt-independent-review-v1"
+            "txnopt-independent-review-v3"
+            if manifest.get("schema_version") == "txnopt-raw-artifact-v3"
+            else (
+                "txnopt-independent-review-v2"
+                if review_lifecycle is not None
+                else "txnopt-independent-review-v1"
+            )
         ),
         "run_label": manifest.get("run_label"),
         "raw_manifest_sha256": raw_manifest_sha256,
@@ -352,10 +684,19 @@ def replay_manifest(manifest_path: Path, *, output_dir: Path) -> dict[str, Any]:
     return review
 
 
+def _required_identity(
+    identity: ExpectedEvidenceIdentity | None,
+) -> ExpectedEvidenceIdentity:
+    if identity is None:  # pragma: no cover - private call contract
+        raise ValueError("anchored replay requires an expected evidence identity")
+    return identity
+
+
 def _validate_physical_trace(
     events: tuple[dict[str, Any], ...],
     *,
     semantic_exact_work_started: bool = False,
+    expected_identity: ExpectedEvidenceIdentity | None = None,
 ) -> None:
     observation = events[0] if events else {}
     if (
@@ -405,7 +746,10 @@ def _validate_physical_trace(
     )
     if len(native_events) + len(waste_events) != len(events) - 1:
         raise ValueError("physical trace contains an unsupported observation")
-    _validate_native_round_observations(native_events)
+    _validate_native_round_observations(
+        native_events,
+        expected_identity=expected_identity,
+    )
     for event in waste_events:
         if (
             event.get("event") != "t4_waste_observation"
@@ -467,6 +811,8 @@ def _validate_physical_trace(
 
 def _validate_native_round_observations(
     events: Sequence[Mapping[str, Any]],
+    *,
+    expected_identity: ExpectedEvidenceIdentity | None = None,
 ) -> None:
     previous_round_call = 0
     integer_fields = (
@@ -599,6 +945,21 @@ def _validate_native_round_observations(
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
                 raise ValueError("native round source identity is malformed")
+        if expected_identity is not None:
+            producer = expected_identity.producer_identity
+            attestation = producer.get("native_build_attestation")
+            expected_revision = producer.get("source_revision")
+            expected_tree = producer.get("source_tree")
+            if isinstance(attestation, dict):
+                expected_revision = attestation.get("source_revision")
+                expected_tree = attestation.get("source_tree")
+            if (
+                expected_revision is not None
+                and event.get("source_revision") != expected_revision
+            ) or (
+                expected_tree is not None and event.get("source_tree") != expected_tree
+            ):
+                raise ValueError("native round source identity differs from the expected build")
 
 
 def _semantic_exact_work_started(events: Sequence[Mapping[str, Any]]) -> bool:
@@ -654,8 +1015,12 @@ def _validate_event_stream(
 
 
 __all__ = [
+    "replay_legacy_manifest",
     "replay_manifest",
+    "verify_legacy_failure_manifest",
+    "verify_legacy_manifest",
     "verify_failure_manifest",
+    "verify_legacy_raw_manifest",
     "verify_manifest",
     "verify_raw_manifest",
 ]
