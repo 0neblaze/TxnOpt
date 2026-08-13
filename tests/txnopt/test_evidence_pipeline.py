@@ -656,6 +656,30 @@ def test_reviewer_replays_native_prepared_round_observations() -> None:
         semantic_exact_work_started=True,
         expected_identity=expected,
     )
+    with pytest.raises(ValueError, match="lacks its native round receipt"):
+        _validate_physical_trace(
+            (run,),
+            semantic_exact_work_started=True,
+            expected_identity=expected,
+        )
+    python_expected = ExpectedEvidenceIdentity(
+        run_label="txnopt_python_attempt01",
+        input_config_sha256="0" * 64,
+        config_artifact_sha256="0" * 64,
+        domain="evrptw",
+        execution_mode="barrier",
+        expected_oracle="txnopt_cases.evrptw.oracle.EVRPTWOracle",
+        producer_identity={
+            "binding_status": "UNBOUND_TEST_ONLY",
+            "installed_native_sha256": "3" * 64,
+        },
+    )
+    with pytest.raises(ValueError, match="non-native evidence"):
+        _validate_physical_trace(
+            (run, native),
+            semantic_exact_work_started=True,
+            expected_identity=python_expected,
+        )
     native["source_revision"] = "c" * 40
     with pytest.raises(ValueError, match="source identity differs"):
         _validate_physical_trace(

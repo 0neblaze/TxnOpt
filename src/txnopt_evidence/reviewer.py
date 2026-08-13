@@ -746,6 +746,15 @@ def _validate_physical_trace(
     )
     if len(native_events) + len(waste_events) != len(events) - 1:
         raise ValueError("physical trace contains an unsupported observation")
+    if expected_identity is not None:
+        expects_native = (
+            expected_identity.expected_oracle
+            == "txnopt_cases.evrptw.native_oracle.NativeEVRPTWOracle"
+        )
+        if expects_native and semantic_exact_work_started and not native_events:
+            raise ValueError("native exact work lacks its native round receipt")
+        if not expects_native and native_events:
+            raise ValueError("non-native evidence contains a native round receipt")
     _validate_native_round_observations(
         native_events,
         expected_identity=expected_identity,

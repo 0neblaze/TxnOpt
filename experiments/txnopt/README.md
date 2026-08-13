@@ -65,6 +65,10 @@ python -m tools.run_txnopt_level1_campaign preflight \
 
 Attempt23 preflight status was `PASS_NOT_AUTHORIZED_TO_EXECUTE`; Attempt09's
 major findings keep it permanently unexecuted and unauthorized.
+The first v3 successor build is retained as failed Build12 evidence after an
+adversarial reviewer exposed a vacuous empty native-round receipt check. The
+corrected implementation must use a later build attempt and may not overwrite
+the Build12 external directory or failure receipt.
 The `run` subcommand
 also requires the exact plan-bound Build11 wheel, an isolated Python installation, host
 resource checks, and a separately signed

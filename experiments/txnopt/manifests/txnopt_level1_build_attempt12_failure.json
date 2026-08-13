@@ -1,0 +1,62 @@
+{
+  "schema_version": "txnopt-level1-build-failure-v1",
+  "run_label": "txnopt_level1_build_attempt12",
+  "status": "BUILD_ABORTED_ADVERSARIAL_REVIEW_MAJOR_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T17:17:08Z",
+  "successor_of": "txnopt_level1_build_attempt11",
+  "producer": {
+    "revision": "028d5e7960630b4cb0ae155dec16bb67a6129f1f",
+    "git_tree": "9b26d18a2f40adaa5dcaed1a8cd5d6c920584dfd",
+    "source_manifest_sha256": "3e5c1d36eeadfff28c3606216f2987d5b776a5acb87b754fb3ce8773eefb83d0",
+    "tracked_file_count": 1145,
+    "source_dirty": false,
+    "development_override": false,
+    "performance_profile": "host-native-lto"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-028d5e7/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "949e6c7d59b0aad9a6e0e14f578031ce076245d35a48fb63a9f6c7ba374d69e9",
+      "entry_count": 55
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-028d5e7/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "87c13d92643fcd77552fc9d40fdaa667edbd8d899332eb2e6e464f9dbc627b51",
+      "entry_count": 1197
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "4f49cf96a98dd6b80123cf9d6d7ee70e3eab60e038db726825a32fb5c47b12fb",
+      "protocol": "txnopt-native-round-v1"
+    }
+  },
+  "completed_validation": {
+    "clean_source_attestation": "PASS",
+    "wheel_build": "PASS",
+    "isolated_wheel_install": "PASS",
+    "installed_module_identity": "PASS"
+  },
+  "not_completed_validation": [
+    "full installed-wheel pytest",
+    "property-based test gate",
+    "ASan/UBSan",
+    "TSan",
+    "100000-round resource soak",
+    "independent successor review"
+  ],
+  "finding": {
+    "id": "BUILD12-NATIVE-RECEIPT-EMPTY-SET",
+    "severity": "major",
+    "component": "txnopt_evidence.reviewer._validate_physical_trace",
+    "description": "A native-oracle run that started semantic exact work could remove every native_round_observation and still satisfy the v3 physical verifier because the empty native receipt sequence passed vacuously.",
+    "disposition": "fixed only in a later source revision; this Build12 wheel remains failed evidence and must not be reused"
+  },
+  "claim_boundary": {
+    "build_complete": false,
+    "level1_ready": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false
+  }
+}

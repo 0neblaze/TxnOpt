@@ -207,6 +207,15 @@ use a new clean build plus a pre-run expected identity that binds the exact
 config bytes, producer source/tree/wheel/native identity, domain, execution
 mode, and result contract before independent replay.
 
+Build12 freezes the first anchored-v3 correction at revision `028d5e7`, but it
+is retained as failed build evidence. Its wheel and isolated installation pass;
+adversarial review then finds that a native run could delete every native-round
+receipt and satisfy the empty receipt sequence vacuously. The build stops before
+full installed-wheel, sanitizer, resource, or successor-review gates. Its exact
+failure receipt is
+`manifests/txnopt_level1_build_attempt12_failure.json`; no Build12 artifact may
+authorize calibration, procurement, or execution.
+
 Static gate Attempt01 binds the unchanged Build11 implementation and installed
 wheel to 24/24 producer-owned contract, dependency, distribution, and CLI
 tests. It records entrypoint coverage 1, zero core import cycles, zero reverse
