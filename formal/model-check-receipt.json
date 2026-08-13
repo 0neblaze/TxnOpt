@@ -1,0 +1,35 @@
+{
+  "schema_version": "txnopt-formal-model-check-receipt-v1",
+  "checked_at": "2026-08-13T11:06:50+08:00",
+  "scope": {
+    "candidate_count": 4,
+    "models": [
+      "formal/TxnOpt.tla",
+      "formal/TxnOptOrderedPlusCal.tla"
+    ]
+  },
+  "input_sha256": {
+    "formal/TxnOpt.tla": "701224a772256b3afb354d99b6b3d06875f743c1ca17605f6d1440c07a8ea974",
+    "formal/TxnOpt.cfg": "bfc41a75bfcf65925914a5a7f26762e46b1e3693267c3500ee2cf6a37fabddae",
+    "formal/TxnOptOrderedPlusCal.tla": "7c9567874d9ffeae792b8d16ac3be3c6c298cec4d3b4abd3df465612704aca0d",
+    "formal/TxnOptOrderedPlusCal.cfg": "29d1cedd9e7e4de5e034f3f10007d4c36d772501b293bf6fbb495bf3f368a97c"
+  },
+  "toolchain": {
+    "tlc_version": "TLC2 2.19 rev 5a47802",
+    "pluscal_version": "pcal.trans 1.11",
+    "java_runtime": "Temurin 21.0.12+8 LTS",
+    "tla2tools_jar_sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  },
+  "model_check": {
+    "primary": {
+      "generated_states": 1366,
+      "distinct_states": 372
+    },
+    "pluscal": {
+      "generated_states": 52837,
+      "distinct_states": 16480
+    }
+  },
+  "result": "PASS",
+  "claim_boundary": "Bounded model checking supports T1/T2 for four candidates; T3/T4 remain proof obligations requiring independent review and measured non-vacuous bounds."
+}

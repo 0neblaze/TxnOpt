@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,17 @@ def test_formal_model_and_python_state_machine_name_the_same_phases() -> None:
     model = (ROOT / "formal/TxnOpt.tla").read_text(encoding="utf-8")
     for phase in TxnPhase:
         assert f'"{phase.value}"' in model
+
+
+def test_formal_receipt_binds_checked_in_models_and_generated_translation() -> None:
+    receipt = json.loads((ROOT / "formal/model-check-receipt.json").read_text(encoding="utf-8"))
+    for relative_path, expected in receipt["input_sha256"].items():
+        assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == expected
+    translated = (ROOT / "formal/TxnOptOrderedPlusCal.tla").read_text(encoding="utf-8")
+    assert "BEGIN TRANSLATION" in translated
+    assert receipt["result"] == "PASS"
+    assert receipt["model_check"]["primary"]["distinct_states"] == 372
+    assert receipt["model_check"]["pluscal"]["distinct_states"] == 16_480
 
 
 def test_first_generation_protocol_identities_are_exact() -> None:

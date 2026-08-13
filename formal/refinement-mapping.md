@@ -1,21 +1,23 @@
 # Draft refinement mapping for `txnopt-contract-v1`
 
-Status: structural draft; not an accepted proof.
+Status: T1/T2 implementation mapping; independent review pending.
 
 | Formal variable or action | Python contract | Planned native receipt |
 | --- | --- | --- |
 | `phase` | `CandidateTxn.phase` | transaction phase code |
-| `startedWork` | budget ledger reservation/settlement | started request counter |
-| `committed` | runtime-owned state replacement | committed transaction bit |
-| `cacheVisible` | cache transaction publication | cache commit generation |
-| `semanticEvents` | committed semantic trace records | semantic event SoA |
-| `Reserve` | runtime budget reservation | round reservation receipt |
-| `BeginEvaluation` | ordered oracle batch launch | started-work receipt |
-| `Validate` | `Oracle.validate` for every result | validation status array |
-| `Commit` | sole `TxnRuntime` state/cache commit | typed commit receipt |
-| `Abort` | rollback on validation, snapshot, or write failure | abort receipt |
-| `Interrupt` | deadline, insufficient budget, late result, worker failure | interrupt receipt |
+| `pending`/`completed` | private evaluation futures/results | physical task receipts |
+| `nextCommit` | canonical resolved-result index | canonical resolution-order array |
+| `committedTrace` | committed semantic event prefix | semantic counters/order arrays |
+| `cacheVisible` | cache transaction publication | future native cache generation |
+| `terminated` | `RunResult.termination_reason` | typed phase/interrupt receipt |
+| `Complete(candidate)` | barrier/ordered physical completion | physical task receipt only |
+| `Commit` | runtime-owned state and cache publication | validated round receipt applied by Python runtime |
+| `Terminate` | deadline, budget, worker, validation, snapshot, or write failure | `ABORTED`/`INTERRUPTED` receipt |
 
-The mapping is incomplete until the Python reference runtime and
-`txnopt-native-round-v1` exist. In particular, T1 needs canonical candidate and
-random-tape identities, and T2 needs an explicit prior committed-state digest.
+`PythonTxnRuntime` owns the abstract state and cache generation. The native
+module returns a prepared, validated result; it never publishes Python state or
+cache. This preserves one commit owner while allowing one packed native call per
+round. The native receipt refines the evaluation transition; reservation,
+validation, commit, rollback, budget settlement, and cache publication refine
+through the Python runtime. Independent review is still required before this
+mapping is accepted.

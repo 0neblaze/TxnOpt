@@ -1,77 +1,111 @@
 ------------------------------ MODULE TxnOpt ------------------------------
-EXTENDS Naturals, Sequences
+EXTENDS Integers, Sequences, FiniteSets
 
-CONSTANT WorkBudget
+CONSTANT CandidateCount
 
-VARIABLES phase, startedWork, committed, cacheVisible, semanticEvents
-
-vars == <<phase, startedWork, committed, cacheVisible, semanticEvents>>
-
-Phases == {
+CandidateOrder == [index \in 1..CandidateCount |-> index]
+CandidateIndices == 1..Len(CandidateOrder)
+SeqToSet(sequence) == {sequence[index] : index \in DOMAIN sequence}
+TxnPhases == {
     "PREPARED", "RESERVED", "EVALUATING", "VALIDATED", "COMMITTED",
     "ABORTED", "INTERRUPTED"
 }
 
+VARIABLES pending, completed, nextCommit, committedTrace, cacheVisible, terminated,
+          txnPhase
+
+vars == <<pending, completed, nextCommit, committedTrace, cacheVisible, terminated,
+          txnPhase>>
+
 Init ==
-    /\ phase = "PREPARED"
-    /\ startedWork = 0
-    /\ committed = FALSE
-    /\ cacheVisible = FALSE
-    /\ semanticEvents = <<>>
+    /\ CandidateCount > 0
+    /\ pending = CandidateIndices
+    /\ completed = {}
+    /\ nextCommit = 1
+    /\ committedTrace = <<>>
+    /\ cacheVisible = {}
+    /\ terminated = FALSE
+    /\ txnPhase = [candidate \in CandidateIndices |-> "PREPARED"]
 
-Reserve ==
-    /\ phase = "PREPARED"
-    /\ startedWork < WorkBudget
-    /\ phase' = "RESERVED"
-    /\ UNCHANGED <<startedWork, committed, cacheVisible, semanticEvents>>
+Reserve(candidate) ==
+    /\ ~terminated
+    /\ candidate \in pending
+    /\ txnPhase[candidate] = "PREPARED"
+    /\ txnPhase' = [txnPhase EXCEPT ![candidate] = "RESERVED"]
+    /\ UNCHANGED <<pending, completed, nextCommit, committedTrace,
+                    cacheVisible, terminated>>
 
-BeginEvaluation ==
-    /\ phase = "RESERVED"
-    /\ startedWork < WorkBudget
-    /\ phase' = "EVALUATING"
-    /\ startedWork' = startedWork + 1
-    /\ UNCHANGED <<committed, cacheVisible, semanticEvents>>
+StartEvaluation(candidate) ==
+    /\ ~terminated
+    /\ candidate \in pending
+    /\ txnPhase[candidate] = "RESERVED"
+    /\ txnPhase' = [txnPhase EXCEPT ![candidate] = "EVALUATING"]
+    /\ UNCHANGED <<pending, completed, nextCommit, committedTrace,
+                    cacheVisible, terminated>>
 
-Validate ==
-    /\ phase = "EVALUATING"
-    /\ phase' = "VALIDATED"
-    /\ UNCHANGED <<startedWork, committed, cacheVisible, semanticEvents>>
+Complete(candidate) ==
+    /\ ~terminated
+    /\ candidate \in pending
+    /\ txnPhase[candidate] = "EVALUATING"
+    /\ pending' = pending \ {candidate}
+    /\ completed' = completed \cup {candidate}
+    /\ txnPhase' = [txnPhase EXCEPT ![candidate] = "VALIDATED"]
+    /\ UNCHANGED <<nextCommit, committedTrace, cacheVisible, terminated>>
 
 Commit ==
-    /\ phase = "VALIDATED"
-    /\ phase' = "COMMITTED"
-    /\ committed' = TRUE
-    /\ cacheVisible' = TRUE
-    /\ semanticEvents' = Append(semanticEvents, "COMMITTED")
-    /\ UNCHANGED startedWork
+    /\ ~terminated
+    /\ nextCommit \in completed
+    /\ completed' = completed \ {nextCommit}
+    /\ committedTrace' = Append(committedTrace, CandidateOrder[nextCommit])
+    /\ cacheVisible' = cacheVisible \cup {CandidateOrder[nextCommit]}
+    /\ txnPhase' = [txnPhase EXCEPT ![nextCommit] = "COMMITTED"]
+    /\ nextCommit' = nextCommit + 1
+    /\ UNCHANGED <<pending, terminated>>
 
-Abort ==
-    /\ phase \in {"PREPARED", "RESERVED", "EVALUATING", "VALIDATED"}
-    /\ phase' = "ABORTED"
-    /\ UNCHANGED <<startedWork, committed, cacheVisible, semanticEvents>>
+Terminate ==
+    /\ ~terminated
+    /\ terminated' = TRUE
+    /\ pending' = {}
+    /\ completed' = {}
+    /\ txnPhase' = [candidate \in CandidateIndices |->
+           IF txnPhase[candidate] = "COMMITTED" THEN "COMMITTED"
+           ELSE IF txnPhase[candidate] = "EVALUATING" THEN "INTERRUPTED"
+           ELSE "ABORTED"]
+    /\ UNCHANGED <<nextCommit, committedTrace, cacheVisible>>
 
-Interrupt ==
-    /\ phase \in {"PREPARED", "RESERVED", "EVALUATING", "VALIDATED"}
-    /\ phase' = "INTERRUPTED"
-    /\ UNCHANGED <<startedWork, committed, cacheVisible, semanticEvents>>
-
-Next == Reserve \/ BeginEvaluation \/ Validate \/ Commit \/ Abort \/ Interrupt
+Next ==
+    (\E candidate \in pending : Reserve(candidate))
+    \/ (\E candidate \in pending : StartEvaluation(candidate))
+    \/ (\E candidate \in pending : Complete(candidate))
+    \/ Commit
+    \/ Terminate
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ phase \in Phases
-    /\ startedWork \in 0..WorkBudget
-    /\ committed \in BOOLEAN
-    /\ cacheVisible \in BOOLEAN
-    /\ semanticEvents \in Seq({"COMMITTED"})
+    /\ pending \subseteq CandidateIndices
+    /\ completed \subseteq CandidateIndices
+    /\ pending \cap completed = {}
+    /\ nextCommit \in 1..(Len(CandidateOrder) + 1)
+    /\ committedTrace \in Seq(SeqToSet(CandidateOrder))
+    /\ cacheVisible \subseteq SeqToSet(CandidateOrder)
+    /\ terminated \in BOOLEAN
+    /\ txnPhase \in [CandidateIndices -> TxnPhases]
 
-WorkChargedAtStart ==
-    phase \in {"EVALUATING", "VALIDATED", "COMMITTED"} => startedWork > 0
+CanonicalCommitPrefix ==
+    committedTrace = SubSeq(CandidateOrder, 1, Len(committedTrace))
 
-CacheOnlyAfterCommit == cacheVisible => committed
+CacheOnlyAfterCommit == cacheVisible = SeqToSet(committedTrace)
 
-FailureHasNoVisibleWrite ==
-    phase \in {"ABORTED", "INTERRUPTED"} => ~cacheVisible
+CommittedPhaseMatchesTrace ==
+    {candidate \in CandidateIndices : txnPhase[candidate] = "COMMITTED"}
+        = SeqToSet(committedTrace)
+
+ValidatedMatchesCompleted ==
+    ~terminated =>
+        ({candidate \in CandidateIndices : txnPhase[candidate] = "VALIDATED"}
+            = completed)
+
+LastCompletePrefixOnFailure == terminated => CanonicalCommitPrefix
 
 =============================================================================
