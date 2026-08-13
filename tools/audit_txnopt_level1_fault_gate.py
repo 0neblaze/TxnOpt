@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from tools.txnopt_level1_campaign_common import (
     canonical_json_bytes,
+    executable_path,
     load_campaign_plan,
     read_signed_object,
     require_clean_repository,
@@ -214,6 +215,24 @@ def _write_text_exclusive(path: Path, value: str) -> None:
         handle.write(value)
 
 
+def _pytest_command(python: Path, junit_path: Path) -> list[str]:
+    """Keep the virtual-environment launcher path instead of resolving its symlink."""
+
+    return [
+        str(executable_path(python)),
+        "-I",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--disable-warnings",
+        "--maxfail=1",
+        f"--junitxml={junit_path}",
+        *(scenario.node_id for scenario in FAULT_SCENARIOS),
+    ]
+
+
 def run_fault_gate(
     *,
     root: Path,
@@ -245,19 +264,7 @@ def run_fault_gate(
     runtime_identity = verify_runtime_installation(plan, python=python, wheel=wheel)
     test_sources = _producer_test_sources(root, revision=str(producer["revision"]))
     junit_path = output / "pytest-junit.xml"
-    command = [
-        str(python.expanduser().absolute().resolve(strict=True)),
-        "-I",
-        "-m",
-        "pytest",
-        "-q",
-        "-p",
-        "no:cacheprovider",
-        "--disable-warnings",
-        "--maxfail=1",
-        f"--junitxml={junit_path}",
-        *(scenario.node_id for scenario in FAULT_SCENARIOS),
-    ]
+    command = _pytest_command(python, junit_path)
     completed = run_isolated_process(command, cwd=root, timeout_seconds=900.0)
     stdout_path = output / "pytest.stdout.txt"
     stderr_path = output / "pytest.stderr.txt"

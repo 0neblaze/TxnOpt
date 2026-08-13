@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from tools.audit_txnopt_level1_fault_gate import (
     EXPECTED_CASES,
     REQUIRED_CATEGORIES,
     _junit_counts,
+    _pytest_command,
     verify_fault_gate,
 )
 from tools.txnopt_level1_campaign_common import sha256_file
@@ -33,6 +35,15 @@ def test_junit_parser_rejects_a_partial_fault_matrix(tmp_path: Path) -> None:
     _write_junit(junit, tests=EXPECTED_CASES - 1)
     with pytest.raises(ValueError, match="expected"):
         _junit_counts(junit)
+
+
+def test_pytest_command_preserves_the_virtual_environment_launcher(
+    tmp_path: Path,
+) -> None:
+    launcher = tmp_path / "python"
+    launcher.symlink_to(sys.executable)
+    command = _pytest_command(launcher, tmp_path / "receipt.xml")
+    assert command[0] == str(launcher.absolute())
 
 
 def test_verifier_rejects_a_tampered_fault_artifact(tmp_path: Path) -> None:
