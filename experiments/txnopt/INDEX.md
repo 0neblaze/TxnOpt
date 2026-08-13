@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build11 local build/semantic/performance/bounded-exhaustive-fault/runtime gates complete; review packet machine-verified; pre-cloud Attempt05 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration and fault Attempt03 retained; Attempt23 raw root absent/unexecuted | Packet verification Attempt08 passes; external Build11 decision pending |
+| `txnopt-level1-protocol-v1` | Build11 local build/static/semantic/performance/bounded-exhaustive-fault/runtime gates complete; review packet machine-verified; pre-cloud Attempt06 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration, static Attempt01, and fault Attempt03 retained; Attempt23 raw root absent/unexecuted | Packet verification Attempt08 passes; external Build11 decision pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -195,7 +195,16 @@ request, all 16 source/artifact inputs, the installed Build11 wheel, the sealed
 10-input formal receipt, producer/reviewer import independence, and 46/46
 lifecycle/refinement tests. Its machine status is
 `MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING`: it does not supply a reviewer
-identity or decision and therefore does not unblock pre-cloud Attempt05.
+identity or decision. Attempt08 did not unblock the then-current pre-cloud
+Attempt05; successor Attempt06 remains blocked for the same external decision.
+
+Static gate Attempt01 binds the unchanged Build11 implementation and installed
+wheel to 24/24 producer-owned contract, dependency, distribution, and CLI
+tests. It records entrypoint coverage 1, zero core import cycles, zero reverse
+dependencies, zero active `evrptw` imports or new `stage05.2` schemas, no Level
+1 full-native fast path, and zero protected-history changes. Pre-cloud Attempt06
+adds this exact local evidence while retaining the external-review blocker and
+all purchase/execution boundaries.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

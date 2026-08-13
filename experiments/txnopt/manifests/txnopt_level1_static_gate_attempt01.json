@@ -1,0 +1,81 @@
+{
+  "schema_version": "txnopt-level1-static-gate-manifest-v1",
+  "run_label": "txnopt_level1_static_gate_attempt01",
+  "status": "LOCAL_STATIC_GATE_PASS_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T15:40:59Z",
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854"
+  },
+  "orchestration_identity": {
+    "revision": "d3d273ef53fe241f2e0ec9fbafec7239b588de2b",
+    "git_tree": "af8b49861efae8c8a208987c97c7f1fa8939e156",
+    "source_dirty": false,
+    "detached_clean_worktree": "/home/oneblaze/txnopt-audits/level1-static-gate-d3d273e",
+    "tool_path": "tools/audit_txnopt_level1_static_gate.py",
+    "tool_sha256": "d6dfd87d08c6f099194ec76d541a954d7bdec48b4b5eb020663364ed0ad8cadf",
+    "tool_test_path": "tests/txnopt/test_level1_static_gate_tool.py",
+    "tool_test_sha256": "1396a79057249a9c6da240c09cacf929bb98430d8e8ef390c25c737b57b02bd4"
+  },
+  "formal_plan": {
+    "path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/manifest.json",
+    "sha256": "be5a2bbe98bfa6092188ba849eb64f01de8232e10fbb91c8919d90d250c59e1c",
+    "config_tree_sha256": "4a828f134d971172cd6ebdef15d45e14b8315be9dc7cf51e96ea00856d27e901",
+    "formal_matrix_started": false
+  },
+  "external_receipt": {
+    "path": "/home/oneblaze/txnopt-calibration/level1-local-static-gate-build11-attempt01/receipt.json",
+    "sha256": "9fbd8d50519b61985f86c2248caa8a676ff3646c339f77046eafacb6252b7115",
+    "sidecar_verified": true,
+    "independent_verify_exit_code": 0,
+    "junit_sha256": "00ad2179357f6d7f7b9cb9e21f7beb55bbcf934c88bc0d4b3c79e9efa057a3ee",
+    "pytest_case_count": 24,
+    "passed": 24,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "producer_binding": {
+    "active_implementation_path_count": 8,
+    "active_implementation_diff_count": 0,
+    "producer_bound_test_source_count": 4,
+    "installed_wheel_identity": "PASS"
+  },
+  "gate_results": {
+    "entrypoint_coverage": 1,
+    "core_import_cycles": 0,
+    "txnopt_reverse_dependencies": 0,
+    "producer_reviewer_mutual_imports": 0,
+    "active_evrptw_imports": 0,
+    "active_stage05_2_schemas": 0,
+    "level1_full_native_fast_paths": 0,
+    "historical_path_and_byte_mutations": 0,
+    "root_public_export_count": 5,
+    "installed_wheel_identity": "PASS",
+    "producer_bound_static_tests": "PASS_24_OF_24"
+  },
+  "immutability": {
+    "protected_history_comparison_base_revision": "80d6cabdd9bedf4200afa60a3a86f6c27233e191",
+    "protected_history_path_count": 8,
+    "protected_history_changed_path_count": 0,
+    "build11_review_request_bound_input_count": 16,
+    "build11_review_request_hash_mismatch_count": 0,
+    "historical_stage_evidence_mutated": false
+  },
+  "claim_boundary": {
+    "local_static_gate": "PASS",
+    "external_independent_review_completed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "level2_entry_authorized": false,
+    "next_gate": "external independent Build11 evidence-lifecycle and formal-successor review"
+  }
+}

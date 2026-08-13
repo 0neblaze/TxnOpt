@@ -483,3 +483,60 @@ def test_fifth_precloud_receipt_binds_the_exhaustive_fault_gate() -> None:
     assert manifest["execution_boundary"]["procurement_authorized"] is False
     assert manifest["execution_boundary"]["formal_matrix_started"] is False
     assert manifest["execution_boundary"]["level1_ready"] is False
+
+
+def test_first_static_gate_proves_the_non_cloud_identity_predicates() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_static_gate_attempt01.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "LOCAL_STATIC_GATE_PASS_NOT_LEVEL1_READY"
+    gates = manifest["gate_results"]
+    assert gates["entrypoint_coverage"] == 1
+    assert gates["core_import_cycles"] == 0
+    assert gates["txnopt_reverse_dependencies"] == 0
+    assert gates["producer_reviewer_mutual_imports"] == 0
+    assert gates["active_evrptw_imports"] == 0
+    assert gates["active_stage05_2_schemas"] == 0
+    assert gates["level1_full_native_fast_paths"] == 0
+    assert gates["historical_path_and_byte_mutations"] == 0
+    assert gates["root_public_export_count"] == 5
+    assert gates["producer_bound_static_tests"] == "PASS_24_OF_24"
+    assert manifest["claim_boundary"]["external_independent_review_completed"] is False
+    assert manifest["claim_boundary"]["procurement_authorized"] is False
+    assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_sixth_precloud_receipt_adds_static_evidence_but_stays_blocked() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/txnopt_level1_precloud_gate_attempt06.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["status"] == "BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING"
+    local = manifest["local_precloud_gates"]
+    assert local["local_precloud_gate_complete"] is True
+    assert local["static_identity_import_naming_gate"] == "PASS_ATTEMPT01"
+    assert local["entrypoint_coverage"] == 1
+    assert local["core_import_cycles"] == 0
+    assert local["txnopt_reverse_dependencies"] == 0
+    assert local["historical_path_and_byte_mutations"] == 0
+    reviews = manifest["formal_and_legacy_reviews"]
+    assert reviews["review_packet_machine_verification"] == "PASS"
+    assert reviews["build11_independent_successor_review_completed"] is False
+    assert manifest["decision"]["local_precloud_gate"] == "PASS"
+    assert manifest["decision"]["precloud_gate"] == "BLOCKED"
+    assert manifest["execution_boundary"]["procurement_authorized"] is False
+    assert manifest["execution_boundary"]["formal_matrix_started"] is False
+    assert manifest["execution_boundary"]["level1_ready"] is False

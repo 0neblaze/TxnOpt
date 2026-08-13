@@ -1,0 +1,107 @@
+{
+  "schema_version": "txnopt-level1-precloud-gate-v1",
+  "run_label": "txnopt_level1_precloud_gate_attempt06",
+  "status": "BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING",
+  "created_at_utc": "2026-08-13T15:42:00Z",
+  "successor_of": "txnopt_level1_precloud_gate_attempt05",
+  "orchestration_identity": {
+    "revision": "d3d273ef53fe241f2e0ec9fbafec7239b588de2b",
+    "git_tree": "af8b49861efae8c8a208987c97c7f1fa8939e156",
+    "source_dirty": false,
+    "branch": "codex/txnopt-level1",
+    "producer_identity_separate": true
+  },
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854"
+  },
+  "formal_plan": {
+    "manifest_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/manifest.json",
+    "manifest_sha256": "be5a2bbe98bfa6092188ba849eb64f01de8232e10fbb91c8919d90d250c59e1c",
+    "config_count": 2880,
+    "config_tree_sha256": "4a828f134d971172cd6ebdef15d45e14b8315be9dc7cf51e96ea00856d27e901",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build11-attempt23",
+    "raw_output_root_absent": true,
+    "atomic_launch_claim_absent": true,
+    "holdout_opened": false,
+    "formal_matrix_started": false
+  },
+  "analysis_preregistration": {
+    "path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/analysis-protocol.json",
+    "sha256": "53ceebf854257add33b3ccb28c493818d1d96f0416fa5f343fd2c925e5a5442c",
+    "status": "PREREGISTERED_BEFORE_FORMAL_MATRIX",
+    "bootstrap_resamples": 20000,
+    "bootstrap_seed": 20260813,
+    "holdout_opened": false
+  },
+  "local_precloud_gates": {
+    "build_manifest_status": "PASS",
+    "semantic_and_objective_parity": "PASS",
+    "representative_performance_and_overhead": "PASS",
+    "exhaustive_bounded_microstate_fault_gate": "PASS_ATTEMPT03",
+    "static_identity_import_naming_gate": "PASS_ATTEMPT01",
+    "runtime_estimate_within_ten_days": "PASS",
+    "fallback_count": 0,
+    "static_manifest_path": "experiments/txnopt/manifests/txnopt_level1_static_gate_attempt01.json",
+    "static_manifest_sha256": "cc1aef7003fe3fd03a58b28bd2a619d5d85a9202de43833e9e50a6f96fbe0daa",
+    "entrypoint_coverage": 1,
+    "core_import_cycles": 0,
+    "txnopt_reverse_dependencies": 0,
+    "active_evrptw_imports": 0,
+    "active_stage05_2_schemas": 0,
+    "historical_path_and_byte_mutations": 0,
+    "fault_manifest_path": "experiments/txnopt/manifests/txnopt_level1_fault_gate_attempt03.json",
+    "fault_manifest_sha256": "9b24bfeb888a97dc34ce9376279af5c117a39b98ab0a04f199312e965fc363a2",
+    "fault_pytest_case_count": 75,
+    "calibration_manifest_path": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt22.json",
+    "calibration_manifest_sha256": "9d751d77cc9c67d4373ecda32c938f4ffa61037c0a8624318d292eb692f36889",
+    "cloud_estimate_path": "/home/oneblaze/txnopt-calibration/level1-cloud-estimate-attempt05.json",
+    "cloud_estimate_sha256": "c0228bb6140f2eb8396f498d441ea093261d7df4647587d4b16c46d0c5deb20c",
+    "estimated_32_physical_core_seconds": 4299.962982560017,
+    "local_precloud_gate_complete": true
+  },
+  "formal_and_legacy_reviews": {
+    "build11_review_request_path": "formal/reviews/txnopt_evidence_lifecycle_review_request_attempt07.json",
+    "build11_review_request_sha256": "f09bd66ac7d4bc08ab3835199d0bf8925151df1f775abc8712c7d8de91f3a5e8",
+    "build11_review_request_bound_input_count": 16,
+    "build11_review_request_hash_mismatch_count": 0,
+    "review_packet_manifest_path": "formal/reviews/txnopt_build11_review_packet_verification_attempt08.json",
+    "review_packet_manifest_sha256": "0266f45ec22bbcdb782132f69de898b664529a80928ef5574cccf2a09612cf7f",
+    "review_packet_machine_verification": "PASS",
+    "build11_independent_successor_review_completed": false,
+    "legacy_compatibility_status": "PASS_WITH_IMMUTABLE_PROVENANCE_CAVEAT"
+  },
+  "clean_preflight": {
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE",
+    "authority_revision": "d3d273ef53fe241f2e0ec9fbafec7239b588de2b",
+    "authority_tree": "af8b49861efae8c8a208987c97c7f1fa8939e156",
+    "authority_clean": true,
+    "active_target_process_count": 0,
+    "raw_output_root_absent": true,
+    "atomic_launch_claim_absent": true,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false
+  },
+  "execution_boundary": {
+    "procurement_authorized": false,
+    "cloud_purchase_performed": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "internal_level1_seal_created": false,
+    "level2_entry_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false
+  },
+  "decision": {
+    "local_precloud_gate": "PASS",
+    "precloud_gate": "BLOCKED",
+    "blocking_gate": "BUILD11_EXTERNAL_INDEPENDENT_EVIDENCE_LIFECYCLE_AND_FORMAL_SUCCESSOR_REVIEW",
+    "authorized_next_action": "EXTERNAL_INDEPENDENT_REVIEW_ONLY",
+    "claim_boundary": "Build11 local gates now include exact static identity, import, naming, bounded-exhaustive fault, semantic, representative performance, and runtime-estimate evidence. Machine packet verification is not an external review decision; this receipt authorizes no purchase or execution."
+  }
+}

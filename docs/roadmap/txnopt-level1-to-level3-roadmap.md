@@ -95,6 +95,11 @@ cloud purchase, public alpha, or manuscript submission.
   Its status remains `MACHINE_VERIFIED_EXTERNAL_DECISION_PENDING`; a separately
   identified external reviewer must still issue the allowed PASS or
   `NEEDS_WORK` decision.
+- Static gate Attempt01 binds the unchanged Build11 implementation and wheel to
+  24/24 producer-owned contract, dependency, distribution, and CLI tests. It
+  records entrypoint coverage 1, zero core import cycles, zero reverse
+  dependencies, zero active `evrptw` imports or Stage 5.2 schemas, no Level 1
+  full-native fast path, and zero protected-history changes.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96
   independent replays. Fixed-work semantic/objective parity is 100%. Its
   representative RCPSP four-worker geometric-mean speedup is 2.12x, while
@@ -323,9 +328,11 @@ performance, fault/prefix, and runtime-estimate gates are complete; the Build11
 review packet is machine-verified, but the external independent
 evidence-lifecycle/formal-successor decision remains pending; purchase and
 execution are unauthorized**. Attempt22 is the current local calibration,
-Attempt03 is the current local fault receipt, and review-packet Attempt08 is
-machine-only evidence. Formal plan Attempt23 freezes 2,880 Build11-bound configs
-with a fresh absent raw root and passes structural preflight. Pre-cloud Attempt05 remains
+Attempt03 is the current local fault receipt, static Attempt01 closes the local
+identity/import/naming predicates, and review-packet Attempt08 is machine-only
+evidence. Formal plan Attempt23 freezes 2,880 Build11-bound configs
+with a fresh absent raw root and passes structural preflight. Pre-cloud Attempt06
+supersedes Attempt05 and remains
 `BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; no procurement or execution
 authority is implied, and full-scope confidence intervals remain post-run
 Level 1 completion evidence.
