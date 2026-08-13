@@ -1,0 +1,82 @@
+{
+  "schema_version": "txnopt-formal-independent-review-request-v1",
+  "run_label": "txnopt_evidence_lifecycle_review_request_attempt07",
+  "status": "READY_FOR_EXTERNAL_INDEPENDENT_REVIEW",
+  "review_completed": false,
+  "reviewer_identity": null,
+  "review_decision": null,
+  "producer_identity": {
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json",
+    "build_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "source_revision": "6d28923c92fc9b7eb8324c0f5be493e88e489d6c",
+    "source_tree": "7d8ec31aa8d3e08a3b4b41b4ec34a58516959c23",
+    "wheel_sha256": "b307b64ce46ad27e634c52ed3355a874ac5fdf569eb7c0d9c03785ea3481f304",
+    "native_sha256": "67a86a13d4abc128b982bef3a1ce32f0eb31d02f351cd2e948469592a26e9854"
+  },
+  "prior_review_boundary": {
+    "review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "build10_request_path": "formal/reviews/txnopt_native_round_refinement_review_request_attempt06.json",
+    "build10_request_sha256": "318b59d0f64ea9b417d763497ccb31d8205c82d71308d9058c494d9c8a5d05e8",
+    "binding": "PRIOR_SOURCE_ONLY",
+    "must_not_be_promoted_as_build11_review": true
+  },
+  "bound_inputs": [
+    {"path": "experiments/txnopt/manifests/txnopt_level1_build_attempt11.json", "sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff"},
+    {"path": "formal/proofs.md", "sha256": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da"},
+    {"path": "formal/refinement-mapping.md", "sha256": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135"},
+    {"path": "formal/model-check-receipt.json", "sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5"},
+    {"path": "formal/native-round-prepared-receipt-refinement.md", "sha256": "cbd2ede49c31e3b6b53fd3eaea8718876a319bb6be535c524f0df6b259c6f2c6"},
+    {"path": "cpp/txnopt_core/round_transaction.hpp", "sha256": "e4738adb1c02602c3770c6a78f7bc4a9857e98b1b08a91c6fcafd8ba73780c93"},
+    {"path": "src/txnopt/runtime.py", "sha256": "aa6ad9b9dbc2264c11a6d771bfdd532c6890a102603129d9b72dab23596c6511"},
+    {"path": "src/txnopt_evidence/lifecycle.py", "sha256": "4557bcbcc827ee11cf2264b5591cf677fe021508c8f649aeb8f99c25ed66cc70"},
+    {"path": "src/txnopt_evidence/refinement.py", "sha256": "d99d52f012e15fbcfa84fcffd5dc9ee02846d20f49fe40d8e22e40a705df782b"},
+    {"path": "src/txnopt_evidence/reviewer.py", "sha256": "47c4fecd50fa2e7a2a15ba4aea0f09f0d6dfc200afef479bf810f5cb08e5da94"},
+    {"path": "src/txnopt_evidence/runner.py", "sha256": "d822d6a2336ff0fe8b26234433ccda86b41120871f073de4a1dbfce75ff671ca"},
+    {"path": "tools/run_txnopt_level1_campaign.py", "sha256": "29c29eec14873ee6c8e28adf27644507fc8d4975e023ddff02e1de9e0d8d1820"},
+    {"path": "tools/review_txnopt_level1_campaign.py", "sha256": "d079df601b10842c3a4c65b1f2b73be59952307e49b4a7693c72e56cd0240470"},
+    {"path": "tests/txnopt/test_evidence_lifecycle.py", "sha256": "84eb48b2e1c2d2990e79bf7b1c197bc9f4c54c8b356cfca2e3dab9ea1d9df652"},
+    {"path": "tests/txnopt/test_evidence_pipeline.py", "sha256": "a5faa51889a392a6fc5155fdc2c153a5129e0aef2c9905287f0b8b4e5bb6109a"},
+    {"path": "tests/txnopt/test_formal_contract.py", "sha256": "814fafb242c8a87780c6aa3372a19b5a42eaf8f8bcae7c285e3c3bba53ad8e94"}
+  ],
+  "evidence_inputs": {
+    "build11_manifest_sha256": "cf70912981a3044018dbcffccafcb09d052880fce3844c36f0733f6dfaab64ff",
+    "wheel_installed_pytest_passed": 186,
+    "property_test_functions": 5,
+    "property_generated_examples": 600,
+    "asan_ubsan_status": "PASS",
+    "tsan_status": "PASS",
+    "resource_soak_status": "PASS",
+    "resource_soak_rounds": 100000,
+    "historical_protected_paths": "UNCHANGED",
+    "build10_calibration_binding": "IMMUTABLE_PRIOR_BUILD_NOT_REBOUND"
+  },
+  "review_obligations": [
+    "verify every bound input hash against the exact Build11 source and artifact identity",
+    "verify the lifecycle state machine and event hash chain are canonical and append-only",
+    "verify PLANNED binds the input config, RUNNING binds the producer identity, and SEALED binds the complete artifact inventory",
+    "verify only an independent raw replay can append REVIEWED and that it binds the exact raw-manifest digest",
+    "verify resigned lifecycle, artifact, producer, run-label, state, ordinal, and prior-event tampering all fail closed",
+    "verify Build10 v1 bundles remain readable without adding or rewriting lifecycle evidence",
+    "verify the v2 runner and reviewer remain independent and do not mutually import",
+    "verify the prior T1 to T4, aggregate refinement, and native-round claim boundaries remain unchanged",
+    "report critical and major findings separately and refuse PASS if either count is nonzero"
+  ],
+  "required_review_output": {
+    "new_attempt_label_required": true,
+    "allowed_statuses": ["PASS_BUILD11_EVIDENCE_LIFECYCLE_REFINEMENT", "NEEDS_WORK"],
+    "must_bind_this_request_sha256": true,
+    "must_bind_reviewer_revision_and_source_tree": true,
+    "must_record_critical_and_major_finding_counts": true,
+    "must_preserve_prior_attempts": true
+  },
+  "claim_boundary": {
+    "independent_review_completed": false,
+    "level1_formal_gate_passed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "level1_ready": false,
+    "level2_entry_authorized": false
+  }
+}
