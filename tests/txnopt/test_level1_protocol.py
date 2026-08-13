@@ -297,3 +297,32 @@ def test_tenth_build_receipt_keeps_the_successor_formal_gate_open() -> None:
     )
     assert manifest["claim_boundary"]["cloud_purchase_authorized"] is False
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_build10_calibration_passes_representative_gates_without_authorization() -> None:
+    path = ROOT / (
+        "experiments/txnopt/manifests/"
+        "txnopt_level1_local_calibration_attempt20.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer_build"]["revision"].startswith("3e18b99")
+    assert manifest["calibration"]["raw_run_count"] == 96
+    assert manifest["calibration"]["raw_manifest_hash_match_count"] == 96
+    assert manifest["calibration"]["independent_review_pass_count"] == 96
+    assert manifest["calibration"]["independent_review_hash_match_count"] == 96
+    assert manifest["fixed_work_physical_results"]["evrptw"]["speedup_gate"] == (
+        "PASS_REPRESENTATIVE_ONLY"
+    )
+    assert manifest["fixed_work_physical_results"]["rcpsp"]["speedup_gate"] == (
+        "PASS_REPRESENTATIVE_ONLY"
+    )
+    assert manifest["formal_successor"]["independent_review_completed"] is False
+    assert manifest["cloud_estimate"]["purchase_authorized"] is False
+    assert manifest["decision"]["formal_cloud_matrix_authorized"] is False
+    assert manifest["decision"]["level1_ready"] is False

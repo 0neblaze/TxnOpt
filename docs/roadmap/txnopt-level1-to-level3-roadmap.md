@@ -286,15 +286,20 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
-Current gate status: **Build10 is complete; successor formal review, calibration,
-and pre-cloud evidence remain required; purchase and execution are unauthorized**.
+Current gate status: **Build10 and its representative calibration are complete;
+successor formal review and a fresh pre-cloud decision remain required; purchase
+and execution are unauthorized**.
 Build09-bound calibration Attempt17 passed
 the representative EVRPTW and RCPSP performance thresholds at 1.35x and 2.13x
 with 100% fixed-work semantic/objective parity, zero fallback, and 2.68% maximum
 one-worker overhead. Those facts remain valid for Build09 only. Build10 now
-freezes the active native transaction source, but still requires an independent
-successor refinement review, new local calibration, runtime estimate, formal
-plan, and pre-cloud decision before procurement can be considered again.
+freezes the active native transaction source. Build10-bound local calibration
+Attempt20 completed 96/96 raw runs and independent reviews. Its fixed-work
+physical results preserve 100% semantic/objective parity, measure 1.32x EVRPTW
+and 2.12x RCPSP representative four-worker geometric-mean speedup, and keep
+maximum one-worker overhead below 1.85%. The 32-physical-core estimate is 4,243
+seconds. These measurements do not replace the pending independent successor
+refinement review or the full-scope confidence interval.
 
 The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree

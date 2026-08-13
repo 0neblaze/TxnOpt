@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build10 complete; successor review/calibration/pre-cloud evidence required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build09 + local calibration retained; Attempt18 raw root absent and superseded for active source | Build10 native-receipt refinement review pending |
+| `txnopt-level1-protocol-v1` | Build10 calibration complete; successor review and fresh pre-cloud decision required; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build10 Attempt20 calibration retained; prior Attempt18 and Attempt19 formal roots remain absent/unexecuted | Build10 native-receipt refinement review pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -137,8 +137,14 @@ five property suites (600 generated examples), Ruff, strict mypy, wheel RECORD,
 legacy verifier, ASan/UBSan, TSan, protected-history comparison, and 100,000-round
 resource soak pass with zero fallback. The signed Attempt04/05 formal package is
 retained only for its prior source: the additive Build10 refinement note is
-`REVIEW_PENDING_BUILD10`. Therefore no local calibration, formal plan, pre-cloud
-gate, purchase, or Level 1 readiness is inherited from Build09.
+`REVIEW_PENDING_BUILD10`. Build10-bound local calibration Attempt20 now retains
+96/96 raw runs and 96/96 independent reviews with exact fixed-work semantic and
+objective parity. Representative EVRPTW and RCPSP four-worker geometric-mean
+speedups are 1.32x and 2.12x, while maximum one-worker overhead is 0.46% and
+1.84%. A conservative 32-physical-core estimate predicts about 4,243 seconds
+for the matrix. These are representative calibration results only: no
+full-scope confidence interval exists, the successor review remains pending,
+and purchase, execution, holdout access, and Level 1 readiness are false.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
