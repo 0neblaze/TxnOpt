@@ -1,5 +1,11 @@
 # Reproducible-EVRPTW
 
+> **TxnOpt transition:** the frozen EVRPTW implementation remains available at
+> tag `stage052-legacy-freeze-v1`. Active in-place restructuring now follows
+> [`docs/roadmap/txnopt-level1-to-level3-roadmap.md`](docs/roadmap/txnopt-level1-to-level3-roadmap.md).
+> Level 1 is in progress; no TxnOpt performance, formal-completeness, package
+> release, or publication claim is currently made.
+
 Reproducible research code and evidence for the Electric Vehicle Routing
 Problem with Time Windows and Recharging Stations (EVRP-TW).
 

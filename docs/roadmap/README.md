@@ -1,18 +1,25 @@
 # Research roadmap
 
-The detailed evolving roadmap is maintained locally as
-`docs/roadmap/evrptw-research-roadmap.local.md`. It is intentionally ignored:
-the document mixes active planning, superseded decisions, and unpublished
-research directions. The public repository records only the status summary
-below and the independently reviewed evidence under `experiments/`.
+The current public roadmap is
+[`txnopt-level1-to-level3-roadmap.md`](txnopt-level1-to-level3-roadmap.md).
+It governs the in-place transition from the frozen EVRPTW implementation to
+TxnOpt. Level 1, Level 2, and Level 3 are mandatory sequential gates; a later
+level cannot be opened by relabelling a failed earlier result.
 
-## Publication-facing status
+The unpublished strategy appendix is maintained locally as
+`docs/roadmap/txnopt-research-strategy.local.md` and is intentionally ignored.
+The earlier local EVRPTW roadmap remains ignored historical planning input.
 
-- Stages 0--4 and Stage 5.1 have accepted independent evidence.
-- Stage 5.2 has an accepted 36-shard Pilot (`attempt72`).
-- The 92-instance, ten-seed Stage 5.2 Formal campaign is incomplete.
-- Stages 6--8 remain planned research: BPC expansion, a unified solution
-  schema, and partial/nonlinear charging.
+## Current status
 
-The roadmap is a sequencing and governance document, not a claim that planned
-stages have been implemented.
+- The legacy implementation is frozen at tag `stage052-legacy-freeze-v1`.
+- Stage 5.2 performance-calibration Attempt16 is retained and closed as a
+  known unique failure; it is not a successful benchmark result.
+- TxnOpt Level 1 implementation is in progress on `codex/txnopt-level1`.
+- Level 2 and Level 3 remain required future gates and are not implemented.
+- No push, remote rename, public package/archive release, or submission is
+  authorized by this roadmap.
+
+Roadmap status is sequencing and governance metadata, never implementation or
+readiness evidence. Only independently replayed artifacts may support a result
+claim.

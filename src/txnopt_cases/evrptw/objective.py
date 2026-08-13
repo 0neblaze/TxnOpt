@@ -1,0 +1,219 @@
+"""Single authoritative EVRPTW objective construction and comparison policy."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Protocol
+
+OBJECTIVE_PRECISION_DIGITS = 9
+OBJECTIVE_SCHEMA_VERSION = "vehicles,distance,charging_time,charging_count"
+_STATION_KIND = "f"
+
+
+class _NodeLike(Protocol):
+    @property
+    def kind(self) -> object: ...
+
+
+class _InstanceLike(Protocol):
+    @property
+    def by_name(self) -> Mapping[str, _NodeLike]: ...
+
+
+class _RouteReportLike(Protocol):
+    @property
+    def route(self) -> tuple[str, ...]: ...
+
+
+class _SolutionReportLike(Protocol):
+    @property
+    def feasible(self) -> bool: ...
+
+    @property
+    def vehicle_count(self) -> int: ...
+
+    @property
+    def total_distance(self) -> float: ...
+
+    @property
+    def total_charging_time(self) -> float: ...
+
+    @property
+    def routes(self) -> tuple[_RouteReportLike, ...]: ...
+
+
+def canonical_objective_component(value: float) -> float:
+    """Normalize one continuous objective field under the formal policy."""
+
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("objective component must be finite and non-negative")
+    return round(value, OBJECTIVE_PRECISION_DIGITS)
+
+
+def count_charging_visits(
+    instance: _InstanceLike,
+    routes: Iterable[Iterable[str]],
+) -> int:
+    """Count charging-station visits using the canonical Schneider kind code."""
+
+    return sum(
+        1
+        for route in routes
+        for name in route
+        if str(instance.by_name[name].kind) == _STATION_KIND
+    )
+
+
+class ObjectiveComparison(StrEnum):
+    BETTER = "better"
+    EQUAL = "equal"
+    WORSE = "worse"
+
+
+@dataclass(frozen=True, slots=True)
+class SolutionObjective:
+    vehicle_count: int
+    total_distance: float
+    total_charging_time: float
+    charging_count: int
+
+    def __post_init__(self) -> None:
+        if self.vehicle_count < 0:
+            raise ValueError("vehicle_count must be non-negative")
+        if self.charging_count < 0:
+            raise ValueError("charging_count must be non-negative")
+        for name, value in (
+            ("total_distance", self.total_distance),
+            ("total_charging_time", self.total_charging_time),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+
+    @property
+    def key(self) -> tuple[int, float, float, int]:
+        return (
+            self.vehicle_count,
+            canonical_objective_component(self.total_distance),
+            canonical_objective_component(self.total_charging_time),
+            self.charging_count,
+        )
+
+    @classmethod
+    def zero(cls) -> SolutionObjective:
+        return cls(0, 0.0, 0.0, 0)
+
+    @classmethod
+    def from_report(
+        cls,
+        instance: _InstanceLike,
+        report: _SolutionReportLike,
+    ) -> SolutionObjective:
+        if not report.feasible:
+            raise ValueError("cannot construct an objective from an infeasible solution report")
+        return cls(
+            report.vehicle_count,
+            report.total_distance,
+            report.total_charging_time,
+            count_charging_visits(instance, (route.route for route in report.routes)),
+        )
+
+    @classmethod
+    def from_route(
+        cls,
+        instance: _InstanceLike,
+        route: Iterable[str],
+        *,
+        total_distance: float,
+        total_charging_time: float,
+    ) -> SolutionObjective:
+        route_tuple = tuple(route)
+        return cls(
+            1,
+            total_distance,
+            total_charging_time,
+            count_charging_visits(instance, (route_tuple,)),
+        )
+
+    def __add__(self, other: SolutionObjective) -> SolutionObjective:
+        if not isinstance(other, SolutionObjective):
+            return NotImplemented
+        return SolutionObjective(
+            self.vehicle_count + other.vehicle_count,
+            self.total_distance + other.total_distance,
+            self.total_charging_time + other.total_charging_time,
+            self.charging_count + other.charging_count,
+        )
+
+
+def compare_objectives(
+    left: SolutionObjective,
+    right: SolutionObjective,
+) -> ObjectiveComparison:
+    if left.key < right.key:
+        return ObjectiveComparison.BETTER
+    if left.key > right.key:
+        return ObjectiveComparison.WORSE
+    return ObjectiveComparison.EQUAL
+
+
+def objective_key_from_exact_numeric(
+    node_kinds: Sequence[int],
+    path_indices: Sequence[int],
+    metrics: Sequence[Sequence[float]],
+    *,
+    vehicle_count: int,
+    station_kind: int,
+) -> tuple[int, float, float, int]:
+    """Construct the canonical objective key for a native exact-result batch."""
+
+    objective = SolutionObjective(
+        vehicle_count=vehicle_count,
+        total_distance=sum(float(row[0]) for row in metrics),
+        total_charging_time=sum(float(row[3]) for row in metrics),
+        charging_count=sum(
+            int(node_kinds[int(node_index)]) == station_kind
+            for node_index in path_indices
+        ),
+    )
+    return objective.key
+
+
+def accept_annealing_move(
+    current: SolutionObjective,
+    candidate: SolutionObjective,
+    *,
+    temperature: float,
+    random_draw: float,
+) -> bool:
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("temperature must be finite and positive")
+    if not 0.0 <= random_draw <= 1.0:
+        raise ValueError("random_draw must be in [0, 1]")
+    if candidate.vehicle_count < current.vehicle_count:
+        return True
+    if candidate.vehicle_count > current.vehicle_count:
+        return False
+
+    comparison = compare_objectives(candidate, current)
+    if comparison is not ObjectiveComparison.WORSE:
+        return True
+    if candidate.key[1] == current.key[1]:
+        return False
+    distance_delta = candidate.total_distance - current.total_distance
+    return random_draw < math.exp(-distance_delta / temperature)
+
+
+__all__ = [
+    "OBJECTIVE_PRECISION_DIGITS",
+    "OBJECTIVE_SCHEMA_VERSION",
+    "ObjectiveComparison",
+    "SolutionObjective",
+    "accept_annealing_move",
+    "canonical_objective_component",
+    "compare_objectives",
+    "count_charging_visits",
+    "objective_key_from_exact_numeric",
+]

@@ -33,6 +33,7 @@ commercial-solvers = [
 ]
 
 [project.scripts]
+txnopt = "txnopt_evidence.cli:main"
 evrptw-env = "evrptw.environment:main"
 experiment-lifecycle = "evrptw.experiment_lifecycle:main"
 experiment-historical-review = "evrptw.experiments.lifecycle_historical_review:main"
@@ -57,7 +58,14 @@ dev = [
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-wheel.packages = ["src/evrptw", "tools"]
+wheel.packages = [
+  "src/evrptw",
+  "src/txnopt",
+  "src/txnopt_cases",
+  "src/txnopt_evidence",
+  "src/txnopt_legacy",
+  "tools",
+]
 
 [tool.ruff]
 line-length = 100
@@ -75,7 +83,8 @@ markers = [
 
 [tool.mypy]
 python_version = "3.13"
-packages = ["evrptw"]
+mypy_path = "src"
+packages = ["evrptw", "txnopt", "txnopt_cases", "txnopt_evidence", "txnopt_legacy"]
 strict = true
 warn_unused_ignores = false
 

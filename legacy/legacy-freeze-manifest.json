@@ -1,0 +1,14 @@
+{
+  "branch_after_freeze": "codex/txnopt-level1",
+  "legacy_commit": "3b0cf371759f3465c7264b85894d090004f3cf43",
+  "legacy_git_tree": "984b340e5062a3c6eb5cc16f8d25f96fff6baffe",
+  "legacy_source_manifest_sha256": "ccc89346eac1876b7a59bebc20a76bd36edcb70c615624dadb2dd97eec006d48",
+  "legacy_tag": "stage052-legacy-freeze-v1",
+  "legacy_wheel_sha256": "c2d33b9ced6a711a91ac8b810ca5de91b0270ea5a320679fc81657f64f0a188a",
+  "protected_historical_paths_mutated": false,
+  "schema_version": "txnopt-legacy-freeze-manifest-v1",
+  "source_disposition_matches_active_source": false,
+  "stage052_attempt16_lifecycle_state": "CLOSED",
+  "stage052_attempt16_retention_class": "unique_failure_full",
+  "verification_status": "freeze_not_correctness"
+}

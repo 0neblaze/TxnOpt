@@ -41,4 +41,10 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --frozen --all-groups
-      - run: uv run pytest tests/test_benchmark_audit.py tests/test_objective.py tests/test_exact_charging.py -q
+      - run: >-
+          uv run pytest
+          tests/txnopt
+          tests/test_benchmark_audit.py
+          tests/test_objective.py
+          tests/test_exact_charging.py
+          -q
