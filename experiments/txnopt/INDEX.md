@@ -81,6 +81,17 @@ the refinement relation is not mechanically checked, and finite measured
 `Cmax` is absent. The Level 1 formal gate and Level 2 positive entry stay
 closed.
 
+Correction Attempt04 and independent Review Attempt05 preserve Attempt03 and
+close those formal findings for the current package. T3 is accepted only as a
+scheduler-relative conditional theorem; the reviewer independently recomputes
+T4 unit and measured per-run Cmax bounds; aggregate replay enforces one active
+transaction, ordered candidate-key identity, and atomic state/cache visibility.
+The formal package has zero unresolved critical findings, but Level 1 remains
+not ready because the complete legacy compatibility run timed out and no clean
+build-bound successor calibration or confidence interval exists. A dirty
+developer probe reached 1.33x representative EVRPTW speedup and is retained only
+as a diagnostic, not as evidence or cloud authorization.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

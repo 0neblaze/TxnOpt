@@ -62,6 +62,15 @@ def _round(context: _native.EVRPTWContext):
     )
 
 
+def _parallel_round(context: _native.EVRPTWContext):
+    return context.exact_round_v1(
+        np.asarray((0, 1, 2, 3, 4), dtype=np.int64),
+        np.asarray((1, 2, 1, 2), dtype=np.int64),
+        math.inf,
+        64,
+    )
+
+
 def test_native_round_is_one_typed_call_and_matches_python_exact_charging() -> None:
     context = _context(1)
     output = _round(context)
@@ -94,14 +103,26 @@ def test_native_round_is_one_typed_call_and_matches_python_exact_charging() -> N
 
 
 def test_native_serial_and_parallel_rounds_have_equal_semantic_arrays() -> None:
-    serial = _round(_context(1))
-    parallel = _round(_context(2))
+    serial = _parallel_round(_context(1))
+    parallel = _parallel_round(_context(2))
 
     for index in range(8):
         np.testing.assert_array_equal(serial[index], parallel[index])
     assert serial[9]["worker_count"] == 1
     assert parallel[9]["worker_count"] == 2
+    assert parallel[9]["scheduled_worker_count"] == 2
+    assert parallel[9]["execution_policy"] == "parallel"
     assert parallel[8].shape == (2, 7)
+
+
+def test_native_parallel_context_uses_serial_policy_for_a_small_round() -> None:
+    output = _round(_context(2))
+
+    assert output[9]["worker_count"] == 2
+    assert output[9]["scheduled_worker_count"] == 1
+    assert output[9]["execution_policy"] == "serial_small_batch"
+    assert output[9]["parallel_route_threshold"] == 4
+    assert output[8].shape == (0, 7)
 
 
 def test_native_round_rejects_dtype_coercion_and_invalid_customer_indices() -> None:

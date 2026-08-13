@@ -48,3 +48,31 @@ The prior per-candidate publication model did not refine the implementation and
 is superseded by this aggregate model. The new TLC receipt binds the aggregate
 TLA+/PlusCal inputs, while acceptance of this mapping remains an independent
 review action.
+
+The executable independent mapping is
+`txnopt_evidence.refinement.replay_aggregate_refinement`. It treats
+PREPARED/RESERVED/EVALUATING/VALIDATED as stuttering steps, permits visible
+state and cache-generation changes only on one COMMITTED event, and requires
+ABORTED/INTERRUPTED events to expose neither. The raw-only reviewer invokes this
+module in its separate process and binds `aggregate_refinement_replay=PASS` to
+the signed review; malformed visible intermediate state or non-atomic cache
+generation is rejected.
+
+The executable relation also enforces the single-owner part of the formal
+state: at most one transaction may be non-terminal, every phase repeats the
+same unique ordered candidate-key tuple and visible snapshot, and its length
+must equal the immediately preceding `candidate_screening.admitted_count`.
+Each whole-batch commit appends a domain-separated digest of that ordered tuple
+to the replay receipt. Sequential rounds therefore refine sequential
+instantiations of the one-transaction TLA+ model; interleaved owners, changed
+candidate sets, missing admitted transactions, and reused private state are
+rejected before a review can pass. The v1 semantic event set is closed during
+replay: only screening, transaction, and round-termination events may appear
+between the run boundaries, and no non-transaction event may carry a visible
+state digest or cache generation.
+
+A backend contract failure that leaves cache publication unknowable is retained
+as an `INTERRUPTED` failure event with `cache_outcome="unknown"`. It is not a
+refinement witness: the replay receipt sets `prefix_safety_proven=false`, and a
+successful independent review must reject it. This preserves failure evidence
+without falsely claiming either commit or rollback.

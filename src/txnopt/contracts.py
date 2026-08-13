@@ -180,7 +180,12 @@ class Oracle[OracleCandidateT, OracleStateT, OracleObjectiveT](Protocol):
         ...
 
     def screen(self, candidates: Sequence[OracleCandidateT]) -> Sequence[bool]:
-        """Return ordered safe-admission decisions; False is a proof of rejection."""
+        """Return ordered safe-admission decisions; False proves rejection.
+
+        Decisions must be elementwise and partition invariant: screening an ordered
+        sequence in contiguous batches must return the same concatenated decisions
+        as screening the complete sequence once.
+        """
 
         ...
 

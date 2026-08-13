@@ -1,0 +1,37 @@
+{
+  "schema_version": "txnopt-formal-independent-review-v1",
+  "run_label": "txnopt_t3_t4_review_attempt05",
+  "status": "FORMAL_PACKAGE_PASS_LEVEL1_NOT_READY",
+  "responds_to": "txnopt_t3_t4_proof_correction_attempt04",
+  "review_scope": {
+    "correction_sha256": "858bc5a3a5c0da6725b1df3bfeb0ca0c7bcf73d479fb7d3de885f1fb7e8d0d94",
+    "proofs_sha256": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da",
+    "mapping_sha256": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135",
+    "model_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "runtime_sha256": "b234549cce9daa2bd67dfed16ff7160a3a68bf9d95523749d8bd6ddf106342e1",
+    "refinement_replay_sha256": "d99d52f012e15fbcfa84fcffd5dc9ee02846d20f49fe40d8e22e40a705df782b",
+    "independent_reviewer_sha256": "dda9d64ef8a65e48e6b1fa830f3047b5504b932c915c90ea2158dee2355b2001"
+  },
+  "classifications": {
+    "t3_scheduler_relative_conditional_theorem": "PASS",
+    "t4_unit_bound_and_runtime_mapping": "PASS_CONDITIONAL",
+    "t4_independent_bound_and_cmax_recalculation": "PASS",
+    "aggregate_refinement_replay": "PASS",
+    "tlc_scope": "BOUNDED_MODEL_CHECK_PASS",
+    "attempt04_hash_binding": "PASS_15_OF_15",
+    "level1_gate": "NEEDS_WORK",
+    "level2_positive_entry": "BLOCKED"
+  },
+  "findings": [],
+  "claim_boundary": {
+    "independent_successor_review_completed": true,
+    "formal_package_review_passed": true,
+    "t3_is_general_domain_mechanized_theorem": false,
+    "tlc_proves_only_bounded_t1_t2_and_t3_quotient": true,
+    "full_scope_cmax_reviewed": false,
+    "legacy_compatibility_complete": false,
+    "level1_ready": false,
+    "level2_positive_entry_open": false,
+    "unresolved_critical_formal_findings": 0
+  }
+}

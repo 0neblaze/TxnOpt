@@ -4,10 +4,12 @@
 atomic cache visibility, and failure termination for `txnopt-contract-v1`.
 `TxnOpt.cfg` is the bounded four-candidate TLC model.
 `TxnOptOrderedPlusCal.tla` contains the process-level PlusCal source for worker,
-committer, and failure interleavings. `proofs.md` gives the generalized
-inductive T1/T2 argument, the T3 counterexample, and the T4 algebraic bound.
-`model-check-receipt.json` binds both model inputs, the generated PlusCal
-translation, the exact `tla2tools.jar`, and the observed bounded state counts.
+committer, and failure interleavings. `TxnOptT3.tla` checks the finite
+wait/discard/use quotient and weak-fair termination used by the T3 meta-theorem.
+`proofs.md` gives the generalized inductive T1/T2 argument, the quantified T3
+proof, and the T4 algebraic and measured-cost bounds. `model-check-receipt.json`
+binds all model inputs, the generated PlusCal translation, the exact
+`tla2tools.jar`, and the observed bounded state counts.
 
 Re-run the receipt with:
 
@@ -17,10 +19,13 @@ python tools/verify_txnopt_formal.py \
   --tla2tools /path/to/tla2tools.jar
 ```
 
-The bounded TLA+/PlusCal safety checks are complete for four candidates. They
-do not check liveness or establish T3/T4. Independent review Attempt01 is
-retained under `formal/reviews/` with status `NEEDS_WORK`: it found a mismatch
-between the physical speculation window and the larger atomic batch rollback
-boundary, plus an unproved per-candidate-to-batch refinement. Measured `Qmax`
-and `Cmax` are also required before T4 may support a positive performance
-claim.
+The bounded T1/T2 safety checks are complete for four candidates, and the T3
+quotient checks both its no-triple invariant and termination under weak fairness.
+Review Attempts01 and 03 remain immutable `NEEDS_WORK` history. Correction
+Attempt04 and independent Review Attempt05 pass the scheduler-relative
+conditional T3 theorem, independently recomputed T4 unit/Cmax bounds, and the
+single-owner aggregate refinement replay; they do not relabel earlier reviews
+or turn the five-state quotient into a general-domain mechanized theorem.
+`txnopt-physical-trace-v1` now binds each observed run to a conservative elapsed
+transaction `Cmax`; Level 2 still requires independent review and full-scope
+measurements before any positive claim.

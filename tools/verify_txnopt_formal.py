@@ -133,10 +133,22 @@ def verify(
             ],
             cwd=temp,
         )
+        t3_output = _run(
+            base
+            + [
+                "-metadir",
+                str(temp / "t3-states"),
+                "-config",
+                "TxnOptT3.cfg",
+                "TxnOptT3.tla",
+            ],
+            cwd=formal,
+        )
 
     observed = {
         "primary": _counts(primary_output),
         "pluscal": _counts(pluscal_output),
+        "t3_witness": _counts(t3_output),
     }
     if observed != receipt["model_check"]:
         raise RuntimeError(

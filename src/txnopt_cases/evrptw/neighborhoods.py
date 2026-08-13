@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from itertools import chain
+
 from txnopt_cases.evrptw.oracle import EVRPTWPlan
 
 CustomerRoutes = tuple[tuple[str, ...], ...]
 
 
-def relocate_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
-    proposals: list[EVRPTWPlan] = []
+def _iter_relocate_plans(routes: CustomerRoutes) -> Iterator[EVRPTWPlan]:
     for source_index, source in enumerate(routes):
         for source_position, customer in enumerate(source):
             for target_index, target in enumerate(routes):
@@ -37,17 +39,19 @@ def relocate_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
                             *target[target_position:],
                         )
                         changed = [route for route in changed if route]
-                    proposals.append(EVRPTWPlan(tuple(changed)))
-    return tuple(proposals)
+                    yield EVRPTWPlan(tuple(changed))
 
 
-def swap_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
+def relocate_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
+    return tuple(_iter_relocate_plans(routes))
+
+
+def _iter_swap_plans(routes: CustomerRoutes) -> Iterator[EVRPTWPlan]:
     positions = tuple(
         (route_index, position)
         for route_index, route in enumerate(routes)
         for position in range(len(route))
     )
-    proposals: list[EVRPTWPlan] = []
     for left_index, left in enumerate(positions):
         for right in positions[left_index + 1 :]:
             changed = [list(route) for route in routes]
@@ -55,12 +59,14 @@ def swap_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
                 changed[right[0]][right[1]],
                 changed[left[0]][left[1]],
             )
-            proposals.append(EVRPTWPlan(tuple(tuple(route) for route in changed)))
-    return tuple(proposals)
+            yield EVRPTWPlan(tuple(tuple(route) for route in changed))
 
 
-def merge_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
-    proposals: list[EVRPTWPlan] = []
+def swap_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
+    return tuple(_iter_swap_plans(routes))
+
+
+def _iter_merge_plans(routes: CustomerRoutes) -> Iterator[EVRPTWPlan]:
     for left in range(len(routes)):
         for right in range(left + 1, len(routes)):
             for merged in (routes[left] + routes[right], routes[right] + routes[left]):
@@ -70,15 +76,24 @@ def merge_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
                     if index not in {left, right}
                 ]
                 changed.insert(left, merged)
-                proposals.append(EVRPTWPlan(tuple(changed)))
-    return tuple(proposals)
+                yield EVRPTWPlan(tuple(changed))
+
+
+def merge_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
+    return tuple(_iter_merge_plans(routes))
 
 
 def canonical_neighborhood_plans(routes: CustomerRoutes) -> tuple[EVRPTWPlan, ...]:
     """Return the de-duplicated canonical relocate/swap/merge plan order."""
 
     return tuple(
-        dict.fromkeys((*merge_plans(routes), *relocate_plans(routes), *swap_plans(routes)))
+        dict.fromkeys(
+            chain(
+                _iter_merge_plans(routes),
+                _iter_relocate_plans(routes),
+                _iter_swap_plans(routes),
+            )
+        )
     )
 
 

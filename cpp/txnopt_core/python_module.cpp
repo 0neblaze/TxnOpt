@@ -185,6 +185,10 @@ public:
 
         evrptw_native::ExactBatchOutput output;
         std::int64_t screened_routes = 0;
+        const auto parallel_route_threshold = static_cast<std::size_t>(
+            std::max<std::int64_t>(1, worker_count_ * 2));
+        const bool use_parallel = worker_count_ > 1
+            && route_count >= parallel_route_threshold;
         {
             py::gil_scoped_release release;
             const double screen_options[4]{1.0, 1e-9, 0.0, 0.0};
@@ -206,7 +210,7 @@ public:
                 }
                 ++screened_routes;
             }
-            if (worker_count_ == 1) {
+            if (!use_parallel) {
                 output = run_exact(
                     offsets.data(), indices.data(), route_count,
                     deadline_seconds, batch_size);
@@ -235,6 +239,15 @@ public:
             ? "VALIDATED"
             : "INTERRUPTED";
         receipt["worker_count"] = worker_count_;
+        receipt["scheduled_worker_count"] = use_parallel
+            ? static_cast<std::int64_t>(std::min<std::size_t>(
+                route_count, static_cast<std::size_t>(worker_count_)))
+            : 1;
+        receipt["execution_policy"] = worker_count_ == 1
+            ? "serial_configured"
+            : (use_parallel ? "parallel" : "serial_small_batch");
+        receipt["parallel_route_threshold"] = static_cast<std::int64_t>(
+            parallel_route_threshold);
         receipt["context_pack_count"] = 1;
         receipt["round_call_count"] = round_calls_;
         receipt["started_work"] = output.batch_counters[1];

@@ -67,11 +67,19 @@ cloud purchase, public alpha, or manuscript submission.
   formalizes the conditional T3 meta-theorem, and aligns the checked model with
   aggregate runtime publication. It remains `READY_FOR_INDEPENDENT_REVIEW`, not
   accepted evidence; measured finite `Cmax` is still required.
-- Independent successor review Attempt03 accepts the corrected atomic-window
-  unit inequality conditionally and confirms aggregate model/runtime
-  granularity. It remains `NEEDS_WORK`: T3 is a textual meta-theorem, general
-  contract-error paths lack uniform waste audits, the refinement relation is
-  not mechanically checked, and finite measured `Cmax` is absent.
+- Independent successor review Attempt03 remains immutable `NEEDS_WORK`.
+  Correction Attempt04 and independent Review Attempt05 close its formal
+  findings: T3 is an explicitly scheduler-relative conditional theorem, every
+  active transaction error has fail-fast rollback/audit evidence, the raw-only
+  reviewer independently recomputes T4 and measured per-run `Cmax`, and the
+  aggregate refinement replay rejects interleaved owners, candidate-set drift,
+  hidden state publication, and invalid round termination. This passes the
+  current formal package only; it does not prove a general-domain T3 theorem,
+  complete legacy compatibility, or Level 1 readiness.
+- A dirty development probe of the adaptive native scheduling policy reached
+  1.33x representative EVRPTW four-worker geometric-mean fixed-work speedup
+  with exact digest parity. It is diagnostic only: no clean producer identity,
+  confidence interval, or independent performance review exists yet.
 
 ## 3. Target repository and dependency structure
 
@@ -221,7 +229,7 @@ after proving equivalence to the canonical round stream.
 - [x] Use fixed-seed single-thread CP-SAT exact repair and reconstruct every
   schedule in an independent validator; the objective is feasible makespan.
 - [x] Complete bounded T1/T2 proof and model checking.
-- [ ] Produce independently reviewable T3/T4 proofs. Close the positive Level 2
+- [x] Produce independently reviewable T3/T4 proofs. Close the positive Level 2
   entry if T3 fails or T4 is vacuous at measured parameters.
 
 The formal obligations are:
@@ -253,10 +261,12 @@ estimation gates pass. The formal environment is exclusive Linux with at least
 days; the predicted formal matrix must fit in ten days with four days reserved
 for failed reruns. Sixty-four cores are used only if total cost is lower.
 
-Current gate status: **blocked before procurement**. The local ten-day runtime
-estimate passes for provisional budgets, but representative EVRPTW fixed-work
-speedup is 1.24x rather than the required 1.30x. The preregistered scope and
-threshold remain unchanged; the formal matrix has not started.
+Current gate status: **blocked before procurement**. The last clean calibration
+records representative EVRPTW fixed-work speedup of 1.19x, below 1.30x. A dirty
+developer probe reached 1.33x after adaptive native scheduling, but it is not
+evidence. The preregistered scope and threshold remain unchanged; a new clean
+build, independent calibration, confidence interval, and complete compatibility
+gate are required before the formal matrix may start.
 
 ### Level 1 gate
 

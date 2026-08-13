@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -70,6 +70,15 @@ class EVRPTWOracle:
             raise ValueError("route_screen_cache_capacity must be a positive integer")
         self._instance = instance
         self._instance_digest = _instance_digest(instance)
+        self._plan_key_prefix = (
+            b"txnopt-evrptw-plan-key-v1\0" + bytes.fromhex(self._instance_digest)
+        )
+        self._plan_key_cache: OrderedDict[EVRPTWPlan, str] = OrderedDict()
+        self._customer_bits = {
+            customer.name: 1 << index
+            for index, customer in enumerate(instance.customers)
+        }
+        self._all_customer_bits = (1 << len(self._customer_bits)) - 1
         self._route_screen_cache_capacity = route_screen_cache_capacity
         self._route_screen_cache: OrderedDict[tuple[str, ...], bool] = OrderedDict()
         self._route_screen_cache_hits = 0
@@ -93,16 +102,20 @@ class EVRPTWOracle:
         )
 
     def stable_key(self, candidate: EVRPTWPlan) -> str:
-        return hashlib.sha256(
-            json.dumps(
-                {
-                    "instance": self._instance_digest,
-                    "customer_routes": candidate.customer_routes,
-                },
+        try:
+            cached = self._plan_key_cache.pop(candidate)
+        except KeyError:
+            encoded_routes = json.dumps(
+                candidate.customer_routes,
                 separators=(",", ":"),
-                sort_keys=True,
             ).encode()
-        ).hexdigest()
+            cached = hashlib.sha256(self._plan_key_prefix + encoded_routes).hexdigest()
+            self._plan_key_cache[candidate] = cached
+            if len(self._plan_key_cache) > self._route_screen_cache_capacity:
+                self._plan_key_cache.popitem(last=False)
+        else:
+            self._plan_key_cache[candidate] = cached
+        return cached
 
     def state_digest(self, state: EVRPTWSolution) -> str:
         return hashlib.sha256(
@@ -193,38 +206,41 @@ class EVRPTWOracle:
         return state
 
     def _screen_one(self, candidate: EVRPTWPlan) -> bool:
-        expected = {customer.name for customer in self._instance.customers}
-        flattened = tuple(name for route in candidate.customer_routes for name in route)
-        counts = Counter(flattened)
-        if set(flattened) != expected or any(count != 1 for count in counts.values()):
-            return False
-        by_name = self._instance.by_name
+        visited = 0
+        customer_count = 0
         for route in candidate.customer_routes:
-            if any(
-                name not in by_name or by_name[name].kind is not NodeType.CUSTOMER
-                for name in route
-            ):
-                return False
-            if (
+            for name in route:
+                bit = self._customer_bits.get(name)
+                if bit is None or visited & bit:
+                    return False
+                visited |= bit
+                customer_count += 1
+        if (
+            customer_count != len(self._customer_bits)
+            or visited != self._all_customer_bits
+        ):
+            return False
+        return all(self._screen_route(route) for route in candidate.customer_routes)
+
+    def _screen_route(self, route: tuple[str, ...]) -> bool:
+        try:
+            cached = self._route_screen_cache.pop(route)
+        except KeyError:
+            by_name = self._instance.by_name
+            cached = (
                 sum(by_name[name].demand for name in route)
-                > self._instance.vehicle.load_capacity + 1e-9
-            ):
-                return False
-            try:
-                cached = self._route_screen_cache.pop(route)
-            except KeyError:
-                cached = _screen_route_safely(self._instance, route)
-                self._route_screen_cache[route] = cached
-                self._route_screen_cache_misses += 1
-                if len(self._route_screen_cache) > self._route_screen_cache_capacity:
-                    self._route_screen_cache.popitem(last=False)
-                    self._route_screen_cache_evictions += 1
-            else:
-                self._route_screen_cache[route] = cached
-                self._route_screen_cache_hits += 1
-            if not cached:
-                return False
-        return True
+                <= self._instance.vehicle.load_capacity + 1e-9
+                and _screen_route_safely(self._instance, route)
+            )
+            self._route_screen_cache[route] = cached
+            self._route_screen_cache_misses += 1
+            if len(self._route_screen_cache) > self._route_screen_cache_capacity:
+                self._route_screen_cache.popitem(last=False)
+                self._route_screen_cache_evictions += 1
+        else:
+            self._route_screen_cache[route] = cached
+            self._route_screen_cache_hits += 1
+        return cached
 
     def _evaluate_one(self, candidate: EVRPTWPlan) -> EVRPTWSolution:
         if not self._screen_one(candidate):

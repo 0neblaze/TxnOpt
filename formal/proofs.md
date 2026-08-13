@@ -45,8 +45,9 @@ the runtime fault tests exercise the inductive implementation boundary.
 
 ## T3: state-dependent search trilemma
 
-This is a meta-theorem about an extended state-dependent search model, not a
-property checked by the fixed-candidate TLA+ model.
+This is a meta-theorem about an extended state-dependent search model. It is
+separate from the fixed-candidate T1/T2 model; `TxnOptT3.tla` mechanically checks
+the finite observational quotient used by the proof below.
 
 Let `S` be the visible-state set, `T` a deterministic random tape, `G(s, t)` the
 candidate generator, `E(s, c)` deterministic evaluation, and `D(s, c, E(s,c))`
@@ -63,11 +64,23 @@ the serial decision. Define:
   unresolved, an idle worker starts any available successor/branch work instead
   of waiting for that predecessor's state transition.
 
-Assume the search is non-trivially state dependent: there exist `s0`, a tape
-segment, and a first candidate `c1` such that accepting `c1` produces `s1`, and
-the next serial candidate/result generated from `s1` is not observationally
-equivalent to every successor/branch that can be generated using only
-pre-resolution information from `s0`.
+The scheduler class is every non-anticipating scheduler whose pre-resolution
+choices are measurable with respect to the history available before `c1`
+resolves. Such a scheduler may wait, start one branch, or start any finite set of
+branches, but it cannot observe the successor state `s1` before resolution. The
+quantifier order is:
+
+`for every scheduler A, for every claimed unconditional SI/ZW/AP guarantee,
+there exists a state-dependent witness (s0, t, c1) and an accepting outcome of
+c1 for which at least one guarantee fails`.
+
+Assume the search is adversarially state dependent for the scheduler under
+review: for every non-empty finite set `K_A` of successors that scheduler `A`
+starts from pre-resolution information, there exist `s0`, a tape segment, a
+first candidate `c1`, and an accepting outcome producing `s1` such that the next
+canonical serial candidate/result from `s1` is observationally inequivalent to
+every member of `K_A`. This is the witness condition; it is stronger than merely
+requiring one inequivalent branch and is essential to the theorem.
 
 Before `c1` resolves, either no successor/branch evaluation starts or at least
 one starts. In the first case AP is false. In the second case choose the witness
@@ -77,9 +90,21 @@ recomputing it makes ZW false; publishing or using it makes SI false. Starting
 both acceptance and rejection branches does not escape the result: at least one
 unrealized branch is discarded on the realized trajectory, so ZW is false.
 
-Therefore `SI /\ ZW /\ AP` is impossible for arbitrary state-dependent search
-with such a witness. The conclusion is conditional: state-independent or
-observationally equivalent successor generation is outside the witness class.
+Any finite non-empty witness set `K_A` collapses observationally to the
+`successorStarted = TRUE` state in `TxnOptT3.tla`; its members are all marked
+non-equivalent by the witness condition above. At acceptance, retaining any
+member is the `use` outcome (SI fails); discarding every member is the `discard`
+outcome (ZW fails). The empty set is the `wait` outcome (AP fails). These cases
+exhaust the scheduler-relative witness quotient. TLC checks
+`NoTripleAtTermination` and, under weak fairness of predecessor resolution,
+`Termination` for this quotient; it does not prove that an arbitrary problem
+domain satisfies the adversarial witness condition.
+
+Therefore `SI /\ ZW /\ AP` is impossible for a non-anticipating scheduler when
+the scheduler-relative adversarial witness exists. The conclusion is
+conditional: a restricted domain in which a scheduler can always pre-start a
+successor observationally equivalent to every realized canonical branch is
+outside the theorem and may satisfy all three properties.
 
 ## T4: bounded transaction waste
 
@@ -113,9 +138,12 @@ the admitted work; a synchronous/internal-native call detects its boundary
 only when the call returns, so work performed before detection is discarded
 work and its post-detection `P` is zero.
 
-`txnopt._internal.waste_bounds.audit_waste` now fails closed when fixed-work
+`txnopt._internal.waste_bounds.audit_waste` fails closed when fixed-work
 observations exceed these unit bounds. `txnopt-physical-trace-v1` records `W`,
-`Qmax`, `P`, observed discarded/non-terminal units, and both bounds. The receipt
-labels cost as normalized work units. A non-vacuous physical-cost claim still
-requires independently measured and enforced `Cmax`; this proof does not
-manufacture that measurement.
+`Qmax`, `P`, observed discarded/non-terminal units, and both bounds. Runtime
+measurement additionally records the elapsed time of the complete evaluation
+transaction as `observed_cmax_upper_ns`. Because every request starts and ends
+inside that interval, it is a conservative upper bound for each request in that
+observed transaction. Waste receipts multiply both observed units and unit
+bounds by this same measured `Cmax`; independent review must still reject a run
+with missing or non-positive measurement whenever exact work started.

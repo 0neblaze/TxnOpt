@@ -34,6 +34,8 @@ def test_formal_receipt_binds_checked_in_models_and_generated_translation() -> N
     assert receipt["scope"]["publication_granularity"] == "atomic_candidate_batch"
     assert receipt["model_check"]["primary"]["distinct_states"] == 22
     assert receipt["model_check"]["pluscal"]["distinct_states"] == 8_134
+    assert receipt["model_check"]["t3_witness"]["distinct_states"] == 5
+    assert "T3 weak-fair termination" in receipt["properties_checked"]
     assert receipt["proof_package_status"] == "READY_FOR_INDEPENDENT_REVIEW"
 
 
@@ -88,6 +90,53 @@ def test_independent_successor_review_keeps_the_formal_gate_open() -> None:
     assert review["claim_boundary"]["independent_successor_review_completed"] is True
     assert review["claim_boundary"]["t3_t4_gate_passed"] is False
     assert review["claim_boundary"]["level1_ready"] is False
+
+
+def test_fourth_proof_correction_is_signed_and_remains_fail_closed() -> None:
+    path = ROOT / "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    correction = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert correction["status"] == "READY_FOR_INDEPENDENT_REVIEW"
+    assert correction["responds_to"] == "txnopt_t3_t4_review_attempt03"
+    for relative_path, expected in correction["bound_inputs"].items():
+        assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == expected
+    assert correction["verification"]["legacy_compatibility_status"] == "TIMEOUT"
+    assert correction["claim_boundary"]["independent_review_completed"] is False
+    assert correction["claim_boundary"]["t3_t4_gate_passed"] is False
+    assert correction["claim_boundary"]["level1_ready"] is False
+
+
+def test_fifth_independent_review_accepts_only_the_formal_package() -> None:
+    path = ROOT / "formal/reviews/txnopt_t3_t4_review_attempt05.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    review = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert review["status"] == "FORMAL_PACKAGE_PASS_LEVEL1_NOT_READY"
+    review_scope_paths = {
+        "correction_sha256": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
+        "proofs_sha256": "formal/proofs.md",
+        "mapping_sha256": "formal/refinement-mapping.md",
+        "model_receipt_sha256": "formal/model-check-receipt.json",
+        "runtime_sha256": "src/txnopt/runtime.py",
+        "refinement_replay_sha256": "src/txnopt_evidence/refinement.py",
+        "independent_reviewer_sha256": "src/txnopt_evidence/reviewer.py",
+    }
+    for field, relative_path in review_scope_paths.items():
+        assert hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest() == (
+            review["review_scope"][field]
+        )
+    assert review["claim_boundary"]["formal_package_review_passed"] is True
+    assert review["claim_boundary"]["level1_ready"] is False
+    assert review["claim_boundary"]["unresolved_critical_formal_findings"] == 0
 
 
 def test_first_generation_protocol_identities_are_exact() -> None:

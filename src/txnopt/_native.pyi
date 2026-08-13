@@ -24,6 +24,9 @@ class NativeRoundReceipt(TypedDict):
     protocol: str
     phase: str
     worker_count: int
+    scheduled_worker_count: int
+    execution_policy: str
+    parallel_route_threshold: int
     context_pack_count: int
     round_call_count: int
     started_work: int

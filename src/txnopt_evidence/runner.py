@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import traceback
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,14 @@ from txnopt_evidence.codec import (
 from txnopt_evidence.contracts import RawArtifactRef
 
 _RUN_LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{2,127}")
+
+
+class RunExecutionError(RuntimeError):
+    """Fail-fast producer error whose signed failure bundle remains reviewable."""
+
+    def __init__(self, message: str, *, manifest_path: Path) -> None:
+        super().__init__(message)
+        self.manifest_path = manifest_path
 
 
 def run_config_file(config_path: Path) -> RawArtifactRef:
@@ -51,6 +60,8 @@ def run_config(
     if not isinstance(run_config_payload, dict) or not isinstance(case_payload, dict):
         raise ValueError("run_config and case must be objects")
     producer_identity = _producer_identity(payload.get("build_manifest"))
+    config = parse_run_config(run_config_payload)
+    normalized_config = canonical_json_bytes(dict(payload), pretty=True)
 
     output_dir = Path(output_root).expanduser().resolve() / run_label
     if output_dir.exists() or output_dir.is_symlink():
@@ -59,30 +70,82 @@ def run_config(
 
     captured: list[tuple[Mapping[str, object], ...]] = []
     physical: list[tuple[Mapping[str, object], ...]] = []
-    config = parse_run_config(run_config_payload)
-    result = execute_case(
-        case_payload,
-        config=config,
-        semantic_sink=captured.append,
-        physical_sink=physical.append,
-    )
-    if len(captured) != 1:
-        raise RuntimeError("runtime did not emit exactly one semantic stream")
-
-    normalized_config = canonical_json_bytes(dict(payload), pretty=True)
     config_path = output_dir / "config.json"
     config_digest = write_exclusive(config_path, normalized_config)
     write_sidecar(config_path, config_digest)
+    config_entry = _artifact_entry(config_path, config_digest)
+    try:
+        result = execute_case(
+            case_payload,
+            config=config,
+            semantic_sink=captured.append,
+            physical_sink=physical.append,
+        )
+        if len(captured) != 1:
+            raise RuntimeError("runtime did not emit exactly one semantic stream")
+        if not captured[0]:
+            raise RuntimeError("runtime emitted an empty semantic stream")
+        if len(physical) > 1:
+            raise RuntimeError("runtime emitted more than one physical stream")
+        if any(not stream for stream in physical):
+            raise RuntimeError("runtime emitted an empty physical stream")
+        if not isinstance(result, dict):
+            raise RuntimeError("runtime result must be an object")
+        canonical_json_bytes(result, pretty=True)
+        for stream in (*captured, *physical):
+            for event in stream:
+                canonical_json_bytes(dict(event))
+    except Exception as error:
+        retained_semantic = [stream for stream in captured if stream]
+        retained_physical = [stream for stream in physical if stream]
+        failure = {
+            "schema_version": "txnopt-run-failure-v1",
+            "run_label": run_label,
+            "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+            "error_message": str(error),
+            "semantic_stream_count": len(retained_semantic),
+            "physical_stream_count": len(retained_physical),
+            "emitted_semantic_stream_count": len(captured),
+            "emitted_physical_stream_count": len(physical),
+            "traceback": traceback.format_exception(error),
+            "fallback_count": 0,
+        }
+        failure_path = output_dir / "failure.json"
+        failure_digest = write_signed_json(failure_path, failure)
+        failure_artifacts = [config_entry, _artifact_entry(failure_path, failure_digest)]
+        failure_artifacts.extend(
+            _write_failure_streams(output_dir, "events", retained_semantic)
+        )
+        failure_artifacts.extend(
+            _write_failure_streams(output_dir, "physical", retained_physical)
+        )
+        failure_manifest = {
+            "schema_version": "txnopt-failure-artifact-v1",
+            "run_label": run_label,
+            "input_config_sha256": input_sha256,
+            "contract": "txnopt-contract-v1",
+            "semantic_trace": "txnopt-semantic-trace-v1",
+            "physical_trace": "txnopt-physical-trace-v1",
+            "domain": case_payload.get("domain"),
+            "producer_identity": producer_identity,
+            "artifacts": failure_artifacts,
+            "runner_decision": "FAILED",
+            "failure_artifact": "failure.json",
+            "fallback_count": 0,
+        }
+        failure_manifest_path = output_dir / "manifest.json"
+        write_signed_json(failure_manifest_path, failure_manifest)
+        raise RunExecutionError(
+            f"TxnOpt run failed; signed evidence retained at {failure_manifest_path}",
+            manifest_path=failure_manifest_path,
+        ) from error
+
     events_path = output_dir / "events.jsonl"
     events_digest, terminal_event_digest = write_event_stream(events_path, captured[0])
     result_path = output_dir / "result.json"
     result_digest = write_signed_json(result_path, result)
     artifacts: list[dict[str, object]] = [
-        {
-            "path": "config.json",
-            "sha256": config_digest,
-            "bytes": config_path.stat().st_size,
-        },
+        config_entry,
         {
             "path": "events.jsonl",
             "sha256": events_digest,
@@ -97,8 +160,6 @@ def run_config(
         },
     ]
     if physical:
-        if len(physical) != 1:
-            raise RuntimeError("runtime emitted more than one physical stream")
         physical_path = output_dir / "physical.jsonl"
         physical_digest, terminal_physical_digest = write_event_stream(
             physical_path,
@@ -129,6 +190,34 @@ def run_config(
     manifest_path = output_dir / "manifest.json"
     manifest_digest = write_signed_json(manifest_path, manifest)
     return RawArtifactRef(run_label, manifest_path, manifest_digest)
+
+
+def _artifact_entry(path: Path, digest: str) -> dict[str, object]:
+    return {
+        "path": path.name,
+        "sha256": digest,
+        "bytes": path.stat().st_size,
+    }
+
+
+def _write_failure_streams(
+    output_dir: Path,
+    stem: str,
+    streams: list[tuple[Mapping[str, object], ...]],
+) -> list[dict[str, object]]:
+    artifacts: list[dict[str, object]] = []
+    for index, stream in enumerate(streams):
+        suffix = "" if len(streams) == 1 else f"-{index:04d}"
+        path = output_dir / f"{stem}{suffix}.jsonl"
+        digest, terminal_digest = write_event_stream(path, stream)
+        artifacts.append(
+            {
+                **_artifact_entry(path, digest),
+                "event_count": len(stream),
+                "terminal_event_sha256": terminal_digest,
+            }
+        )
+    return artifacts
 
 
 def _producer_identity(raw_binding: object) -> dict[str, object]:

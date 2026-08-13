@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
-from txnopt_evidence.reviewer import replay_manifest, verify_raw_manifest
+from txnopt_evidence.reviewer import replay_manifest, verify_manifest
 from txnopt_legacy import LegacyReceiptReader
 
 _VERSION: Final = "0.1.0a1"
@@ -41,17 +41,18 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _error(command: str, error: Exception) -> int:
+    manifest_path = getattr(error, "manifest_path", None)
+    payload = {
+        "schema_version": "txnopt-cli-error-v1",
+        "command": command,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "fallback_used": False,
+    }
+    if isinstance(manifest_path, Path):
+        payload["failure_manifest_path"] = str(manifest_path)
     print(
-        json.dumps(
-            {
-                "schema_version": "txnopt-cli-error-v1",
-                "command": command,
-                "error_type": type(error).__name__,
-                "error": str(error),
-                "fallback_used": False,
-            },
-            sort_keys=True,
-        ),
+        json.dumps(payload, sort_keys=True),
         file=sys.stderr,
     )
     return 2
@@ -78,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_dir=arguments.output_dir,
             )
         elif arguments.command == "verify":
-            payload = verify_raw_manifest(arguments.manifest)
+            payload = verify_manifest(arguments.manifest)
             result = {
                 "schema_version": "txnopt-verification-v1",
                 "status": "verified",

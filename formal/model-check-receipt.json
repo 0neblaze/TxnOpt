@@ -1,12 +1,13 @@
 {
-  "schema_version": "txnopt-formal-model-check-receipt-v2",
-  "checked_at": "2026-08-13T14:29:00+08:00",
+  "schema_version": "txnopt-formal-model-check-receipt-v3",
+  "checked_at": "2026-08-13T16:23:24+08:00",
   "scope": {
     "candidate_count": 4,
     "publication_granularity": "atomic_candidate_batch",
     "models": [
       "formal/TxnOpt.tla",
-      "formal/TxnOptOrderedPlusCal.tla"
+      "formal/TxnOptOrderedPlusCal.tla",
+      "formal/TxnOptT3.tla"
     ]
   },
   "input_sha256": {
@@ -14,9 +15,12 @@
     "formal/TxnOpt.cfg": "85535e10428a3859b4cbf6665b9b096305f5c3d1ee6925dee51238ec5f95a4a9",
     "formal/TxnOptOrderedPlusCal.tla": "6e69d76e2f0d9944ff62c82b9d28133d50ef6c1a642aec165a30182888a75649",
     "formal/TxnOptOrderedPlusCal.cfg": "792b01bd56e9f0bce3daf81ba61f3384239aa2120ad7cecaa87f715ed04796f3",
-    "formal/proofs.md": "fd14ed2dfc9de95fb4acd8d571bfa979b44d9a1e4d3b1a4514ea85fb84226e67",
-    "formal/refinement-mapping.md": "54ff0625cb92305db8f3caaaa1a409dbec1d7940534cdc9c341742a5daa33fd0",
-    "tools/verify_txnopt_formal.py": "aadff518585a676b15a3a96baf314d7bb002b556489a942c4cae96678d988a98"
+    "formal/TxnOptT3.tla": "ae2c941c0eca61fb6747c0df86d6d997680106b6f069da34f6ae85e811e5f7b3",
+    "formal/TxnOptT3.cfg": "45bc1d9494c1d3cf729d10d8f93b536528aa527aab79bd2785e62840c4aa9449",
+    "formal/proofs.md": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da",
+    "formal/refinement-mapping.md": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135",
+    "src/txnopt_evidence/refinement.py": "d99d52f012e15fbcfa84fcffd5dc9ee02846d20f49fe40d8e22e40a705df782b",
+    "tools/verify_txnopt_formal.py": "94fd49c57fc751a60298bc5804c77a767e27615e0fc8262cf205c89835f16ab0"
   },
   "toolchain": {
     "tlc_version": "TLC2 2.19 rev 5a47802",
@@ -32,6 +36,10 @@
     "pluscal": {
       "generated_states": 36402,
       "distinct_states": 8134
+    },
+    "t3_witness": {
+      "generated_states": 5,
+      "distinct_states": 5
     }
   },
   "properties_checked": [
@@ -39,9 +47,11 @@
     "cache visibility only after commit",
     "private candidate completion",
     "whole-batch commit",
-    "last complete prefix on failure"
+    "last complete prefix on failure",
+    "T3 no-triple witness quotient",
+    "T3 weak-fair termination"
   ],
   "result": "PASS",
   "proof_package_status": "READY_FOR_INDEPENDENT_REVIEW",
-  "claim_boundary": "Bounded safety checking supports the aggregate T1/T2 model for four candidates. T3 is a separate state-dependent-search meta-theorem. T4 unit bounds are runtime-audited, but physical Cmax measurement and independent proof/refinement review remain mandatory. No liveness or performance claim is made."
+  "claim_boundary": "Bounded safety checking supports the aggregate T1/T2 model for four candidates. The finite T3 witness quotient checks the exhaustive wait/discard/use scheduler classes and weak-fair termination; the general result remains a separately reviewed meta-theorem. T4 unit and measured per-run Cmax cost bounds are runtime-audited. Independent proof/refinement review remains mandatory, and no performance claim is made."
 }

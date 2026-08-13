@@ -207,6 +207,25 @@ class NativeEVRPTWOracle(EVRPTWOracle):
             or resolution_order.tolist() != list(range(route_count))
             or receipt["protocol"] != "txnopt-native-round-v1"
             or receipt["fallback_count"] != 0
+            or receipt["parallel_route_threshold"] != receipt["worker_count"] * 2
+            or receipt["scheduled_worker_count"] < 1
+            or receipt["scheduled_worker_count"] > receipt["worker_count"]
+            or receipt["execution_policy"]
+            not in {"serial_configured", "serial_small_batch", "parallel"}
+            or (
+                receipt["worker_count"] == 1
+                and receipt["execution_policy"] != "serial_configured"
+            )
+            or (
+                receipt["worker_count"] > 1
+                and route_count < receipt["parallel_route_threshold"]
+                and receipt["execution_policy"] != "serial_small_batch"
+            )
+            or (
+                receipt["worker_count"] > 1
+                and route_count >= receipt["parallel_route_threshold"]
+                and receipt["execution_policy"] != "parallel"
+            )
         ):
             raise RuntimeError("txnopt-native-round-v1 projection is inconsistent")
 

@@ -1,0 +1,70 @@
+{
+  "schema_version": "txnopt-formal-proof-correction-v1",
+  "run_label": "txnopt_t3_t4_proof_correction_attempt04",
+  "status": "READY_FOR_INDEPENDENT_REVIEW",
+  "supersedes_review": null,
+  "responds_to": "txnopt_t3_t4_review_attempt03",
+  "bound_inputs": {
+    "formal/proofs.md": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da",
+    "formal/refinement-mapping.md": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135",
+    "formal/model-check-receipt.json": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "formal/TxnOptT3.tla": "ae2c941c0eca61fb6747c0df86d6d997680106b6f069da34f6ae85e811e5f7b3",
+    "formal/TxnOptT3.cfg": "45bc1d9494c1d3cf729d10d8f93b536528aa527aab79bd2785e62840c4aa9449",
+    "tools/verify_txnopt_formal.py": "94fd49c57fc751a60298bc5804c77a767e27615e0fc8262cf205c89835f16ab0",
+    "src/txnopt/runtime.py": "b234549cce9daa2bd67dfed16ff7160a3a68bf9d95523749d8bd6ddf106342e1",
+    "src/txnopt/_internal/waste_bounds.py": "aa94600bd08551cb7a65f9155218c448924b9145ba7dbd2506c0e981b89df4f8",
+    "src/txnopt_evidence/refinement.py": "d99d52f012e15fbcfa84fcffd5dc9ee02846d20f49fe40d8e22e40a705df782b",
+    "src/txnopt_evidence/reviewer.py": "dda9d64ef8a65e48e6b1fa830f3047b5504b932c915c90ea2158dee2355b2001",
+    "src/txnopt_evidence/runner.py": "5786c8976f1bbc56324198cc0c6e101c4d104a719db4daa1e29cf1ecffff03ef",
+    "tests/txnopt/test_formal_contract.py": "f5c3dae1def130a9c04e00e92c8cd298a9220b28ba151363ecb74e26def15037",
+    "tests/txnopt/test_serial_runtime.py": "51f4d150f4c9f829fc6b9f7f07ae7c5e75bb151f01c5e431afb16fe03dea849c",
+    "tests/txnopt/test_parallel_runtime.py": "efe312b6915b3ae6614a7923bab9c79f48fd7468f2a4331552138cdcdb9fcaf8",
+    "tests/txnopt/test_evidence_pipeline.py": "addf16694c3a56d07e4c64a8c80142acd3e9336157c26be758ae9280a581c100"
+  },
+  "corrections": [
+    {
+      "finding": "T3-MECHANIZATION",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "TxnOptT3 checks the exhaustive wait, discard/recompute, and stale-use quotient, its no-triple invariant, and weak-fair termination; proofs.md states the scheduler class and quantifier order for the general meta-theorem."
+    },
+    {
+      "finding": "T4-AUDIT-COVERAGE",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "Every post-reservation exception now closes cache and budget ownership, records an aggregate terminal phase, binds a unit waste audit when fixed work started, emits physical evidence, and preserves fail-fast exception propagation. Preparation failures close the cache transaction before re-raising."
+    },
+    {
+      "finding": "REFINEMENT-PROOF",
+      "disposition": "ADDRESSED_PENDING_REVIEW",
+      "evidence": "The independent raw-only reviewer executes aggregate refinement replay: private phases stutter, only COMMITTED may atomically publish state and cache generation, and abort/interruption cannot expose either."
+    },
+    {
+      "finding": "T4-PHYSICAL-COST",
+      "disposition": "ADDRESSED_FOR_OBSERVED_RUN_PENDING_SCOPE_REVIEW",
+      "evidence": "Each work-bearing transaction records a conservative elapsed-time upper bound for every request in that transaction and binds measured Cmax, observed cost, and T4 cost bounds in txnopt-physical-trace-v1. Full-scope Level 2 measurements remain mandatory."
+    }
+  ],
+  "verification": {
+    "tla_primary_generated_states": 75,
+    "tla_primary_distinct_states": 22,
+    "pluscal_generated_states": 36402,
+    "pluscal_distinct_states": 8134,
+    "t3_generated_states": 5,
+    "t3_distinct_states": 5,
+    "formal_verifier_exit_code": 0,
+    "txnopt_pytest_passed": 152,
+    "txnopt_pytest_exit_code": 0,
+    "ruff_exit_code": 0,
+    "strict_mypy_exit_code": 0,
+    "legacy_compatibility_status": "TIMEOUT",
+    "legacy_compatibility_timeout_seconds": 1200
+  },
+  "claim_boundary": {
+    "independent_review_completed": false,
+    "t3_t4_gate_passed": false,
+    "observed_run_cmax_available": true,
+    "full_scope_cmax_reviewed": false,
+    "legacy_compatibility_complete": false,
+    "level1_ready": false,
+    "level2_positive_entry_open": false
+  }
+}
