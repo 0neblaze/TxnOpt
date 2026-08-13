@@ -1,0 +1,342 @@
+{
+  "schema_version": "txnopt-formal-independent-review-v1",
+  "run_label": "txnopt_evidence_lifecycle_review_attempt10",
+  "status": "NEEDS_WORK",
+  "responds_to": "txnopt_evidence_lifecycle_review_request_attempt07",
+  "request_sha256": "f09bd66ac7d4bc08ab3835199d0bf8925151df1f775abc8712c7d8de91f3a5e8",
+  "review_scope": {
+    "authoritative_checkout": "/home/oneblaze/work/Reproducible-EVRPTW",
+    "authoritative_revision": "7de3bcb8d25bbb24a7c61b89ccc37c0174781466",
+    "authoritative_tree": "3868c22ab0708a2433d03990a6a667a79b3efb62",
+    "authoritative_clean": true,
+    "producer_revision": "993cdb61205043d9588e9ea31d365668852e7d79",
+    "producer_tree": "ce660d56a344551bb439ff87e9652551f8b03174",
+    "build_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt13.json",
+    "build_manifest_sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de",
+    "external_root": "/home/oneblaze/txnopt-builds/level1-993cdb6",
+    "formal_model_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "scope_note": "Read-only review of Build13 anchored evidence and trust-root code; no formal matrix, cloud experiment, procurement, push, or release was started."
+  },
+  "producer_identity": {
+    "binding_status": "BOUND_CLEAN_BUILD",
+    "build_manifest_sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de",
+    "source_revision": "993cdb61205043d9588e9ea31d365668852e7d79",
+    "source_tree": "ce660d56a344551bb439ff87e9652551f8b03174",
+    "source_manifest_sha256": "faf497b0894011391f46d74b09a079b9f8d9e3bb4f40b055ee04ed159710a30f",
+    "tracked_file_count": 1147,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot",
+    "performance_profile": "host-native-lto",
+    "wheel_sha256": "be81b4458c00be919249f457fdf56543f4f50e39db7dd3fc32d7674b1dc60f7a",
+    "source_archive_sha256": "84c386ad56e4f6b93589dfb43e7c5b1a9e98554071ac7295af0eefec9df25ac0",
+    "native_wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+    "native_sha256": "531b90bf67e85cf7b0a97e338fdbb3a447cc9f1470e609413eff821d48566c52",
+    "installed_native_sha256": "531b90bf67e85cf7b0a97e338fdbb3a447cc9f1470e609413eff821d48566c52",
+    "resource_soak_sha256": "bae5786c1c314d1c3aa7f28dec184dd257e8ebe5863f979f9f9cb7c941d0093a",
+    "resource_soak_attestation_matches_native": true
+  },
+  "reviewer_identity": {
+    "agent_task": "/root/build13_independent_review",
+    "reviewer_checkout": "/home/oneblaze/work/Reproducible-EVRPTW",
+    "revision": "7de3bcb8d25bbb24a7c61b89ccc37c0174781466",
+    "source_tree": "3868c22ab0708a2433d03990a6a667a79b3efb62",
+    "clean": true,
+    "clean_check": "git status --short --branch showed only codex/txnopt-level1 with no changes",
+    "reviewer_write_boundary": "Only this JSON and its SHA-256 sidecar are written by this review."
+  },
+  "bound_inputs": [
+    {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt13.json",
+      "sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de"
+    },
+    {
+      "path": "experiments/txnopt/manifests/txnopt_level1_build_attempt12_failure.json",
+      "sha256": "9af9f6e18ff2bebde9bebce80540eb29944f4a17bf8e897834c24c4c13351028"
+    },
+    {
+      "path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt09.json",
+      "sha256": "87105cea68e8ad70d062c6132e7b5761f21fc088d45e0b8bcf6cdd105c55e114"
+    },
+    {
+      "path": "formal/proofs.md",
+      "sha256": "f2f1176707018a71da5d79f096e05bfea41aceb7d8a43aa735d5f370b6d948da"
+    },
+    {
+      "path": "formal/refinement-mapping.md",
+      "sha256": "cc868e369dc2fe5385bba621822d70d4b2e6d35cad9c0a3f521d6d995eff0135"
+    },
+    {
+      "path": "formal/native-round-prepared-receipt-refinement.md",
+      "sha256": "cbd2ede49c31e3b6b53fd3eaea8718876a319bb6be535c524f0df6b259c6f2c6"
+    },
+    {
+      "path": "formal/model-check-receipt.json",
+      "sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5"
+    },
+    {
+      "path": "src/txnopt_evidence/identity.py",
+      "sha256": "10c0ac49d538745a74e8304f89dbd540f0b5529710901a7c2f1281e69559c0bb"
+    },
+    {
+      "path": "src/txnopt_evidence/reviewer.py",
+      "sha256": "9a8af362d2869ef14bd4840d61401da4cbfe1ee926c0684ced4ee041b8f0cc66"
+    },
+    {
+      "path": "src/txnopt_evidence/runner.py",
+      "sha256": "a8d1e5b70f55d6d156f35e6c9ffd7443fccb15dc412c5a2b8930566c74c9ebaa"
+    },
+    {
+      "path": "src/txnopt_evidence/campaign.py",
+      "sha256": "de5dc5380c73b8ac2f2eefa32e62f9f73cee4f9fca31a7d23ccf818f96eef630"
+    },
+    {
+      "path": "tools/txnopt_level1_campaign_common.py",
+      "sha256": "3cf4b4a066c50967de02b1cb3d795595034658d431dba1ba26af0cdeba658dbb"
+    },
+    {
+      "path": "tools/run_txnopt_level1_campaign.py",
+      "sha256": "950b82c85f9800ec79287470f99c2f25c9e5a3efd6a8d6a9235705cbf7da7190"
+    },
+    {
+      "path": "tools/review_txnopt_level1_campaign.py",
+      "sha256": "33882a9e66a48168a0ef041ab8904410bad2c5756dee44572c6db05b58532f21"
+    },
+    {
+      "path": "tests/txnopt/test_evidence_pipeline.py",
+      "sha256": "b23c2d8996aca12e0b83a3eb2ff019c8a2e4a39d5687448598b14d2ec5b0c2af"
+    },
+    {
+      "path": "tests/txnopt/test_level1_campaign_tools.py",
+      "sha256": "2551a4324bb4a8c921df525ab9ba7ed55c6a7e4b08fedf348c80da4daba947c6"
+    }
+  ],
+  "artifact_verification": {
+    "manifest_sidecar": {
+      "expected_sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de",
+      "observed_sha256": "5ff8846c19473597a9c85950946c5df7c11aa0c286d8e0ad0ecbe2474735f3de",
+      "sidecar_exact": true,
+      "sidecar_format": "<json_sha256>  <filename>\\n"
+    },
+    "source_attestation_recomputed": {
+      "revision": "993cdb61205043d9588e9ea31d365668852e7d79",
+      "git_tree": "ce660d56a344551bb439ff87e9652551f8b03174",
+      "source_manifest_sha256": "faf497b0894011391f46d74b09a079b9f8d9e3bb4f40b055ee04ed159710a30f",
+      "tracked_file_count": 1147,
+      "source_dirty": false,
+      "result": "PASS"
+    },
+    "wheel": {
+      "path": "/home/oneblaze/txnopt-builds/level1-993cdb6/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "be81b4458c00be919249f457fdf56543f4f50e39db7dd3fc32d7674b1dc60f7a",
+      "entry_count": 55,
+      "record_row_count": 55,
+      "record_set_exact": true,
+      "record_rows_valid": true,
+      "installed_non_record_bytes_compared": 54,
+      "installed_record_valid": true,
+      "result": "PASS"
+    },
+    "source_archive": {
+      "path": "/home/oneblaze/txnopt-builds/level1-993cdb6/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "84c386ad56e4f6b93589dfb43e7c5b1a9e98554071ac7295af0eefec9df25ac0",
+      "entry_count": 1199,
+      "result": "PASS"
+    },
+    "native": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "installed_path": "/home/oneblaze/txnopt-builds/level1-993cdb6/formal-venv/lib/python3.13/site-packages/txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "wheel_entry_sha256": "531b90bf67e85cf7b0a97e338fdbb3a447cc9f1470e609413eff821d48566c52",
+      "installed_sha256": "531b90bf67e85cf7b0a97e338fdbb3a447cc9f1470e609413eff821d48566c52",
+      "attestation_source_revision": "993cdb61205043d9588e9ea31d365668852e7d79",
+      "attestation_source_tree": "ce660d56a344551bb439ff87e9652551f8b03174",
+      "attestation_source_manifest_sha256": "faf497b0894011391f46d74b09a079b9f8d9e3bb4f40b055ee04ed159710a30f",
+      "result": "PASS"
+    },
+    "resource_soak": {
+      "path": "/home/oneblaze/txnopt-builds/level1-993cdb6/resource-soak-attempt13.json",
+      "sha256": "bae5786c1c314d1c3aa7f28dec184dd257e8ebe5863f979f9f9cb7c941d0093a",
+      "sidecar_exact": true,
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "native_round_call_count": 101000,
+      "rss_growth_kib": 0,
+      "maximum_rss_growth_kib": 65536,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0,
+      "attestation_matches_installed_native": true,
+      "result": "PASS"
+    },
+    "sanitizer_binaries_observed": {
+      "asan_ubsan_native_sha256": "1048fa8233885d725f296620f664f7cdb696b47102ea4460ca916e3a6462e89f",
+      "tsan_native_sha256": "06992cedf59ba61a0f740aabdce002e113e15ebf9118bb1a11795fe507eb6dcc",
+      "asan_ubsan_linked": ["libasan.so.8", "libubsan.so.1"],
+      "tsan_linked": ["libtsan.so.2"],
+      "result": "OBSERVED"
+    }
+  },
+  "obligations": [
+    {
+      "id": "O1",
+      "classification": "PASS",
+      "text": "Build13 manifest/sidecar, source attestation, wheel and installed RECORD, native identity, source archive, and resource-soak path/hash/entry evidence reconcile."
+    },
+    {
+      "id": "O2",
+      "classification": "PASS",
+      "text": "Attempt09 F-01/F-02/F-03 are closed in the v3 anchored path: expected producer identity is compared to a pre-run identity, retained config bytes/run label are checked, and manifest/artifact/result/failure field sets are exact."
+    },
+    {
+      "id": "O3",
+      "classification": "NEEDS_WORK",
+      "text": "Native exact-work receipt presence is not fail-closed for an interrupted/aborted work-bearing transaction when no committed transaction has started_work."
+    },
+    {
+      "id": "O4",
+      "classification": "PASS",
+      "text": "Campaign plan-v2 materializes canonical expected identities and an identity tree before execution; plan loading, authorization, runner launch, per-run execution, reviewer replay, and final review all bind/recheck that tree."
+    },
+    {
+      "id": "O5",
+      "classification": "PASS",
+      "text": "Runner and reviewer do not import each other; both use the shared helper only, and txnopt core/evidence modules do not import campaign tools."
+    },
+    {
+      "id": "O6",
+      "classification": "PASS",
+      "text": "Explicit v1/v2 legacy verification remains readable, while formal campaign execution requires plan-v2 prebound identities and rejects pre-Build13 producers; Build12 has no approved producer branch."
+    },
+    {
+      "id": "O7",
+      "classification": "PASS",
+      "text": "Build12 failure and Attempt09 evidence remain byte/hash stable and are still referenced as immutable predecessor evidence."
+    },
+    {
+      "id": "O8",
+      "classification": "PASS",
+      "text": "The two Build13 harness diagnostics are explicitly classified and corrected commands have passing results; build_complete is bounded separately from Level 1/formal readiness."
+    },
+    {
+      "id": "O9",
+      "classification": "NEEDS_WORK",
+      "text": "Testing, ruff, strict mypy, sanitizer, resource-soak, and formal claim-boundary checks pass, but O3 prevents an anchored-evidence PASS or Level 1 readiness."
+    }
+  ],
+  "independent_reproduction": {
+    "method": "Read-only external artifact replay, source-attestation recomputation, wheel/RECORD verification, installed-wheel path probe, sanitizer CTest rerun, legacy/boundary tests, and adversarial validator calls over temporary in-memory/copy data.",
+    "commands": [
+      {
+        "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -c 'committed_source_attestation(root, producer_revision)'",
+        "exit_code": 0,
+        "result": "revision/tree/source-manifest/count matched Build13"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider --basetemp=/tmp/build13-review-tests tests/txnopt -q",
+        "exit_code": 0,
+        "result": "282 passed in 3.29s; product modules resolved from installed wheel"
+      },
+      {
+        "command": "formal-venv/bin/python -m pytest -p no:cacheprovider --basetemp=/tmp/build13-property --hypothesis-seed=20260814 tests/txnopt/test_transaction_properties.py -q",
+        "exit_code": 0,
+        "result": "5 passed; declared five property functions and 600 maximum generated examples"
+      },
+      {
+        "command": "stage052-dev-fe35cd9/bin/ruff check src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy tools tests/txnopt",
+        "exit_code": 0,
+        "result": "All checks passed"
+      },
+      {
+        "command": "stage052-dev-fe35cd9/bin/mypy --strict --no-incremental --cache-dir /tmp/build13-review-mypy src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy",
+        "exit_code": 0,
+        "result": "Success: no issues found in 44 source files"
+      },
+      {
+        "command": "ctest --test-dir /home/oneblaze/txnopt-builds/level1-993cdb6/asan-ubsan --output-on-failure",
+        "exit_code": 0,
+        "result": "1/1 PASS; binary links libasan.so.8 and libubsan.so.1"
+      },
+      {
+        "command": "ctest --test-dir /home/oneblaze/txnopt-builds/level1-993cdb6/tsan --output-on-failure",
+        "exit_code": 0,
+        "result": "1/1 PASS; binary links libtsan.so.2"
+      },
+      {
+        "command": "pytest tests/txnopt/test_evidence_pipeline.py -k 'v1_raw_artifact'",
+        "exit_code": 0,
+        "result": "v1 legacy raw replay PASS"
+      },
+      {
+        "command": "pytest tests/txnopt/test_evidence_pipeline.py -k 'v2_failure_artifact'",
+        "exit_code": 0,
+        "result": "v2 legacy failure verification PASS"
+      },
+      {
+        "command": "pytest tests/txnopt/test_level1_campaign_tools.py -k 'build10 or build11 or build13 or prebound_identity or legacy_plan'",
+        "exit_code": 0,
+        "result": "5 passed; pre-Build13 and prebound-identity gates exercised"
+      }
+    ],
+    "adversarial_temporary_copy_tests": {
+      "real_evidence_modified": false,
+      "tamper_matrix": [
+        "producer identity resign",
+        "manifest label detached from retained config",
+        "retained config detached from input digest",
+        "extra artifact field",
+        "result schema/provenance/domain/physical-reference/extra-field",
+        "lifecycle evidence/chain tamper",
+        "missing native receipt after committed exact work"
+      ],
+      "closed_cases": "all listed closed cases rejected by the 282-test suite",
+      "interrupted_missing_native_receipt_probe": {
+        "input": "native expected identity, positive discarded-work T4 observation, no native_round_observation, semantic_exact_work_started=false",
+        "observed": "ACCEPTED",
+        "command_exit_code": 0,
+        "interpretation": "major finding F-04; this is an in-memory temporary probe and does not alter real evidence"
+      }
+    }
+  },
+  "findings": [
+    {
+      "id": "F-04",
+      "severity": "MAJOR",
+      "path": "src/txnopt_evidence/reviewer.py",
+      "line": 993,
+      "title": "Interrupted or aborted native exact work can omit the native receipt",
+      "counterexample": "_semantic_exact_work_started only returns true for candidate_transaction events whose phase is COMMITTED and whose started_work is positive (lines 993-1001). The native-receipt gate at lines 768-776 therefore runs only when that flag is true. A deadline/worker-failure path can have physical t4_waste_observation with positive discarded work but no committed started_work; the validator then accepts a native expected identity with no native_round_observation. The temporary adversarial probe returned ACCEPTED for this case, while the analogous committed case returned REJECTED.",
+      "related_paths": [
+        "src/txnopt/runtime.py:384-443",
+        "src/txnopt_evidence/reviewer.py:264-291",
+        "src/txnopt_evidence/reviewer.py:709-837",
+        "src/txnopt_evidence/reviewer.py:993-1001"
+      ],
+      "impact": "A raw bundle with uncommitted native exact work can pass physical/T4 replay without a receipt binding its native source identity, so native exact-work evidence is not fail-closed for all work-bearing transaction outcomes. This blocks anchored-evidence PASS and Level 1 readiness.",
+      "required_correction": "Define work-start detection over every work-bearing transaction outcome (including INTERRUPTED and ABORTED/T4-positive paths), require at least one matching native round receipt for native exact work, and add a full raw-bundle tamper test that removes that receipt and recomputes all temporary sidecars/lifecycle fields."
+    }
+  ],
+  "finding_counts": {
+    "critical": 0,
+    "major": 1,
+    "minor": 0
+  },
+  "critical_finding_count": 0,
+  "major_finding_count": 1,
+  "minor_finding_count": 0,
+  "claim_boundary": {
+    "independent_review_completed": true,
+    "formal_package_reviewed": false,
+    "build_complete": true,
+    "level1_formal_gate_passed": false,
+    "precloud_gate_unblocked": false,
+    "procurement_authorized": false,
+    "formal_matrix_authorized": false,
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "level2_entry_authorized": false
+  }
+}
