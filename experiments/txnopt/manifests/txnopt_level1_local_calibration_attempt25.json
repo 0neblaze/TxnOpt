@@ -1,0 +1,141 @@
+{
+  "schema_version": "txnopt-level1-local-calibration-manifest-v1",
+  "run_label": "txnopt_level1_local_calibration_attempt25",
+  "status": "LOCAL_CALIBRATION_COMPLETE_REPRESENTATIVE_PERFORMANCE_PASS_BUILD14_INDEPENDENT_REVIEW_PASS_NOT_LEVEL1_READY",
+  "producer_build": {
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt14.json",
+    "manifest_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+    "revision": "bec0dd89cf8e0db158c9a617d13613c3c491aa35",
+    "source_tree": "1b5984b9dc79ac086f559d3c6472f3e04dc4b38e",
+    "source_manifest_sha256": "d20d44e74f08de5ad101ec874a0f88a95355808b9056cad8be6e48e8c678bd5c",
+    "tracked_file_count": 1151,
+    "wheel_sha256": "a0f25119ab16519afae3df95e0e7d28236923dfc34d5e77da0254a7c1517eb5c",
+    "native_sha256": "968a750b2e1912c169c9c6c7bef15fe2d3326dfe1f3feb6147006b625997bc08",
+    "source_dirty": false,
+    "development_override": false
+  },
+  "plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-calibration-plan-attempt25/manifest.json",
+    "sha256": "c4c2e2f193adeb5ae9d915969e5ab8096e8f7f2c4015bac01133c1c28b56f830",
+    "config_count": 2880,
+    "config_tree_sha256": "a98d7d536106ae93f95004211cef48b5f56fb08bacbe8355e5b0ba09927fdda8",
+    "expected_identity_tree_sha256": "f23241552cb3aa44415bfe70afbaf273e79a3eb3b2b6e66f3992844fa3eca344",
+    "fixed_work": 1200,
+    "fixed_time_seconds": 3.0,
+    "max_rounds": 10,
+    "holdout_opened": false,
+    "cloud_purchase_authorized": false
+  },
+  "calibration": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt25.json",
+    "sha256": "2c04b63e287a89002c058263e684a9bbc8a4c5b3ddc11293e6443bb8c7fe0368",
+    "representative_cases": {
+      "evrptw": ["c101C5", "c101_21"],
+      "rcpsp": ["j1201_1", "j1206_4"]
+    },
+    "seeds": [2014, 2015, 2016],
+    "raw_run_count": 96,
+    "raw_manifest_hash_match_count": 96,
+    "independent_review_pass_count": 96,
+    "independent_review_hash_match_count": 96,
+    "sealed_lifecycle_count": 96,
+    "reviewed_lifecycle_count": 96,
+    "positive_observed_cmax_count": 96,
+    "fallback_count": 0,
+    "formal_level1_evidence": false
+  },
+  "fixed_work_physical_results": {
+    "evrptw": {
+      "paired_sample_count": 6,
+      "four_worker_geomean_speedup": 1.3740859981859461,
+      "minimum_four_worker_speedup": 0.9915839970476212,
+      "maximum_four_worker_speedup": 1.948157746696616,
+      "maximum_one_worker_overhead_fraction": 0.05693903036612635,
+      "semantic_digest_match_rate": 1.0,
+      "objective_match_rate": 1.0,
+      "level1_speedup_threshold": 1.3,
+      "speedup_gate": "PASS_REPRESENTATIVE_ONLY"
+    },
+    "rcpsp": {
+      "paired_sample_count": 6,
+      "four_worker_geomean_speedup": 2.1840980947628554,
+      "minimum_four_worker_speedup": 2.0289112578566013,
+      "maximum_four_worker_speedup": 2.469391010242668,
+      "maximum_one_worker_overhead_fraction": 0.018638489775751443,
+      "semantic_digest_match_rate": 1.0,
+      "objective_match_rate": 1.0,
+      "level1_speedup_threshold": 1.3,
+      "speedup_gate": "PASS_REPRESENTATIVE_ONLY"
+    }
+  },
+  "interpretation": {
+    "finding": "Build14 clears the representative two-domain speedup and one-worker-overhead thresholds with complete anchored v3 lifecycle replay, native started-work receipt coverage, and unchanged fixed-work semantics",
+    "scope_or_threshold_changed": false,
+    "full_scope_confidence_intervals_computed": false,
+    "formal_matrix_started": false,
+    "cloud_purchase_performed": false
+  },
+  "cloud_estimate": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-cloud-estimate-attempt06.json",
+    "sha256": "34c736fddd2ad96b33de4d9e559799b845cf4d48c286788503a3d213e3466cdd",
+    "physical_cores": 32,
+    "scheduler_efficiency": 0.8,
+    "usable_cores": 25,
+    "predicted_matrix_seconds": 4092.4705551400093,
+    "predicted_matrix_days": 0.047366557351157516,
+    "runtime_estimate_gate": "PASS_PROVISIONAL_CALIBRATION_ONLY",
+    "purchase_authorized": false
+  },
+  "formal_successor": {
+    "independent_review_path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt11.json",
+    "independent_review_sha256": "37270d49fd31b2e71fadfd706be18b043b482908d11cd74af08ca46da41b0c9b",
+    "independent_review_status": "PASS_BUILD14_ANCHORED_EVIDENCE_NOT_LEVEL1_READY",
+    "independent_review_completed": true,
+    "critical_finding_count": 0,
+    "major_finding_count": 0,
+    "minor_finding_count": 0,
+    "formal_plan_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt24/manifest.json",
+    "formal_plan_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+    "formal_plan_status": "PLANNED_NOT_STARTED",
+    "formal_raw_root_absent": true,
+    "level1_formal_gate_passed": false
+  },
+  "legacy_compatibility": {
+    "manifest_path": "legacy/txnopt-legacy-compatibility-attempt01.json",
+    "manifest_sha256": "8fa31e2bdd8b0457bff628e6c190c96da8ef4b9d988b8c83335abdaf7240f38e",
+    "review_manifest_path": "legacy/txnopt-legacy-compatibility-review-attempt01.json",
+    "review_manifest_sha256": "d675babbf86167788d19e94ab63010e0ef0ccfaff38fa0bc16ced76589976a0c",
+    "independent_review_status": "PASS_WITH_IMMUTABLE_PROVENANCE_CAVEAT",
+    "decision_complete": true,
+    "functional_compatibility": true,
+    "immutable_provenance_mismatch_retained": true,
+    "timeout_resolved": true
+  },
+  "harness_diagnostics": [
+    {
+      "step": "local calibration launcher monitoring",
+      "initial_exit_code": 124,
+      "classification": "CONTROL_PLANE_TIMEOUT_WITH_LIVE_UNIQUE_WRITER",
+      "reason": "the desktop launcher used a five-second wait while the uniquely identified calibration writer continued running",
+      "corrected_boundary": "the existing writer was monitored without starting a successor or overwriting evidence",
+      "corrected_exit_code": 0,
+      "corrected_result": "96 raw runs and 96 independent reviews sealed"
+    },
+    {
+      "step": "cloud-window estimate output argument",
+      "initial_exit_code": 1,
+      "classification": "HARNESS_ARGUMENT_EXPANSION_ERROR",
+      "reason": "the outer Windows shell expanded the inner output variable to an empty value and the writer refused the current directory",
+      "corrected_boundary": "an explicit absolute output path with a new attempt label was used",
+      "corrected_exit_code": 0,
+      "corrected_result": "Attempt06 estimate sealed without a cloud purchase"
+    }
+  ],
+  "decision": {
+    "level1_ready": false,
+    "formal_cloud_matrix_authorized": false,
+    "cloud_purchase_authorized": false,
+    "reason": "Build14 independent review and representative local performance pass, but the preregistered 2880-run full matrix, full-scope confidence intervals, and final independent replay have not run",
+    "next_step": "prepare a fail-closed Build14 pre-cloud decision while keeping procurement and the Attempt24 formal matrix separately unauthorized"
+  }
+}
