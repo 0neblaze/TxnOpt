@@ -130,3 +130,20 @@ def test_fourth_build_receipt_binds_deadline_fix_without_readiness() -> None:
     assert manifest["validation"]["pytest"]["passed"] == 95
     assert manifest["failure_lineage"]["same_attempt_reused"] is False
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_fifth_build_receipt_binds_bounded_screen_cache_without_readiness() -> None:
+    path = ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt05.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["producer"]["development_override"] is False
+    assert manifest["artifacts"]["resource_soak"]["completed_rounds"] == 100000
+    assert manifest["change"]["capacity"] == 65_536
+    assert manifest["change"]["semantic_effect"].startswith("none")
+    assert manifest["claim_boundary"]["level1_ready"] is False

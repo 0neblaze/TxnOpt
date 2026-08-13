@@ -29,6 +29,13 @@ deadline-limited CP-SAT `UNKNOWN`/`FEASIBLE` outcomes to transactional timeout,
 so the runtime returns the last committed prefix. The build gates pass, but the
 Level 1 experiment and performance gates remain pending.
 
+Build Attempt05 supersedes Attempt04 for new runs. It adds a bounded solve-local
+LRU for repeated EVRPTW safe route screening and exports cache statistics only
+through the physical trace, so the semantic digest remains independent of this
+performance optimization. Its build, sanitizer, and 100,000-round resource
+gates pass; Build05-bound calibration and all Level 1 experiment gates remain
+pending.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

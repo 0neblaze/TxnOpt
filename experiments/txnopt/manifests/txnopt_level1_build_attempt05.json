@@ -1,0 +1,104 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt05",
+  "status": "BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T05:35:40Z",
+  "successor_of": "txnopt_level1_build_attempt04",
+  "producer": {
+    "revision": "046b96e42e068731aeb20c986bb595bdf90732ed",
+    "git_tree": "e4f02cabc59814c6c8be954f63b911918c5da80a",
+    "source_manifest_sha256": "02b70dedbbc094b790e867a291fdf1a200cc0e224533e68784e3b7fd0fe1ef75",
+    "tracked_file_count": 1052,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-046b96e/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "c11edcbb741fafaacd25645b88cda92efff502113027e99f31fbe04538784eb6",
+      "entry_count": 52,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-046b96e/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "c35f14571b6b944dc1157d7cbd77c602dcf9728fa1f9bac084a355cf058672cc"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "dee59e2364a38b0b51f5cf5fe5194dac8041d2912e335f09c35226e206924cd1",
+      "protocol": "txnopt-native-round-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-046b96e/resource-soak-attempt06.json",
+      "sha256": "e1c9af4144c3e69ea6b877d838e73d30444c40d9abd4756420eaed6d921f5727",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 8,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "change": {
+    "summary": "EVRPTW safe route screening is memoized in a bounded solve-local LRU cache",
+    "semantic_effect": "none; screening decisions and fixed-work semantic digests are unchanged",
+    "physical_observability": [
+      "route_screen_cache_hits",
+      "route_screen_cache_misses",
+      "route_screen_cache_size",
+      "route_screen_cache_capacity",
+      "route_screen_cache_evictions"
+    ],
+    "capacity": 65536,
+    "development_benchmark_status": "EXPLORATORY_NOT_FORMAL_EVIDENCE"
+  },
+  "protocol": {
+    "path": "experiments/txnopt/level1-protocol.json",
+    "sha256": "603c452d60296c4f9cd4afba55842b3a826d67f7abbb2eed75dbf04de6a9d2f2",
+    "holdout_opened": false
+  },
+  "formal_model": {
+    "receipt_path": "formal/model-check-receipt.json",
+    "receipt_sha256": "8137f6c2297bf9ef8735c64bbba14c072254329b7259a75a6067700733fba05b",
+    "bounded_t1_t2_status": "PASS",
+    "t3_t4_independent_review_status": "PENDING"
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 41},
+    "pytest": {"exit_code": 0, "status": "PASS", "passed": 98},
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "asan_ubsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_drain_rounds": 20000,
+      "aslr_disabled_for_runtime": true
+    },
+    "historical_protected_paths": {"exit_code": 0, "status": "UNCHANGED"}
+  },
+  "environment": {
+    "kernel": "Linux 6.18.35.2-microsoft-standard-WSL2 x86_64",
+    "python": "3.13.13",
+    "compiler": "GNU 13.3.0",
+    "cmake": "3.28.3",
+    "performance_profile": "portable-o3"
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "independent T3/T4 proof review",
+      "Build05-bound local p95 calibration and ten-day matrix forecast",
+      "Level 1 raw experiment matrix and independent replay",
+      "single-worker overhead threshold",
+      "two-domain four-worker speedup and confidence-interval thresholds",
+      "fixed-work quality and measured T4 waste thresholds"
+    ]
+  }
+}
