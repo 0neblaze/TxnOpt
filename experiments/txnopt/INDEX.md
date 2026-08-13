@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v1` | Build10 calibration complete; pre-cloud Attempt02 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build10 Attempt20 calibration retained; Attempt21 raw root absent/unexecuted | Build10 native-receipt refinement review pending |
+| `txnopt-level1-protocol-v1` | Build11 calibration complete; pre-cloud Attempt03 blocked; purchase and formal matrix not authorized | 12 EVRPTW + 24 RCPSP, 10 seeds | Build11 Attempt22 calibration retained; Attempt23 raw root absent/unexecuted | Build11 evidence-lifecycle and formal-successor review pending |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
@@ -153,6 +153,33 @@ and preregisters the exact paired bootstrap and T4/Cmax gates. Its structural
 preflight is `PASS_NOT_AUTHORIZED_TO_EXECUTE`; the raw root is absent. Pre-cloud
 Attempt02 deliberately records `BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING`, so it
 authorizes neither procurement nor execution.
+
+Build Attempt11 is the current clean internal producer. It adds the
+hash-chained `txnopt-evidence-lifecycle-v1` contract without changing the
+semantic or physical trace protocols: new raw/failure bundles are v2 and bind
+`PLANNED -> RUNNING -> SEALED`; independent replay appends `REVIEWED` using
+the exact raw-manifest digest. Build10 v1 bundles remain readable and
+unchanged. The Build11 wheel passes 186 installed tests, five property suites
+(600 generated examples), Ruff, strict mypy, wheel RECORD verification,
+legacy verification, ASan/UBSan, TSan, protected-history comparison, and a
+100,000-round resource soak with zero fallback.
+
+Build11 local calibration Attempt22 retains 96/96 raw v2 bundles and 96/96
+independent v2 reviews. Every lifecycle, raw/review hash, producer identity,
+positive observed Cmax, fixed-work semantic digest, and objective replays
+exactly. Representative EVRPTW and RCPSP four-worker geometric-mean speedups
+are 1.35x and 2.12x; maximum one-worker overhead is 8.08% and 0.70%. These are
+representative pre-cloud results only; EVRPTW has a 0.91x worst pair and no
+full-scope confidence interval has been computed.
+
+Formal plan Attempt23 is the fresh unexecuted Build11 identity. Its 2,880
+configs are fixed by tree
+`4a828f134d971172cd6ebdef15d45e14b8315be9dc7cf51e96ea00856d27e901`,
+the preregistered analysis remains unchanged, its raw root and atomic claim are
+absent, and clean preflight is `PASS_NOT_AUTHORIZED_TO_EXECUTE`. A conservative
+32-physical-core estimate is about 4,300 seconds. Pre-cloud Attempt03 remains
+`BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; it authorizes neither procurement
+nor execution.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

@@ -37,32 +37,29 @@ anything. `tools/estimate_txnopt_cloud_window.py` converts the complete local
 p95 calibration into a signed 32/64-core time forecast. Server rental remains
 blocked unless that forecast is at most ten days.
 
-The prior formal identity is external Attempt18, bound to Build09 and a fresh
-raw root. It was never executed. Attempt19 was the first unexecuted Build10
-materialization before calibration. Neither may be launched as active successor
-evidence. The post-calibration identity is external Attempt21, with its own
-preregistered analysis file and a fresh absent raw root. Structural preflight is
-read-only:
+The prior formal identities Attempts18 and 21 remain immutable and unexecuted.
+The current post-calibration Build11 identity is external Attempt23, with its
+own preregistered analysis file and a fresh absent raw root. Structural
+preflight is read-only:
 
-Build10 now freezes that active solver source as
-`manifests/txnopt_level1_build_attempt10.json`. Build09 calibration Attempt17,
-formal plan Attempt18, and pre-cloud gate Attempt01 remain immutable but cannot
-authorize Build10. The Build10 prepared native-receipt refinement is explicitly
-pending independent review; its fresh calibration, formal plan, and pre-cloud
-receipt must use new attempt identities.
+Build11 freezes the active solver source as
+`manifests/txnopt_level1_build_attempt11.json`. Build10 and all earlier
+calibrations, plans, and pre-cloud gates remain immutable but cannot authorize
+Build11. Build11 lifecycle/formal refinement is explicitly pending independent
+review; Attempt22 calibration and Attempt23 plan use fresh identities.
 
 ```bash
 python -m tools.run_txnopt_level1_campaign preflight \
-  --plan-manifest /home/oneblaze/txnopt-plans/level1-formal-plan-attempt21/manifest.json \
-  --analysis-protocol /home/oneblaze/txnopt-plans/level1-formal-plan-attempt21/analysis-protocol.json
+  --plan-manifest /home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/manifest.json \
+  --analysis-protocol /home/oneblaze/txnopt-plans/level1-formal-plan-attempt23/analysis-protocol.json
 ```
 
-Attempt21 preflight status is `PASS_NOT_AUTHORIZED_TO_EXECUTE`.
+Attempt23 preflight status is `PASS_NOT_AUTHORIZED_TO_EXECUTE`.
 The `run` subcommand
-also requires an exact Build09 wheel, an isolated Python installation, host
+also requires the exact plan-bound Build11 wheel, an isolated Python installation, host
 resource checks, and a separately signed
 `txnopt-level1-procurement-authorization-v1` receipt. That receipt must bind the
-exact plan, analysis protocol, config tree, Build09 manifest, wheel, raw root,
+exact plan, analysis protocol, config tree, Build11 manifest, wheel, raw root,
 exclusive-Linux contract, and 14-day maximum window. Before the first raw
 write, the runner creates an immutable atomic launch claim and records that no
 target process is active. Each run executes in its own process group; timeout
@@ -73,7 +70,7 @@ review or declare readiness. After a complete run,
 replays every raw manifest into a new review root and recomputes the registered
 performance, confidence-interval, parity, prefix-safety, fallback, and Cmax
 gates. Failed attempts retain their raw root and require a new attempt label.
-The current Build10 decision receipt is
-`manifests/txnopt_level1_precloud_gate_attempt02.json`. It is explicitly
-`BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING`, not an authorization receipt and not
-a Level 1 readiness claim. Attempt01 remains the immutable prior Build09 result.
+The current Build11 decision receipt is
+`manifests/txnopt_level1_precloud_gate_attempt03.json`. It is explicitly
+`BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`, not an authorization receipt and
+not a Level 1 readiness claim. Attempts01-02 remain immutable prior results.
