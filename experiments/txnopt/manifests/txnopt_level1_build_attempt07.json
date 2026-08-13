@@ -1,0 +1,102 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt07",
+  "status": "BUILD_AND_FORMAL_CORRECTION_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T06:44:53Z",
+  "successor_of": "txnopt_level1_build_attempt06",
+  "producer": {
+    "revision": "91cec97a48b8e2cc1513f1299cdd9722e43455eb",
+    "git_tree": "24245becccbe19630ebfe2aed34ec8aaa78a937b",
+    "source_manifest_sha256": "ce5fb43c6b12e64292997e71d4fc41fecc37a953a594c01116ed694ad32a69e6",
+    "tracked_file_count": 1065,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-91cec97/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "a3d6d35d2e4e4f144e44cfea07f166617c0839153e299655ff3764814db7d7a9",
+      "entry_count": 52,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-91cec97/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "55176118b8d6c2262db3c3281e8b8233478e7fc0fb3eb97c94bd6c3d29b34409"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "732e0b9313c8cc0822fce07fd1dda0bd00261a45b67417a7c47a6ffb0f52f26c",
+      "protocol": "txnopt-native-round-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-91cec97/resource-soak-attempt08.json",
+      "sha256": "7fa6ee13aea4ac25318a3087e4402eb0506b3f5b8385b72048d4d1aa2a8e7984",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 8,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "formal_correction": {
+    "path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt02.json",
+    "sha256": "1f2a1537f5724d25f4ffd6071e968793efb796831188331f1ae57c93359ba9d7",
+    "status": "READY_FOR_INDEPENDENT_REVIEW",
+    "independent_review_completed": false,
+    "t3_t4_gate_passed": false,
+    "model_check_scope": "AGGREGATE_BATCH_TLC_SAFETY_ONLY",
+    "measured_cmax_available": false
+  },
+  "predecessor_calibration": {
+    "build_manifest": "experiments/txnopt/manifests/txnopt_level1_build_attempt05.json",
+    "calibration_manifest": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt14.json",
+    "binding_status": "NOT_REBOUND_TO_BUILD07",
+    "evrptw_speedup_gate": "FAIL",
+    "formal_matrix_authorized": false
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 41},
+    "pytest": {"exit_code": 0, "status": "PASS", "passed": 111},
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "maximum_generated_examples": 600
+    },
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "legacy_verify": {"exit_code": 0, "status": "PASS"},
+    "formal_replay": {
+      "exit_code": 0,
+      "status": "PASS",
+      "primary_distinct_states": 22,
+      "pluscal_distinct_states": 8134
+    },
+    "asan_ubsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_drain_rounds": 20000,
+      "aslr_disabled_for_runtime": true
+    },
+    "historical_protected_paths": {"exit_code": 0, "status": "UNCHANGED"}
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "independent successor review of T3/T4 proof and aggregate refinement mapping",
+      "measure and receipt-bind finite Cmax for non-vacuous T4 cost bounds",
+      "resolve the EVRPTW four-worker geometric-mean speedup gate without changing the preregistered scope or threshold",
+      "freeze final Level 1 work/time parameters and create a Build07-bound campaign plan",
+      "Level 1 raw experiment matrix and independent replay",
+      "both-domain 95% confidence-interval thresholds"
+    ]
+  }
+}

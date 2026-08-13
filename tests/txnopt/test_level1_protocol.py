@@ -206,3 +206,24 @@ def test_sixth_build_receipt_keeps_failed_gates_open() -> None:
         "NOT_REBOUND_TO_BUILD06"
     )
     assert manifest["claim_boundary"]["level1_ready"] is False
+
+
+def test_seventh_build_receipt_binds_formal_correction_without_approving_it() -> None:
+    path = ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt07.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["validation"]["pytest"]["passed"] == 111
+    assert manifest["validation"]["property_based_tests"]["status"] == "PASS"
+    assert manifest["formal_correction"]["status"] == "READY_FOR_INDEPENDENT_REVIEW"
+    assert manifest["formal_correction"]["independent_review_completed"] is False
+    assert manifest["formal_correction"]["t3_t4_gate_passed"] is False
+    assert manifest["predecessor_calibration"]["binding_status"] == (
+        "NOT_REBOUND_TO_BUILD07"
+    )
+    assert manifest["claim_boundary"]["level1_ready"] is False

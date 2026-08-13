@@ -43,7 +43,7 @@ cloud purchase, public alpha, or manuscript submission.
   deadline/failure prefix safety, cross-domain adapters, and non-vacuous waste
   bounds, not as the invention of speculative simulated annealing or ordered
   transactions.
-- Clean Build Attempt06 passes Ruff, strict mypy, 103 TxnOpt tests, wheel/CLI
+- Clean Build Attempt07 passes Ruff, strict mypy, 111 TxnOpt tests, wheel/CLI
   verification, ASan/UBSan, TSan, historical-path preservation, and a
   100,000-round resource soak with zero fallback.
 - Build05-bound local calibration Attempt14 completes 96/96 raw runs and 96/96

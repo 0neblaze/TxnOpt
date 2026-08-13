@@ -44,11 +44,19 @@ case does not amortize worker scheduling. The formal cloud matrix is therefore
 blocked even though the provisional 32-core runtime estimate fits the ten-day
 window. This calibration is not Level 1 evidence and does not open a holdout.
 
-Build Attempt06 is the current clean internal artifact after scoping default
-pytest discovery to the active TxnOpt suite and retaining independent formal
+Build Attempt06 scoped default pytest discovery to the active TxnOpt suite and
+retained independent formal
 review Attempt01. It passes 102 tests and the same build, sanitizer, resource,
 legacy, and historical-path gates. Attempt14 remains bound to Build05 and is
 not relabelled as Build06 evidence. Build06 is not Level 1 ready.
+
+Build Attempt07 is the current clean internal artifact. It binds the corrected
+aggregate TLA+/PlusCal model, T3 conditional meta-theorem, runtime-audited T4
+unit bounds, and 111 active tests including property-generated cache, budget,
+duplicate-key, late-result, and transaction-window cases. Build, wheel,
+sanitizer, 100,000-round resource, formal replay, legacy, and protected-path
+gates pass. The correction is only `READY_FOR_INDEPENDENT_REVIEW`; measured
+finite `Cmax`, the EVRPTW speedup gate, and the Level 1 matrix remain open.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
