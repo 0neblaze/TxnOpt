@@ -187,3 +187,22 @@ def test_active_pytest_collection_failure_is_retained_and_not_reused() -> None:
     assert failure["collection_error_count"] == 59
     assert failure["historical_test_files_changed"] is False
     assert failure["same_attempt_reused"] is False
+
+
+def test_sixth_build_receipt_keeps_failed_gates_open() -> None:
+    path = ROOT / "experiments/txnopt/manifests/txnopt_level1_build_attempt06.json"
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    manifest = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert manifest["producer"]["source_dirty"] is False
+    assert manifest["validation"]["pytest"]["passed"] == 102
+    assert manifest["active_test_boundary"]["historical_test_paths_moved_or_deleted"] is False
+    assert manifest["formal_review"]["t3_t4_gate_passed"] is False
+    assert manifest["predecessor_calibration"]["binding_status"] == (
+        "NOT_REBOUND_TO_BUILD06"
+    )
+    assert manifest["claim_boundary"]["level1_ready"] is False

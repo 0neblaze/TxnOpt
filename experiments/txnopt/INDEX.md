@@ -44,6 +44,12 @@ case does not amortize worker scheduling. The formal cloud matrix is therefore
 blocked even though the provisional 32-core runtime estimate fits the ten-day
 window. This calibration is not Level 1 evidence and does not open a holdout.
 
+Build Attempt06 is the current clean internal artifact after scoping default
+pytest discovery to the active TxnOpt suite and retaining independent formal
+review Attempt01. It passes 102 tests and the same build, sanitizer, resource,
+legacy, and historical-path gates. Attempt14 remains bound to Build05 and is
+not relabelled as Build06 evidence. Build06 is not Level 1 ready.
+
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error
 and that evidence limitation are retained in

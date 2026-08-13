@@ -1,0 +1,94 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt06",
+  "status": "BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-13T06:15:04Z",
+  "successor_of": "txnopt_level1_build_attempt05",
+  "producer": {
+    "revision": "6b94bbac1673d7cce406ae7b3270db67e7ad67c5",
+    "git_tree": "609ddd371b2d1b9f5846acc61442abd07b87318e",
+    "source_manifest_sha256": "4bc0feda7312483d1c1a4ed06b96454aa2f6dc96cd8d559793ae8d1fe4d43cb9",
+    "tracked_file_count": 1060,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-6b94bba/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "ebb0c4e9a8deaaf1482f4e97f48395b2f8a7961ec5e467d219acab892a77e1c0",
+      "entry_count": 52,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-6b94bba/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "86b6117aef224cce383266a02eba456bcb8ee8ec0e5d95a00ca646aad4e72847"
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "117edfa909dcccae6553d24da0fd1beb68163f3a0a6e26d604850099d2a1d755",
+      "protocol": "txnopt-native-round-v1"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-6b94bba/resource-soak-attempt07.json",
+      "sha256": "f88b2003e7b6141ae4cdbeb84e87f062cd357c6c798ee2c8118f653f65e8757e",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "rss_growth_kib": 8,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    }
+  },
+  "active_test_boundary": {
+    "default_test_path": "tests/txnopt",
+    "historical_test_paths_moved_or_deleted": false,
+    "active_evrptw_alias_present": false,
+    "predecessor_failure_manifest": "experiments/txnopt/manifests/txnopt_active_pytest_attempt01_failure.json"
+  },
+  "formal_review": {
+    "path": "formal/reviews/txnopt_t3_t4_review_attempt01.json",
+    "sha256": "2e9c380a60a2b6e2f49218d5de4208d8e0825efda17c05ef67a29f8c1d38f860",
+    "status": "NEEDS_WORK",
+    "t3_t4_gate_passed": false,
+    "model_check_scope": "TLC_SAFETY_PASS_ONLY"
+  },
+  "predecessor_calibration": {
+    "build_manifest": "experiments/txnopt/manifests/txnopt_level1_build_attempt05.json",
+    "calibration_manifest": "experiments/txnopt/manifests/txnopt_level1_local_calibration_attempt14.json",
+    "binding_status": "NOT_REBOUND_TO_BUILD06",
+    "evrptw_speedup_gate": "FAIL",
+    "formal_matrix_authorized": false
+  },
+  "validation": {
+    "ruff": {"exit_code": 0, "status": "PASS"},
+    "strict_mypy": {"exit_code": 0, "status": "PASS", "source_file_count": 41},
+    "pytest": {"exit_code": 0, "status": "PASS", "passed": 102},
+    "wheel_surface": {"exit_code": 0, "status": "PASS", "fallback_count": 0},
+    "legacy_verify": {"exit_code": 0, "status": "PASS"},
+    "asan_ubsan": {"exit_code": 0, "status": "PASS", "receipt_drain_rounds": 20000},
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_drain_rounds": 20000,
+      "aslr_disabled_for_runtime": true
+    },
+    "historical_protected_paths": {"exit_code": 0, "status": "UNCHANGED"}
+  },
+  "claim_boundary": {
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "push_authorized": false,
+    "public_release_authorized": false,
+    "pending_gates": [
+      "correct and independently re-review T3/T4 proof and refinement mapping",
+      "resolve the EVRPTW four-worker geometric-mean speedup gate without changing the preregistered scope or threshold",
+      "freeze final Level 1 work/time parameters and create a Build06-bound campaign plan",
+      "Level 1 raw experiment matrix and independent replay",
+      "both-domain 95% confidence-interval thresholds",
+      "measured T4 waste bound"
+    ]
+  }
+}
