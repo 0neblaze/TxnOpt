@@ -1,0 +1,20 @@
+{
+  "schema_version": "txnopt-validation-failure-v1",
+  "run_label": "txnopt_active_pytest_attempt01",
+  "status": "FAILED_DURING_COLLECTION",
+  "command": "python -m pytest -q",
+  "exit_code": 1,
+  "collected_active_tests": 0,
+  "collection_error_count": 59,
+  "failure": "the default pytest discovery still collected frozen Stage-era tests that import the intentionally absent active evrptw package",
+  "root_cause": "pyproject.toml did not define the TxnOpt active test path after the distribution cutover",
+  "raw_output_persisted": false,
+  "historical_test_files_changed": false,
+  "resolution": "limit default active discovery to tests/txnopt; retain legacy test files at their historical paths for frozen-tag reproduction",
+  "same_attempt_reused": false,
+  "claim_boundary": {
+    "txnopt_test_failure": false,
+    "level1_ready": false,
+    "new_clean_build_required": true
+  }
+}

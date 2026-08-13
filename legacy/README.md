@@ -14,3 +14,9 @@ The complete former root policy is preserved byte-for-byte at
 
 The freeze is intentionally not named `correctness`: the historical source
 disposition receipt describes an older snapshot and remains immutable.
+
+The Stage-era tests remain at their historical `tests/test_*.py` paths because
+some frozen manifests bind those names. They are not part of active TxnOpt
+test discovery and require the frozen tag and legacy wheel. The repository-root
+`pytest` command runs `tests/txnopt`; this boundary removes no historical test
+bytes and does not restore an active `evrptw.*` compatibility package.

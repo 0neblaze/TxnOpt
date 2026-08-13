@@ -169,3 +169,21 @@ def test_local_calibration_records_failed_evrptw_gate_without_procurement() -> N
     )
     assert manifest["cloud_estimate"]["purchase_authorized"] is False
     assert manifest["decision"]["formal_cloud_matrix_authorized"] is False
+
+
+def test_active_pytest_collection_failure_is_retained_and_not_reused() -> None:
+    path = (
+        ROOT
+        / "experiments/txnopt/manifests/txnopt_active_pytest_attempt01_failure.json"
+    )
+    digest, filename = (
+        path.with_suffix(".json.sha256").read_text(encoding="utf-8").strip().split()
+    )
+    failure = json.loads(path.read_bytes())
+
+    assert filename == path.name
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    assert failure["status"] == "FAILED_DURING_COLLECTION"
+    assert failure["collection_error_count"] == 59
+    assert failure["historical_test_files_changed"] is False
+    assert failure["same_attempt_reused"] is False
