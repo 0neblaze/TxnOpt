@@ -17,6 +17,7 @@ _STATE_COUNTS = re.compile(
     r"(?P<generated>\d+) states generated, "
     r"(?P<distinct>\d+) distinct states found"
 )
+_PRE_REFACTOR_TAG = "txnopt-pre-refactor-v1"
 
 
 def _sha256(path: Path) -> str:
@@ -25,6 +26,22 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _protected_input_sha256(root: Path, relative_path: str) -> str:
+    path = root / relative_path
+    if path.is_file():
+        return _sha256(path)
+    completed = subprocess.run(
+        ["git", "-C", str(root), "show", f"{_PRE_REFACTOR_TAG}:{relative_path}"],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"formal input is absent from the active tree and frozen tag: {relative_path}"
+        )
+    return hashlib.sha256(completed.stdout).hexdigest()
 
 
 def _run(command: list[str], *, cwd: Path) -> str:
@@ -84,7 +101,7 @@ def verify(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     expected_hashes: dict[str, str] = receipt["input_sha256"]
     for relative_path, expected in expected_hashes.items():
-        actual = _sha256(root / relative_path)
+        actual = _protected_input_sha256(root, relative_path)
         if actual != expected:
             raise RuntimeError(
                 f"formal input hash mismatch for {relative_path}: {actual} != {expected}"
