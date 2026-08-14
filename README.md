@@ -58,9 +58,23 @@ The internal CLI surface is:
 
 ```text
 txnopt run --config RUN.json
-txnopt verify RAW/manifest.json
-txnopt replay RAW/manifest.json --output-dir REVIEW
+txnopt verify RAW/manifest.json \
+  --expected-identity PLAN/expected-identities/RUN.json
+txnopt replay RAW/manifest.json --output-dir REVIEW \
+  --expected-identity PLAN/expected-identities/RUN.json
 txnopt env
+txnopt plan --protocol PROTOCOL.json --catalog CASE-CATALOG.json \
+  --destination PLAN_DIR --raw-output-root RAW_ROOT \
+  --build-manifest BUILD.json --fixed-work WORK \
+  --fixed-time-seconds SECONDS --max-rounds ROUNDS \
+  --evrptw-max-candidates N --rcpsp-max-candidates N [--attempt ATTEMPT]
+txnopt preflight --plan-manifest PLAN/manifest.json \
+  --analysis-protocol PLAN/analysis-protocol.json [--python PYTHON --wheel WHEEL]
+txnopt review --plan-manifest PLAN/manifest.json \
+  --analysis-protocol PLAN/analysis-protocol.json \
+  --execution-receipt EXECUTION.json --python PYTHON --wheel WHEEL \
+  --review-root REVIEW_ROOT --review-receipt REVIEW.json \
+  [--review-workers N --per-run-timeout-seconds SECONDS]
 txnopt archive inventory SOURCE
 txnopt archive mirror SOURCE --store ARCHIVE --commit-id ATTEMPT
 txnopt archive verify --store ARCHIVE --commit-id ATTEMPT \

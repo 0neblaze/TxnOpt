@@ -45,6 +45,34 @@ def _parser() -> argparse.ArgumentParser:
     replay_identity.add_argument("--expected-identity", type=Path)
     replay_identity.add_argument("--legacy-compatibility", action="store_true")
 
+    plan = commands.add_parser(
+        "plan",
+        help="materialize the closed Level 1 campaign plan without executing it",
+    )
+    plan.add_argument("--protocol", type=Path, required=True)
+    plan.add_argument("--catalog", type=Path, required=True)
+    plan.add_argument("--destination", type=Path, required=True)
+    plan.add_argument("--raw-output-root", type=Path, required=True)
+    plan.add_argument("--build-manifest", type=Path, required=True)
+    plan.add_argument("--fixed-work", type=int, required=True)
+    plan.add_argument("--fixed-time-seconds", type=float, required=True)
+    plan.add_argument("--max-rounds", type=int, required=True)
+    plan.add_argument("--evrptw-max-candidates", type=int, required=True)
+    plan.add_argument("--rcpsp-max-candidates", type=int, required=True)
+    plan.add_argument("--attempt", type=int, default=1)
+
+    preflight = commands.add_parser(
+        "preflight",
+        help="validate a closed Level 1 campaign without creating raw output",
+    )
+    _add_campaign_preflight_arguments(preflight)
+
+    review = commands.add_parser(
+        "review",
+        help="independently replay and review a completed Level 1 campaign",
+    )
+    _add_campaign_review_arguments(review)
+
     commands.add_parser("env")
 
     archive = commands.add_parser("archive")
@@ -104,6 +132,50 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "manifest_sha256": raw.manifest_sha256,
                 "fallback_count": 0,
             }
+        elif arguments.command == "plan":
+            from txnopt_evidence.campaign import materialize_level1_plan
+
+            manifest_path = materialize_level1_plan(
+                arguments.protocol,
+                arguments.catalog,
+                destination=arguments.destination,
+                raw_output_root=arguments.raw_output_root,
+                build_manifest_path=arguments.build_manifest,
+                fixed_work=arguments.fixed_work,
+                fixed_time_seconds=arguments.fixed_time_seconds,
+                max_rounds=arguments.max_rounds,
+                evrptw_max_candidates=arguments.evrptw_max_candidates,
+                rcpsp_max_candidates=arguments.rcpsp_max_candidates,
+                attempt=arguments.attempt,
+            )
+            result = {
+                "schema_version": "txnopt-level1-plan-command-v1",
+                "status": "planned",
+                "manifest_path": str(manifest_path),
+            }
+        elif arguments.command == "preflight":
+            from txnopt_evidence.level1_campaign_runner import preflight_campaign
+
+            result = preflight_campaign(
+                arguments.plan_manifest,
+                arguments.analysis_protocol,
+                python=arguments.python,
+                wheel=arguments.wheel,
+            )
+        elif arguments.command == "review":
+            from txnopt_evidence.level1_campaign_reviewer import review_campaign
+
+            result = review_campaign(
+                arguments.plan_manifest,
+                arguments.analysis_protocol,
+                execution_receipt_path=arguments.execution_receipt,
+                python=arguments.python,
+                wheel=arguments.wheel,
+                review_root=arguments.review_root,
+                review_receipt_path=arguments.review_receipt,
+                review_workers=arguments.review_workers,
+                per_run_timeout_seconds=arguments.per_run_timeout_seconds,
+            )
         elif arguments.command == "replay":
             result = (
                 replay_legacy_manifest(
@@ -159,6 +231,25 @@ def _expected_identity(path: Path | None) -> ExpectedEvidenceIdentity:
     if path is None:
         raise ValueError("expected evidence identity is required")
     return ExpectedEvidenceIdentity.from_payload(read_signed_json(path))
+
+
+def _add_campaign_preflight_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--plan-manifest", type=Path, required=True)
+    parser.add_argument("--analysis-protocol", type=Path, required=True)
+    parser.add_argument("--python", type=Path)
+    parser.add_argument("--wheel", type=Path)
+
+
+def _add_campaign_review_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--plan-manifest", type=Path, required=True)
+    parser.add_argument("--analysis-protocol", type=Path, required=True)
+    parser.add_argument("--execution-receipt", type=Path, required=True)
+    parser.add_argument("--python", type=Path, required=True)
+    parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--review-root", type=Path, required=True)
+    parser.add_argument("--review-receipt", type=Path, required=True)
+    parser.add_argument("--review-workers", type=int, default=4)
+    parser.add_argument("--per-run-timeout-seconds", type=float, default=600.0)
 
 
 def _add_archive_ref_arguments(parser: argparse.ArgumentParser) -> None:
