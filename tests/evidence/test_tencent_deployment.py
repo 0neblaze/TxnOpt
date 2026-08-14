@@ -96,6 +96,7 @@ tencent = [
     statuses = {
         16: "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY",
         18: "BUILD_COMPLETE_TENCENT_PRE_CLOUD_SUCCESSOR_NOT_LEVEL1_READY",
+        19: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
     }
     write_signed_json(
         build,
@@ -222,6 +223,36 @@ def test_bundle_accepts_only_the_closed_build18_attempt28_pair(tmp_path: Path) -
                 mismatch_root,
                 build_number=18,
                 formal_attempt=29,
+            ),
+        )
+
+
+def test_bundle_accepts_only_the_closed_build19_attempt30_pair(tmp_path: Path) -> None:
+    manifest = materialize_tencent_deployment(
+        tmp_path / "build19-deployment",
+        inputs=_inputs(tmp_path, build_number=19, formal_attempt=30),
+    )
+
+    receipt = verify_tencent_deployment(manifest)
+
+    assert receipt["build"] == "Build19"
+    assert receipt["attempt"] == 30
+    assert read_signed_json(manifest)["schema_version"] == (
+        "txnopt-tencent-deployment-bundle-v2"
+    )
+    assert (manifest.parent / "artifacts" / "build19-manifest.json").is_file()
+    assert (manifest.parent / "artifacts" / "attempt30-plan.json").is_file()
+    assert (manifest.parent / "artifacts" / "level1-protocol-v2.json").is_file()
+
+    mismatch_root = tmp_path / "mismatch-build19"
+    mismatch_root.mkdir()
+    with pytest.raises(ValueError, match="formal attempt"):
+        materialize_tencent_deployment(
+            mismatch_root / "deployment",
+            inputs=_inputs(
+                mismatch_root,
+                build_number=19,
+                formal_attempt=31,
             ),
         )
 

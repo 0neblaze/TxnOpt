@@ -82,7 +82,7 @@ def materialize_tencent_deployment(
             True,
         ),
     ]
-    if build_name == "Build18":
+    if identity["bundle_schema_version"] == "txnopt-tencent-deployment-bundle-v2":
         sources.append(
             (
                 "protocol",
@@ -138,11 +138,7 @@ def materialize_tencent_deployment(
     write_signed_json(
         manifest,
         {
-            "schema_version": (
-                "txnopt-tencent-deployment-bundle-v2"
-                if build_name == "Build18"
-                else "txnopt-tencent-deployment-bundle-v1"
-            ),
+            "schema_version": identity["bundle_schema_version"],
             "status": "BUNDLE_MATERIALIZED_NOT_AUTHORIZED",
             "build": build_name,
             "attempt": formal_attempt,
@@ -287,14 +283,7 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
         protocol_path_override=role_paths.get("protocol"),
     )
     if (
-        (
-            payload["build"] == "Build16"
-            and payload["schema_version"] != "txnopt-tencent-deployment-bundle-v1"
-        )
-        or (
-            payload["build"] == "Build18"
-            and payload["schema_version"] != "txnopt-tencent-deployment-bundle-v2"
-        )
+        payload["schema_version"] != identity["bundle_schema_version"]
         or payload["build"] != identity["build"]
         or payload["attempt"] != identity["attempt"]
         or payload["build_manifest_sha256"] != identity["build_manifest_sha256"]
@@ -406,6 +395,11 @@ def _validate_inputs(
         ),
         "protocol_path": str(protocol_path),
         "protocol_sha256": protocol_digest,
+        "bundle_schema_version": (
+            "txnopt-tencent-deployment-bundle-v1"
+            if successor.build_number == 16
+            else "txnopt-tencent-deployment-bundle-v2"
+        ),
     }
 
 
