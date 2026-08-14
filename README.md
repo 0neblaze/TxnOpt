@@ -61,16 +61,35 @@ txnopt run --config RUN.json
 txnopt verify RAW/manifest.json
 txnopt replay RAW/manifest.json --output-dir REVIEW
 txnopt env
+txnopt archive inventory SOURCE
+txnopt archive mirror SOURCE --store ARCHIVE --commit-id ATTEMPT
+txnopt archive verify --store ARCHIVE --commit-id ATTEMPT \
+  --commit-sha256 SHA256 --commit-size BYTES
+txnopt archive restore --store ARCHIVE --commit-id ATTEMPT \
+  --commit-sha256 SHA256 --commit-size BYTES --destination DESTINATION
 txnopt legacy verify LEGACY_RECEIPT.json
 ```
 
 Runner output contains raw artifacts only. Readiness decisions must be made by
 a separate review/gate process after raw replay.
 
+Rebuildable local state is tree-scoped outside the repository:
+
+```text
+~/.local/state/txnopt/<source-tree>/
+~/.cache/txnopt/<source-tree>/
+```
+
+Formal evidence always requires an explicit governed output root. The internal
+`ArchiveStore` port currently has one production adapter,
+`LocalFilesystemArchiveStore`; no cloud-provider adapter is claimed before a
+provider is selected and separately authorized.
+
 ## Evidence and formal verification
 
-New protocol definitions and indexes live under `experiments/txnopt/`; large
-raw output remains under ignored `results/` or a governed external root.
+New protocol definitions and indexes live under `experiments/txnopt/`; new raw
+output must use a governed external root. Repository-local `results/` is legacy
+or rebuildable state, not the default destination and not formal evidence.
 
 The bounded formal receipt is re-run with:
 
@@ -90,9 +109,11 @@ import independence, and request-scoped tests; it deliberately emits no
 independent review decision.
 
 Level 1 matrix materialization, cloud-window estimation, and the native
-resource soak are separate tools under `tools/`. They write signed receipts,
-never start a cloud server, and fail closed on incomplete catalogs,
-calibrations, or existing output paths.
+resource soak are still transitional tools pending the remote recovery gate.
+They write signed receipts, never start a cloud server, and fail closed on
+incomplete catalogs, calibrations, or existing output paths. Their next active
+implementation belongs in `txnopt_evidence`; the frozen tool bytes referenced
+by prior attempts are not rewritten.
 
 ## Frozen EVRPTW history
 
@@ -103,6 +124,13 @@ paths, manifests, hashes, statuses, and ABI exports are not renamed or
 recomputed. The active `txnopt` wheel contains no `evrptw` package and no old
 Stage CLI wrappers; historical reproduction uses the frozen tag/wheel and the
 read-only `txnopt_legacy` reader.
+
+The pre-refactor TxnOpt recovery baseline is additionally preserved by the
+local annotated tag `txnopt-pre-refactor-v1` at commit
+`5901a339ae0fa0fe490a67d2ce9d995a530d110b` and an externally verified full Git
+bundle. Pushing this branch and both recovery tags remains separately
+authorized work; tracked legacy deletion is blocked until a fresh remote clone
+passes recovery checks.
 
 Schneider and PSPLIB benchmark data are not redistributed. Third-party data,
 papers, and solvers remain under their own licenses; see

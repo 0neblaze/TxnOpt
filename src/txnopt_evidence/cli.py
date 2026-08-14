@@ -46,6 +46,23 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("env")
 
+    archive = commands.add_parser("archive")
+    archive_commands = archive.add_subparsers(dest="archive_command", required=True)
+    archive_inventory = archive_commands.add_parser("inventory")
+    archive_inventory.add_argument("source", type=Path)
+
+    archive_mirror = archive_commands.add_parser("mirror")
+    archive_mirror.add_argument("source", type=Path)
+    archive_mirror.add_argument("--store", type=Path, required=True)
+    archive_mirror.add_argument("--commit-id", required=True)
+
+    archive_verify = archive_commands.add_parser("verify")
+    _add_archive_ref_arguments(archive_verify)
+
+    archive_restore = archive_commands.add_parser("restore")
+    _add_archive_ref_arguments(archive_restore)
+    archive_restore.add_argument("--destination", type=Path, required=True)
+
     legacy = commands.add_parser("legacy")
     legacy_commands = legacy.add_subparsers(dest="legacy_command", required=True)
     legacy_verify = legacy_commands.add_parser("verify")
@@ -122,6 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "python_version": platform.python_version(),
                 "platform": platform.platform(),
             }
+        elif arguments.command == "archive":
+            result = _archive_command(arguments)
         else:
             payload = LegacyReceiptReader().read(arguments.receipt)
             result = {
@@ -139,6 +158,69 @@ def _expected_identity(path: Path | None) -> ExpectedEvidenceIdentity:
     if path is None:
         raise ValueError("expected evidence identity is required")
     return ExpectedEvidenceIdentity.from_payload(read_signed_json(path))
+
+
+def _add_archive_ref_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--store", type=Path, required=True)
+    parser.add_argument("--commit-id", required=True)
+    parser.add_argument("--commit-sha256", required=True)
+    parser.add_argument("--commit-size", type=int, required=True)
+
+
+def _archive_command(arguments: argparse.Namespace) -> object:
+    from txnopt_evidence.archive import (
+        ArchiveCommitRef,
+        LocalFilesystemArchiveStore,
+        inventory_tree,
+        mirror_tree,
+        restore_commit,
+    )
+
+    if arguments.archive_command == "inventory":
+        return inventory_tree(arguments.source).to_payload()
+    store = LocalFilesystemArchiveStore(arguments.store)
+    if arguments.archive_command == "mirror":
+        ref = mirror_tree(arguments.source, store=store, commit_id=arguments.commit_id)
+        return {
+            "schema_version": "txnopt-archive-mirror-result-v1",
+            "commit_ref": _archive_ref_payload(ref),
+        }
+    ref = ArchiveCommitRef(
+        commit_id=arguments.commit_id,
+        sha256=arguments.commit_sha256,
+        size=arguments.commit_size,
+    )
+    if arguments.archive_command == "verify":
+        verification = store.verify_commit(ref)
+        return {
+            "schema_version": "txnopt-archive-verification-v1",
+            "commit_ref": _archive_ref_payload(ref),
+            "object_count": verification.object_count,
+            "total_size": verification.total_size,
+            "verified": verification.verified,
+        }
+    if arguments.archive_command == "restore":
+        restore_receipt = restore_commit(store, ref, destination=arguments.destination)
+        return {
+            "schema_version": "txnopt-archive-restore-v1",
+            "commit_ref": _archive_ref_payload(ref),
+            "object_count": restore_receipt.object_count,
+            "total_size": restore_receipt.total_size,
+            "verified": restore_receipt.verified,
+        }
+    raise ValueError("unknown archive command")
+
+
+def _archive_ref_payload(ref: object) -> dict[str, object]:
+    from txnopt_evidence.archive import ArchiveCommitRef
+
+    if not isinstance(ref, ArchiveCommitRef):
+        raise TypeError("archive commit reference has the wrong type")
+    return {
+        "commit_id": ref.commit_id,
+        "sha256": ref.sha256,
+        "size": ref.size,
+    }
 
 
 if __name__ == "__main__":
