@@ -37,6 +37,10 @@ from txnopt_evidence.level1_campaign_common import (
     verify_sidecar,
     write_signed_object,
 )
+from txnopt_evidence.level1_tencent_successors import (
+    calibration_peak_rss_from_payload,
+    successor_from_formal_attempt,
+)
 
 
 class _WeightedTokens:
@@ -156,11 +160,16 @@ def execute_campaign(
     else:
         from txnopt_evidence.tencent_cloud import memory_bytes
 
-        peak_rss = authorization.get("attempt27_peak_rss_bytes")
-        if isinstance(peak_rss, bool) or not isinstance(peak_rss, int) or peak_rss < 0:
-            raise PermissionError("Tencent authorization lacks Attempt27 peak RSS")
+        formal_attempt = plan.payload.get("attempt")
+        if isinstance(formal_attempt, bool) or not isinstance(formal_attempt, int):
+            raise PermissionError("Tencent formal attempt identity is invalid")
+        successor = successor_from_formal_attempt(formal_attempt)
+        try:
+            peak_rss = calibration_peak_rss_from_payload(authorization, successor)
+        except ValueError as error:
+            raise PermissionError(str(error)) from error
         if peak_rss > memory_bytes() * float(resources["attempt27_peak_rss_fraction_max"]):
-            raise RuntimeError("Attempt27 peak RSS exceeds the visible-memory margin")
+            raise RuntimeError("calibration peak RSS exceeds the visible-memory margin")
         memory_floor_satisfied = True
     if physical_cores < minimum_cores or not memory_floor_satisfied:
         raise RuntimeError("host does not satisfy the preregistered physical resource floor")
@@ -181,7 +190,11 @@ def execute_campaign(
             "Tencent provider instance",
         )
         host_identity["linux_visible_memory_is_admission_gate"] = False
-        host_identity["attempt27_peak_rss_bytes"] = authorization["attempt27_peak_rss_bytes"]
+        if successor.build_number == 16:
+            host_identity["attempt27_peak_rss_bytes"] = peak_rss
+        else:
+            host_identity["calibration_attempt"] = successor.calibration_attempt
+            host_identity["calibration_peak_rss_bytes"] = peak_rss
     started_datetime = datetime.now(UTC)
     started_at = started_datetime.isoformat().replace("+00:00", "Z")
     started_ns = time.monotonic_ns()

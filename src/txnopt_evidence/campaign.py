@@ -24,6 +24,10 @@ from txnopt_evidence.codec import (
 )
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.level1_protocol import validate_level1_protocol_v2
+from txnopt_evidence.level1_tencent_successors import (
+    require_formal_attempt,
+    successor_from_build_manifest,
+)
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{1,63}")
 _AXES: Mapping[str, tuple[str, int, int]] = {
@@ -76,11 +80,11 @@ def materialize_level1_plan(
         "txnopt-level1-protocol-v2",
     }:
         raise ValueError("unsupported Level 1 protocol schema")
-    if (
-        protocol_schema == "txnopt-level1-protocol-v2"
-        and build_manifest.get("run_label") != "txnopt_level1_build_attempt16"
-    ):
-        raise ValueError("Level 1 protocol v2 requires the Build16 producer")
+    if protocol_schema == "txnopt-level1-protocol-v2":
+        require_formal_attempt(
+            successor_from_build_manifest(build_manifest),
+            attempt,
+        )
     if protocol.get("holdout_opened") is not False:
         raise ValueError("Level 1 planning requires a closed holdout")
     if catalog.get("schema_version") != "txnopt-level1-case-catalog-v1":

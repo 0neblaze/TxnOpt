@@ -1,4 +1,4 @@
-"""Offline Tencent deployment bundle for one exact Build16/Attempt26 identity."""
+"""Offline Tencent deployment bundle for one closed build/plan identity."""
 
 from __future__ import annotations
 
@@ -15,6 +15,10 @@ from txnopt_evidence.codec import (
     verify_sidecar,
     write_exclusive,
     write_signed_json,
+)
+from txnopt_evidence.level1_tencent_successors import (
+    require_formal_attempt,
+    successor_from_build_manifest,
 )
 from txnopt_evidence.toolchain import read_toolchain_lock
 
@@ -46,13 +50,24 @@ def materialize_tencent_deployment(
     """Create an account-free, region-free deployment bundle exactly once."""
 
     identity = _validate_inputs(inputs)
+    build_name = str(identity["build"])
+    raw_attempt = identity["attempt"]
+    if isinstance(raw_attempt, bool) or not isinstance(raw_attempt, int):
+        raise TypeError("validated deployment attempt must be an integer")
+    formal_attempt = raw_attempt
+    build_slug = build_name.lower()
     target = destination.expanduser().absolute()
     target.mkdir(parents=False, exist_ok=False)
     artifacts = target / "artifacts"
     artifacts.mkdir()
     copied: list[dict[str, object]] = []
-    for role, source, name, signed in (
-        ("build_manifest", inputs.build_manifest, "build16-manifest.json", True),
+    sources: list[tuple[str, Path, str, bool]] = [
+        (
+            "build_manifest",
+            inputs.build_manifest,
+            f"{build_slug}-manifest.json",
+            True,
+        ),
         ("wheel", inputs.wheel, inputs.wheel.name, False),
         ("source_manifest", inputs.source_manifest, "source-manifest.json", False),
         ("native_attestation", inputs.native_attestation, "native-attestation.json", False),
@@ -60,8 +75,23 @@ def materialize_tencent_deployment(
         ("uv_lock", inputs.uv_lock, "uv.lock", False),
         ("uv_wheel", inputs.uv_wheel, inputs.uv_wheel.name, False),
         ("toolchain_lock", inputs.toolchain_lock, "toolchain-lock.json", True),
-        ("attempt26_plan", inputs.plan_manifest, "attempt26-plan.json", True),
-    ):
+        (
+            "formal_plan",
+            inputs.plan_manifest,
+            f"attempt{formal_attempt}-plan.json",
+            True,
+        ),
+    ]
+    if build_name == "Build18":
+        sources.append(
+            (
+                "protocol",
+                Path(str(identity["protocol_path"])),
+                "level1-protocol-v2.json",
+                True,
+            )
+        )
+    for role, source, name, signed in sources:
         copied.append(_copy_input(artifacts, role=role, source=source, name=name))
         if signed:
             copied.append(
@@ -75,6 +105,7 @@ def materialize_tencent_deployment(
 
     generated = {
         "bootstrap-ubuntu-24.04.sh": _bootstrap_script(
+            build_name=build_name,
             wheel_name=inputs.wheel.name,
             wheel_sha256=sha256_file(inputs.wheel),
             uv_wheel_name=inputs.uv_wheel.name,
@@ -107,10 +138,14 @@ def materialize_tencent_deployment(
     write_signed_json(
         manifest,
         {
-            "schema_version": "txnopt-tencent-deployment-bundle-v1",
+            "schema_version": (
+                "txnopt-tencent-deployment-bundle-v2"
+                if build_name == "Build18"
+                else "txnopt-tencent-deployment-bundle-v1"
+            ),
             "status": "BUNDLE_MATERIALIZED_NOT_AUTHORIZED",
-            "build": "Build16",
-            "attempt": 26,
+            "build": build_name,
+            "attempt": formal_attempt,
             "build_manifest_sha256": identity["build_manifest_sha256"],
             "plan_manifest_sha256": identity["plan_manifest_sha256"],
             "config_tree_sha256": identity["config_tree_sha256"],
@@ -157,10 +192,15 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
     if set(payload) != expected_fields:
         raise ValueError("deployment bundle receipt field set differs")
     if (
-        payload["schema_version"] != "txnopt-tencent-deployment-bundle-v1"
+        payload["schema_version"]
+        not in {
+            "txnopt-tencent-deployment-bundle-v1",
+            "txnopt-tencent-deployment-bundle-v2",
+        }
         or payload["status"] != "BUNDLE_MATERIALIZED_NOT_AUTHORIZED"
-        or payload["build"] != "Build16"
-        or payload["attempt"] != 26
+        or not isinstance(payload["build"], str)
+        or isinstance(payload["attempt"], bool)
+        or not isinstance(payload["attempt"], int)
         or payload["region"] is not None
         or payload["region_required_live_input"] is not True
         or payload["credentials_included"] is not False
@@ -176,6 +216,7 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
     root = manifest_path.resolve(strict=True).parent
     expected_paths = {manifest_path.name, f"{manifest_path.name}.sha256"}
     normalized: list[dict[str, object]] = []
+    role_paths: dict[str, Path] = {}
     for entry in files:
         if not isinstance(entry, dict) or set(entry) != {
             "role",
@@ -184,6 +225,9 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
             "size",
         }:
             raise ValueError("deployment bundle file entry differs")
+        role = entry["role"]
+        if not isinstance(role, str) or not role or role in role_paths:
+            raise ValueError("deployment bundle role differs")
         relative = _relative_path(entry["relative_path"])
         candidate = root / relative
         if candidate.is_symlink() or candidate.resolve(strict=True).parent not in {
@@ -196,6 +240,7 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
         if digest != entry["sha256"] or size != entry["size"]:
             raise ValueError(f"deployment bundle digest differs: {relative}")
         expected_paths.add(relative)
+        role_paths[role] = candidate
         normalized.append(dict(entry))
     if sha256_bytes(canonical_json_bytes(normalized)) != payload["file_tree_sha256"]:
         raise ValueError("deployment bundle tree digest differs")
@@ -212,12 +257,58 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
     serialized = b"\n".join(path.read_bytes() for path in root.rglob("*") if path.is_file())
     if any(field.encode() in serialized for field in _FORBIDDEN_SERIALIZED_FIELDS):
         raise ValueError("deployment bundle contains credential fields")
-    read_toolchain_lock(root / "artifacts" / "toolchain-lock.json")
+    required_roles = {
+        "build_manifest",
+        "wheel",
+        "source_manifest",
+        "native_attestation",
+        "pyproject",
+        "uv_lock",
+        "uv_wheel",
+        "toolchain_lock",
+        "formal_plan",
+    }
+    if payload["schema_version"] == "txnopt-tencent-deployment-bundle-v2":
+        required_roles.add("protocol")
+    if not required_roles.issubset(role_paths):
+        raise ValueError("deployment bundle lacks a required identity input")
+    identity = _validate_inputs(
+        TencentDeploymentInputs(
+            build_manifest=role_paths["build_manifest"],
+            wheel=role_paths["wheel"],
+            source_manifest=role_paths["source_manifest"],
+            native_attestation=role_paths["native_attestation"],
+            pyproject=role_paths["pyproject"],
+            uv_lock=role_paths["uv_lock"],
+            uv_wheel=role_paths["uv_wheel"],
+            toolchain_lock=role_paths["toolchain_lock"],
+            plan_manifest=role_paths["formal_plan"],
+        ),
+        protocol_path_override=role_paths.get("protocol"),
+    )
+    if (
+        (
+            payload["build"] == "Build16"
+            and payload["schema_version"] != "txnopt-tencent-deployment-bundle-v1"
+        )
+        or (
+            payload["build"] == "Build18"
+            and payload["schema_version"] != "txnopt-tencent-deployment-bundle-v2"
+        )
+        or payload["build"] != identity["build"]
+        or payload["attempt"] != identity["attempt"]
+        or payload["build_manifest_sha256"] != identity["build_manifest_sha256"]
+        or payload["plan_manifest_sha256"] != identity["plan_manifest_sha256"]
+        or payload["config_tree_sha256"] != identity["config_tree_sha256"]
+        or payload["expected_identity_tree_sha256"]
+        != identity["expected_identity_tree_sha256"]
+    ):
+        raise ValueError("deployment bundle receipt identity differs")
     return {
         "schema_version": "txnopt-tencent-deployment-verification-v1",
         "status": "BUNDLE_VERIFIED_NOT_AUTHORIZED",
-        "build": "Build16",
-        "attempt": 26,
+        "build": identity["build"],
+        "attempt": identity["attempt"],
         "region": None,
         "credentials_included": False,
         "file_tree_sha256": payload["file_tree_sha256"],
@@ -227,32 +318,32 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
     }
 
 
-def _validate_inputs(inputs: TencentDeploymentInputs) -> dict[str, object]:
+def _validate_inputs(
+    inputs: TencentDeploymentInputs,
+    *,
+    protocol_path_override: Path | None = None,
+) -> dict[str, object]:
     build_digest = verify_sidecar(inputs.build_manifest)
     build = read_signed_json(inputs.build_manifest)
-    if (
-        build.get("schema_version") != "txnopt-level1-build-manifest-v1"
-        or build.get("run_label") != "txnopt_level1_build_attempt16"
-    ):
-        raise ValueError("deployment requires Build16")
+    successor = successor_from_build_manifest(build)
     producer = build.get("producer")
     artifacts = build.get("artifacts")
     if not isinstance(producer, dict) or not isinstance(artifacts, dict):
-        raise ValueError("Build16 producer or artifact identity is missing")
+        raise ValueError(f"{successor.build_name} producer or artifact identity is missing")
     wheel = artifacts.get("wheel")
     native = artifacts.get("native_extension")
     if not isinstance(wheel, dict) or not isinstance(native, dict):
-        raise ValueError("Build16 wheel or native identity is missing")
+        raise ValueError(f"{successor.build_name} wheel or native identity is missing")
     if wheel.get("sha256") != sha256_file(inputs.wheel):
-        raise ValueError("Build16 wheel identity differs")
+        raise ValueError(f"{successor.build_name} wheel identity differs")
     if producer.get("source_manifest_sha256") != sha256_file(
         inputs.source_manifest
     ):
-        raise ValueError("Build16 source manifest identity differs")
+        raise ValueError(f"{successor.build_name} source manifest identity differs")
     if native.get("attestation_sha256") != sha256_file(
         inputs.native_attestation
     ):
-        raise ValueError("Build16 native attestation identity differs")
+        raise ValueError(f"{successor.build_name} native attestation identity differs")
     toolchain = read_toolchain_lock(inputs.toolchain_lock)
     uv_entries = [
         entry
@@ -279,15 +370,22 @@ def _validate_inputs(inputs: TencentDeploymentInputs) -> dict[str, object]:
     plan = read_signed_json(inputs.plan_manifest)
     protocol_path_value = plan.get("protocol_path")
     if not isinstance(protocol_path_value, str) or not protocol_path_value:
-        raise ValueError("Attempt26 protocol path is missing")
-    protocol_path = Path(protocol_path_value).expanduser().absolute()
+        raise ValueError("formal plan protocol path is missing")
+    protocol_path = (
+        Path(protocol_path_value).expanduser().absolute()
+        if protocol_path_override is None
+        else protocol_path_override.expanduser().absolute()
+    )
     protocol_digest = verify_sidecar(protocol_path)
     protocol = read_signed_json(protocol_path)
+    plan_attempt = plan.get("attempt")
+    if isinstance(plan_attempt, bool) or not isinstance(plan_attempt, int):
+        raise ValueError("formal plan attempt is invalid")
+    require_formal_attempt(successor, plan_attempt)
     if (
         plan.get("schema_version") != "txnopt-level1-campaign-plan-v2"
         or protocol.get("schema_version") != "txnopt-level1-protocol-v2"
         or plan.get("protocol_sha256") != protocol_digest
-        or plan.get("attempt") != 26
         or plan.get("status") != "PLANNED_NOT_STARTED"
         or plan.get("build_manifest_sha256") != build_digest
         or plan.get("region") is not None
@@ -296,14 +394,18 @@ def _validate_inputs(inputs: TencentDeploymentInputs) -> dict[str, object]:
         or plan.get("cloud_purchase_authorized") is not False
         or plan.get("holdout_opened") is not False
     ):
-        raise ValueError("Attempt26 plan or region boundary differs")
+        raise ValueError("formal plan or region boundary differs")
     return {
+        "build": successor.build_name,
+        "attempt": successor.formal_attempt,
         "build_manifest_sha256": build_digest,
         "plan_manifest_sha256": plan_digest,
         "config_tree_sha256": _sha_field(plan, "config_tree_sha256"),
         "expected_identity_tree_sha256": _sha_field(
             plan, "expected_identity_tree_sha256"
         ),
+        "protocol_path": str(protocol_path),
+        "protocol_sha256": protocol_digest,
     }
 
 
@@ -377,6 +479,7 @@ def _cos_contract_template() -> dict[str, object]:
 
 def _bootstrap_script(
     *,
+    build_name: str,
     wheel_name: str,
     wheel_sha256: str,
     uv_wheel_name: str,
@@ -432,7 +535,7 @@ import txnopt_legacy
 assert set(txnopt.__all__) == {{
     "TxnRuntime", "SearchKernel", "Oracle", "RunConfig", "RunResult"
 }}
-print("TxnOpt Build16 installation verified; account and region remain required.")
+print("TxnOpt {build_name} installation verified; account and region remain required.")
 PY
 "$INSTALL_ROOT/venv/bin/txnopt" --help >/dev/null
 """
@@ -468,7 +571,7 @@ def _sha_field(payload: dict[str, Any], field: str) -> str:
         or len(value) != 64
         or any(character not in "0123456789abcdef" for character in value)
     ):
-        raise ValueError(f"Attempt26 {field} is invalid")
+        raise ValueError(f"formal plan {field} is invalid")
     return value
 
 

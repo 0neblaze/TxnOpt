@@ -19,6 +19,10 @@ from typing import Any
 
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.level1_protocol import validate_level1_protocol_v2
+from txnopt_evidence.level1_tencent_successors import (
+    require_formal_attempt,
+    successor_from_build_manifest,
+)
 
 AXES: dict[str, tuple[str, int, int]] = {
     "serial_1": ("serial", 1, 0),
@@ -252,16 +256,11 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             raise ValueError("Build14 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
-    elif run_label == "txnopt_level1_build_attempt16":
-        formal_successor = _object(build.get("formal_successor"), "build formal successor")
-        if (
-            status != "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY"
-            or formal_successor.get("prior_review_binding_status") != "PRIOR_SOURCE_ONLY"
-            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD16"
-            or formal_successor.get("independent_successor_review_completed") is not False
-            or formal_successor.get("level1_formal_gate_passed") is not False
-        ):
-            raise ValueError("Build16 Tencent-cloud boundary differs")
+    elif run_label in {
+        "txnopt_level1_build_attempt16",
+        "txnopt_level1_build_attempt18",
+    }:
+        successor_from_build_manifest(build)
         surface_gate = "wheel_surface_and_record"
         additional_gates = (
             "formal_contract_tests",
@@ -278,11 +277,14 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             and run_label != "txnopt_level1_build_attempt14"
         ):
             raise ValueError("campaign plan v2 requires the approved Build14 producer")
-        if (
-            protocol_schema == "txnopt-level1-protocol-v2"
-            and run_label != "txnopt_level1_build_attempt16"
-        ):
-            raise ValueError("campaign protocol v2 requires the approved Build16 producer")
+        if protocol_schema == "txnopt-level1-protocol-v2":
+            attempt = plan.get("attempt")
+            if isinstance(attempt, bool) or not isinstance(attempt, int):
+                raise ValueError("campaign formal attempt is invalid")
+            require_formal_attempt(
+                successor_from_build_manifest(build),
+                attempt,
+            )
     for gate in (
         "ruff",
         "strict_mypy",

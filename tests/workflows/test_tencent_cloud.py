@@ -91,7 +91,11 @@ def _calibration(
 ) -> dict[str, object]:
     return {
         "schema_version": schema_version,
-        **({"peak_rss_bytes": 64 * 1024**2} if schema_version.endswith("v2") else {}),
+        **(
+            {"attempt": 27, "peak_rss_bytes": 64 * 1024**2}
+            if schema_version.endswith("v2")
+            else {}
+        ),
         "observations": [
             {
                 "domain": domain,
@@ -192,6 +196,8 @@ def test_tencent_capacity_accepts_protocol_v2_resource_contract() -> None:
     assert assessment["schema_version"] == "txnopt-tencent-capacity-assessment-v2"
     assert assessment["usable_core_tokens"] == 51
     assert assessment["attempt27_peak_rss_bytes"] == 64 * 1024**2
+    assert assessment["calibration_attempt"] == 27
+    assert assessment["calibration_peak_rss_bytes"] == 64 * 1024**2
     assert assessment["memory_margin_live_host_verified"] is False
     with pytest.raises(ValueError, match="128 GB"):
         assess_tencent_capacity(

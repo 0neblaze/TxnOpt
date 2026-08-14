@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from txnopt_evidence.cli import main
-from txnopt_evidence.codec import sha256_file, write_signed_json
+from txnopt_evidence.codec import read_signed_json, sha256_file, write_signed_json
 from txnopt_evidence.tencent_deployment import (
     TencentDeploymentInputs,
     materialize_tencent_deployment,
@@ -35,15 +35,27 @@ _TOOLS = (
 )
 
 
-def _inputs(tmp_path: Path, *, region: object = None) -> TencentDeploymentInputs:
+def _inputs(
+    tmp_path: Path,
+    *,
+    region: object = None,
+    build_number: int = 16,
+    formal_attempt: int = 26,
+) -> TencentDeploymentInputs:
     inputs = tmp_path / "inputs"
     inputs.mkdir()
     wheel = inputs / "txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl"
     wheel.write_bytes(b"wheel")
     source_manifest = inputs / "source-manifest.json"
-    source_manifest.write_text('{"source":"build16"}\n', encoding="utf-8")
+    source_manifest.write_text(
+        json.dumps({"source": f"build{build_number}"}) + "\n",
+        encoding="utf-8",
+    )
     native = inputs / "native-attestation.json"
-    native.write_text('{"source_revision":"build16"}\n', encoding="utf-8")
+    native.write_text(
+        json.dumps({"source_revision": f"build{build_number}"}) + "\n",
+        encoding="utf-8",
+    )
     pyproject = inputs / "pyproject.toml"
     pyproject.write_text(
         """[project]
@@ -80,12 +92,23 @@ tencent = [
             for name in _TOOLS
         ],
     )
-    build = inputs / "build16.json"
+    build = inputs / f"build{build_number}.json"
+    statuses = {
+        16: "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY",
+        18: "BUILD_COMPLETE_TENCENT_PRE_CLOUD_SUCCESSOR_NOT_LEVEL1_READY",
+    }
     write_signed_json(
         build,
         {
             "schema_version": "txnopt-level1-build-manifest-v1",
-            "run_label": "txnopt_level1_build_attempt16",
+            "run_label": f"txnopt_level1_build_attempt{build_number}",
+            "status": statuses[build_number],
+            "formal_successor": {
+                "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+                "successor_status": f"REVIEW_PENDING_BUILD{build_number}",
+                "independent_successor_review_completed": False,
+                "level1_formal_gate_passed": False,
+            },
             "producer": {
                 "source_manifest_sha256": sha256_file(source_manifest),
             },
@@ -104,12 +127,12 @@ tencent = [
             "schema_version": "txnopt-level1-protocol-v2",
         },
     )
-    plan = inputs / "attempt26.json"
+    plan = inputs / f"attempt{formal_attempt}.json"
     write_signed_json(
         plan,
         {
             "schema_version": "txnopt-level1-campaign-plan-v2",
-            "attempt": 26,
+            "attempt": formal_attempt,
             "status": "PLANNED_NOT_STARTED",
             "protocol_path": str(protocol),
             "protocol_sha256": sha256_file(protocol),
@@ -171,6 +194,36 @@ def test_bundle_materializes_offline_no_secret_no_region_contract(tmp_path: Path
     assert "SecretId" not in serialized
     assert "SecretKey" not in serialized
     assert "SessionToken" not in serialized
+
+
+def test_bundle_accepts_only_the_closed_build18_attempt28_pair(tmp_path: Path) -> None:
+    manifest = materialize_tencent_deployment(
+        tmp_path / "build18-deployment",
+        inputs=_inputs(tmp_path, build_number=18, formal_attempt=28),
+    )
+
+    receipt = verify_tencent_deployment(manifest)
+
+    assert receipt["build"] == "Build18"
+    assert receipt["attempt"] == 28
+    assert read_signed_json(manifest)["schema_version"] == (
+        "txnopt-tencent-deployment-bundle-v2"
+    )
+    assert (manifest.parent / "artifacts" / "build18-manifest.json").is_file()
+    assert (manifest.parent / "artifacts" / "attempt28-plan.json").is_file()
+    assert (manifest.parent / "artifacts" / "level1-protocol-v2.json").is_file()
+
+    mismatch_root = tmp_path / "mismatch"
+    mismatch_root.mkdir()
+    with pytest.raises(ValueError, match="formal attempt"):
+        materialize_tencent_deployment(
+            mismatch_root / "deployment",
+            inputs=_inputs(
+                mismatch_root,
+                build_number=18,
+                formal_attempt=29,
+            ),
+        )
 
 
 def test_bundle_rejects_live_region_and_tamper(tmp_path: Path) -> None:

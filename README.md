@@ -84,10 +84,10 @@ txnopt cloud tencent dry-run --region REGION --zone ZONE \
   --security-group-id SECURITY-GROUP --provider-memory-gb 128 \
   --request-output REQUEST.json --receipt-output RECEIPT.json
 txnopt cloud tencent bundle --destination DEPLOYMENT \
-  --build-manifest BUILD16.json --wheel TXNOPT.whl \
+  --build-manifest BUILD.json --wheel TXNOPT.whl \
   --source-manifest SOURCE.json --native-attestation NATIVE.json \
   --uv-lock uv.lock --toolchain-lock TOOLCHAIN.json \
-  --plan-manifest ATTEMPT26.json
+  --plan-manifest FORMAL-PLAN.json
 txnopt cloud tencent bundle-verify --manifest DEPLOYMENT/bundle-receipt.json
 txnopt archive inventory SOURCE
 txnopt cloud tencent cos mirror SOURCE --cos-bucket BUCKET-APPID \
@@ -133,9 +133,14 @@ formal run, both the Tencent instance metadata/API and the Linux topology probe
 must show 64 physical cores and one thread per core. The Tencent product/API
 memory specification must be at least 128 GB. Linux `MemTotal` is recorded but
 may be slightly below the product value because of platform reservations; that
-alone is not a failure. The Attempt27 peak RSS must remain below 80% of the
-actual visible memory. Capacity assessment, account configuration, procurement
-authorization, build portability, and formal execution remain separate gates.
+alone is not a failure. The calibration receipt bound to the selected producer
+(Attempt27 for the immutable Build16 pair, or Attempt29 for the Build18
+successor) must report peak RSS below 80% of actual visible memory. The accepted
+pairings are closed: Build16/Attempt26/Attempt27 and
+Build18/Attempt28/Attempt29. The intermediate Build17 validation candidate is
+not an approved formal producer. Capacity assessment, account configuration,
+procurement authorization, build portability, and formal execution remain
+separate gates.
 
 ## Evidence and formal verification
 

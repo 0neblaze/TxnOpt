@@ -30,6 +30,11 @@ from txnopt_evidence.level1_campaign_common import (
     require_clean_repository,
     require_prebound_expected_identities,
 )
+from txnopt_evidence.level1_tencent_successors import (
+    TencentLevel1Successor,
+    require_calibration_attempt,
+    successor_from_build_manifest,
+)
 
 _ATTEMPT_SUFFIX = re.compile(r"_attempt[0-9]+$")
 
@@ -137,8 +142,8 @@ def _materialize_calibration_plan(
         or any(character not in "0123456789abcdef" for character in source_plan_sha256)
     ):
         raise ValueError("source formal plan digest is invalid")
-    if attempt != 27:
-        raise ValueError("the Build16 local calibration must use Attempt27")
+    build = build_manifest_path.expanduser().resolve(strict=True)
+    successor = _calibration_successor(build, attempt)
     if not selections:
         raise ValueError("calibration plan requires at least one selection")
     output = destination.expanduser().resolve()
@@ -147,7 +152,6 @@ def _materialize_calibration_plan(
         raise FileExistsError(f"calibration plan destination already exists: {output}")
     if raw_output.exists() or raw_output.is_symlink():
         raise FileExistsError(f"calibration raw root already exists: {raw_output}")
-    build = build_manifest_path.expanduser().resolve(strict=True)
     build_sha256 = _verify_sidecar(build)
     configs = output / "configs"
     identities = output / "expected-identities"
@@ -228,7 +232,7 @@ def _materialize_calibration_plan(
         {
             "schema_version": "txnopt-local-calibration-plan-v1",
             "status": "PLANNED_NOT_STARTED",
-            "build": "Build16",
+            "build": successor.build_name,
             "attempt": attempt,
             "source_formal_plan_sha256": source_plan_sha256,
             "build_manifest_path": str(build),
@@ -261,11 +265,12 @@ def _load_calibration_plan(
     manifest = manifest_path.resolve(strict=True)
     payload = read_signed_json(manifest)
     build = build_manifest_path.resolve(strict=True)
+    successor = _calibration_successor(build, attempt)
     raw_output = raw_root.resolve()
     if (
         payload.get("schema_version") != "txnopt-local-calibration-plan-v1"
         or payload.get("status") != "PLANNED_NOT_STARTED"
-        or payload.get("build") != "Build16"
+        or payload.get("build") != successor.build_name
         or payload.get("attempt") != attempt
         or payload.get("source_formal_plan_sha256") != source_plan_sha256
         or payload.get("build_manifest_path") != str(build)
@@ -360,6 +365,17 @@ def _load_calibration_plan(
     ):
         raise ValueError("materialized calibration tree digest differs")
     return manifest, tuple(execution)
+
+
+def _calibration_successor(
+    build_manifest_path: Path,
+    attempt: int,
+) -> TencentLevel1Successor:
+    build = read_signed_json(build_manifest_path)
+    return require_calibration_attempt(
+        successor_from_build_manifest(build),
+        attempt,
+    )
 
 
 def _relative_plan_path(value: object) -> str:
@@ -535,6 +551,10 @@ def main() -> int:
     plan_sha256 = _verify_sidecar(plan_path)
     plan = load_campaign_plan(plan_path)
     require_prebound_expected_identities(plan)
+    calibration_successor = _calibration_successor(
+        plan.build_manifest_path,
+        arguments.attempt,
+    )
     formal_raw_root = plan.raw_output_root.resolve()
     if formal_raw_root.exists() or formal_raw_root.is_symlink():
         raise FileExistsError(
@@ -730,7 +750,7 @@ def main() -> int:
         "calibration_plan_sha256": calibration_plan_sha256,
         "raw_output_root": str(calibration_raw_root),
         "review_root": str(review_root),
-        "build": "Build16",
+        "build": calibration_successor.build_name,
         "attempt": arguments.attempt,
         "orchestration_identity": orchestration_identity,
         "representative_cases": {key: sorted(value) for key, value in cases.items()},

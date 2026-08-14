@@ -32,8 +32,9 @@
 如果普通 CVM 不能提供 `CoreCount >= 64` 的实例，则候选应转为 CBM（黑石物理服务器）
 或腾讯明确给出物理核心拓扑的专用实例。腾讯商品/API 规格内存必须至少 128 GB；
 Linux `MemTotal` 因平台保留略低于 128 GiB 不单独构成失败。真正的内存性能门是
-Attempt27 峰值 RSS 低于目标主机实际可见内存的 80%。公开规格、库存、地域和价格
-都不能替代购买时的带时间戳 API/控制台回执。
+与所选正式 producer 绑定的校准峰值 RSS 必须低于目标主机实际可见内存的 80%。
+历史 Build16 对应 Attempt27；后继 Build18 对应 Attempt29，两者不得交叉重绑。公开
+规格、库存、地域和价格都不能替代购买时的带时间戳 API/控制台回执。
 
 官方入口：
 
@@ -47,7 +48,7 @@ Attempt27 峰值 RSS 低于目标主机实际可见内存的 80%。公开规格�
 1. 在目标镜像上从新 source identity（源码身份）重建 wheel/native extension（原生
    扩展），保存编译器、依赖、CPU feature（CPU 特性）和完整哈希；
 2. 运行 doctor/preflight（环境诊断/预检），验证 Linux、64 物理核、腾讯商品/API
-   至少 128 GB 内存、Attempt27 RSS 余量、独占使用和 process-group cleanup
+   至少 128 GB 内存、绑定校准的 RSS 余量、独占使用和 process-group cleanup
    （进程组清理）；
 3. 先运行小型 portability smoke（可移植性冒烟测试）与独立 replay（重放），不能直接
    启动 2,880-run matrix（2,880 次矩阵）；

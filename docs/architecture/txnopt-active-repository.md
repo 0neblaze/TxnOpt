@@ -80,9 +80,9 @@ txnopt cloud tencent assess --protocol <protocol> --calibration <calibration> \
 txnopt cloud tencent spec --output <spec>
 txnopt cloud tencent doctor --instance-type <sku> --provider-physical-cores 64 \
   --provider-memory-gb 128 --expected-peak-rss-bytes <bytes> --output <receipt>
-txnopt cloud tencent bundle --destination <deployment> --build-manifest <build16> \
+txnopt cloud tencent bundle --destination <deployment> --build-manifest <build> \
   --wheel <wheel> --source-manifest <source> --native-attestation <native> \
-  --uv-lock <uv.lock> --toolchain-lock <toolchain> --plan-manifest <attempt26>
+  --uv-lock <uv.lock> --toolchain-lock <toolchain> --plan-manifest <formal-plan>
 txnopt cloud tencent bundle-verify --manifest <deployment>/bundle-receipt.json
 txnopt archive inventory <source>
 txnopt cloud tencent cos mirror <source> --cos-bucket <bucket-appid> \
@@ -103,7 +103,9 @@ Build portability（构建可移植性）以及正式矩阵执行都必须等真
 明确给出至少 **128 GB** 内存。64 vCPU 不是 64 个物理核心的替代证据；腾讯 API
 必须返回 `CoreCount=64`、`ThreadPerCore=1`，Linux `/proc/cpuinfo` 拓扑也必须达到
 64 个物理核心。Linux 可见 `MemTotal` 只记录、不因平台保留略低于 128 GiB 而失败；
-真正的内存门是 Attempt27 峰值 RSS 低于实际可见内存的 80%。
+真正的内存门是与所选 producer（生产器）绑定的校准峰值 RSS 低于实际可见内存的
+80%。Build16 只允许 Attempt26/27；Build18 只允许 Attempt28/29。Build17
+validation candidate（验证候选）未闭合正式计划入口，不能作为正式 producer。
 
 ## 5. 不可变恢复边界
 

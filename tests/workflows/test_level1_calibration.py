@@ -19,6 +19,44 @@ from txnopt_evidence.level1_calibration import (
 )
 
 
+def _build_manifest(tmp_path: Path, number: int) -> Path:
+    statuses = {
+        16: "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY",
+        18: "BUILD_COMPLETE_TENCENT_PRE_CLOUD_SUCCESSOR_NOT_LEVEL1_READY",
+    }
+    build = tmp_path / f"build{number}.json"
+    write_signed_json(
+        build,
+        {
+            "schema_version": "txnopt-level1-build-manifest-v1",
+            "run_label": f"txnopt_level1_build_attempt{number}",
+            "status": statuses[number],
+            "formal_successor": {
+                "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+                "successor_status": f"REVIEW_PENDING_BUILD{number}",
+                "independent_successor_review_completed": False,
+                "level1_formal_gate_passed": False,
+            },
+            "producer": {
+                "revision": "a" * 40,
+                "git_tree": "b" * 40,
+                "source_manifest_sha256": "c" * 64,
+                "tracked_file_count": 1,
+                "source_dirty": False,
+                "development_override": False,
+            },
+            "artifacts": {
+                "wheel": {"sha256": "d" * 64},
+                "native_extension": {
+                    "sha256": "e" * 64,
+                    "protocol": "txnopt-native-round-v1",
+                },
+            },
+        },
+    )
+    return build
+
+
 def test_calibration_command_observes_peak_rss() -> None:
     payload, elapsed, peak_rss_bytes = _run(
         [
@@ -120,28 +158,7 @@ def test_attempt27_v1_receipt_is_corrected_without_overwrite(tmp_path: Path) -> 
 def test_attempt27_materialization_cannot_write_attempt26_raw_root(
     tmp_path: Path,
 ) -> None:
-    build = tmp_path / "build16.json"
-    write_signed_json(
-        build,
-        {
-            "schema_version": "txnopt-level1-build-manifest-v1",
-            "producer": {
-                "revision": "a" * 40,
-                "git_tree": "b" * 40,
-                "source_manifest_sha256": "c" * 64,
-                "tracked_file_count": 1,
-                "source_dirty": False,
-                "development_override": False,
-            },
-            "artifacts": {
-                "wheel": {"sha256": "d" * 64},
-                "native_extension": {
-                    "sha256": "e" * 64,
-                    "protocol": "txnopt-native-round-v1",
-                },
-            },
-        },
-    )
+    build = _build_manifest(tmp_path, 16)
     formal_raw = tmp_path / "formal-attempt26-raw"
     source = tmp_path / "attempt26.json"
     source.write_bytes(
@@ -208,3 +225,66 @@ def test_attempt27_materialization_cannot_write_attempt26_raw_root(
     )
     assert loaded_path == plan_path
     assert loaded_execution == execution
+
+
+def test_build18_calibration_is_closed_to_attempt29(tmp_path: Path) -> None:
+    build = _build_manifest(tmp_path, 18)
+    formal_raw = tmp_path / "formal-attempt28-raw"
+    source = tmp_path / "attempt28.json"
+    source.write_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": "txnopt-run-config-v1",
+                "run_label": (
+                    "txnopt_level1_rcpsp_j1201_1_2014_serial_1_"
+                    "fixed_work_attempt28"
+                ),
+                "output_root": str(formal_raw),
+                "build_manifest": {
+                    "path": str(build),
+                    "sha256": hashlib.sha256(build.read_bytes()).hexdigest(),
+                },
+                "run_config": {
+                    "seed": 2014,
+                    "workers": 1,
+                    "execution_mode": "serial",
+                    "fixed_work": 1200,
+                    "deadline_seconds": None,
+                    "speculation_window": 0,
+                    "trace_policy": "semantic_and_physical",
+                    "max_rounds": 10,
+                },
+                "case": {"domain": "rcpsp"},
+            },
+            pretty=True,
+        )
+    )
+    selection = CalibrationSelection(
+        source_config_path=source,
+        domain="rcpsp",
+        case_id="j1201_1",
+        axis="serial_1",
+        seed=2014,
+        budget="fixed_work",
+    )
+
+    plan_path, execution = _materialize_calibration_plan(
+        source_plan_sha256="f" * 64,
+        build_manifest_path=build,
+        selections=(selection,),
+        destination=tmp_path / "attempt29-plan",
+        raw_root=tmp_path / "attempt29-raw",
+        attempt=29,
+    )
+
+    assert read_signed_json(plan_path)["build"] == "Build18"
+    assert execution[0].config_path.stem.endswith("_attempt29")
+    with pytest.raises(ValueError, match="calibration attempt"):
+        _materialize_calibration_plan(
+            source_plan_sha256="f" * 64,
+            build_manifest_path=build,
+            selections=(selection,),
+            destination=tmp_path / "attempt30-plan",
+            raw_root=tmp_path / "attempt30-raw",
+            attempt=30,
+        )

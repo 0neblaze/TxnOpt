@@ -412,13 +412,22 @@ def assess_tencent_capacity(
     capacity_pass = predicted_days <= requirements.maximum_matrix_days
     protocol_v2 = protocol.get("schema_version") == "txnopt-level1-protocol-v2"
     peak_rss_bytes: int | None = None
+    calibration_attempt: int | None = None
     if protocol_v2:
         if calibration.get("schema_version") != "txnopt-local-runtime-calibration-v2":
-            raise ValueError("protocol v2 requires the Attempt27 calibration schema")
+            raise ValueError("protocol v2 requires the v2 calibration schema")
         candidate = calibration.get("peak_rss_bytes")
         if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate <= 0:
-            raise ValueError("Attempt27 calibration peak RSS is missing")
+            raise ValueError("calibration peak RSS is missing")
+        raw_attempt = calibration.get("attempt")
+        if (
+            isinstance(raw_attempt, bool)
+            or not isinstance(raw_attempt, int)
+            or raw_attempt <= 0
+        ):
+            raise ValueError("calibration attempt identity is missing")
         peak_rss_bytes = candidate
+        calibration_attempt = raw_attempt
     return {
         "schema_version": "txnopt-tencent-capacity-assessment-v2",
         "status": (
@@ -431,7 +440,11 @@ def assess_tencent_capacity(
         "provider_memory_gb": provider_memory_gb,
         "physical_core_requirement_satisfied": True,
         "memory_requirement_satisfied": True,
-        "attempt27_peak_rss_bytes": peak_rss_bytes,
+        "attempt27_peak_rss_bytes": (
+            peak_rss_bytes if calibration_attempt == 27 else None
+        ),
+        "calibration_attempt": calibration_attempt,
+        "calibration_peak_rss_bytes": peak_rss_bytes,
         "memory_margin_live_host_verified": False,
         "usable_core_tokens": estimate["usable_cores"],
         "scheduler_efficiency": scheduler_efficiency,
@@ -521,7 +534,7 @@ def inspect_tencent_host(
         if expected_peak_rss_bytes < 0:
             raise ValueError("expected peak RSS must be non-negative")
         if expected_peak_rss_bytes > observed_memory_bytes * 0.8:
-            failures.append("attempt27_peak_rss_exceeds_visible_memory_margin")
+            failures.append("calibration_peak_rss_exceeds_visible_memory_margin")
     for field in (
         "writer_count",
         "lease_count",

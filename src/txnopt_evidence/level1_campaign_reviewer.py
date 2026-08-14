@@ -39,6 +39,10 @@ from txnopt_evidence.level1_campaign_common import (
     verify_sidecar,
     write_signed_object,
 )
+from txnopt_evidence.level1_tencent_successors import (
+    calibration_peak_rss_from_payload,
+    successor_from_formal_attempt,
+)
 
 
 def review_campaign(
@@ -736,15 +740,17 @@ def _validate_execution_receipt(
         raise ValueError("campaign execution host does not satisfy the v1 memory contract")
     if analysis_schema == "txnopt-level1-analysis-protocol-v2":
         provider = _object(host.get("provider_instance"), "execution Tencent provider instance")
+        formal_attempt = plan.payload.get("attempt")
+        if isinstance(formal_attempt, bool) or not isinstance(formal_attempt, int):
+            raise ValueError("campaign formal attempt identity is invalid")
+        successor = successor_from_formal_attempt(formal_attempt)
+        calibration_peak_rss_from_payload(host, successor)
         if (
             provider.get("physical_cores") != 64
             or isinstance(provider.get("memory_gb"), bool)
             or not isinstance(provider.get("memory_gb"), int)
             or provider["memory_gb"] < 128
             or host.get("linux_visible_memory_is_admission_gate") is not False
-            or isinstance(host.get("attempt27_peak_rss_bytes"), bool)
-            or not isinstance(host.get("attempt27_peak_rss_bytes"), int)
-            or host["attempt27_peak_rss_bytes"] < 0
         ):
             raise ValueError("campaign execution Tencent resource evidence differs")
     current_host = linux_host_identity(
