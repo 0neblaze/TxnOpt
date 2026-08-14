@@ -277,9 +277,16 @@ def _validate_inputs(inputs: TencentDeploymentInputs) -> dict[str, object]:
         raise ValueError("deployment pyproject lacks the locked Tencent environment")
     plan_digest = verify_sidecar(inputs.plan_manifest)
     plan = read_signed_json(inputs.plan_manifest)
+    protocol_path_value = plan.get("protocol_path")
+    if not isinstance(protocol_path_value, str) or not protocol_path_value:
+        raise ValueError("Attempt26 protocol path is missing")
+    protocol_path = Path(protocol_path_value).expanduser().absolute()
+    protocol_digest = verify_sidecar(protocol_path)
+    protocol = read_signed_json(protocol_path)
     if (
         plan.get("schema_version") != "txnopt-level1-campaign-plan-v2"
-        or plan.get("protocol_schema_version") != "txnopt-level1-protocol-v2"
+        or protocol.get("schema_version") != "txnopt-level1-protocol-v2"
+        or plan.get("protocol_sha256") != protocol_digest
         or plan.get("attempt") != 26
         or plan.get("status") != "PLANNED_NOT_STARTED"
         or plan.get("build_manifest_sha256") != build_digest

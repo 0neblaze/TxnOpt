@@ -97,6 +97,13 @@ tencent = [
             },
         },
     )
+    protocol = inputs / "level1-protocol-v2.json"
+    write_signed_json(
+        protocol,
+        {
+            "schema_version": "txnopt-level1-protocol-v2",
+        },
+    )
     plan = inputs / "attempt26.json"
     write_signed_json(
         plan,
@@ -104,7 +111,8 @@ tencent = [
             "schema_version": "txnopt-level1-campaign-plan-v2",
             "attempt": 26,
             "status": "PLANNED_NOT_STARTED",
-            "protocol_schema_version": "txnopt-level1-protocol-v2",
+            "protocol_path": str(protocol),
+            "protocol_sha256": sha256_file(protocol),
             "build_manifest_sha256": sha256_file(build),
             "config_tree_sha256": "c" * 64,
             "expected_identity_tree_sha256": "d" * 64,
