@@ -5,9 +5,12 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from txnopt_evidence.codec import canonical_json_bytes, read_signed_json, write_signed_json
 from txnopt_evidence.level1_calibration import (
     CalibrationSelection,
+    _load_calibration_plan,
     _materialize_calibration_plan,
     _run,
 )
@@ -25,6 +28,23 @@ def test_calibration_command_observes_peak_rss() -> None:
     assert payload == {"ok": True}
     assert elapsed > 0.0
     assert peak_rss_bytes >= 8_000_000
+
+
+def test_calibration_subprocess_does_not_inherit_pythonpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A source-tree PYTHONPATH would make the bound Build16 interpreter import
+    # orchestration sources instead of its installed producer wheel.
+    monkeypatch.setenv("PYTHONPATH", "/forged/source")
+    payload, _elapsed, _peak = _run(
+        [
+            sys.executable,
+            "-c",
+            "import json,os; print(json.dumps({'pythonpath': os.getenv('PYTHONPATH')}))",
+        ]
+    )
+
+    assert payload == {"pythonpath": None}
 
 
 def test_attempt27_materialization_cannot_write_attempt26_raw_root(
@@ -109,3 +129,12 @@ def test_attempt27_materialization_cannot_write_attempt26_raw_root(
     plan = read_signed_json(plan_path)
     assert plan["source_formal_plan_sha256"] == "f" * 64
     assert plan["formal_matrix_started"] is False
+    loaded_path, loaded_execution = _load_calibration_plan(
+        plan_path,
+        source_plan_sha256="f" * 64,
+        build_manifest_path=build,
+        raw_root=calibration_raw,
+        attempt=27,
+    )
+    assert loaded_path == plan_path
+    assert loaded_execution == execution

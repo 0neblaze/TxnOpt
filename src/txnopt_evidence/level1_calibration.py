@@ -6,17 +6,20 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from txnopt_evidence.codec import (
     canonical_json_bytes,
+    read_signed_json,
     sha256_bytes,
+    sha256_file,
     write_sidecar,
     write_signed_json,
 )
@@ -72,11 +75,17 @@ def _object(value: object, label: str) -> dict[str, Any]:
 
 def _run(command: list[str]) -> tuple[dict[str, Any], float, int]:
     started = time.perf_counter()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONHOME", "PYTHONPATH"}
+    }
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=environment,
     )
     peak_rss_bytes = 0
     while True:
@@ -239,6 +248,129 @@ def _materialize_calibration_plan(
     return manifest, tuple(execution)
 
 
+def _load_calibration_plan(
+    manifest_path: Path,
+    *,
+    source_plan_sha256: str,
+    build_manifest_path: Path,
+    raw_root: Path,
+    attempt: int,
+) -> tuple[Path, tuple[CalibrationExecution, ...]]:
+    """Resume an already materialized plan after a pre-run launcher failure."""
+
+    manifest = manifest_path.resolve(strict=True)
+    payload = read_signed_json(manifest)
+    build = build_manifest_path.resolve(strict=True)
+    raw_output = raw_root.resolve()
+    if (
+        payload.get("schema_version") != "txnopt-local-calibration-plan-v1"
+        or payload.get("status") != "PLANNED_NOT_STARTED"
+        or payload.get("build") != "Build16"
+        or payload.get("attempt") != attempt
+        or payload.get("source_formal_plan_sha256") != source_plan_sha256
+        or payload.get("build_manifest_path") != str(build)
+        or payload.get("build_manifest_sha256") != _verify_sidecar(build)
+        or payload.get("raw_output_root") != str(raw_output)
+        or payload.get("cloud_purchase_authorized") is not False
+        or payload.get("formal_matrix_started") is not False
+        or payload.get("holdout_opened") is not False
+    ):
+        raise ValueError("materialized calibration plan identity differs")
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list) or payload.get("config_count") != len(raw_entries):
+        raise ValueError("materialized calibration plan entries differ")
+    root = manifest.parent
+    execution: list[CalibrationExecution] = []
+    config_tree: list[dict[str, object]] = []
+    identity_tree: list[dict[str, object]] = []
+    for raw_entry in raw_entries:
+        expected_fields = {
+            "path",
+            "sha256",
+            "expected_identity_path",
+            "expected_identity_sha256",
+            "domain",
+            "case_id",
+            "axis",
+            "seed",
+            "budget",
+        }
+        if not isinstance(raw_entry, dict) or set(raw_entry) != expected_fields:
+            raise ValueError("materialized calibration entry field set differs")
+        config_relative = _relative_plan_path(raw_entry["path"])
+        identity_relative = _relative_plan_path(raw_entry["expected_identity_path"])
+        config_path = root / config_relative
+        identity_path = root / identity_relative
+        config_sha256 = sha256_file(config_path)
+        identity_sha256 = sha256_file(identity_path)
+        if (
+            config_sha256 != raw_entry["sha256"]
+            or identity_sha256 != raw_entry["expected_identity_sha256"]
+            or _verify_sidecar(identity_path) != identity_sha256
+        ):
+            raise ValueError("materialized calibration entry digest differs")
+        config = _object(json.loads(config_path.read_bytes()), "calibration config")
+        label = config.get("run_label")
+        if (
+            not isinstance(label, str)
+            or not label.endswith(f"_attempt{attempt:02d}")
+            or config.get("output_root") != str(raw_output)
+        ):
+            raise ValueError("materialized calibration run identity differs")
+        identity = ExpectedEvidenceIdentity.from_payload(read_signed_json(identity_path))
+        if (
+            identity.run_label != label
+            or identity.input_config_sha256 != config_sha256
+            or identity.config_artifact_sha256 != config_sha256
+        ):
+            raise ValueError("materialized calibration expected identity differs")
+        domain = raw_entry["domain"]
+        case_id = raw_entry["case_id"]
+        axis = raw_entry["axis"]
+        seed = raw_entry["seed"]
+        budget = raw_entry["budget"]
+        if (
+            domain not in {"evrptw", "rcpsp"}
+            or not isinstance(case_id, str)
+            or not case_id
+            or axis not in {"serial_1", "txnopt_1", "txnopt_4", "barrier_4"}
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or budget not in {"fixed_work", "fixed_time"}
+        ):
+            raise ValueError("materialized calibration metadata differs")
+        config_tree.append({"path": config_relative, "sha256": config_sha256})
+        identity_tree.append({"path": identity_relative, "sha256": identity_sha256})
+        execution.append(
+            CalibrationExecution(
+                config_path=config_path,
+                expected_identity_path=identity_path,
+                domain=domain,
+                case_id=case_id,
+                axis=axis,
+                seed=seed,
+                budget=budget,
+            )
+        )
+    if (
+        sha256_bytes(canonical_json_bytes(config_tree))
+        != payload.get("config_tree_sha256")
+        or sha256_bytes(canonical_json_bytes(identity_tree))
+        != payload.get("expected_identity_tree_sha256")
+    ):
+        raise ValueError("materialized calibration tree digest differs")
+    return manifest, tuple(execution)
+
+
+def _relative_plan_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("calibration plan path is invalid")
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ValueError("calibration plan path is invalid")
+    return candidate.as_posix()
+
+
 def _orchestration_identity(repository: Path) -> dict[str, object]:
     root = repository.expanduser().resolve(strict=True)
     require_clean_repository(root)
@@ -276,6 +408,7 @@ def main() -> int:
     parser.add_argument("--python", type=Path, required=True)
     parser.add_argument("--orchestration-repository", type=Path, required=True)
     parser.add_argument("--attempt", type=int, default=27)
+    parser.add_argument("--resume-materialized-plan", action="store_true")
     parser.add_argument("--case", action="append", required=True)
     parser.add_argument("--seed", action="append", type=int, required=True)
     arguments = parser.parse_args()
@@ -284,7 +417,9 @@ def main() -> int:
     if output.exists() or output.with_suffix(output.suffix + ".sha256").exists():
         raise FileExistsError(f"calibration output already exists: {output}")
     review_root = arguments.review_root.resolve()
-    if review_root.exists():
+    if review_root.exists() and (
+        not arguments.resume_materialized_plan or any(review_root.iterdir())
+    ):
         raise FileExistsError(f"calibration review root already exists: {review_root}")
     calibration_raw_root = arguments.raw_root.resolve()
     if calibration_raw_root.exists() or calibration_raw_root.is_symlink():
@@ -292,7 +427,12 @@ def main() -> int:
             f"calibration raw root already exists: {calibration_raw_root}"
         )
     calibration_plan_root = arguments.calibration_plan_root.resolve()
-    if calibration_plan_root.exists() or calibration_plan_root.is_symlink():
+    if arguments.resume_materialized_plan:
+        if not calibration_plan_root.is_dir() or calibration_plan_root.is_symlink():
+            raise FileNotFoundError(
+                f"materialized calibration plan is unavailable: {calibration_plan_root}"
+            )
+    elif calibration_plan_root.exists() or calibration_plan_root.is_symlink():
         raise FileExistsError(
             f"calibration plan root already exists: {calibration_plan_root}"
         )
@@ -362,20 +502,39 @@ def main() -> int:
             f"calibration selected {len(selected)} configs, expected {expected_count}"
         )
 
-    calibration_plan_path, execution = _materialize_calibration_plan(
-        source_plan_sha256=plan_sha256,
-        build_manifest_path=plan.build_manifest_path,
-        selections=tuple(selected),
-        destination=calibration_plan_root,
-        raw_root=calibration_raw_root,
-        attempt=arguments.attempt,
-    )
+    if arguments.resume_materialized_plan:
+        calibration_plan_path, execution = _load_calibration_plan(
+            calibration_plan_root / "manifest.json",
+            source_plan_sha256=plan_sha256,
+            build_manifest_path=plan.build_manifest_path,
+            raw_root=calibration_raw_root,
+            attempt=arguments.attempt,
+        )
+    else:
+        calibration_plan_path, execution = _materialize_calibration_plan(
+            source_plan_sha256=plan_sha256,
+            build_manifest_path=plan.build_manifest_path,
+            selections=tuple(selected),
+            destination=calibration_plan_root,
+            raw_root=calibration_raw_root,
+            attempt=arguments.attempt,
+        )
+    requested_keys = {
+        (item.domain, item.case_id, item.axis, item.seed, item.budget)
+        for item in selected
+    }
+    execution_keys = {
+        (item.domain, item.case_id, item.axis, item.seed, item.budget)
+        for item in execution
+    }
+    if len(execution) != expected_count or execution_keys != requested_keys:
+        raise ValueError("materialized calibration selection differs")
     calibration_plan_sha256 = _verify_sidecar(calibration_plan_path)
 
     samples: list[dict[str, object]] = []
     groups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     maximum_peak_rss_bytes = 0
-    review_root.mkdir(parents=True, exist_ok=False)
+    review_root.mkdir(parents=True, exist_ok=arguments.resume_materialized_plan)
     for ordinal, item in enumerate(execution, 1):
         run_output, elapsed, run_peak_rss_bytes = _run(
             [
