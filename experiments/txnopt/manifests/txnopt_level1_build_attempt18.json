@@ -1,0 +1,279 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt18",
+  "status": "BUILD_COMPLETE_TENCENT_PRE_CLOUD_SUCCESSOR_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-14T20:48:40Z",
+  "successor_of": "txnopt_level1_build_attempt16",
+  "producer": {
+    "revision": "1d093dee20f1c90049f722f1650032bb0afc213e",
+    "git_tree": "f0e6845273a0ece1a33c6c0f34209bc941930241",
+    "source_manifest_sha256": "90348df150c6a36aa4238e30797eee7a7c3abcba02447ccaa9ba54c6c9a7b37f",
+    "tracked_file_count": 258,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot",
+    "performance_profile": "portable-o3",
+    "compiler_id": "GNU",
+    "compiler_version": "13.3.0"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/wheel/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "3717c2222e9ba360c371370aee68720008169286c4e1359c3c12235f1947a9b3",
+      "entry_count": 70,
+      "record_row_count": 70,
+      "installed_non_record_bytes_compared": 69,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "17eab83f35036894b4b1cc48a698c89b34fa38512101d846bc66d7c72921e58d",
+      "entry_count": 293
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "9c32a35529a417da3b1adcd6be33ab20080d515ab5be3cd37dcd973e1d583d32",
+      "protocol": "txnopt-native-round-v1",
+      "prepared_receipt_trace": "txnopt-physical-trace-v1",
+      "attestation_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/native-build-attestation-attempt18.json",
+      "attestation_sha256": "beabf18ea54760ed0a8b5fdf3397a099a45a2d503c89fcfa47cd754782655574"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/resource-soak-attempt18.json",
+      "sha256": "002155e36acde1dc15bd06466a731ccfc89248e77caf9269928e18c309b110e8",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "native_round_call_count": 101000,
+      "rss_growth_kib": 0,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    },
+    "toolchain_lock": {
+      "external_path": "/home/oneblaze/txnopt-toolchains/tencent-precloud-v1/txnopt-toolchain-lock-v1.json",
+      "sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d",
+      "status": "TOOLCHAIN_COMPLETE"
+    }
+  },
+  "runtime_change": {
+    "components": [
+      "txnopt_evidence.level1_tencent_successors",
+      "txnopt_evidence.level1_calibration",
+      "txnopt_evidence.level1_campaign_common",
+      "txnopt_evidence.level1_campaign_runner",
+      "txnopt_evidence.level1_campaign_reviewer",
+      "txnopt_evidence.tencent_deployment"
+    ],
+    "properties": [
+      "Build16 remains bound only to formal Attempt26 and calibration Attempt27",
+      "Build18 is the only approved successor bound to formal Attempt28 and calibration Attempt29",
+      "Build17 is rejected and cannot materialize, execute, review, or deploy a formal campaign",
+      "formal campaign identities are selected from a closed build-attempt registry",
+      "Build18 deployment bundles carry their exact protocol bytes and sidecar",
+      "runner produces raw evidence only and reviewer remains an independent process",
+      "generic ArchiveStore and local or S3 archive backends remain absent",
+      "Tencent CVM remains DryRun-only with 64 physical cores and ThreadPerCore equal to one",
+      "provider memory admission requires at least 128 GB while Linux visible memory is observational",
+      "Tencent COS remains a direct concrete module with VersionId, digest, size, retention, and last-write commit binding"
+    ],
+    "semantic_trace_changed": false,
+    "physical_trace_changed": false,
+    "raw_artifact_schema": "txnopt-raw-artifact-v3",
+    "failure_artifact_schema": "txnopt-failure-artifact-v3",
+    "review_artifact_schema": "txnopt-independent-review-v3",
+    "campaign_plan_schema": "txnopt-level1-campaign-plan-v2",
+    "protocol_schema": "txnopt-level1-protocol-v2",
+    "lifecycle_schema": "txnopt-evidence-lifecycle-v1",
+    "fallback_count": 0
+  },
+  "formal_successor": {
+    "prior_reviewed_correction_path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
+    "prior_reviewed_correction_sha256": "858bc5a3a5c0da6725b1df3bfeb0ca0c7bcf73d479fb7d3de885f1fb7e8d0d94",
+    "prior_independent_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "prior_independent_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "build14_independent_review_path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt11.json",
+    "build14_independent_review_sha256": "37270d49fd31b2e71fadfd706be18b043b482908d11cd74af08ca46da41b0c9b",
+    "model_check_receipt_path": "formal/model-check-receipt.json",
+    "model_check_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "live_verification_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/formal-live-verification-attempt18.json",
+    "live_verification_sha256": "9a971016ed1cf75e78596ac71432269df69f4d6896c2de59f210a7fb65381b12",
+    "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+    "successor_status": "REVIEW_PENDING_BUILD18",
+    "independent_successor_review_completed": false,
+    "level1_formal_gate_passed": false
+  },
+  "predecessor_disposition": {
+    "build16_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt16.json",
+    "build16_manifest_sha256": "702aa53ea89756473d295cfc0c5a834e50c59ad8f9a630be87a5522903795034",
+    "build16_status": "SUPERSEDED_BY_BUILD18_NOT_REWRITTEN",
+    "build17_external_disposition_path": "/home/oneblaze/txnopt-builds/level1-ba898f3-build17/build17-candidate-disposition.json",
+    "build17_external_disposition_sha256": "938a329505f4b6cc0b9fac71e1282b33c65cabed3f4cb6ced8208eb2aae92595",
+    "build17_status": "NOT_APPROVED_FORMAL_PRODUCER"
+  },
+  "validation": {
+    "ruff": {
+      "exit_code": 0,
+      "status": "PASS",
+      "log_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/logs/ruff.log",
+      "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "strict_mypy": {
+      "exit_code": 0,
+      "status": "PASS",
+      "source_file_count": 59,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/logs/mypy.log",
+      "log_sha256": "960745a059df2e6bf5556b518f6404c7707247bf3da084d48c3008145eb95a5d"
+    },
+    "pytest_wheel_installed": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 346,
+      "skipped": 0,
+      "product_modules_loaded_from_installed_wheel": true,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/logs/pytest-full.xml",
+      "log_sha256": "85a46cad0623c2c3dccd563994712ac69119f6c49d4ddc5a7e2968d0c71e78cb"
+    },
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "examples_per_function": 600,
+      "hypothesis_seeds": [20260818, 20260819, 20260820, 20260821, 20260822],
+      "passed_test_invocations": 25,
+      "log_sha256": [
+        "3c41ff0f0a4a78cbe49f0a832d5f551aa70409cbc7aeb15963528b81eab2a84c",
+        "71fa4d7ac9c34a99b4267768199e7ff5a64366e9180e6bce7d1d0f41c123be07",
+        "f100446bc9b749021b01d45072cc92c970c641b2642cd0ba9bb0922bab559bc2",
+        "f22339cff7912fdc07de485490d5784bdf433fb93baeff805a9f9fe99078eb3c",
+        "16dbabc2fbdcd830161227eee5250ff76a01255ce508e11fb80964728233a752"
+      ]
+    },
+    "formal_contract_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 15,
+      "log_sha256": "a4876bbfbe6f088ec1a37e33302839e65799694e4352764fc0a739c1084f5a6f"
+    },
+    "formal_model_receipt": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+      "live_verification_sha256": "9a971016ed1cf75e78596ac71432269df69f4d6896c2de59f210a7fb65381b12",
+      "primary_generated_states": 75,
+      "primary_distinct_states": 22,
+      "pluscal_generated_states": 36402,
+      "pluscal_distinct_states": 8134,
+      "t3_generated_states": 5,
+      "t3_distinct_states": 5
+    },
+    "wheel_surface_and_record": {
+      "exit_code": 0,
+      "status": "PASS",
+      "wheel_entry_count": 70,
+      "record_row_count": 70,
+      "installed_non_record_bytes_compared": 69,
+      "fallback_count": 0,
+      "receipt_path": "/home/oneblaze/txnopt-builds/level1-1d093de-build18/installed-wheel-verification-attempt18-v2.json",
+      "receipt_sha256": "d80889d60b95d615923b7ee18b97ad3930b38742678f9da2dfef88e1662a6df6"
+    },
+    "native_source_identity": {
+      "exit_code": 0,
+      "status": "PASS",
+      "revision_and_tree_match": true,
+      "native_receipt_presence_and_work_coverage_enforced": true,
+      "phase_trace_match": true,
+      "attestation_sha256": "beabf18ea54760ed0a8b5fdf3397a099a45a2d503c89fcfa47cd754782655574"
+    },
+    "legacy_verify": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 7,
+      "log_sha256": "e5fd1be4d7b1063355132cc3d1c2f1bf15ae410cbdf6d89d5b8a09bce91cb8ad"
+    },
+    "tencent_interface": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 33,
+      "skipped": 0,
+      "live_account_used": false,
+      "run_instances_false_surface_present": false,
+      "log_sha256": "7890462df5398bba4309248dcb90307245004c4e116243c383be602b0994989e"
+    },
+    "toolchain_lock": {
+      "exit_code": 0,
+      "status": "PASS",
+      "schema_version": "txnopt-toolchain-lock-v1",
+      "lock_sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d"
+    },
+    "asan_ubsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "ctest_passed": 1,
+      "ctest_total": 1,
+      "log_sha256": "6a92dc390a7db65ea15012dec9769231be5bf70909b27bb0fc5144f689a9537b"
+    },
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "ctest_passed": 1,
+      "ctest_total": 1,
+      "log_sha256": "d915577febf7f3eb50667bd62a1513d5c8232535c2a2eac3d26c961f6fd6620c"
+    },
+    "resource_soak": {
+      "exit_code": 0,
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "fallback_count": 0
+    },
+    "historical_protected_paths": {
+      "exit_code": 0,
+      "status": "UNCHANGED",
+      "build14_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+      "attempt25_sha256": "3251a1b31b9def18cf99e210449eedac04401a09178e4948cccc1eb170c524b5",
+      "attempt07_sha256": "ebd3a95f4318ce609d431dedef64a082e6d94828287bfcc7f3d60a7da5390839",
+      "attempt24_manifest_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+      "attempt24_analysis_sha256": "ea726847648c241db15beeecee81f22668eeddd47d53ad03353e09f6256c86d1"
+    }
+  },
+  "validation_harness_diagnostics": [
+    {
+      "step": "first installed-wheel pytest collection",
+      "initial_exit_code": 1,
+      "classification": "TEST_HARNESS_REPOSITORY_TOOL_PATH_MISSING",
+      "reason": "the native attestation test imports the pre-build-only tools package while product imports must remain wheel-installed",
+      "corrected_boundary": "only the repository root, not src, was added to PYTHONPATH; all product module origins remained inside the Build18 venv",
+      "corrected_exit_code": 0,
+      "corrected_result": "346 installed-wheel tests passed with zero skips"
+    },
+    {
+      "step": "installed-wheel verification receipt metadata",
+      "initial_exit_code": 0,
+      "classification": "NON_SEMANTIC_RECEIPT_LABEL_CORRECTION",
+      "reason": "the first receipt labelled the site-packages parent as python_prefix",
+      "corrected_boundary": "a v2 receipt records sys.prefix while repeating the full wheel, RECORD, and installed-byte verification",
+      "corrected_exit_code": 0,
+      "corrected_result": "70 wheel and RECORD rows plus 69 installed non-RECORD entries verified"
+    }
+  ],
+  "claim_boundary": {
+    "build_complete": true,
+    "independent_review_completed": false,
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "holdout_opened": false,
+    "public_release_authorized": false,
+    "source_push_completed": true,
+    "build_manifest_push_authorized": true,
+    "pending_gates": [
+      "materialize and independently verify Attempt28 without starting its raw root",
+      "complete Attempt29 representative local calibration and independent review",
+      "materialize and verify the credential-free Build18 Tencent deployment bundle",
+      "complete Precloud Attempt08 and Independent Review Attempt12",
+      "obtain separate Tencent account, live selection, DryRun, COS, purchase, and formal-matrix authorization"
+    ]
+  }
+}
