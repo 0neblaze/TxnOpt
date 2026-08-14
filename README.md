@@ -80,10 +80,14 @@ Rebuildable local state is tree-scoped outside the repository:
 ~/.cache/txnopt/<source-tree>/
 ```
 
-Formal evidence always requires an explicit governed output root. The internal
+When a local run config omits `output_root`, raw output defaults to the `runs/`
+directory below that tree-scoped state root. Formal evidence always requires an
+explicit governed output root. The internal
 `ArchiveStore` port currently has one production adapter,
-`LocalFilesystemArchiveStore`; no cloud-provider adapter is claimed before a
-provider is selected and separately authorized.
+`LocalFilesystemArchiveStore`, implemented with WSL/Linux POSIX no-follow and
+atomic no-replace primitives. Native Windows archive portability and every
+cloud-provider adapter remain unimplemented until separately designed,
+validated, and authorized.
 
 ## Evidence and formal verification
 

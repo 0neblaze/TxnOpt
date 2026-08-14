@@ -18,6 +18,7 @@ from txnopt_evidence.reviewer import (
     verify_legacy_manifest,
     verify_manifest,
 )
+from txnopt_evidence.workspace import require_governed_external_root
 from txnopt_legacy import LegacyReceiptReader
 
 _VERSION: Final = "0.1.0a1"
@@ -148,7 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "status": "verified",
                 "legacy_schema_version": payload.get("schema_version", ""),
             }
-    except (OSError, RuntimeError, ValueError) as error:
+    except (ImportError, OSError, RuntimeError, ValueError) as error:
         return _error(str(arguments.command), error)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -178,13 +179,17 @@ def _archive_command(arguments: argparse.Namespace) -> object:
 
     if arguments.archive_command == "inventory":
         return inventory_tree(arguments.source).to_payload()
-    store = LocalFilesystemArchiveStore(arguments.store)
+    _require_explicit_external_archive_root(arguments.store)
     if arguments.archive_command == "mirror":
+        _require_separate_archive_source(arguments.source, arguments.store)
+    if arguments.archive_command == "mirror":
+        store = LocalFilesystemArchiveStore(arguments.store)
         ref = mirror_tree(arguments.source, store=store, commit_id=arguments.commit_id)
         return {
             "schema_version": "txnopt-archive-mirror-result-v1",
             "commit_ref": _archive_ref_payload(ref),
         }
+    store = LocalFilesystemArchiveStore(arguments.store, create=False)
     ref = ArchiveCommitRef(
         commit_id=arguments.commit_id,
         sha256=arguments.commit_sha256,
@@ -209,6 +214,25 @@ def _archive_command(arguments: argparse.Namespace) -> object:
             "verified": restore_receipt.verified,
         }
     raise ValueError("unknown archive command")
+
+
+def _require_explicit_external_archive_root(path: Path) -> None:
+    require_governed_external_root(path)
+
+
+def _require_separate_archive_source(source: Path, store: Path) -> None:
+    source_path = source.expanduser().absolute()
+    store_path = store.expanduser().absolute()
+    if _path_contains(source_path, store_path) or _path_contains(store_path, source_path):
+        raise ValueError("archive source and store roots must not overlap")
+
+
+def _path_contains(parent: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _archive_ref_payload(ref: object) -> dict[str, object]:

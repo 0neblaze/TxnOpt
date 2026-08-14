@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,9 @@ def test_cli_run_and_replay_fail_closed_without_fallback(
     assert main(["replay", str(path), "--output-dir", str(tmp_path / "review")]) == 2
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
+)
 def test_cli_archive_inventory_mirror_verify_and_restore(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -88,3 +92,110 @@ def test_cli_archive_inventory_mirror_verify_and_restore(
     assert (destination / "evidence.json").read_bytes() == (
         source / "evidence.json"
     ).read_bytes()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
+)
+def test_cli_archive_rejects_relative_or_worktree_local_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "evidence.txt").write_text("evidence\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(
+        [
+            "archive",
+            "mirror",
+            str(source),
+            "--store",
+            "relative-archive",
+            "--commit-id",
+            "relative-store",
+        ]
+    ) == 2
+
+    worktree = tmp_path / "worktree"
+    (worktree / ".git").mkdir(parents=True)
+    assert main(
+        [
+            "archive",
+            "mirror",
+            str(source),
+            "--store",
+            str(worktree / "archive"),
+            "--commit-id",
+            "worktree-store",
+        ]
+    ) == 2
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
+)
+def test_cli_archive_rejects_overlapping_source_and_store(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "evidence.txt").write_text("evidence\n", encoding="utf-8")
+
+    assert main(
+        [
+            "archive",
+            "mirror",
+            str(source),
+            "--store",
+            str(source / "archive"),
+            "--commit-id",
+            "overlapping-store",
+        ]
+    ) == 2
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
+)
+def test_cli_archive_verify_missing_store_is_read_only(tmp_path: Path) -> None:
+    store = tmp_path / "missing-archive"
+
+    assert main(
+        [
+            "archive",
+            "verify",
+            "--store",
+            str(store),
+            "--commit-id",
+            "missing",
+            "--commit-sha256",
+            "0" * 64,
+            "--commit-size",
+            "0",
+        ]
+    ) == 2
+
+    assert not store.exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
+)
+def test_cli_archive_rejects_rebuildable_cache_root(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "evidence.txt").write_text("evidence\n", encoding="utf-8")
+    cache_home = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+
+    assert main(
+        [
+            "archive",
+            "mirror",
+            str(source),
+            "--store",
+            str(cache_home / "txnopt" / ("a" * 40) / "archive"),
+            "--commit-id",
+            "cache-store",
+        ]
+    ) == 2

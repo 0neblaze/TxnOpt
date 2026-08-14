@@ -27,6 +27,7 @@ from txnopt_evidence.lifecycle import (
     EvidenceState,
     lifecycle_evidence_sha256,
 )
+from txnopt_evidence.workspace import resolve_run_output_root
 
 _RUN_LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{2,127}")
 
@@ -58,26 +59,28 @@ def run_config(
     if payload.get("schema_version") != "txnopt-run-config-v1":
         raise ValueError("unsupported TxnOpt run config schema")
     run_label = payload.get("run_label")
-    output_root = payload.get("output_root")
+    configured_output_root = payload.get("output_root")
     run_config_payload = payload.get("run_config")
     case_payload = payload.get("case")
     if not isinstance(run_label, str) or _RUN_LABEL.fullmatch(run_label) is None:
         raise ValueError("run_label is not canonical")
-    if not isinstance(output_root, str) or not output_root:
-        raise ValueError("output_root must be a non-empty path string")
     if not isinstance(run_config_payload, dict) or not isinstance(case_payload, dict):
         raise ValueError("run_config and case must be objects")
     if json.loads(input_config_bytes) != dict(payload):
         raise ValueError("input config bytes differ from the parsed payload")
     input_sha256 = sha256_bytes(input_config_bytes)
     producer_identity = _producer_identity(payload.get("build_manifest"))
+    output_root = resolve_run_output_root(
+        configured_output_root,
+        producer_identity=producer_identity,
+    )
     lifecycle = EvidenceLifecycle.start(run_label, evidence_sha256=input_sha256).advance(
         EvidenceState.RUNNING,
         evidence_sha256=lifecycle_evidence_sha256(producer_identity),
     )
     config = parse_run_config(run_config_payload)
 
-    output_dir = Path(output_root).expanduser().resolve() / run_label
+    output_dir = output_root / run_label
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"raw run directory already exists: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=False)

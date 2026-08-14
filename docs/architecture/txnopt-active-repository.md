@@ -36,15 +36,18 @@ state: ~/.local/state/txnopt/<source-tree>/
 cache: ~/.cache/txnopt/<source-tree>/
 ```
 
-正式 evidence（证据）必须使用显式、受治理的外部 root，不允许从默认 cache
-推断 formal readiness（正式就绪状态）。`source-tree` 是当前 source identity
+普通 `txnopt run` 配置省略 `output_root` 时，runner 会实际写入上述 state 下的
+`runs/`；正式 evidence（证据）仍必须使用显式、受治理的外部 root，不允许从默认
+cache 推断 formal readiness（正式就绪状态）。`source-tree` 是当前 source identity
 （源码身份）绑定的 Git tree digest（Git 树摘要）；更换源码必须进入新目录。
 
 ## 4. ArchiveStore 接缝
 
 `ArchiveStore` 是 `txnopt_evidence` 内部 provider-neutral port（供应商中立端口），
 不从 `txnopt` 根包导出。当前唯一生产实现是
-`LocalFilesystemArchiveStore`；云厂商确定后，新的 object store adapter
+`LocalFilesystemArchiveStore`；它使用 WSL/Linux 的 POSIX no-follow（禁止跟随链接）
+与原子 no-replace（禁止替换）原语，当前不宣称原生 Windows portability（可移植性）。
+云厂商确定后，新的 object store adapter
 （对象存储适配器）必须复用相同契约测试。
 
 接口：
@@ -68,6 +71,13 @@ verify_commit(ref)
 6. verify 必须重算 commit 和所有引用 blob；
 7. restore 使用临时目录，目标已存在时拒绝覆盖，完成前不暴露最终目录；
 8. 路径穿越、符号链接、截断写入和摘要漂移均 fail closed（失败即停止）。
+9. mirror（镜像）前后源树摘要必须一致；崩溃遗留的不可见 staging（暂存）文件由
+   下一次持有独占 writer lock（写入锁）的适配器实例清理；
+10. CLI 的 archive store 必须是 Git 工作树外的显式绝对路径，且不得与镜像源重叠。
+11. inventory/mirror（清单/镜像）逐级拒绝源目录符号链接和非普通文件；`open` 在同一
+    文件句柄上先核验大小与 SHA-256，FIFO（命名管道）等对象不得阻塞读取；
+12. verify/restore（验证/恢复）以只读模式打开 store，不创建 root、锁或 staging；恢复
+    目标不得位于 store 内部。
 
 统一命令：
 
