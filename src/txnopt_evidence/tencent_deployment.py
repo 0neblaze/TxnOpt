@@ -230,13 +230,26 @@ def verify_tencent_deployment(manifest_path: Path) -> dict[str, object]:
 def _validate_inputs(inputs: TencentDeploymentInputs) -> dict[str, object]:
     build_digest = verify_sidecar(inputs.build_manifest)
     build = read_signed_json(inputs.build_manifest)
-    if build.get("run_label") != "txnopt_level1_build_attempt16":
+    if (
+        build.get("schema_version") != "txnopt-level1-build-manifest-v1"
+        or build.get("run_label") != "txnopt_level1_build_attempt16"
+    ):
         raise ValueError("deployment requires Build16")
-    if build.get("wheel_sha256") != sha256_file(inputs.wheel):
+    producer = build.get("producer")
+    artifacts = build.get("artifacts")
+    if not isinstance(producer, dict) or not isinstance(artifacts, dict):
+        raise ValueError("Build16 producer or artifact identity is missing")
+    wheel = artifacts.get("wheel")
+    native = artifacts.get("native_extension")
+    if not isinstance(wheel, dict) or not isinstance(native, dict):
+        raise ValueError("Build16 wheel or native identity is missing")
+    if wheel.get("sha256") != sha256_file(inputs.wheel):
         raise ValueError("Build16 wheel identity differs")
-    if build.get("source_manifest_sha256") != sha256_file(inputs.source_manifest):
+    if producer.get("source_manifest_sha256") != sha256_file(
+        inputs.source_manifest
+    ):
         raise ValueError("Build16 source manifest identity differs")
-    if build.get("native_build_attestation_sha256") != sha256_file(
+    if native.get("attestation_sha256") != sha256_file(
         inputs.native_attestation
     ):
         raise ValueError("Build16 native attestation identity differs")

@@ -84,11 +84,17 @@ tencent = [
     write_signed_json(
         build,
         {
-            "schema_version": "txnopt-level1-build-attempt-v1",
+            "schema_version": "txnopt-level1-build-manifest-v1",
             "run_label": "txnopt_level1_build_attempt16",
-            "wheel_sha256": sha256_file(wheel),
-            "source_manifest_sha256": sha256_file(source_manifest),
-            "native_build_attestation_sha256": sha256_file(native),
+            "producer": {
+                "source_manifest_sha256": sha256_file(source_manifest),
+            },
+            "artifacts": {
+                "wheel": {"sha256": sha256_file(wheel)},
+                "native_extension": {
+                    "attestation_sha256": sha256_file(native),
+                },
+            },
         },
     )
     plan = inputs / "attempt26.json"
