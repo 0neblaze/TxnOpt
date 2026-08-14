@@ -1,2 +1,0 @@
-first_run,second_run,status,first_gate_status,second_gate_status,first_run_keys,second_run_keys,configuration_match,details
-results/stage02-constraint-guided_attempt06,stage02_constraint_guided_rerun02,pass,pass,pass,36/36,36/36,True,first_gate=pass; second_gate=pass; first_keys=36/36; second_keys=36/36; configuration_match=True

@@ -654,8 +654,7 @@ def active_campaign_processes(plan: CampaignPlan) -> tuple[dict[str, object], ..
             executable_name.startswith("python")
             and any(marker in command for marker in markers)
             and (
-                "tools.run_txnopt_level1_campaign" in command
-                or "txnopt_evidence.level1_campaign_runner" in command
+                "txnopt_evidence.level1_campaign_runner" in command
                 or "txnopt_evidence.cli" in command
             )
         ):

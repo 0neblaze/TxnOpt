@@ -1,6 +1,0 @@
-gate,status,detail
-instance_coverage,PASS,csv=92 canonical=92
-bks_values_present,PASS,all 92 instances have bks_vehicles and bks_distance
-no_gap_computation,PASS,no gap columns
-compatibility_assessment_correct,PASS,all BKS and compatibility fields match canonical data
-replay_consistency,PASS,all BKS values match canonical data

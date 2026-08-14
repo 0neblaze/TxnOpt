@@ -93,8 +93,11 @@ txnopt archive restore --store <root> --commit-id <id> \
 ## 5. 不可变恢复边界
 
 重构前基线为 commit `5901a339ae0fa0fe490a67d2ce9d995a530d110b`、tree
-`8bd04d72f95d8e94d00750ddee899369acdc1400`，由本地 annotated tag
-（带说明标签）`txnopt-pre-refactor-v1` 和完整 Git bundle 保护。
+`8bd04d72f95d8e94d00750ddee899369acdc1400`，由 annotated tag
+（带说明标签）`txnopt-pre-refactor-v1` 和完整 Git bundle 保护。当前 TxnOpt
+分支与 `txnopt-pre-refactor-v1`、`stage052-legacy-freeze-v1` 已推送到远端，
+并已通过全新 clone（克隆）、tag 解析、`git fsck` 与受保护哈希复核；后续活树
+删除不改变这两个恢复对象。
 
 以下对象保持逐字节不变：
 
@@ -106,8 +109,10 @@ txnopt archive restore --store <root> --commit-id <id> \
   sidecars（哈希旁文件）；
 - `stage052-legacy-freeze-v1` 指向的历史标签和历史绝对路径。
 
-旧 tracked files（受版本控制文件）只有在当前 TxnOpt 分支与两个冻结标签完成
-远端推送，并从全新 clone（克隆）验证恢复后，才允许从活 HEAD 删除。
+活动测试按 `tests/core`、`tests/cases`、`tests/evidence`、`tests/workflows`、
+`tests/formal`、`tests/legacy` 分类。历史收据若绑定已经从活树删除的路径，验证器
+从冻结 tag 读取原字节，不修改收据或把旧工具重新装入 wheel。`tools/` 仅保留
+构建安装包之前必须执行的 `native_build_attestation.py`。
 
 ## 6. E 盘与未来云归档
 

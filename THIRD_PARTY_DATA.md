@@ -29,6 +29,6 @@ under ignored `document/literature/`; it is for private research use and must
 not be committed, released, or redistributed through this project.
 
 The public bibliographic records are maintained in
-[`docs/references.bib`](docs/references.bib), with a reader-facing index in
-[`docs/literature.md`](docs/literature.md). Bibliographic metadata and DOI
+[`docs/research/references.bib`](docs/research/references.bib), with a reader-facing index in
+[`docs/research/literature.md`](docs/research/literature.md). Bibliographic metadata and DOI
 links are attribution records, not permission to redistribute publisher PDFs.

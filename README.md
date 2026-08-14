@@ -51,7 +51,7 @@ Python 3.13 and [uv](https://docs.astral.sh/uv/) are required.
 uv sync --frozen --all-groups
 uv run ruff check src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy
 uv run mypy
-uv run pytest tests/txnopt -q
+uv run pytest -q
 ```
 
 The internal CLI surface is:
@@ -112,7 +112,7 @@ or rebuildable state, not the default destination and not formal evidence.
 The bounded formal receipt is re-run with:
 
 ```bash
-python tools/verify_txnopt_formal.py \
+python -m txnopt_evidence.formal_verify \
   --java /path/to/java \
   --tla2tools /path/to/tla2tools.jar
 ```
@@ -120,18 +120,12 @@ python tools/verify_txnopt_formal.py \
 Model-check success is not presented as a complete mathematical proof or an
 independent review.
 
-The Build11 evidence-lifecycle review packet can be machine-checked with
-`tools/verify_txnopt_build11_review_packet.py`. This verifies the request,
-bound source and artifact identities, installed wheel, sealed formal receipt,
-import independence, and request-scoped tests; it deliberately emits no
-independent review decision.
-
-Level 1 matrix materialization, cloud-window estimation, and the native
-resource soak are still transitional tools pending the remote recovery gate.
-They write signed receipts, never start a cloud server, and fail closed on
-incomplete catalogs, calibrations, or existing output paths. Their next active
-implementation belongs in `txnopt_evidence`; the frozen tool bytes referenced
-by prior attempts are not rewritten.
+Level 1 plan, preflight, raw execution, independent review, calibration,
+cloud-window estimation, and native resource-soak implementations live in
+`txnopt_evidence`. Only the first three safe control-plane operations exposed
+above are part of the unified CLI; formal execution still requires a separate
+signed authorization. Historical Build11 gate executors remain recoverable
+from the frozen Git tags and are not shipped in the active wheel.
 
 ## Frozen EVRPTW history
 

@@ -23,9 +23,10 @@ jobs:
       - run: >-
           uv run ruff check
           src/txnopt src/txnopt_cases src/txnopt_evidence src/txnopt_legacy
-          tests/txnopt
+          tests/core tests/cases tests/evidence
+          tests/workflows tests/formal tests/legacy
       - run: uv run mypy
-      - run: uv run pytest tests/txnopt -q
+      - run: uv run pytest -q
 
   windows-smoke:
     runs-on: windows-latest
@@ -39,4 +40,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --frozen --all-groups
-      - run: uv run pytest tests/txnopt -q
+      - run: uv run pytest -q

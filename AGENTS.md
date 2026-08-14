@@ -34,11 +34,13 @@ TxnOpt code.
   failure. Never describe it as a successful benchmark, revive it, reuse its
   label, or overwrite its raw/review evidence.
 - Historical run labels, Stage paths, manifests, registries, lifecycle states,
-  schemas, hashes, source maps, and old C++/Python ABI exports are immutable.
-  Do not move, rename, regenerate, relabel, or promote them.
-- `experiments/baselines/stage00/` is immutable. Large raw evidence remains in
-  ignored or governed external storage; tracked summaries must come from an
-  independent raw replay.
+  schemas, hashes, source maps, and old C++/Python ABI exports are immutable at
+  the frozen tags, Git bundle, and governed external archive. Do not recreate,
+  rewrite, relabel, or promote them in the active tree.
+- Historical Stage baselines and summaries are restored from
+  `txnopt-pre-refactor-v1` or `stage052-legacy-freeze-v1`; they are not active
+  package inputs. Large raw evidence remains in governed external storage, and
+  new tracked summaries must come from an independent raw replay.
 - Any code, config, ABI, runtime, resource, prerequisite, or evidence change
   requires a new TxnOpt source identity and attempt label. A failed attempt is
   append-only evidence.
@@ -58,6 +60,8 @@ cpp/txnopt_cases/evrptw/            EVRPTW native kernels
 formal/                             TLA+/PlusCal and refinement mapping
 experiments/txnopt/                 new protocol and evidence indexes
 legacy/                             frozen identity and governance metadata
+tests/{core,cases,evidence,workflows,formal,legacy}/
+tools/native_build_attestation.py  pre-build source attestation only
 ```
 
 The dependency direction is fixed:
@@ -224,7 +228,8 @@ legacy material, historical evidence, literature, and data licences. There may
 be no active `import evrptw`, old CLI wrapper, new `stage05.2` schema, or old
 native fallback in the TxnOpt artifact.
 
-Until that coordinated cutover is complete, preserve the old source paths and
-ABI rather than performing a visual mass rename that breaks historical
-identity. Mark transitional status honestly in the roadmap and do not publish a
-transitional wheel.
+The active-tree cutover is protected by the pushed `txnopt-pre-refactor-v1`
+and `stage052-legacy-freeze-v1` tags plus a verified fresh-clone recovery.
+Historical paths stay in those immutable recovery objects rather than the
+active HEAD. Every successor wheel still requires a new clean source identity
+and full gate evidence before publication.

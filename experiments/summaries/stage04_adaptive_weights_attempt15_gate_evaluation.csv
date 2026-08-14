@@ -1,7 +1,0 @@
-gate,status,details
-operator_call_sufficiency,pass,all wall_clock axes passed per-operator segment audit
-six_category_statistics,pass,all adaptive_wall_clock axes have complete reconciled six-category statistics
-adaptive_better_than_fixed,pass,"adaptive wins 7 (instance, seed) pairs; need >= 3. won: [('c101_21', 2014), ('c101_21', 2015), ('c101_21', 2016), ('r101_21', 2015), ('r105C15', 2016), ('rc101_21', 2014), ('rc101_21', 2015)]"
-not_single_best_seed,pass,"adaptive wins on 3 unique seeds: [2014, 2015, 2016]; need >= 2."
-std_not_increased,pass,Stage 4 vehicle_count std <= Stage 0 for all instances
-replay_consistency,pass,exact 144-axis scope; all objectives and exact-call counts match
