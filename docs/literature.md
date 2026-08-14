@@ -12,10 +12,20 @@ not covered by Apache-2.0 and must not be committed or redistributed.
 | `Montoya2017NonlinearCharging` | Montoya, A., Guéret, C., Mendoza, J. E., & Villegas, J. G. (2017). The Electric Vehicle Routing Problem with Nonlinear Charging Function. *Transportation Research Part B*, 103, 87-110. | Nonlinear-charging roadmap | [10.1016/j.trb.2017.02.004](https://doi.org/10.1016/j.trb.2017.02.004) |
 | `Pelletier2016GoodsDistribution` | Pelletier, S., Jabali, O., & Laporte, G. (2016). Goods Distribution with Electric Vehicles: Review and Research Perspectives. *Transportation Science*, 50(1), 3-22. | Domain review and research framing | [10.1287/trsc.2015.0646](https://doi.org/10.1287/trsc.2015.0646) |
 | `Desaulniers2016ExactEVRPTW` | Desaulniers, G., Errico, F., Irnich, S., & Schneider, M. (2016). Exact Algorithms for Electric Vehicle-Routing Problems with Time Windows. *Operations Research*, 64(6), 1388-1405. | Exact branch-price-and-cut benchmark and Stage 6 context | [10.1287/opre.2016.1535](https://doi.org/10.1287/opre.2016.1535) |
+| `Jia2022BilevelACO` | Jia, Y.-H., Mei, Y., & Zhang, M. (2022). A Bilevel Ant Colony Optimization Algorithm for Capacitated Electric Vehicle Routing Problem. *IEEE Transactions on Cybernetics*, 52(10), 10855-10868. | Bilevel route/charging decomposition and fixed-route charging heuristics; out-of-family CEVRP reference only | [10.1109/TCYB.2021.3069942](https://doi.org/10.1109/TCYB.2021.3069942) |
+| `Jia2022ConfidenceACO` | Jia, Y.-H., Mei, Y., & Zhang, M. (2022). Confidence-Based Ant Colony Optimization for Capacitated Electric Vehicle Routing Problem With Comparison of Different Encoding Schemes. *IEEE Transactions on Evolutionary Computation*, 26(6), 1394-1408. | Selective lower-level evaluation, encoding analysis, and candidate-ranking context; not a safe-screening rule | [10.1109/TEVC.2022.3144142](https://doi.org/10.1109/TEVC.2022.3144142) |
+| `Feng2024BilevelHGA` | Feng, C.-T., Jia, Y.-H., Yang, Q., Chen, W.-N., & Jiang, H. (2024). A Bilevel Hybrid Genetic Algorithm for Capacitated Electric Vehicle Routing Problem. In *2024 IEEE Congress on Evolutionary Computation (CEC)* (pp. 1-8). IEEE. | Hybrid upper-level search and lower-level screening/enumeration; heuristic pipeline reference only | [10.1109/CEC60901.2024.10611987](https://doi.org/10.1109/CEC60901.2024.10611987) |
+
+## TxnOpt research assessments
+
+- [External methods and benchmark boundary](research/txnopt-external-methods-and-benchmarks-2026.md)
+- [Publication gap audit](research/txnopt-publication-gap-audit-2026.md)
+- [Provider-neutral cloud resource boundary](research/txnopt-cloud-resource-boundary-2026.md)
+- [Windows salvage source audit](research/txnopt-windows-salvage-source-audit.md)
 
 ## Local file audit
 
-The local collection contains six unique cited articles and two alternate PDF
+The local collection contains nine unique cited works and two alternate PDF
 copies:
 
 - `03_Keskin_Catay_2016_Transportation_Research_Part_C_alternate.pdf`
