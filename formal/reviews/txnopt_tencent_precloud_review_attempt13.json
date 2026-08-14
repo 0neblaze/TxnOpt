@@ -1,0 +1,169 @@
+{
+  "schema_version": "txnopt-tencent-precloud-independent-review-v1",
+  "run_label": "txnopt_tencent_precloud_review_attempt13",
+  "status": "NEEDS_WORK",
+  "completed_at_utc": "2026-08-14T23:39:22Z",
+  "review_scope": {
+    "reviewed_revision": "73984a661310db6e327d573606c6d6cbb6e0770f",
+    "reviewed_tree": "7dd0169c04f8fcfc6e98212584a23987228a71c5",
+    "review_checkout": "/home/oneblaze/txnopt-recovery/tencent-precloud09-73984a6",
+    "producer_build": "Build19",
+    "formal_plan_attempt": 30,
+    "local_calibration_attempt": 31,
+    "precloud_attempt": 9,
+    "cloud_account_used": false,
+    "live_cloud_request_sent": false,
+    "e_drive_written_or_deleted": false
+  },
+  "reviewer_independence": {
+    "standards_axis_agent": "review13_standards",
+    "spec_axis_agent": "review13_spec",
+    "fixed_fresh_clone": true,
+    "producer_process_reused": false,
+    "mutable_producer_cache_reused": false,
+    "reviewer_imports_runner": false,
+    "review_artifact_written_by_axis_agents": false
+  },
+  "independent_evidence": {
+    "build19_git_blob_count": 270,
+    "build19_git_blob_mismatch_count": 0,
+    "wheel_entry_count": 70,
+    "wheel_record_row_count": 70,
+    "formal_plan_config_count": 2880,
+    "formal_plan_expected_identity_count": 2880,
+    "formal_plan_tree_recomputation": "PASS",
+    "formal_raw_root_absent": true,
+    "atomic_launch_claim_absent": true,
+    "calibration_raw_count": 96,
+    "calibration_review_count": 96,
+    "calibration_sidecar_match_count": 576,
+    "independent_replay_process_count": 96,
+    "independent_replay_byte_identical_count": 96,
+    "fixed_work_parity_group_count": 12,
+    "prefix_safety_pass_count": 96,
+    "refinement_pass_count": 96,
+    "native_round_observation_count": 164,
+    "positive_cmax_count": 96,
+    "semantic_exact_work_run_count": 92,
+    "fallback_count": 0,
+    "peak_rss_bytes": 244408320,
+    "capacity_predicted_seconds": 2059.3587537429194,
+    "capacity_usable_core_tokens": 51,
+    "deployment_declared_file_count": 18,
+    "deployment_tree_sha256": "0fd6f3930341971f8ee805b82697ad5943c4eaad02950a98721154836a3f9dec",
+    "local_doctor_expected_failure_physical_cores": 12,
+    "standards_targeted_tests_passed": 40,
+    "spec_targeted_tests_passed": 83,
+    "build19_recorded_wheel_tests": "354 passed, 0 skipped",
+    "ruff_result": "PASS",
+    "strict_mypy_result": "PASS (59 source files)",
+    "formal_state_counts": {
+      "primary": {
+        "generated": 75,
+        "distinct": 22
+      },
+      "pluscal": {
+        "generated": 36402,
+        "distinct": 8134
+      },
+      "t3_quotient": {
+        "generated": 5,
+        "distinct": 5
+      }
+    }
+  },
+  "standards_axis": {
+    "status": "NEEDS_WORK",
+    "finding_counts": {
+      "critical": 0,
+      "major": 2,
+      "minor": 0
+    },
+    "findings": [
+      {
+        "id": "STANDARDS-13-01",
+        "severity": "MAJOR",
+        "path": "experiments/txnopt/README.md",
+        "line": 112,
+        "title": "Operator instructions still bind active execution to Build14 and a deleted reviewer command",
+        "impact": "The current experiment README can direct an operator to an immutable predecessor wheel and python -m tools.review_txnopt_level1_campaign, although the tools module no longer exists and the unified txnopt review command is the active surface."
+      },
+      {
+        "id": "STANDARDS-13-02",
+        "severity": "MAJOR",
+        "path": "docs/roadmap/README.md",
+        "line": 19,
+        "related_paths": [
+          "docs/architecture/txnopt-active-repository.md",
+          "experiments/txnopt/INDEX.md"
+        ],
+        "title": "Supporting architecture and chronology documents still call superseded builds current",
+        "impact": "Build10, Build03, and Build11 are still described as current, while the architecture pairing omits Build19/Attempt30/31; this conflicts with the active roadmap and Precloud09."
+      }
+    ]
+  },
+  "spec_axis": {
+    "status": "NEEDS_WORK",
+    "finding_counts": {
+      "critical": 0,
+      "major": 1,
+      "minor": 0
+    },
+    "findings": [
+      {
+        "id": "SPEC-13-01",
+        "severity": "MAJOR",
+        "paths": [
+          "src/txnopt_evidence/tencent_cos.py",
+          "src/txnopt_evidence/tencent_cloud.py",
+          "src/txnopt_evidence/cli.py"
+        ],
+        "title": "CAM-role temporary credential material can survive SDK exception serialization",
+        "impact": "Redaction only knows current or snapshotted environment values. Synthetic CAM-role secrets embedded by third-party COS/CVM SDK exceptions survive into TencentCosError and CLI stderr, violating the no-secret-in-exception-or-log boundary.",
+        "adversarial_probe": {
+          "cos_cam_role_secret_material_survives": true,
+          "cvm_cam_role_secret_material_survives": true,
+          "cli_cam_role_secret_material_survives": true,
+          "environment_snapshot_redaction_pass": true
+        },
+        "required_fix": "Do not expose untrusted third-party SDK exception text. Emit only operation, exception category, and allowlisted safe codes or request identifiers, with CAM-role and nested-exception regression tests."
+      }
+    ]
+  },
+  "finding_counts": {
+    "critical": 0,
+    "major": 3,
+    "minor": 0
+  },
+  "protected_history": {
+    "build14_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+    "build16_sha256": "702aa53e07eaf8171498cc233ea416dcd2d31a38717409a47645187b29dffe7c",
+    "build18_sha256": "0ce681854d45f065bd6b05065531903537249a32dd1be92613be0e4909fc47d8",
+    "build19_sha256": "88b5efceceab240068e5f523a05926e90596cc13f5dbac62ae9afd3d146d0cf0",
+    "attempt24_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+    "attempt25_sha256": "3251a1b31b9def18cf99e210449eedac04401a09178e4948cccc1eb170c524b5",
+    "precloud07_sha256": "ebd3a95f4318ce609d431dedef64a082e6d94828287bfcc7f3d60a7da5390839",
+    "review12_sha256": "4f505414ee197f76a3757d89cd4bf1b14f59bfb2a164740c0f80af50b3686e11",
+    "precloud09_sha256": "f717d4bc8b2d183670955cd169784e5823d5f8123b40d6145a76c526de27d072",
+    "e_drive_registry_sha256": "15b9eb5eae6e67cf5124985c36289fb349649a64ce919dc8f2796b3088544fc4",
+    "historical_bytes_rewritten": false,
+    "e_drive_written_or_deleted": false
+  },
+  "claim_boundary": {
+    "independent_review_completed": true,
+    "account_independent_work_complete": false,
+    "ready_for_tencent_account_input": false,
+    "tencent_account_configured": false,
+    "live_dry_run_completed": false,
+    "cloud_purchase_authorized": false,
+    "instance_creation_authorized": false,
+    "cos_live_operation_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "public_release_authorized": false,
+    "e_drive_deletion_authorized": false
+  },
+  "next_action": "Preserve this failed Review13, fix all three major findings under a new source identity, create Build20 with formal Attempt32 and local calibration Attempt33, then issue Precloud Attempt10 and a fresh Independent Review Attempt14 without overwriting Build19, Attempts30/31, Precloud09, or Review13."
+}
