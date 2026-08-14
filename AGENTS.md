@@ -11,8 +11,10 @@ TxnOpt code.
 - This repository is being transformed in place into **TxnOpt**. Do not create
   a replacement repository or discard Git history.
 - The authoritative implementation checkout is the WSL ext4 path
-  `/home/oneblaze/work/Reproducible-EVRPTW`. A Windows checkout or old worktree
-  is not authoritative by proximity.
+  `/home/oneblaze/work/TxnOpt`. The old WSL path
+  `/home/oneblaze/work/Reproducible-EVRPTW` is a compatibility symlink only;
+  historical evidence containing that absolute path must not be rewritten. A
+  Windows checkout or old worktree is not authoritative by proximity.
 - The active roadmap is
   `docs/roadmap/txnopt-level1-to-level3-roadmap.md`. The ignored private
   appendix is `docs/roadmap/txnopt-research-strategy.local.md`.
