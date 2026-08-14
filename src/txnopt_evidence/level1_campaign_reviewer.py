@@ -382,14 +382,7 @@ def _audit_t4_waste_events(
         ):
             raise ValueError("campaign T4 event lacks its independently recomputed Cmax cost")
     expected_abort_audits = (
-        sum(
-            event.get("event") == "candidate_transaction"
-            and event.get("phase") in {"ABORTED", "INTERRUPTED"}
-            and isinstance(event.get("started_work"), int)
-            and not isinstance(event.get("started_work"), bool)
-            and event["started_work"] > 0
-            for event in semantic_events
-        )
+        _expected_fixed_work_abort_audits(semantic_events)
         if budget == "fixed_work"
         else 0
     )
@@ -401,6 +394,40 @@ def _audit_t4_waste_events(
         "expected_fixed_work_abort_audit_count": expected_abort_audits,
         "independently_recomputed_t4_event_count": len(waste_events),
     }
+
+
+def _expected_fixed_work_abort_audits(
+    semantic_events: tuple[dict[str, Any], ...],
+) -> int:
+    """Count terminal ledgers that prove new work was discarded.
+
+    ``started_work`` is a cumulative run ledger.  A reservation denial reports
+    the already committed ledger again, so a positive absolute value does not
+    by itself prove that the interrupted transaction started work.  Only a
+    terminal ABORTED/INTERRUPTED ledger that advances beyond the previous
+    terminal ledger requires a corresponding T4 waste observation here.
+    """
+
+    previous_terminal_started_work = 0
+    expected = 0
+    for event in semantic_events:
+        if event.get("event") != "candidate_transaction":
+            continue
+        phase = event.get("phase")
+        if phase not in {"COMMITTED", "ABORTED", "INTERRUPTED"}:
+            continue
+        started_work = event.get("started_work")
+        if isinstance(started_work, bool) or not isinstance(started_work, int):
+            continue
+        if phase in {"ABORTED", "INTERRUPTED"} and started_work > (
+            previous_terminal_started_work
+        ):
+            expected += 1
+        previous_terminal_started_work = max(
+            previous_terminal_started_work,
+            started_work,
+        )
+    return expected
 
 
 def _aggregate(

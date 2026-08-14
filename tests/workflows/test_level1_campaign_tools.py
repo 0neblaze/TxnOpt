@@ -858,6 +858,36 @@ def test_campaign_recomputes_t4_bounds_and_requires_fixed_work_abort_audit() -> 
         )
 
 
+def test_fixed_work_reservation_denial_does_not_claim_committed_work_as_waste() -> None:
+    semantic = (
+        {
+            "event": "candidate_transaction",
+            "phase": "COMMITTED",
+            "started_work": 896,
+        },
+        {
+            "event": "candidate_transaction",
+            "phase": "INTERRUPTED",
+            "requested_work": 896,
+            "started_work": 896,
+            "remaining_work": 0,
+        },
+    )
+    observation = {
+        "event": "run_observation",
+        "observed_cmax_upper_ns": 10,
+    }
+
+    receipt = _audit_t4_waste_events(
+        (observation,),
+        semantic_events=semantic,
+        budget="fixed_work",
+    )
+
+    assert receipt["expected_fixed_work_abort_audit_count"] == 0
+    assert receipt["t4_waste_event_count"] == 0
+
+
 def test_subprocess_timeout_terminates_the_complete_process_group(tmp_path: Path) -> None:
     script = (
         "import subprocess,sys,time; "
