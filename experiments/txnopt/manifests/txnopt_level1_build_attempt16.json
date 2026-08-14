@@ -1,0 +1,286 @@
+{
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "run_label": "txnopt_level1_build_attempt16",
+  "status": "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-14T18:42:28Z",
+  "successor_of": "txnopt_level1_build_attempt15",
+  "producer": {
+    "revision": "2b83bea312118af767e7cc6960abcc6a2181f6b3",
+    "git_tree": "99b8d20189dc20c623bda73d6e6b48bf97f1fccc",
+    "source_manifest_sha256": "f1614eb1dd2525603dae1b20e9dc71a0faae9cd6ab27aabfafc3f6cb6a20c1da",
+    "tracked_file_count": 254,
+    "source_dirty": false,
+    "development_override": false,
+    "cpp_source_kind": "git_blob_snapshot",
+    "performance_profile": "portable-o3",
+    "compiler_id": "GNU",
+    "compiler_version": "13.3.0"
+  },
+  "artifacts": {
+    "wheel": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/wheel/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "sha256": "5a6a18e8aac177a7adf6cf64fc158379ad9c333fa4b9cc1872ff03f6ac0df3ec",
+      "entry_count": 69,
+      "record_row_count": 69,
+      "installed_non_record_bytes_compared": 68,
+      "verification_status": "PASS"
+    },
+    "source_archive": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "2eb1a2f3f19c70ec3a9f0902c2bbec65cd15da67922249a3b632dfc993d5711b",
+      "entry_count": 289
+    },
+    "native_extension": {
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so",
+      "sha256": "5a912fc07320edcb9d2a3887ec57ec0b04fe2b891a0b0613fea42741ee47f4f5",
+      "protocol": "txnopt-native-round-v1",
+      "prepared_receipt_trace": "txnopt-physical-trace-v1",
+      "attestation_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/native-build-attestation-attempt16.json",
+      "attestation_sha256": "814f0e1ac9322af872566eb35e06859b8ed88b0e8d71c60b53cd5ef85c6ffbe2"
+    },
+    "resource_soak": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/resource-soak-attempt16.json",
+      "sha256": "2e333ea72075b450214c833df8f670541f6a5600717eaa7455f7b7149bda0278",
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "native_round_call_count": 101000,
+      "rss_growth_kib": 0,
+      "thread_delta": 0,
+      "fd_delta": 0,
+      "fallback_count": 0
+    },
+    "toolchain_lock": {
+      "external_path": "/home/oneblaze/txnopt-toolchains/tencent-precloud-v1/txnopt-toolchain-lock-v1.json",
+      "sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d",
+      "status": "TOOLCHAIN_COMPLETE"
+    }
+  },
+  "runtime_change": {
+    "components": [
+      "txnopt_evidence.archive",
+      "txnopt_evidence.cli",
+      "txnopt_evidence.level1_protocol",
+      "txnopt_evidence.level1_calibration",
+      "txnopt_evidence.level1_campaign_common",
+      "txnopt_evidence.level1_campaign_runner",
+      "txnopt_evidence.level1_campaign_reviewer",
+      "txnopt_evidence.tencent_cloud",
+      "txnopt_evidence.tencent_cos",
+      "txnopt_evidence.tencent_deployment",
+      "txnopt_evidence.toolchain"
+    ],
+    "properties": [
+      "generic ArchiveStore, local archive backend, and S3 compatibility paths are absent",
+      "archive inventory is local read-only and cannot publish or restore evidence",
+      "Tencent CVM dry-run first verifies the exact zone and instance type through DescribeZoneInstanceConfigInfos",
+      "RunInstances is publicly reachable only with DryRun=true and CpuTopology CoreCount=64 ThreadPerCore=1",
+      "provider memory admission uses the authenticated Tencent SKU response and requires at least 128 GB",
+      "Linux visible memory is observational while Attempt27 peak RSS must remain below 80 percent",
+      "Tencent COS binds exact VersionId, SHA-256, byte size, COMPLIANCE retention, and last-write commit marker",
+      "Level 1 protocol v2 is restricted to Build16 and Attempt26 while Build14 and Attempt24 remain immutable v1 compatibility inputs",
+      "Attempt27 calibration records per-process and aggregate peak RSS",
+      "runner produces raw evidence only and reviewer remains an independent process"
+    ],
+    "semantic_trace_changed": false,
+    "physical_trace_changed": false,
+    "raw_artifact_schema": "txnopt-raw-artifact-v3",
+    "failure_artifact_schema": "txnopt-failure-artifact-v3",
+    "review_artifact_schema": "txnopt-independent-review-v3",
+    "campaign_plan_schema": "txnopt-level1-campaign-plan-v2",
+    "protocol_schema": "txnopt-level1-protocol-v2",
+    "lifecycle_schema": "txnopt-evidence-lifecycle-v1",
+    "fallback_count": 0
+  },
+  "formal_successor": {
+    "prior_reviewed_correction_path": "formal/reviews/txnopt_t3_t4_proof_correction_attempt04.json",
+    "prior_reviewed_correction_sha256": "858bc5a3a5c0da6725b1df3bfeb0ca0c7bcf73d479fb7d3de885f1fb7e8d0d94",
+    "prior_independent_review_path": "formal/reviews/txnopt_t3_t4_review_attempt05.json",
+    "prior_independent_review_sha256": "93d1f11509a5a0f4470c06f4dc8cdbc4cb4ca8c7e51e9855aa5d8adc5b98ed88",
+    "build14_independent_review_path": "formal/reviews/txnopt_evidence_lifecycle_review_attempt11.json",
+    "build14_independent_review_sha256": "37270d49fd31b2e71fadfd706be18b043b482908d11cd74af08ca46da41b0c9b",
+    "model_check_receipt_path": "formal/model-check-receipt.json",
+    "model_check_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "live_verification_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/formal-live-attempt16.json",
+    "live_verification_sha256": "9a992ebbea4a081c1b066f898681fb5d8bdd9ff31b078c55c6f07f4ee0a17f22",
+    "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+    "successor_status": "REVIEW_PENDING_BUILD16",
+    "independent_successor_review_completed": false,
+    "level1_formal_gate_passed": false
+  },
+  "build15_disposition": {
+    "external_manifest_path": "/home/oneblaze/txnopt-builds/archive-store-build15-f995852-attempt01/txnopt-successor-build-candidate-attempt15.json",
+    "external_manifest_sha256": "7154be88afae294901959ea0b4d08bfa387ed55d5d2df0c049fd210dc2ec74ab",
+    "status": "SUPERSEDED_BY_BUILD16_NOT_REWRITTEN"
+  },
+  "superseded_active_evidence": {
+    "local_calibration": "txnopt_level1_local_calibration_attempt25",
+    "formal_plan": "level1-formal-plan-attempt24",
+    "precloud_gate": "txnopt_level1_precloud_gate_attempt07",
+    "binding_status": "IMMUTABLE_PRIOR_BUILD_EVIDENCE_NOT_REBOUND_TO_BUILD16"
+  },
+  "validation": {
+    "ruff": {
+      "exit_code": 0,
+      "status": "PASS",
+      "log_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/logs/ruff.log",
+      "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "strict_mypy": {
+      "exit_code": 0,
+      "status": "PASS",
+      "source_file_count": 58,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/logs/mypy.log",
+      "log_sha256": "8797c60315242ee16057cb107ea1ec62e2678d358c86bc2be797e23d87e87578"
+    },
+    "pytest_wheel_installed": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 331,
+      "skipped": 0,
+      "product_modules_loaded_from_installed_wheel": true,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-2b83bea-build16/logs/pytest-full.xml",
+      "log_sha256": "3536b6e99a66f73a92a7c7a0430d27cc873c7d98d6a109448b007bf366b25bd8"
+    },
+    "property_based_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "test_functions": 5,
+      "examples_per_function": 600,
+      "hypothesis_seeds": [20260816, 20260817, 20260818, 20260819, 20260820],
+      "passed_test_invocations": 25,
+      "log_sha256": [
+        "ceaeb2c60885ff2a2e25aceb9318c5f4fe6eeaafae85e6f747d0e4712a3371f4",
+        "afb953d9a4aca6b7971c0d19a51fb84234ea19d2e8d2a647b8d784c622dc90ba",
+        "6f7eb3b3e2fadfb7a5d7b868b930b0dacf6b4a06ac2ba0f53972dcbf8fa5e88a",
+        "4583df6ab85ecdccee8148241f53489a7c166e5b91b7e6528163608687d4dfa2",
+        "ff2afd4ae409c7e33a28ba32eca92c1596b8e1bfa48fd2cfefac2444d6d47316"
+      ]
+    },
+    "formal_contract_tests": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 15,
+      "log_sha256": "7867852a82abb20be47d220c86b9db84cf70b9596cefb1c6ca3e71e553961613"
+    },
+    "formal_model_receipt": {
+      "exit_code": 0,
+      "status": "PASS",
+      "receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+      "live_verification_sha256": "9a992ebbea4a081c1b066f898681fb5d8bdd9ff31b078c55c6f07f4ee0a17f22",
+      "primary_generated_states": 75,
+      "primary_distinct_states": 22,
+      "pluscal_generated_states": 36402,
+      "pluscal_distinct_states": 8134,
+      "t3_generated_states": 5,
+      "t3_distinct_states": 5
+    },
+    "wheel_surface_and_record": {
+      "exit_code": 0,
+      "status": "PASS",
+      "wheel_entry_count": 69,
+      "record_row_count": 69,
+      "installed_non_record_bytes_compared": 68,
+      "fallback_count": 0,
+      "receipt_sha256": "1d5926374496943dd3d5efaa7849cc009b4e1d331c1b65d131bb3870936f7749"
+    },
+    "native_source_identity": {
+      "exit_code": 0,
+      "status": "PASS",
+      "revision_and_tree_match": true,
+      "native_receipt_presence_and_work_coverage_enforced": true,
+      "phase_trace_match": true,
+      "attestation_sha256": "814f0e1ac9322af872566eb35e06859b8ed88b0e8d71c60b53cd5ef85c6ffbe2"
+    },
+    "legacy_verify": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 7,
+      "log_sha256": "d14d8ad2ec9753b34399e501b8694ae149c210c9f845c5fc87d43a473e7d7611"
+    },
+    "tencent_interface": {
+      "exit_code": 0,
+      "status": "PASS",
+      "passed": 33,
+      "skipped": 0,
+      "live_account_used": false,
+      "run_instances_false_surface_present": false,
+      "log_sha256": "a9711784f19a30574d9aefef4fb5ef3d44c0f525eca9087b5ab81336144746b5"
+    },
+    "toolchain_lock": {
+      "exit_code": 0,
+      "status": "PASS",
+      "schema_version": "txnopt-toolchain-lock-v1",
+      "lock_sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d"
+    },
+    "asan_ubsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "ctest_passed": 1,
+      "ctest_total": 1,
+      "log_sha256": "db0a95f4c17a4bcfd6611a1a863ea07e0c93c50428550d6c584e76dcefee2f29"
+    },
+    "tsan": {
+      "exit_code": 0,
+      "status": "PASS",
+      "ctest_passed": 1,
+      "ctest_total": 1,
+      "log_sha256": "fa1f0f568d164b3273008c7f102e731a1c7cbb98e4cc358146f934b01bae4933"
+    },
+    "resource_soak": {
+      "exit_code": 0,
+      "status": "PASS",
+      "completed_rounds": 100000,
+      "warmup_rounds": 1000,
+      "fallback_count": 0
+    },
+    "historical_protected_paths": {
+      "exit_code": 0,
+      "status": "UNCHANGED",
+      "build14_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+      "attempt25_sha256": "3251a1b31b9def18cf99e210449eedac04401a09178e4948cccc1eb170c524b5",
+      "attempt07_sha256": "ebd3a95f4318ce609d431dedef64a082e6d94828287bfcc7f3d60a7da5390839",
+      "attempt24_manifest_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+      "attempt24_analysis_sha256": "ea726847648c241db15beeecee81f22668eeddd47d53ad03353e09f6256c86d1"
+    }
+  },
+  "validation_harness_diagnostics": [
+    {
+      "step": "predecessor candidate full installed-wheel suite",
+      "initial_exit_code": 1,
+      "classification": "FROZEN_ROADMAP_HASH_BOUNDARY",
+      "reason": "a historical completion audit binds the prior roadmap bytes",
+      "corrected_boundary": "the roadmap bytes were restored and Tencent documentation remains in new architecture and research files",
+      "corrected_exit_code": 0,
+      "corrected_result": "331 installed-wheel tests passed"
+    },
+    {
+      "step": "ASan CMake frontend invocation",
+      "initial_exit_code": 1,
+      "classification": "HARNESS_ARGUMENT_FORWARDING_ERROR",
+      "reason": "the outer Windows shell split the Python 3.13 pybind11 path",
+      "corrected_boundary": "CMake was invoked inside WSL with exact quoted POSIX paths and fresh configuration",
+      "corrected_exit_code": 0,
+      "corrected_result": "ASan/UBSan CTest 1 of 1 passed"
+    }
+  ],
+  "claim_boundary": {
+    "build_complete": true,
+    "independent_review_completed": false,
+    "level1_ready": false,
+    "publication_ready": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "holdout_opened": false,
+    "public_release_authorized": false,
+    "source_push_completed": true,
+    "build_manifest_push_authorized": true,
+    "pending_gates": [
+      "materialize and independently verify Attempt26 without starting its raw root",
+      "complete Attempt27 representative local calibration and independent review",
+      "materialize and verify the credential-free Tencent deployment bundle",
+      "complete Precloud Attempt08 and Independent Review Attempt12",
+      "obtain separate Tencent account, live selection, DryRun, COS, purchase, and formal-matrix authorization"
+    ]
+  }
+}
