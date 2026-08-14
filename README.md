@@ -1,8 +1,9 @@
 # TxnOpt
 
 TxnOpt is an auditable ordered-transaction runtime for state-dependent
-optimization. The active internal alpha is `0.1.0a1`; it is not published to
-PyPI, Zenodo, or a remote Git repository.
+optimization. The active internal alpha is `0.1.0a1`; it has not been released
+to PyPI, Zenodo, or as a public software release. Recovery branches and tags on
+the existing Git remote are not a release claim.
 
 The Level 1 implementation provides:
 
@@ -122,10 +123,11 @@ independent review.
 
 Level 1 plan, preflight, raw execution, independent review, calibration,
 cloud-window estimation, and native resource-soak implementations live in
-`txnopt_evidence`. Only the first three safe control-plane operations exposed
-above are part of the unified CLI; formal execution still requires a separate
-signed authorization. Historical Build11 gate executors remain recoverable
-from the frozen Git tags and are not shipped in the active wheel.
+`txnopt_evidence`. Plan materialization, fail-closed preflight, and independent
+review are exposed through the unified CLI. Formal execution still requires a
+separate signed authorization and is not implied by any of those commands.
+Historical Build11 gate executors remain recoverable from the frozen Git tags
+and are not shipped in the active wheel.
 
 ## Frozen EVRPTW history
 
@@ -138,11 +140,13 @@ Stage CLI wrappers; historical reproduction uses the frozen tag/wheel and the
 read-only `txnopt_legacy` reader.
 
 The pre-refactor TxnOpt recovery baseline is additionally preserved by the
-local annotated tag `txnopt-pre-refactor-v1` at commit
+annotated tag `txnopt-pre-refactor-v1` at commit
 `5901a339ae0fa0fe490a67d2ce9d995a530d110b` and an externally verified full Git
-bundle. Pushing this branch and both recovery tags remains separately
-authorized work; tracked legacy deletion is blocked until a fresh remote clone
-passes recovery checks.
+bundle. The active branch and both recovery tags are present on the existing
+remote, and a fresh clone has passed tag resolution, Git object verification,
+protected-hash checks, wheel installation, and the active test suite. This
+recovery publication does not rename the GitHub repository or authorize a
+public release.
 
 Schneider and PSPLIB benchmark data are not redistributed. Third-party data,
 papers, and solvers remain under their own licenses; see

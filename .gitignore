@@ -57,22 +57,6 @@ Thumbs.db
 *.pdf
 data/
 
-# Curated experiment summaries that are small enough to review
-!experiments/
-!experiments/summaries/
-!experiments/summaries/**/*.csv
-!experiments/summaries/**/*.tsv
-!experiments/baselines/
-!experiments/baselines/**/*.csv
-!experiments/registries/
-!experiments/registries/**/*.csv
-!experiments/manifests/
-!experiments/manifests/**/*.json
-# Stage 2.1 keeps complete high-volume operator logs in ignored results/;
-# only aggregate operator summaries and gate reports are tracked.
-experiments/summaries/stage02*_operator_events.csv
-experiments/summaries/stage02*_operator_failure_events.csv
-
 # Large media deliverables; store externally and link from docs
 *.mp4
 *.mov
@@ -112,35 +96,19 @@ secrets.*
 # Read-only reference repositories
 /reference/
 
-# Generated experiment output and local scratch work
+# Generated output and local scratch work. Active commands default to the
+# tree-scoped XDG state/cache roots; repository-local results are legacy or
+# unclassified data and never satisfy a formal evidence gate.
 /results/
 /outputs/
 /scratch/
 /tmp/
 
-# Machine-specific Stage 5.2 storage roots
-/configs/stage052_storage_roots.local.toml
-/.storage-governance/
-/configs/stage052_runtime_identity.local.json
-/configs/stage052_campaign_lock.local.json
-/configs/stage052_campaign_lock.local.sha256
-/configs/stage052_resource_calibration.local.json
-/configs/stage052_resource_calibration.local.sha256
-/configs/stage052_resource_calibration.local.report.json
-/configs/stage052_resource_calibration.local.report.sha256
-/configs/stage052_resource_calibration.local.review.json
-/configs/stage052_resource_calibration.local.review.json.sha256
-/configs/stage052_calibration_successor.local.json
-/configs/stage052_calibration_successor.local.sha256
-/configs/stage052_review_calibration.local.json
-/configs/stage052_review_calibration.local.sha256
-
 # Local databases and spill files
 *.sqlite
 *.sqlite3
 
-# Local evolving research roadmap (kept in the repository directory, not tracked)
-/docs/roadmap/evrptw-research-roadmap.local.md
+# Local evolving research inputs (kept in the repository directory, not tracked)
 /docs/roadmap/txnopt-research-strategy.local.md
 /experiments/txnopt/case-catalog.local.json
 /experiments/txnopt/runtime-calibration.local.json
