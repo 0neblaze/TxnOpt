@@ -398,6 +398,16 @@ def _orchestration_identity(repository: Path) -> dict[str, object]:
     }
 
 
+def _execution_python_path(path: Path) -> Path:
+    """Validate a Python launcher without collapsing its virtualenv identity."""
+
+    candidate = path.expanduser().absolute()
+    target = candidate.resolve(strict=True)
+    if not target.is_file() or not os.access(candidate, os.X_OK):
+        raise ValueError("calibration Python must resolve to an executable file")
+    return candidate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan-manifest", type=Path, required=True)
@@ -436,9 +446,7 @@ def main() -> int:
         raise FileExistsError(
             f"calibration plan root already exists: {calibration_plan_root}"
         )
-    execution_python = arguments.python.resolve(strict=True)
-    if execution_python.is_symlink() or not execution_python.is_file():
-        raise ValueError("calibration Python must be a regular executable")
+    execution_python = _execution_python_path(arguments.python)
     orchestration_identity = _orchestration_identity(
         arguments.orchestration_repository
     )

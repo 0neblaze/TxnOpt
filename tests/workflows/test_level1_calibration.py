@@ -10,6 +10,7 @@ import pytest
 from txnopt_evidence.codec import canonical_json_bytes, read_signed_json, write_signed_json
 from txnopt_evidence.level1_calibration import (
     CalibrationSelection,
+    _execution_python_path,
     _load_calibration_plan,
     _materialize_calibration_plan,
     _run,
@@ -45,6 +46,17 @@ def test_calibration_subprocess_does_not_inherit_pythonpath(
     )
 
     assert payload == {"pythonpath": None}
+
+
+def test_calibration_preserves_virtualenv_python_launcher(tmp_path: Path) -> None:
+    launcher = tmp_path / "venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(Path(sys.executable))
+
+    selected = _execution_python_path(launcher)
+
+    assert selected == launcher.absolute()
+    assert selected.is_symlink()
 
 
 def test_attempt27_materialization_cannot_write_attempt26_raw_root(
