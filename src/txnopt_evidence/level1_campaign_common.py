@@ -256,11 +256,13 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             raise ValueError("Build14 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
-    elif run_label in {
-        "txnopt_level1_build_attempt16",
-        "txnopt_level1_build_attempt18",
-    }:
-        successor_from_build_manifest(build)
+    else:
+        try:
+            successor_from_build_manifest(build)
+        except ValueError as error:
+            raise ValueError(
+                "campaign build identity is not an approved Level 1 producer"
+            ) from error
         surface_gate = "wheel_surface_and_record"
         additional_gates = (
             "formal_contract_tests",
@@ -269,8 +271,6 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             "tencent_interface",
             "toolchain_lock",
         )
-    else:
-        raise ValueError("campaign build identity is not an approved Level 1 producer")
     if schema_version == "txnopt-level1-campaign-plan-v2":
         if (
             protocol_schema == "txnopt-level1-protocol-v1"
