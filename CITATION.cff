@@ -7,7 +7,7 @@ authors:
   - family-names: Guo
     given-names: Yiyang
     affiliation: University of Nottingham Ningbo China
-repository-code: "https://github.com/0neblaze/Reproducible-EVRPTW"
+repository-code: "https://github.com/0neblaze/TxnOpt"
 license: Apache-2.0
 keywords:
   - transactional optimization
