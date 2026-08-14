@@ -44,20 +44,38 @@ def _inputs(tmp_path: Path, *, region: object = None) -> TencentDeploymentInputs
     source_manifest.write_text('{"source":"build16"}\n', encoding="utf-8")
     native = inputs / "native-attestation.json"
     native.write_text('{"source_revision":"build16"}\n', encoding="utf-8")
+    pyproject = inputs / "pyproject.toml"
+    pyproject.write_text(
+        """[project]
+requires-python = ">=3.13,<3.14"
+dependencies = []
+[project.optional-dependencies]
+tencent = [
+  "cos-python-sdk-v5==1.9.44",
+  "tencentcloud-sdk-python-common==3.1.156",
+  "tencentcloud-sdk-python-cvm==3.1.156",
+]
+""",
+        encoding="utf-8",
+    )
     uv_lock = inputs / "uv.lock"
     uv_lock.write_text("version = 1\n", encoding="utf-8")
+    uv_wheel = inputs / "uv-0.12.4-py3-none-manylinux2014_x86_64.whl"
+    uv_wheel.write_bytes(b"locked uv wheel")
     toolchain = inputs / "toolchain-lock.json"
     write_toolchain_lock(
         toolchain,
         [
             ToolchainEntry(
                 name=name,
-                version="locked",
+                version="0.12.4" if name == "uv" else "locked",
                 executable_path=f"/external/{name}",
                 sha256="a" * 64,
                 validation_exit_code=0,
                 source_url="https://example.invalid/tool",
-                download_sha256="b" * 64,
+                download_sha256=(
+                    sha256_file(uv_wheel) if name == "uv" else "b" * 64
+                ),
             )
             for name in _TOOLS
         ],
@@ -96,7 +114,9 @@ def _inputs(tmp_path: Path, *, region: object = None) -> TencentDeploymentInputs
         wheel=wheel,
         source_manifest=source_manifest,
         native_attestation=native,
+        pyproject=pyproject,
         uv_lock=uv_lock,
+        uv_wheel=uv_wheel,
         toolchain_lock=toolchain,
         plan_manifest=plan,
     )
@@ -118,6 +138,12 @@ def test_bundle_materializes_offline_no_secret_no_region_contract(tmp_path: Path
     assert receipt["credentials_included"] is False
     assert (destination / "bootstrap-ubuntu-24.04.sh").is_file()
     assert (destination / "cloud-init.yaml").is_file()
+    bootstrap = (destination / "bootstrap-ubuntu-24.04.sh").read_text()
+    assert "uv 0.12.4" in bootstrap
+    assert "3.13.13" in bootstrap
+    assert "sync --frozen --no-install-project --no-dev --extra tencent" in bootstrap
+    assert "pip install" in bootstrap
+    assert "txnopt._native" in bootstrap
     request = json.loads((destination / "runinstances-request-template.json").read_text())
     assert request["DryRun"] is True
     assert request["CpuTopology"] == {"CoreCount": 64, "ThreadPerCore": 1}
@@ -179,8 +205,12 @@ def test_bundle_and_bundle_verify_are_on_the_unified_cli(
             str(inputs.source_manifest),
             "--native-attestation",
             str(inputs.native_attestation),
+            "--pyproject",
+            str(inputs.pyproject),
             "--uv-lock",
             str(inputs.uv_lock),
+            "--uv-wheel",
+            str(inputs.uv_wheel),
             "--toolchain-lock",
             str(inputs.toolchain_lock),
             "--plan-manifest",

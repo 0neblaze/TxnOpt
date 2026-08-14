@@ -79,7 +79,9 @@ def _parser() -> argparse.ArgumentParser:
     tencent_bundle.add_argument("--wheel", type=Path, required=True)
     tencent_bundle.add_argument("--source-manifest", type=Path, required=True)
     tencent_bundle.add_argument("--native-attestation", type=Path, required=True)
+    tencent_bundle.add_argument("--pyproject", type=Path, required=True)
     tencent_bundle.add_argument("--uv-lock", type=Path, required=True)
+    tencent_bundle.add_argument("--uv-wheel", type=Path, required=True)
     tencent_bundle.add_argument("--toolchain-lock", type=Path, required=True)
     tencent_bundle.add_argument("--plan-manifest", type=Path, required=True)
     tencent_bundle_verify = tencent_commands.add_parser("bundle-verify")
@@ -377,7 +379,9 @@ def _cloud_command(arguments: argparse.Namespace) -> object:
                 wheel=arguments.wheel,
                 source_manifest=arguments.source_manifest,
                 native_attestation=arguments.native_attestation,
+                pyproject=arguments.pyproject,
                 uv_lock=arguments.uv_lock,
+                uv_wheel=arguments.uv_wheel,
                 toolchain_lock=arguments.toolchain_lock,
                 plan_manifest=arguments.plan_manifest,
             ),

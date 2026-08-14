@@ -31,7 +31,9 @@ class TencentDeploymentInputs:
     wheel: Path
     source_manifest: Path
     native_attestation: Path
+    pyproject: Path
     uv_lock: Path
+    uv_wheel: Path
     toolchain_lock: Path
     plan_manifest: Path
 
@@ -54,7 +56,9 @@ def materialize_tencent_deployment(
         ("wheel", inputs.wheel, inputs.wheel.name, False),
         ("source_manifest", inputs.source_manifest, "source-manifest.json", False),
         ("native_attestation", inputs.native_attestation, "native-attestation.json", False),
+        ("pyproject", inputs.pyproject, "pyproject.toml", False),
         ("uv_lock", inputs.uv_lock, "uv.lock", False),
+        ("uv_wheel", inputs.uv_wheel, inputs.uv_wheel.name, False),
         ("toolchain_lock", inputs.toolchain_lock, "toolchain-lock.json", True),
         ("attempt26_plan", inputs.plan_manifest, "attempt26-plan.json", True),
     ):
@@ -70,7 +74,12 @@ def materialize_tencent_deployment(
             )
 
     generated = {
-        "bootstrap-ubuntu-24.04.sh": _bootstrap_script(inputs.wheel.name),
+        "bootstrap-ubuntu-24.04.sh": _bootstrap_script(
+            wheel_name=inputs.wheel.name,
+            wheel_sha256=sha256_file(inputs.wheel),
+            uv_wheel_name=inputs.uv_wheel.name,
+            uv_wheel_sha256=sha256_file(inputs.uv_wheel),
+        ),
         "cloud-init.yaml": _cloud_init(),
         "runinstances-request-template.json": canonical_json_bytes(
             _runinstances_template(), pretty=True
@@ -231,7 +240,28 @@ def _validate_inputs(inputs: TencentDeploymentInputs) -> dict[str, object]:
         inputs.native_attestation
     ):
         raise ValueError("Build16 native attestation identity differs")
-    read_toolchain_lock(inputs.toolchain_lock)
+    toolchain = read_toolchain_lock(inputs.toolchain_lock)
+    uv_entries = [
+        entry
+        for entry in toolchain["tools"]
+        if isinstance(entry, dict) and entry.get("name") == "uv"
+    ]
+    if len(uv_entries) != 1:
+        raise ValueError("toolchain lock lacks its unique uv identity")
+    uv_entry = uv_entries[0]
+    if (
+        uv_entry.get("version") != "0.12.4"
+        or uv_entry.get("download_sha256") != sha256_file(inputs.uv_wheel)
+    ):
+        raise ValueError("deployment uv wheel differs from the toolchain lock")
+    pyproject = inputs.pyproject.read_text(encoding="utf-8")
+    if (
+        'requires-python = ">=3.13,<3.14"' not in pyproject
+        or 'cos-python-sdk-v5==1.9.44' not in pyproject
+        or 'tencentcloud-sdk-python-common==3.1.156' not in pyproject
+        or 'tencentcloud-sdk-python-cvm==3.1.156' not in pyproject
+    ):
+        raise ValueError("deployment pyproject lacks the locked Tencent environment")
     plan_digest = verify_sidecar(inputs.plan_manifest)
     plan = read_signed_json(inputs.plan_manifest)
     if (
@@ -307,21 +337,77 @@ def _cos_contract_template() -> dict[str, object]:
     }
 
 
-def _bootstrap_script(wheel_name: str) -> bytes:
+def _bootstrap_script(
+    *,
+    wheel_name: str,
+    wheel_sha256: str,
+    uv_wheel_name: str,
+    uv_wheel_sha256: str,
+) -> bytes:
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
 test "$(uname -s)" = Linux
-test -f artifacts/{wheel_name}
-test -f artifacts/uv.lock
-test -f artifacts/toolchain-lock.json
-echo 'TxnOpt offline bundle verified; account and region input remain required.'
+test "$(uname -m)" = x86_64
+. /etc/os-release
+test "$ID" = ubuntu
+test "$VERSION_ID" = 24.04
+BUNDLE_ROOT="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd -P)"
+INSTALL_ROOT="${{TXNOPT_INSTALL_ROOT:-/opt/txnopt/runtime}}"
+SYSTEM_PYTHON="${{TXNOPT_SYSTEM_PYTHON:-python3}}"
+WHEEL="$BUNDLE_ROOT/artifacts/{wheel_name}"
+UV_WHEEL="$BUNDLE_ROOT/artifacts/{uv_wheel_name}"
+test -f "$WHEEL"
+test -f "$UV_WHEEL"
+test -f "$BUNDLE_ROOT/artifacts/pyproject.toml"
+test -f "$BUNDLE_ROOT/artifacts/uv.lock"
+test -f "$BUNDLE_ROOT/artifacts/toolchain-lock.json"
+printf '%s  %s\n' '{wheel_sha256}' "$WHEEL" | sha256sum --check --status
+printf '%s  %s\n' '{uv_wheel_sha256}' "$UV_WHEEL" | sha256sum --check --status
+test ! -e "$INSTALL_ROOT"
+mkdir -p "$INSTALL_ROOT"
+"$SYSTEM_PYTHON" -m venv "$INSTALL_ROOT/uv-bootstrap"
+"$INSTALL_ROOT/uv-bootstrap/bin/python" -m pip install \
+  --disable-pip-version-check --no-index --no-deps "$UV_WHEEL"
+UV_BIN="$INSTALL_ROOT/uv-bootstrap/bin/uv"
+case "$("$UV_BIN" --version)" in
+  "uv 0.12.4"*) ;;
+  *) echo 'locked uv 0.12.4 is unavailable' >&2; exit 2 ;;
+esac
+export UV_PYTHON_INSTALL_DIR="$INSTALL_ROOT/python"
+"$UV_BIN" python install 3.13.13
+PYTHON_313="$("$UV_BIN" python find 3.13.13)"
+test "$("$PYTHON_313" -c 'import platform; print(platform.python_version())')" = 3.13.13
+mkdir "$INSTALL_ROOT/project"
+cp "$BUNDLE_ROOT/artifacts/pyproject.toml" "$INSTALL_ROOT/project/pyproject.toml"
+cp "$BUNDLE_ROOT/artifacts/uv.lock" "$INSTALL_ROOT/project/uv.lock"
+export UV_PROJECT_ENVIRONMENT="$INSTALL_ROOT/venv"
+cd "$INSTALL_ROOT/project"
+"$UV_BIN" sync --frozen --no-install-project --no-dev --extra tencent --python 3.13.13
+"$UV_BIN" pip install --python "$INSTALL_ROOT/venv/bin/python" --no-deps "$WHEEL"
+"$INSTALL_ROOT/venv/bin/python" - <<'PY'
+import txnopt
+import txnopt._native
+import txnopt_cases
+import txnopt_evidence
+import txnopt_legacy
+
+assert set(txnopt.__all__) == {{
+    "TxnRuntime", "SearchKernel", "Oracle", "RunConfig", "RunResult"
+}}
+print("TxnOpt Build16 installation verified; account and region remain required.")
+PY
+"$INSTALL_ROOT/venv/bin/txnopt" --help >/dev/null
 """
     return script.encode()
 
 
 def _cloud_init() -> bytes:
     return b"""#cloud-config
-package_update: false
+package_update: true
+packages:
+  - ca-certificates
+  - python3
+  - python3-venv
 runcmd:
   - [bash, /opt/txnopt/bootstrap-ubuntu-24.04.sh]
 final_message: "TxnOpt offline bootstrap complete; no instance run was authorized."

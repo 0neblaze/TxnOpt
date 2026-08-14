@@ -6,18 +6,50 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import subprocess
-import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from txnopt_evidence.codec import (
+    canonical_json_bytes,
+    sha256_bytes,
+    write_sidecar,
+    write_signed_json,
+)
+from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.level1_campaign_common import (
     load_campaign_plan,
     load_prebound_expected_identity,
+    require_clean_repository,
     require_prebound_expected_identities,
 )
+
+_ATTEMPT_SUFFIX = re.compile(r"_attempt[0-9]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationSelection:
+    source_config_path: Path
+    domain: str
+    case_id: str
+    axis: str
+    seed: int
+    budget: str
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationExecution:
+    config_path: Path
+    expected_identity_path: Path
+    domain: str
+    case_id: str
+    axis: str
+    seed: int
+    budget: str
 
 
 def _sha256(path: Path) -> str:
@@ -80,11 +112,170 @@ def _process_peak_rss_bytes(pid: int) -> int:
     return 0
 
 
+def _materialize_calibration_plan(
+    *,
+    source_plan_sha256: str,
+    build_manifest_path: Path,
+    selections: tuple[CalibrationSelection, ...],
+    destination: Path,
+    raw_root: Path,
+    attempt: int,
+) -> tuple[Path, tuple[CalibrationExecution, ...]]:
+    """Derive a prebound local-only plan without touching the formal raw root."""
+
+    if (
+        len(source_plan_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in source_plan_sha256)
+    ):
+        raise ValueError("source formal plan digest is invalid")
+    if attempt != 27:
+        raise ValueError("the Build16 local calibration must use Attempt27")
+    if not selections:
+        raise ValueError("calibration plan requires at least one selection")
+    output = destination.expanduser().resolve()
+    raw_output = raw_root.expanduser().resolve()
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"calibration plan destination already exists: {output}")
+    if raw_output.exists() or raw_output.is_symlink():
+        raise FileExistsError(f"calibration raw root already exists: {raw_output}")
+    build = build_manifest_path.expanduser().resolve(strict=True)
+    build_sha256 = _verify_sidecar(build)
+    configs = output / "configs"
+    identities = output / "expected-identities"
+    configs.mkdir(parents=True, exist_ok=False)
+    identities.mkdir(exist_ok=False)
+    entries: list[dict[str, object]] = []
+    execution: list[CalibrationExecution] = []
+    seen_labels: set[str] = set()
+    for selection in selections:
+        source = selection.source_config_path.resolve(strict=True)
+        if source.is_symlink():
+            raise ValueError("calibration source config cannot be a symlink")
+        payload: object = json.loads(source.read_bytes())
+        if not isinstance(payload, dict) or payload.get("schema_version") != "txnopt-run-config-v1":
+            raise ValueError("calibration source config schema differs")
+        original_label = payload.get("run_label")
+        if not isinstance(original_label, str) or _ATTEMPT_SUFFIX.search(original_label) is None:
+            raise ValueError("calibration source run label lacks an attempt suffix")
+        label = _ATTEMPT_SUFFIX.sub(f"_attempt{attempt:02d}", original_label)
+        if label == original_label or label in seen_labels:
+            raise ValueError("calibration run label is not a unique successor")
+        seen_labels.add(label)
+        derived = json.loads(json.dumps(payload))
+        if not isinstance(derived, dict):  # pragma: no cover - JSON object invariant
+            raise TypeError("calibration config must remain an object")
+        derived["run_label"] = label
+        derived["output_root"] = str(raw_output)
+        config_path = configs / f"{label}.json"
+        config_bytes = canonical_json_bytes(derived, pretty=True)
+        config_path.write_bytes(config_bytes)
+        config_sha256 = sha256_bytes(config_bytes)
+        identity = ExpectedEvidenceIdentity.from_plan_inputs(
+            config_path,
+            build_manifest_path=build,
+        )
+        identity_path = identities / f"{label}.json"
+        identity_bytes = canonical_json_bytes(identity.to_payload(), pretty=True)
+        identity_path.write_bytes(identity_bytes)
+        identity_sha256 = sha256_bytes(identity_bytes)
+        write_sidecar(identity_path, identity_sha256)
+        entries.append(
+            {
+                "path": f"configs/{label}.json",
+                "sha256": config_sha256,
+                "expected_identity_path": f"expected-identities/{label}.json",
+                "expected_identity_sha256": identity_sha256,
+                "domain": selection.domain,
+                "case_id": selection.case_id,
+                "axis": selection.axis,
+                "seed": selection.seed,
+                "budget": selection.budget,
+            }
+        )
+        execution.append(
+            CalibrationExecution(
+                config_path=config_path,
+                expected_identity_path=identity_path,
+                domain=selection.domain,
+                case_id=selection.case_id,
+                axis=selection.axis,
+                seed=selection.seed,
+                budget=selection.budget,
+            )
+        )
+    config_tree = [
+        {"path": entry["path"], "sha256": entry["sha256"]} for entry in entries
+    ]
+    identity_tree = [
+        {
+            "path": entry["expected_identity_path"],
+            "sha256": entry["expected_identity_sha256"],
+        }
+        for entry in entries
+    ]
+    manifest = output / "manifest.json"
+    write_signed_json(
+        manifest,
+        {
+            "schema_version": "txnopt-local-calibration-plan-v1",
+            "status": "PLANNED_NOT_STARTED",
+            "build": "Build16",
+            "attempt": attempt,
+            "source_formal_plan_sha256": source_plan_sha256,
+            "build_manifest_path": str(build),
+            "build_manifest_sha256": build_sha256,
+            "raw_output_root": str(raw_output),
+            "config_count": len(entries),
+            "config_tree_sha256": sha256_bytes(canonical_json_bytes(config_tree)),
+            "expected_identity_tree_sha256": sha256_bytes(
+                canonical_json_bytes(identity_tree)
+            ),
+            "entries": entries,
+            "cloud_purchase_authorized": False,
+            "formal_matrix_started": False,
+            "holdout_opened": False,
+        },
+    )
+    return manifest, tuple(execution)
+
+
+def _orchestration_identity(repository: Path) -> dict[str, object]:
+    root = repository.expanduser().resolve(strict=True)
+    require_clean_repository(root)
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    module = root / "src" / "txnopt_evidence" / "level1_calibration.py"
+    if module.resolve(strict=True) != Path(__file__).resolve(strict=True):
+        raise RuntimeError("calibration module is not running from its bound repository")
+    return {
+        "repository_root": str(root),
+        "revision": revision,
+        "git_tree": tree,
+        "source_dirty": False,
+        "calibration_tool_sha256": _sha256(module),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan-manifest", type=Path, required=True)
+    parser.add_argument("--calibration-plan-root", type=Path, required=True)
+    parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--review-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--python", type=Path, required=True)
+    parser.add_argument("--orchestration-repository", type=Path, required=True)
+    parser.add_argument("--attempt", type=int, default=27)
     parser.add_argument("--case", action="append", required=True)
     parser.add_argument("--seed", action="append", type=int, required=True)
     arguments = parser.parse_args()
@@ -95,10 +286,33 @@ def main() -> int:
     review_root = arguments.review_root.resolve()
     if review_root.exists():
         raise FileExistsError(f"calibration review root already exists: {review_root}")
+    calibration_raw_root = arguments.raw_root.resolve()
+    if calibration_raw_root.exists() or calibration_raw_root.is_symlink():
+        raise FileExistsError(
+            f"calibration raw root already exists: {calibration_raw_root}"
+        )
+    calibration_plan_root = arguments.calibration_plan_root.resolve()
+    if calibration_plan_root.exists() or calibration_plan_root.is_symlink():
+        raise FileExistsError(
+            f"calibration plan root already exists: {calibration_plan_root}"
+        )
+    execution_python = arguments.python.resolve(strict=True)
+    if execution_python.is_symlink() or not execution_python.is_file():
+        raise ValueError("calibration Python must be a regular executable")
+    orchestration_identity = _orchestration_identity(
+        arguments.orchestration_repository
+    )
     plan_path = arguments.plan_manifest.resolve(strict=True)
     plan_sha256 = _verify_sidecar(plan_path)
     plan = load_campaign_plan(plan_path)
     require_prebound_expected_identities(plan)
+    formal_raw_root = plan.raw_output_root.resolve()
+    if formal_raw_root.exists() or formal_raw_root.is_symlink():
+        raise FileExistsError(
+            f"formal raw root must remain absent during calibration: {formal_raw_root}"
+        )
+    if calibration_raw_root == formal_raw_root:
+        raise ValueError("calibration raw root must differ from the formal raw root")
     cases: dict[str, set[str]] = defaultdict(set)
     for raw_case in arguments.case:
         if raw_case.count(":") != 1:
@@ -113,11 +327,9 @@ def main() -> int:
     if len(seeds) < 3 or len(set(seeds)) != len(seeds):
         raise ValueError("calibration requires at least three unique seeds")
 
-    selected: list[tuple[Path, Path, str, str, str, int, str]] = []
+    selected: list[CalibrationSelection] = []
     for entry in plan.entries:
         load_prebound_expected_identity(entry)
-        if entry.expected_identity_path is None:  # guarded above; keeps typing exact
-            raise ValueError("plan entry lacks its expected identity")
         config_path = entry.config_path
         config = _object(json.loads(config_path.read_bytes()), "run config")
         case = _object(config.get("case"), "case")
@@ -135,14 +347,13 @@ def main() -> int:
             and seed in seeds
         ):
             selected.append(
-                (
-                    config_path,
-                    entry.expected_identity_path,
-                    domain,
-                    case_id,
-                    axis,
-                    seed,
-                    budget,
+                CalibrationSelection(
+                    source_config_path=config_path,
+                    domain=domain,
+                    case_id=case_id,
+                    axis=axis,
+                    seed=seed,
+                    budget=budget,
                 )
             )
     expected_count = sum(len(values) for values in cases.values()) * len(seeds) * 4 * 2
@@ -151,53 +362,67 @@ def main() -> int:
             f"calibration selected {len(selected)} configs, expected {expected_count}"
         )
 
+    calibration_plan_path, execution = _materialize_calibration_plan(
+        source_plan_sha256=plan_sha256,
+        build_manifest_path=plan.build_manifest_path,
+        selections=tuple(selected),
+        destination=calibration_plan_root,
+        raw_root=calibration_raw_root,
+        attempt=arguments.attempt,
+    )
+    calibration_plan_sha256 = _verify_sidecar(calibration_plan_path)
+
     samples: list[dict[str, object]] = []
     groups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
     maximum_peak_rss_bytes = 0
     review_root.mkdir(parents=True, exist_ok=False)
-    for ordinal, (
-        config_path,
-        expected_identity_path,
-        domain,
-        case_id,
-        axis,
-        seed,
-        budget,
-    ) in enumerate(selected, 1):
+    for ordinal, item in enumerate(execution, 1):
         run_output, elapsed, run_peak_rss_bytes = _run(
-            [sys.executable, "-m", "txnopt_evidence.cli", "run", "--config", str(config_path)]
+            [
+                str(execution_python),
+                "-m",
+                "txnopt_evidence.cli",
+                "run",
+                "--config",
+                str(item.config_path),
+            ]
         )
         manifest = Path(str(run_output.get("manifest_path"))).resolve(strict=True)
         review_dir = review_root / str(run_output.get("run_label"))
         review_output, _review_elapsed, review_peak_rss_bytes = _run(
             [
-                sys.executable,
+                str(execution_python),
                 "-m",
                 "txnopt_evidence.review_cli",
                 str(manifest),
                 "--output-dir",
                 str(review_dir),
                 "--expected-identity",
-                str(expected_identity_path),
+                str(item.expected_identity_path),
             ]
         )
-        if review_output.get("status") != "PASS":
+        if (
+            review_output.get("status") != "PASS"
+            or review_output.get("prefix_safety") != "PASS"
+            or review_output.get("aggregate_refinement_replay") != "PASS"
+            or review_output.get("fallback_count") != 0
+        ):
             raise RuntimeError("independent calibration replay did not pass")
         maximum_peak_rss_bytes = max(
             maximum_peak_rss_bytes,
             run_peak_rss_bytes,
             review_peak_rss_bytes,
         )
-        key = (domain, axis, budget)
+        key = (item.domain, item.axis, item.budget)
         groups[key].append(elapsed)
         samples.append(
             {
                 "ordinal": ordinal,
-                "domain": domain,
-                "case_id": case_id,
-                "seed": seed,
-                "axis": axis,
-                "budget": budget,
+                "domain": item.domain,
+                "case_id": item.case_id,
+                "seed": item.seed,
+                "axis": item.axis,
+                "budget": item.budget,
                 "elapsed_seconds": elapsed,
                 "run_peak_rss_bytes": run_peak_rss_bytes,
                 "review_peak_rss_bytes": review_peak_rss_bytes,
@@ -206,12 +431,25 @@ def main() -> int:
                 "review_path": str(review_dir / "review.json"),
                 "review_sha256": _verify_sidecar(review_dir / "review.json"),
                 "semantic_digest": str(review_output.get("semantic_digest")),
+                "objective": review_output.get("case_replay"),
+                "prefix_safety": review_output.get("prefix_safety"),
+                "aggregate_refinement_replay": review_output.get(
+                    "aggregate_refinement_replay"
+                ),
+                "physical_event_count": review_output.get("physical_event_count"),
+                "fallback_count": review_output.get("fallback_count"),
+                "expected_identity_sha256": _verify_sidecar(
+                    item.expected_identity_path
+                ),
             }
         )
         print(
-            f"[{ordinal}/{len(selected)}] {domain} {case_id} {seed} "
-            f"{axis} {budget}: {elapsed:.3f}s"
+            f"[{ordinal}/{len(execution)}] {item.domain} {item.case_id} {item.seed} "
+            f"{item.axis} {item.budget}: {elapsed:.3f}s"
         )
+
+    if formal_raw_root.exists() or formal_raw_root.is_symlink():
+        raise RuntimeError("local calibration contaminated the formal raw root")
 
     expected_keys = {
         (domain, axis, budget)
@@ -245,6 +483,13 @@ def main() -> int:
         "status": "LOCAL_CALIBRATION_COMPLETE_NOT_LEVEL1_EVIDENCE",
         "plan_manifest_path": str(plan_path),
         "plan_manifest_sha256": plan_sha256,
+        "calibration_plan_path": str(calibration_plan_path),
+        "calibration_plan_sha256": calibration_plan_sha256,
+        "raw_output_root": str(calibration_raw_root),
+        "review_root": str(review_root),
+        "build": "Build16",
+        "attempt": arguments.attempt,
+        "orchestration_identity": orchestration_identity,
         "representative_cases": {key: sorted(value) for key, value in cases.items()},
         "seeds": seeds,
         "p95_policy": "nearest-rank; six samples per domain-axis-budget group",
@@ -260,6 +505,9 @@ def main() -> int:
             else {}
         ),
         "cloud_purchase_performed": False,
+        "formal_matrix_started": False,
+        "holdout_opened": False,
+        "formal_raw_root_remained_absent": True,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     data = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode()
