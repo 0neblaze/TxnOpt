@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from txnopt_evidence._safe_sdk_error import safe_sdk_error_text
 from txnopt_evidence.codec import (
     canonical_json_bytes,
     read_signed_json,
@@ -303,7 +304,9 @@ class _TencentCvmSdkBridge:
             )
             payload = json.loads(response.to_json_string())
         except Exception as error:
-            raise RuntimeError(_redacted_sdk_error(error)) from None
+            raise RuntimeError(
+                _redacted_sdk_error(error, operation="RunInstances DryRun")
+            ) from None
         if not isinstance(payload, dict):
             raise RuntimeError("Tencent CVM DryRun response is not a JSON object")
         return cast(dict[str, object], payload)
@@ -342,7 +345,12 @@ class _TencentCvmSdkBridge:
             ).DescribeZoneInstanceConfigInfos(sdk_request)
             payload = json.loads(response.to_json_string())
         except Exception as error:
-            raise RuntimeError(_redacted_sdk_error(error)) from None
+            raise RuntimeError(
+                _redacted_sdk_error(
+                    error,
+                    operation="DescribeZoneInstanceConfigInfos",
+                )
+            ) from None
         if not isinstance(payload, dict):
             raise RuntimeError("Tencent CVM instance-config response is not a JSON object")
         items = payload.get("InstanceTypeQuotaSet")
@@ -395,17 +403,16 @@ def _validated_provider_instance(
     }
 
 
-def _redacted_sdk_error(error: Exception) -> str:
-    message = str(error)
-    for variable in (
-        "TENCENTCLOUD_SECRET_ID",
-        "TENCENTCLOUD_SECRET_KEY",
-        "TENCENTCLOUD_SESSION_TOKEN",
-    ):
-        value = os.environ.get(variable)
-        if value:
-            message = message.replace(value, "[REDACTED]")
-    return f"Tencent CVM DryRun failed: {message}"
+def _redacted_sdk_error(
+    error: Exception,
+    *,
+    operation: str = "request",
+) -> str:
+    return safe_sdk_error_text(
+        provider="Tencent CVM",
+        operation=operation,
+        error=error,
+    )
 
 
 def assess_tencent_capacity(

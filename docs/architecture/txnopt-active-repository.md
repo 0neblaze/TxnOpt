@@ -104,7 +104,10 @@ Build portability（构建可移植性）以及正式矩阵执行都必须等真
 必须返回 `CoreCount=64`、`ThreadPerCore=1`，Linux `/proc/cpuinfo` 拓扑也必须达到
 64 个物理核心。Linux 可见 `MemTotal` 只记录、不因平台保留略低于 128 GiB 而失败；
 真正的内存门是与所选 producer（生产器）绑定的校准峰值 RSS 低于实际可见内存的
-80%。Build16 只允许 Attempt26/27；Build18 只允许 Attempt28/29。Build17
+80%。Build16 只允许 Attempt26/27；Build18 只允许 Attempt28/29；Build19
+只允许 Attempt30/31，但其 Independent Review13 以三个 major finding（重大问题）
+拒绝最终云前状态。修复后的闭合后继身份是 Build20/Attempt32/Attempt33，且只有
+Pre-cloud10 与 Independent Review14 零 finding 才能进入账号输入阶段。Build17
 validation candidate（验证候选）未闭合正式计划入口，不能作为正式 producer。
 
 ## 5. 不可变恢复边界

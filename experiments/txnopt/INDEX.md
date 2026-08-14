@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19/Attempt30/31/Pre-cloud09 are the current account-independent successor; Build18/Attempt28/29/Pre-cloud08 and failed Review12 remain immutable predecessors | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt31 retains 96/96 representative raw/review bundles; Attempt30 has 2,880 configs and prebound identities but its raw root and launch claim are absent | Review13 is the authoritative independent adjudication of Pre-cloud09; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19/Attempt30/31/Pre-cloud09 and failed Review13 are immutable predecessors; Build20/Attempt32/33/Pre-cloud10 is the closed next sequence | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt31 retains 96/96 representative raw/review bundles; Attempt30 remains unexecuted; Attempt32/33 require fresh Build20 evidence | Review14 is the next authoritative adjudication; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -13,8 +13,8 @@ Tencent-resource identity for new Level 1 runs. The unversioned
 materializing either protocol does not authorize cloud purchase, benchmark
 launch, holdout access, or a readiness claim.
 
-The current Tencent-specific successor is Build19 under
-`level1-protocol-v2.json`. External formal plan Attempt30 binds 2,880 configs,
+The retained Build19 Tencent chain uses `level1-protocol-v2.json`. External
+formal plan Attempt30 binds 2,880 configs,
 2,880 pre-run expected identities, a 64-physical-core topology, provider-
 reported memory of at least 128 GB, no default region, and an absent formal raw
 root. Local calibration Attempt31 binds 96 raw bundles and 96 independent
@@ -25,9 +25,10 @@ scaling proof. The offline Build19 Tencent deployment Attempt02 passes fresh
 installation and fixture checks without containing credentials or a region.
 Pre-cloud Attempt08 recorded an account-ready candidate but Independent Review
 Attempt12 subsequently found four major gaps, so Attempt08 cannot authorize or
-support a final account-ready claim. Build19 fixes those findings under a new
-source identity; Pre-cloud Attempt09 is its producer-side decision. Review13 is
-the authoritative final decision for the Build19 sequence. None of these
+support a final account-ready claim. Build19 fixed those four findings, but
+Review13 found three further major gaps and rejected Pre-cloud09. The closed
+next source identity is Build20 with Attempt32/33 and Pre-cloud10; Review14 is
+its authoritative decision. None of these
 artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
 holdout, Level 1 claim, or release.
 
@@ -63,7 +64,7 @@ The prior internal build identity is recorded in
 `BUILD_AND_LOCAL_RESOURCE_GATES_COMPLETE_NOT_LEVEL1_READY`: build and soak
 success are not experiment readiness. Attempt01 remains immutable.
 
-The current clean internal producer is
+Historical Build Attempt03 was the clean internal producer for its source:
 `manifests/txnopt_level1_build_attempt03.json`. It adds exact producer-identity
 binding for campaign configs and raw manifests, plus the corrected EVRPTW
 initialization and post-screen admission boundary. Its status remains
@@ -177,7 +178,7 @@ execution, holdout access, Level 1 readiness, and public release false. The
 post-Build09 native prepared-transaction change supersedes that procurement
 gate for the active source; the receipt itself remains immutable.
 
-Build Attempt10 is the current clean internal artifact. It binds the generic
+Historical Build Attempt10 was the clean internal artifact for its source. It binds the generic
 prepared transaction in `cpp/txnopt_core`, complete-work reservation, prepared
 cache-delta receipt, one-shot physical-trace drain, and independent native-round
 receipt replay to source revision `3e18b99`. Its installed-wheel tests (174),
@@ -202,7 +203,7 @@ preflight is `PASS_NOT_AUTHORIZED_TO_EXECUTE`; the raw root is absent. Pre-cloud
 Attempt02 deliberately records `BLOCKED_FORMAL_SUCCESSOR_REVIEW_PENDING`, so it
 authorizes neither procurement nor execution.
 
-Build Attempt11 is the current clean internal producer. It adds the
+Historical Build Attempt11 was the clean internal producer for its source. It adds the
 hash-chained `txnopt-evidence-lifecycle-v1` contract without changing the
 semantic or physical trace protocols: new raw/failure bundles are v2 and bind
 `PLANNED -> RUNNING -> SEALED`; independent replay appends `REVIEWED` using

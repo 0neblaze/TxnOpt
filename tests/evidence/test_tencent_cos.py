@@ -231,6 +231,22 @@ def test_tencent_cos_sdk_errors_redact_environment_credentials(
     assert session_token not in message
 
 
+def test_tencent_cos_sdk_errors_drop_untrusted_cam_role_message() -> None:
+    cam_role_secret = "cam-role-cos-temporary-secret-material"
+    bridge = _QcloudCosSdkBridge(_ExplodingSdkClient(cam_role_secret))
+
+    with pytest.raises(TencentCosError) as raised:
+        TencentCosArchive(
+            bridge,
+            bucket="txnopt-evidence-1250000000",
+            region="ap-guangzhou",
+        )
+
+    message = str(raised.value)
+    assert "_ExplodingSdkError" in message
+    assert cam_role_secret not in message
+
+
 def test_tencent_cos_binds_every_read_to_exact_version_id() -> None:
     client, archive = _archive()
     first = b"first immutable version"

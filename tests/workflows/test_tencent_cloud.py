@@ -27,6 +27,10 @@ _BUDGETS = ["fixed_work", "fixed_time"]
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class _CamRoleSdkError(RuntimeError):
+    """Synthetic Tencent SDK failure containing non-environment credentials."""
+
+
 def test_host_activity_scan_excludes_doctor_process_ancestry() -> None:
     ancestry = tencent_cloud._current_process_ancestry()
 
@@ -637,6 +641,66 @@ def test_cli_tencent_error_receipt_redacts_environment_credentials(
     serialized = json.dumps(error_payload, sort_keys=True)
     assert "[REDACTED]" in serialized
     assert all(value not in serialized for value in secrets.values())
+
+
+def test_tencent_cvm_sdk_errors_drop_untrusted_cam_role_message() -> None:
+    cam_role_secret = "cam-role-cvm-temporary-secret-material"
+
+    message = tencent_cloud._redacted_sdk_error(_CamRoleSdkError(cam_role_secret))
+
+    assert "_CamRoleSdkError" in message
+    assert cam_role_secret not in message
+
+
+def test_cli_does_not_serialize_untrusted_cvm_sdk_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cam_role_secret = "cam-role-cli-temporary-secret-material"
+
+    def fail_with_cam_role_sdk_message(
+        _selection: TencentCvmSelection,
+    ) -> dict[str, object]:
+        raise RuntimeError(
+            tencent_cloud._redacted_sdk_error(_CamRoleSdkError(cam_role_secret))
+        )
+
+    monkeypatch.setattr(
+        tencent_cloud,
+        "execute_cvm_dry_run",
+        fail_with_cam_role_sdk_message,
+    )
+
+    assert main(
+        [
+            "cloud",
+            "tencent",
+            "dry-run",
+            "--region",
+            "ap-test",
+            "--zone",
+            "ap-test-1",
+            "--instance-type",
+            "TEST.64CORE128GB",
+            "--image-id",
+            "img-test",
+            "--vpc-id",
+            "vpc-test",
+            "--subnet-id",
+            "subnet-test",
+            "--security-group-id",
+            "sg-test",
+            "--request-output",
+            str(tmp_path / "request.json"),
+            "--receipt-output",
+            str(tmp_path / "receipt.json"),
+        ]
+    ) == 2
+
+    serialized = capsys.readouterr().err
+    assert "_CamRoleSdkError" in serialized
+    assert cam_role_secret not in serialized
 
 
 def test_cli_tencent_doctor_binds_provider_facts_to_signed_dry_run_receipt(

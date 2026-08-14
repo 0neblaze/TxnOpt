@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Protocol, TypeVar, cast
 
+from txnopt_evidence._safe_sdk_error import safe_sdk_error_text
 from txnopt_evidence.archive import (
     ArchiveError,
     ArchiveIntegrityError,
@@ -39,11 +40,6 @@ _COMMIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _FIVE_GIB = 5 * 1024 * 1024 * 1024
 _ONE_MIB = 1024 * 1024
 _SdkResult = TypeVar("_SdkResult")
-_CREDENTIAL_ENV_VARS = (
-    "TENCENTCLOUD_SECRET_ID",
-    "TENCENTCLOUD_SECRET_KEY",
-    "TENCENTCLOUD_SESSION_TOKEN",
-)
 
 
 class TencentCosError(ArchiveError):
@@ -724,9 +720,6 @@ class _QcloudCosSdkBridge:
 
     def __init__(self, client: Any) -> None:
         self._client = client
-        # Keep a private snapshot so later environment cleanup cannot expose a
-        # credential in an SDK failure raised by this already-configured client.
-        self._credential_values = _credential_values_from_environment()
 
     def head_bucket(self, **kwargs: object) -> Mapping[str, Any]:
         return cast(
@@ -827,14 +820,12 @@ class _QcloudCosSdkBridge:
                 raise _redacted_sdk_error(
                     "object_exists status",
                     status_error,
-                    self._credential_values,
                 ) from None
             if status_code == 404:
                 return False
             raise _redacted_sdk_error(
                 "object_exists",
                 error,
-                self._credential_values,
             ) from None
         return True
 
@@ -847,7 +838,7 @@ class _QcloudCosSdkBridge:
         try:
             return method(**kwargs)
         except Exception as error:
-            raise _redacted_sdk_error(operation, error, self._credential_values) from None
+            raise _redacted_sdk_error(operation, error) from None
 
 
 def encode_tencent_cos_commit(commit: TencentCosCommit) -> bytes:
@@ -955,29 +946,15 @@ def _lower_keys(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _redacted_sdk_error(
     operation: str,
     error: Exception,
-    credential_values: tuple[str, ...] = (),
 ) -> TencentCosError:
-    """Convert SDK failures to a diagnosable, credential-free COS error."""
+    """Convert an SDK failure without exporting its untrusted message body."""
 
-    message = str(error)
-    values = tuple(
-        value
-        for value in (*credential_values, *_credential_values_from_environment())
-        if value
-    )
-    for secret in sorted(set(values), key=len, reverse=True):
-        message = message.replace(secret, "[REDACTED]")
-    category = f"{type(error).__module__}.{type(error).__qualname__}"
-    if not message:
-        message = "<empty SDK error message>"
-    return TencentCosError(f"Tencent COS SDK {operation} failed [{category}]: {message}")
-
-
-def _credential_values_from_environment() -> tuple[str, ...]:
-    return tuple(
-        value
-        for variable in _CREDENTIAL_ENV_VARS
-        if (value := os.environ.get(variable))
+    return TencentCosError(
+        safe_sdk_error_text(
+            provider="Tencent COS",
+            operation=operation,
+            error=error,
+        )
     )
 
 

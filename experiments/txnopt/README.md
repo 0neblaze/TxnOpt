@@ -4,19 +4,21 @@ This directory tracks only new protocol definitions, manifests, registries,
 and independently reviewed summaries. Raw run output belongs under ignored
 `results/<run_label>/` or a governed external root.
 
-The current account-independent Tencent successor uses Build19,
-`level1-protocol-v2.json`, external formal plan Attempt30, representative local
-calibration Attempt31, and pre-cloud Attempt09. Attempt30 requires at least 64
+The retained Build19 Tencent chain uses `level1-protocol-v2.json`, external
+formal plan Attempt30, representative local calibration Attempt31, and
+Pre-cloud Attempt09. Independent Review13 rejected its final account-ready
+claim with three major findings. The closed next chain is Build20, external
+formal plan Attempt32, representative calibration Attempt33, Pre-cloud10, and
+Independent Review14. Attempt32 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
 Attempt31 has 96 raw bundles and 96 independent reviews, while the Attempt30
 formal raw root remains absent. The Build19 deployment Attempt02 is offline-only,
 contains no credentials or region, and exposes no `DryRun=false` instance
-creation path. Pre-cloud Attempt09 records the producer-side
-`READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED` decision. Independent Review
-Attempt13 is the authoritative adjudication of that decision; neither receipt
-authorizes cloud access or Level 1 readiness.
+creation path. Pre-cloud Attempt09 records a producer-side candidate decision,
+but Review13 is `NEEDS_WORK`; neither receipt authorizes cloud access or Level 1
+readiness. Only a zero-finding Review14 may accept the Build20 successor.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
@@ -79,13 +81,14 @@ Server rental remains blocked unless the estimate is at most ten days. The
 live host doctor additionally requires the signed Tencent DryRun receipt; SKU
 resources are never accepted from self-reported CLI numbers.
 
-The prior formal identities Attempts18, 21, 23, 24, and 28 remain immutable and
-unexecuted. Attempt30 is the Build19 protocol-v2 successor with 2,880
+The prior formal identities Attempts18, 21, 23, 24, 28, and 30 remain immutable
+and unexecuted. Attempt32 is the Build20 protocol-v2 successor with 2,880
 prebound expected identities, its own preregistered analysis file, and a fresh
 absent raw root. Structural preflight is read-only.
 
-Build14/Attempt24 and Build18/Attempt28 remain historical, byte-preserved
-predecessor chains. Build19/Attempt30 is the current unexecuted chain. All three
+Build14/Attempt24, Build18/Attempt28, and Build19/Attempt30 remain historical,
+byte-preserved predecessor chains. Build20/Attempt32 is the next unexecuted
+chain. All four
 preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
 holdouts and cloud purchase remain closed, and no launch claim or raw root
 exists. New execution rejects protocol-v1 plans and any build/attempt pair not
@@ -109,25 +112,28 @@ are materialized and tree-bound before raw execution, then consumed unchanged
 by the runner and independent reviewer. Legacy plan v1 remains readable only
 for historical inspection and cannot enter formal preflight, execution, or
 review.
-The `run` subcommand
-also requires the exact plan-bound Build14 wheel, an isolated Python installation, host
+The campaign `run` boundary also requires the exact plan-bound successor wheel,
+an isolated Python installation, host
 resource checks, and a separately signed
 `txnopt-level1-procurement-authorization-v1` receipt. That receipt must bind the
-exact plan, analysis protocol, config and identity trees, Build14 manifest, wheel, raw root,
+exact plan, analysis protocol, config and identity trees, producer manifest,
+wheel, raw root,
 exclusive-Linux contract, and 14-day maximum window. Before the first raw
 write, the runner creates an immutable atomic launch claim and records that no
 target process is active. Each run executes in its own process group; timeout
 cleanup terminates and verifies the whole group rather than leaving a writer
 behind. It writes raw bundles and one raw-only execution receipt; it cannot
-review or declare readiness. After a complete run,
-`python -m tools.review_txnopt_level1_campaign` independently
+review or declare readiness. After a complete run, the installed command
+`txnopt review --plan-manifest <plan> --analysis-protocol <analysis> \
+  --execution-receipt <execution> --python <python> --wheel <wheel> \
+  --review-root <review-root> --review-receipt <review-receipt>` independently
 replays every raw manifest into a new review root and recomputes the registered
 performance, confidence-interval, parity, prefix-safety, fallback, and Cmax
 gates. Failed attempts retain their raw root and require a new attempt label.
 The representative Build11 fault gate is retained as Attempt02. The current
 bounded-exhaustive local gate is
 `manifests/txnopt_level1_fault_gate_attempt03.json`; its first orchestration
-failure remains separately retained. The current Build14 decision receipt is
+failure remains separately retained. The historical Build14 decision receipt is
 `manifests/txnopt_level1_precloud_gate_attempt07.json`. It is explicitly ready
 only for a separate procurement-authorization decision, not an authorization
 receipt and not a Level 1 readiness claim. Pre-cloud Attempts01-06 remain

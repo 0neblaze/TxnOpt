@@ -16,18 +16,18 @@ The earlier local EVRPTW roadmap remains ignored historical planning input.
 - Stage 5.2 performance-calibration Attempt16 is retained and closed as a
   known unique failure; it is not a successful benchmark result.
 - TxnOpt Level 1 implementation is in progress on `codex/txnopt-level1`.
-- Clean Build Attempt09 and its Attempt17/Attempt18 pre-cloud chain remain
-  immutable prior evidence. Clean Build10 now binds the active native prepared
-  transaction/reservation/cache-delta/trace path. Its additive refinement note
-  remains pending independent review, and a new calibration, formal plan, and
-  pre-cloud receipt are required.
-- The corrected aggregate T1/T2 and conditional T3/T4 package passes its current
-  independent formal review. Legacy compatibility Attempt01 resolves the old
-  timeout while retaining the immutable historical source-receipt mismatch.
-- Cloud procurement and the formal Level 1 matrix are blocked while the active
-  successor identity is rebuilt. The prior 32-core estimate was about 1.20
-  hours for Build09's provisional 1200-work/3-second budgets; it must not be
-  relabelled as a forecast for the new native source.
+- Build14/Attempt24/Attempt25 and Build18/Attempt28/Attempt29 remain immutable
+  predecessor evidence. Build19/Attempt30/Attempt31/Pre-cloud09 is also
+  retained, but Independent Review13 rejected its account-ready claim with
+  three major findings: stale operator guidance and an SDK exception boundary
+  that could expose temporary CAM-role credentials.
+- The next closed source identity is Build20 with formal plan Attempt32 and
+  representative calibration Attempt33. Pre-cloud10 and Independent Review14
+  must report zero findings before the repository may reach
+  `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`.
+- The corrected aggregate T1/T2 and conditional T3/T4 package remains bounded
+  formal evidence. The 2,880-run formal matrix, holdout, Tencent API access,
+  purchase, instance creation, and COS use remain unstarted and unauthorized.
 - Level 2 and Level 3 remain required future gates and are not implemented.
 - No push, remote rename, public package/archive release, or submission is
   authorized by this roadmap.

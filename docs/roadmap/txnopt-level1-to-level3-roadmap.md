@@ -29,16 +29,16 @@ cloud purchase, public alpha, or manuscript submission.
 
 ## 2. Current verified baseline
 
-- The current source-bound successor chain is Build19 with protocol-v2 formal
-  plan Attempt30, representative calibration Attempt31, and producer-side
-  Pre-cloud Attempt09. Their signed artifacts preserve an absent 2,880-run raw
-  root, and no Tencent account, purchase, instance, COS bucket, holdout, or
-  formal execution has been authorized.
+- Build19 with protocol-v2 formal plan Attempt30, representative calibration
+  Attempt31, and producer-side Pre-cloud Attempt09 is retained as a rejected
+  predecessor. Its signed artifacts preserve an absent 2,880-run raw root, and
+  no Tencent account, purchase, instance, COS bucket, holdout, or formal
+  execution was authorized.
 - Independent Review Attempt12 is retained as `NEEDS_WORK` with four major
-  findings. The Build18 chain therefore cannot be the final account-ready
-  decision. Build19, Attempt30, Attempt31, and Pre-cloud Attempt09 form the
-  closed successor sequence; Independent Review Attempt13 is its authoritative
-  adjudication and must report zero findings before account input.
+  findings. Independent Review Attempt13 is also retained as `NEEDS_WORK`: it
+  found three major gaps in the Build19 sequence. The next closed sequence is
+  Build20, Attempt32, Attempt33, and Pre-cloud Attempt10; Independent Review
+  Attempt14 must report zero findings before account input.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -344,9 +344,12 @@ superseded identities, the host doctor accepted self-reported provider facts,
 and COS/CLI exception handling did not close credential-value leakage. Those
 findings invalidate Attempt08 as a final account-ready decision without
 rewriting it. Build19, formal plan Attempt30, representative calibration
-Attempt31, and Pre-cloud Attempt09 are the append-only successor evidence.
-Independent Review Attempt13 is the final account-independent adjudication;
-its signed receipt, rather than this roadmap prose, controls acceptance.
+Attempt31, and Pre-cloud Attempt09 are immutable rejected successor evidence.
+Independent Review Attempt13 records three major findings without rewriting
+them. Build20, formal plan Attempt32, representative calibration Attempt33,
+and Pre-cloud Attempt10 are the next append-only sequence. Independent Review
+Attempt14 is the next account-independent adjudication; its signed receipt,
+rather than this roadmap prose, controls acceptance.
 
 The only account-independent terminal state is
 `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`. It authorizes no Tencent API
