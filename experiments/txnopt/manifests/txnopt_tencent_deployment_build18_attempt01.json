@@ -1,0 +1,70 @@
+{
+  "schema_version": "txnopt-tencent-deployment-index-v1",
+  "run_label": "txnopt_tencent_deployment_build18_attempt01",
+  "status": "BUNDLE_VERIFIED_NOT_AUTHORIZED",
+  "created_at_utc": "2026-08-14T21:29:33Z",
+  "bundle": {
+    "external_root": "/home/oneblaze/txnopt-deployments/tencent-build18-attempt01",
+    "receipt_path": "/home/oneblaze/txnopt-deployments/tencent-build18-attempt01/bundle-receipt.json",
+    "receipt_sha256": "7e6dbc9ea20a47bf3c6f77e3d24c8b4b58b1f2dd4f8ca354066e022085e9b864",
+    "schema_version": "txnopt-tencent-deployment-bundle-v2",
+    "build": "Build18",
+    "formal_attempt": 28,
+    "file_count": 18,
+    "file_tree_sha256": "ffcf3ff2fe508a96ab728e9b5eaef2c14450feb63f4097e8ea0d56b1727ae45b",
+    "build_manifest_sha256": "0ce681854d45f065bd6b05065531903537249a32dd1be92613be0e4909fc47d8",
+    "wheel_sha256": "3717c2222e9ba360c371370aee68720008169286c4e1359c3c12235f1947a9b3",
+    "source_manifest_sha256": "90348df150c6a36aa4238e30797eee7a7c3abcba02447ccaa9ba54c6c9a7b37f",
+    "plan_manifest_sha256": "5b4353bb5500e23eb34d4a173cb944b8ec4639cbdf51c69afb2d5a942ab688d7",
+    "toolchain_lock_sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d"
+  },
+  "offline_validation": {
+    "fresh_root": "/home/oneblaze/txnopt-deployments/validation/tencent-build18-attempt01-fresh01",
+    "bundle_verification_path": "/home/oneblaze/txnopt-deployments/validation/tencent-build18-attempt01-fresh01/pre-bootstrap-verify.json",
+    "bundle_verification_sha256": "1d0396f4377a1f42e4a8ddc6c7630e348bab6cc157757e2301499a8d5ba7663a",
+    "bundle_verification_status": "BUNDLE_VERIFIED_NOT_AUTHORIZED",
+    "installed_origin_log_sha256": "cf890bcf0eac15f596b205ea5707ffc519ad226e949bade58a86b55f79141511",
+    "smoke_native_evidence_log_sha256": "48f2265aaa685ffed9629f48fc253f3ccbde105a28753608785e489f3497912c",
+    "smoke_native_evidence_test_count": 84,
+    "tencent_fixture_log_sha256": "7a04ed3e874550c22731380bbc0dec794cba33f45cff2ba506ccda5f21bee748",
+    "tencent_fixture_test_count": 33,
+    "local_doctor_expected_failure_path": "/home/oneblaze/txnopt-deployments/validation/tencent-build18-attempt01-fresh01/local-doctor-expected-fail.json",
+    "local_doctor_expected_failure_sha256": "be81e7b975f5de1f1702bdb4b10a05305ae3eb25d8ea46a1f84c36b1076eae08",
+    "local_doctor_observed_physical_cores": 12,
+    "local_doctor_observed_logical_processors": 24,
+    "local_doctor_expected_failure_reasons": [
+      "linux_physical_cores_below_64",
+      "provider_linux_physical_core_cross_check_failed",
+      "thread_per_core_is_not_one"
+    ],
+    "validation_file_manifest_sha256": "6535ac7e3347ba3760e582ae2a51a2c78756ebde709d308f7104167f0477d514"
+  },
+  "cvm_contract": {
+    "dry_run_only": true,
+    "core_count": 64,
+    "thread_per_core": 1,
+    "minimum_provider_memory_gb": 128,
+    "region": null,
+    "region_required_live_input": true,
+    "instance_creation_interface_included": false
+  },
+  "cos_contract": {
+    "provider": "tencent-cos",
+    "versioning_required": "Enabled",
+    "object_lock_mode_required": "COMPLIANCE",
+    "minimum_retention_days": 365,
+    "version_id_required": true,
+    "credentials_included": false,
+    "live_bucket_verified": false
+  },
+  "claim_boundary": {
+    "cloud_account_configured": false,
+    "credentials_included": false,
+    "region_selected": false,
+    "live_dry_run_completed": false,
+    "cloud_purchase_authorized": false,
+    "instance_created": false,
+    "formal_matrix_started": false,
+    "live_cos_used": false
+  }
+}

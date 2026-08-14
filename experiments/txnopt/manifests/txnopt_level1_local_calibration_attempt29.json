@@ -1,0 +1,97 @@
+{
+  "schema_version": "txnopt-level1-local-calibration-manifest-v2",
+  "run_label": "txnopt_level1_local_calibration_attempt29",
+  "status": "LOCAL_CALIBRATION_COMPLETE_REPRESENTATIVE_ONLY_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-14T21:29:33Z",
+  "producer_build": {
+    "build": "Build18",
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt18.json",
+    "manifest_sha256": "0ce681854d45f065bd6b05065531903537249a32dd1be92613be0e4909fc47d8",
+    "source_revision": "1d093dee20f1c90049f722f1650032bb0afc213e",
+    "source_tree": "f0e6845273a0ece1a33c6c0f34209bc941930241",
+    "source_manifest_sha256": "90348df150c6a36aa4238e30797eee7a7c3abcba02447ccaa9ba54c6c9a7b37f",
+    "wheel_sha256": "3717c2222e9ba360c371370aee68720008169286c4e1359c3c12235f1947a9b3",
+    "native_sha256": "9c32a35529a417da3b1adcd6be33ab20080d515ab5be3cd37dcd973e1d583d32"
+  },
+  "formal_plan": {
+    "tracked_index_path": "experiments/txnopt/manifests/txnopt_level1_formal_plan_attempt28.json",
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt28/manifest.json",
+    "sha256": "5b4353bb5500e23eb34d4a173cb944b8ec4639cbdf51c69afb2d5a942ab688d7",
+    "formal_raw_root_absent": true
+  },
+  "calibration_plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-local-calibration-attempt29/manifest.json",
+    "sha256": "90476de33127915b42a24172a025a10bae13f5a7c457205839afc9239a2561bf",
+    "config_count": 96,
+    "expected_identity_count": 96,
+    "config_tree_sha256": "fbc4840e858ec80ab7cac3c7b3a0ada03caf6edf36e68bf727ff2f44e5293d9a",
+    "expected_identity_tree_sha256": "d3deeac277e23dafdd64efcaf70669063b7f52831e301ada227c695b4c9a26c9"
+  },
+  "calibration": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt29.json",
+    "sha256": "f1aa2a19e99434d11f26ccbfb8569afcfe119f1f7b70b54c654c6ec7225e82b8",
+    "representative_cases": {
+      "evrptw": ["c101C5", "c101_21"],
+      "rcpsp": ["j1201_1", "j1206_4"]
+    },
+    "seeds": [2014, 2015, 2016],
+    "raw_run_count": 96,
+    "independent_review_pass_count": 96,
+    "fixed_work_parity_group_count": 12,
+    "p95_observation_group_count": 16,
+    "peak_rss_bytes": 245383168,
+    "fallback_count": 0,
+    "formal_level1_evidence": false
+  },
+  "independent_aggregate_verification": {
+    "superseded_attempt01_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt29-independent-verification-attempt01.json",
+    "superseded_attempt01_sha256": "f15237688a7806fb0c387646d3588c52ecd46b589e61fdb6ae91e2b6d015eab0",
+    "superseded_attempt01_accepted": false,
+    "attempt02_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt29-independent-verification-attempt02.json",
+    "attempt02_sha256": "80ac7b162d3b3acb9bf75ff8595ad1dde0b597a6bce7032ed23f460d71759197",
+    "status": "PASS_REPRESENTATIVE_CALIBRATION_NOT_LEVEL1_EVIDENCE",
+    "raw_manifest_hash_match_count": 96,
+    "independent_review_hash_match_count": 96,
+    "reviewed_lifecycle_count": 96,
+    "semantic_exact_work_run_count": 92,
+    "positive_run_cmax_count": 92,
+    "zero_exact_work_run_count": 4,
+    "native_round_observation_count": 163,
+    "t4_waste_event_count": 0,
+    "all_t4_bounds_recomputed": true,
+    "all_native_work_covered": true,
+    "all_fixed_work_semantic_and_objective_groups_match": true
+  },
+  "capacity": {
+    "external_path": "/home/oneblaze/txnopt-calibration/tencent-capacity-assessment-attempt29.json",
+    "sha256": "9ed05de0c4347ea0b924d2a2c2884da8d9938ee12b62dae024d61bf7075ad062",
+    "status": "CAPACITY_ESTIMATE_PASS_LIVE_HOST_NOT_VERIFIED",
+    "minimum_physical_cores": 64,
+    "minimum_provider_memory_gb": 128,
+    "scheduler_efficiency": 0.8,
+    "usable_core_tokens": 51,
+    "predicted_matrix_seconds": 2038.2302146419315,
+    "predicted_matrix_days": 0.023590627484281614,
+    "predicted_completion_days_max": 10,
+    "maximum_consecutive_window_days": 14,
+    "live_host_verified": false,
+    "memory_margin_live_host_verified": false
+  },
+  "harness_diagnostics": [
+    {
+      "receipt": "independent aggregate verification Attempt01",
+      "classification": "AGGREGATE_CRITERION_DENOMINATOR_ERROR",
+      "reason": "the first aggregate receipt compared 92 positive-Cmax exact-work runs against all 96 runs, including four legitimate zero-work runs",
+      "disposition": "Attempt01 remains append-only and is not accepted; Attempt02 corrects only the aggregate criterion without rewriting raw or review evidence"
+    }
+  ],
+  "claim_boundary": {
+    "representative_local_calibration_verified": true,
+    "live_64_physical_core_host_verified": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "public_release_authorized": false
+  }
+}

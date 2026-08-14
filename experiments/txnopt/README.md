@@ -4,6 +4,19 @@ This directory tracks only new protocol definitions, manifests, registries,
 and independently reviewed summaries. Raw run output belongs under ignored
 `results/<run_label>/` or a governed external root.
 
+The current account-independent Tencent closure uses Build18,
+`level1-protocol-v2.json`, external formal plan Attempt28, representative local
+calibration Attempt29, and pre-cloud Attempt08. Attempt28 requires at least 64
+physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
+of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
+admission threshold. Region has no default and remains a mandatory live input.
+Attempt29 has 96 raw bundles and 96 independent reviews, while the Attempt28
+formal raw root remains absent. The Build18 deployment bundle is offline-only,
+contains no credentials or region, and exposes no `DryRun=false` instance
+creation path. Current status is
+`READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`, not cloud authorization or
+Level 1 readiness.
+
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
 Build14 raw/failure bundles use `txnopt-raw-artifact-v3` or
