@@ -7,8 +7,9 @@ TxnOpt 在现有 Git history（Git 历史）中原地演进。活分支只承载
 （历史读取器）。历史 Stage 实现由冻结 tag、Git bundle（Git 归档包）和受治理
 外部档案恢复，不再作为新 wheel 的运行路径。
 
-当前阶段不包含云采购、formal matrix（正式矩阵）、GitHub 仓库改名或 E 盘删除。
-这些动作仍分别需要显式授权。
+GitHub 仓库已经原地改名为 `0neblaze/TxnOpt`，并完成分支、冻结标签和全新 clone
+（克隆）恢复验证。当前阶段仍不包含 formal matrix（正式矩阵）或 E 盘删除；云账号、
+计费与 live bucket（真实存储桶）尚未配置，不能把本地实现测试表述成已完成云迁移。
 
 ## 2. 活模块与依赖方向
 
@@ -44,11 +45,11 @@ cache 推断 formal readiness（正式就绪状态）。`source-tree` 是当前 
 ## 4. ArchiveStore 接缝
 
 `ArchiveStore` 是 `txnopt_evidence` 内部 provider-neutral port（供应商中立端口），
-不从 `txnopt` 根包导出。当前唯一生产实现是
-`LocalFilesystemArchiveStore`；它使用 WSL/Linux 的 POSIX no-follow（禁止跟随链接）
-与原子 no-replace（禁止替换）原语，当前不宣称原生 Windows portability（可移植性）。
-云厂商确定后，新的 object store adapter
-（对象存储适配器）必须复用相同契约测试。
+不从 `txnopt` 根包导出。`LocalFilesystemArchiveStore` 使用 WSL/Linux 的 POSIX
+no-follow（禁止跟随链接）与原子 no-replace（禁止替换）原语，当前不宣称原生
+Windows portability（可移植性）。`S3ArchiveStore` 是注入 S3 client（客户端）的
+云端 Adapter（适配器），可由 AWS S3 或通过 live contract（真实契约）验证的
+S3-compatible provider（S3 兼容供应商）使用；它不把任何供应商类型泄漏到 port。
 
 接口：
 
@@ -78,6 +79,13 @@ verify_commit(ref)
     文件句柄上先核验大小与 SHA-256，FIFO（命名管道）等对象不得阻塞读取；
 12. verify/restore（验证/恢复）以只读模式打开 store，不创建 root、锁或 staging；恢复
     目标不得位于 store 内部。
+13. S3 bucket 必须启用 versioning（版本控制）、COMPLIANCE Object Lock（合规对象锁）
+    和不少于声明下限的默认保留期；仅有可重算 sidecar（哈希旁文件）不构成信任根。
+14. S3 blob 与 commit marker 均使用 `If-None-Match: *` 条件创建；同名 key（键）不得
+    被普通 PUT 覆盖。大文件只在 conditional multipart completion（条件分段完成）后
+    可见，失败的未完成分段不属于 evidence。
+15. S3 `open`/`head`/`verify_commit` 下载实际对象并重算字节数与 SHA-256；不能仅信任
+    ETag 或用户 metadata（元数据）。commit marker 仍在所有 blob 后最后发布。
 
 统一命令：
 
@@ -88,7 +96,14 @@ txnopt archive verify --store <root> --commit-id <id> \
   --commit-sha256 <sha256> --commit-size <bytes>
 txnopt archive restore --store <root> --commit-id <id> \
   --commit-sha256 <sha256> --commit-size <bytes> --destination <path>
+txnopt archive mirror <source> --s3-bucket <bucket> --s3-prefix <prefix> \
+  --s3-region <region> [--s3-endpoint-url https://<endpoint>] --commit-id <id>
 ```
+
+S3 凭据只从 boto3 standard credential provider chain（标准凭据提供链）读取；CLI 不
+接受 access key（访问密钥）参数。首次云端副本必须使用可即时读取的 storage class
+（存储层）完成全量 verify 与恢复演练；若后续转入 Deep Archive（深度归档），由 bucket
+lifecycle（存储桶生命周期）在验证后执行，不能在对象仍不可读时签发迁移 PASS。
 
 ## 5. 不可变恢复边界
 

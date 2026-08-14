@@ -230,6 +230,58 @@ def test_cli_archive_inventory_mirror_verify_and_restore(
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
 )
+def test_cli_s3_archive_uses_standard_credential_factory_without_secret_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from txnopt_evidence.archive import LocalFilesystemArchiveStore
+    from txnopt_evidence.archive_s3 import S3ArchiveStore
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "evidence.json").write_text('{"status":"SEALED"}\n', encoding="utf-8")
+    calls: dict[str, object] = {}
+    delegate = LocalFilesystemArchiveStore(tmp_path / "cloud-fixture")
+
+    def fake_factory(
+        _cls: type[S3ArchiveStore], **kwargs: object
+    ) -> LocalFilesystemArchiveStore:
+        calls.update(kwargs)
+        return delegate
+
+    monkeypatch.setattr(S3ArchiveStore, "from_boto3", classmethod(fake_factory))
+
+    assert main(
+        [
+            "archive",
+            "mirror",
+            str(source),
+            "--s3-bucket",
+            "txnopt-evidence",
+            "--s3-prefix",
+            "archive-v1",
+            "--s3-region",
+            "us-west-004",
+            "--s3-endpoint-url",
+            "https://s3.us-west-004.backblazeb2.com",
+            "--commit-id",
+            "s3-cli-attempt-01",
+        ]
+    ) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema_version"] == "txnopt-archive-mirror-result-v1"
+    assert calls["bucket"] == "txnopt-evidence"
+    assert calls["prefix"] == "archive-v1"
+    assert calls["region_name"] == "us-west-004"
+    assert calls["endpoint_url"] == "https://s3.us-west-004.backblazeb2.com"
+    assert all("key" not in argument.lower() for argument in calls)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="local archive adapter is Linux-only"
+)
 def test_cli_archive_rejects_relative_or_worktree_local_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

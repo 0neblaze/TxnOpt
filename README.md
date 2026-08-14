@@ -82,6 +82,9 @@ txnopt archive verify --store ARCHIVE --commit-id ATTEMPT \
   --commit-sha256 SHA256 --commit-size BYTES
 txnopt archive restore --store ARCHIVE --commit-id ATTEMPT \
   --commit-sha256 SHA256 --commit-size BYTES --destination DESTINATION
+txnopt archive mirror SOURCE --s3-bucket BUCKET --s3-prefix PREFIX \
+  --s3-region REGION [--s3-endpoint-url https://S3-ENDPOINT] \
+  --commit-id ATTEMPT
 txnopt legacy verify LEGACY_RECEIPT.json
 ```
 
@@ -97,12 +100,15 @@ Rebuildable local state is tree-scoped outside the repository:
 
 When a local run config omits `output_root`, raw output defaults to the `runs/`
 directory below that tree-scoped state root. Formal evidence always requires an
-explicit governed output root. The internal
-`ArchiveStore` port currently has one production adapter,
-`LocalFilesystemArchiveStore`, implemented with WSL/Linux POSIX no-follow and
-atomic no-replace primitives. Native Windows archive portability and every
-cloud-provider adapter remain unimplemented until separately designed,
-validated, and authorized.
+explicit governed output root. The internal `ArchiveStore` port has a WSL/Linux
+`LocalFilesystemArchiveStore` and an optional `S3ArchiveStore`. The S3 adapter
+uses boto3's standard credential chain, requires bucket versioning plus a
+minimum COMPLIANCE Object Lock rule, conditionally creates every object, and
+downloads each object to recompute SHA-256 before treating it as verified.
+Install the optional client with `txnopt[s3]`; credentials must not be passed on
+the command line or written to Git. A provider is not admitted for governed
+evidence until its live bucket passes the same contract tests. Native Windows
+archive portability remains unimplemented.
 
 ## Evidence and formal verification
 

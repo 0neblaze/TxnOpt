@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
+from txnopt_evidence.archive import ArchiveStore
 from txnopt_evidence.codec import read_signed_json
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.reviewer import (
@@ -82,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
 
     archive_mirror = archive_commands.add_parser("mirror")
     archive_mirror.add_argument("source", type=Path)
-    archive_mirror.add_argument("--store", type=Path, required=True)
+    _add_archive_store_arguments(archive_mirror)
     archive_mirror.add_argument("--commit-id", required=True)
 
     archive_verify = archive_commands.add_parser("verify")
@@ -253,16 +254,27 @@ def _add_campaign_review_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_archive_ref_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--store", type=Path, required=True)
+    _add_archive_store_arguments(parser)
     parser.add_argument("--commit-id", required=True)
     parser.add_argument("--commit-sha256", required=True)
     parser.add_argument("--commit-size", type=int, required=True)
 
 
+def _add_archive_store_arguments(parser: argparse.ArgumentParser) -> None:
+    backend = parser.add_mutually_exclusive_group(required=True)
+    backend.add_argument("--store", type=Path)
+    backend.add_argument("--s3-bucket")
+    parser.add_argument("--s3-prefix", default="txnopt")
+    parser.add_argument("--s3-region")
+    parser.add_argument("--s3-endpoint-url")
+    parser.add_argument("--s3-minimum-retention-days", type=int, default=365)
+    parser.add_argument("--s3-disable-request-checksum", action="store_true")
+    parser.add_argument("--s3-storage-class")
+
+
 def _archive_command(arguments: argparse.Namespace) -> object:
     from txnopt_evidence.archive import (
         ArchiveCommitRef,
-        LocalFilesystemArchiveStore,
         inventory_tree,
         mirror_tree,
         restore_commit,
@@ -270,17 +282,18 @@ def _archive_command(arguments: argparse.Namespace) -> object:
 
     if arguments.archive_command == "inventory":
         return inventory_tree(arguments.source).to_payload()
-    _require_explicit_external_archive_root(arguments.store)
-    if arguments.archive_command == "mirror":
+    if arguments.store is not None:
+        _require_explicit_external_archive_root(arguments.store)
+    if arguments.archive_command == "mirror" and arguments.store is not None:
         _require_separate_archive_source(arguments.source, arguments.store)
     if arguments.archive_command == "mirror":
-        store = LocalFilesystemArchiveStore(arguments.store)
+        store: ArchiveStore = _archive_store(arguments, create=True)
         ref = mirror_tree(arguments.source, store=store, commit_id=arguments.commit_id)
         return {
             "schema_version": "txnopt-archive-mirror-result-v1",
             "commit_ref": _archive_ref_payload(ref),
         }
-    store = LocalFilesystemArchiveStore(arguments.store, create=False)
+    store = _archive_store(arguments, create=False)
     ref = ArchiveCommitRef(
         commit_id=arguments.commit_id,
         sha256=arguments.commit_sha256,
@@ -305,6 +318,24 @@ def _archive_command(arguments: argparse.Namespace) -> object:
             "verified": restore_receipt.verified,
         }
     raise ValueError("unknown archive command")
+
+
+def _archive_store(arguments: argparse.Namespace, *, create: bool) -> ArchiveStore:
+    from txnopt_evidence.archive import LocalFilesystemArchiveStore
+
+    if arguments.store is not None:
+        return LocalFilesystemArchiveStore(arguments.store, create=create)
+    from txnopt_evidence.archive_s3 import S3ArchiveStore
+
+    return S3ArchiveStore.from_boto3(
+        bucket=arguments.s3_bucket,
+        prefix=arguments.s3_prefix,
+        region_name=arguments.s3_region,
+        endpoint_url=arguments.s3_endpoint_url,
+        minimum_retention_days=arguments.s3_minimum_retention_days,
+        send_checksum_sha256=not arguments.s3_disable_request_checksum,
+        storage_class=arguments.s3_storage_class,
+    )
 
 
 def _require_explicit_external_archive_root(path: Path) -> None:

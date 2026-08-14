@@ -96,6 +96,24 @@ class ArchiveCommit:
         }
 
 
+def encode_archive_commit(commit: ArchiveCommit) -> bytes:
+    """Encode one archive commit using the exact canonical wire representation."""
+
+    return canonical_json_bytes(commit.to_payload(), pretty=True)
+
+
+def decode_archive_commit(data: bytes) -> ArchiveCommit:
+    """Decode and schema-close one canonical archive commit."""
+
+    try:
+        payload: object = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ArchiveIntegrityError("archive commit is not valid JSON") from error
+    if canonical_json_bytes(payload, pretty=True) != data:
+        raise ArchiveIntegrityError("archive commit is not canonical JSON")
+    return _commit_from_payload(payload)
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveCommitRef:
     commit_id: str
@@ -316,7 +334,7 @@ class LocalFilesystemArchiveStore:
         expected_absent: bool = True,
     ) -> ArchiveCommitRef:
         self._require_writable()
-        data = canonical_json_bytes(commit.to_payload(), pretty=True)
+        data = encode_archive_commit(commit)
         ref = ArchiveCommitRef(
             commit_id=commit.commit_id,
             sha256=hashlib.sha256(data).hexdigest(),
@@ -408,13 +426,7 @@ class LocalFilesystemArchiveStore:
                 raise ArchiveIntegrityError(
                     "archive commit differs from its immutable reference"
                 )
-            try:
-                payload: object = json.loads(data)
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ArchiveIntegrityError("archive commit is not valid JSON") from error
-            if canonical_json_bytes(payload, pretty=True) != data:
-                raise ArchiveIntegrityError("archive commit is not canonical JSON")
-            commit = _commit_from_payload(payload)
+            commit = decode_archive_commit(data)
             if commit.commit_id != ref.commit_id:
                 raise ArchiveIntegrityError(
                     "archive commit identity differs from its reference"
@@ -1169,6 +1181,8 @@ __all__ = [
     "ArchiveStore",
     "ArchiveVerificationReceipt",
     "LocalFilesystemArchiveStore",
+    "decode_archive_commit",
+    "encode_archive_commit",
     "inventory_tree",
     "mirror_tree",
     "restore_commit",
