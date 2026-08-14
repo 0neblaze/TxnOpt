@@ -408,6 +408,87 @@ def _execution_python_path(path: Path) -> Path:
     return candidate
 
 
+def _protocol_calibration_schema(protocol_path: Path) -> str:
+    payload: object = json.loads(protocol_path.resolve(strict=True).read_bytes())
+    if not isinstance(payload, dict):
+        raise ValueError("Level 1 protocol must be an object")
+    schema = payload.get("schema_version")
+    if schema == "txnopt-level1-protocol-v2":
+        return "txnopt-local-runtime-calibration-v2"
+    if schema == "txnopt-level1-protocol-v1":
+        return "txnopt-local-runtime-calibration-v1"
+    raise ValueError("unsupported Level 1 protocol schema for calibration")
+
+
+def materialize_attempt27_v2_correction(source: Path, output: Path) -> str:
+    """Correct a completed v1-classified Attempt27 receipt without rewriting it."""
+
+    source_path = source.resolve(strict=True)
+    source_sha256 = _verify_sidecar(source_path)
+    payload = read_signed_json(source_path)
+    if (
+        payload.get("schema_version") != "txnopt-local-runtime-calibration-v1"
+        or payload.get("status") != "LOCAL_CALIBRATION_COMPLETE_NOT_LEVEL1_EVIDENCE"
+        or payload.get("build") != "Build16"
+        or payload.get("attempt") != 27
+        or payload.get("cloud_purchase_performed") is not False
+        or payload.get("formal_matrix_started") is not False
+        or payload.get("holdout_opened") is not False
+    ):
+        raise ValueError("Attempt27 source receipt is not eligible for v2 correction")
+    plan_value = payload.get("plan_manifest_path")
+    if not isinstance(plan_value, str) or not plan_value:
+        raise ValueError("Attempt27 source receipt lacks its formal plan")
+    plan = read_signed_json(Path(plan_value))
+    protocol_value = plan.get("protocol_path")
+    if not isinstance(protocol_value, str) or not protocol_value:
+        raise ValueError("Attempt27 formal plan lacks its protocol path")
+    if (
+        _protocol_calibration_schema(Path(protocol_value))
+        != "txnopt-local-runtime-calibration-v2"
+    ):
+        raise ValueError("Attempt27 source plan does not bind protocol v2")
+    samples = payload.get("samples")
+    if not isinstance(samples, list) or len(samples) != 96:
+        raise ValueError("Attempt27 correction requires all 96 samples")
+    peak_rss_bytes = 0
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("Attempt27 sample must be an object")
+        run_peak = sample.get("run_peak_rss_bytes")
+        review_peak = sample.get("review_peak_rss_bytes")
+        if (
+            isinstance(run_peak, bool)
+            or not isinstance(run_peak, int)
+            or run_peak <= 0
+            or isinstance(review_peak, bool)
+            or not isinstance(review_peak, int)
+            or review_peak <= 0
+            or sample.get("prefix_safety") != "PASS"
+            or sample.get("aggregate_refinement_replay") != "PASS"
+            or sample.get("fallback_count") != 0
+        ):
+            raise ValueError("Attempt27 sample is incomplete or failed")
+        peak_rss_bytes = max(peak_rss_bytes, run_peak, review_peak)
+    corrected = dict(payload)
+    corrected.update(
+        {
+            "schema_version": "txnopt-local-runtime-calibration-v2",
+            "supersedes_calibration_receipt_path": str(source_path),
+            "supersedes_calibration_receipt_sha256": source_sha256,
+            "correction_reason": (
+                "the completed protocol-v2 sample set was classified as v1 because "
+                "the aggregator inspected a nonexistent plan field"
+            ),
+            "raw_and_review_evidence_rerun": False,
+            "peak_rss_bytes": peak_rss_bytes,
+            "peak_rss_measurement": "Linux /proc/<pid>/status VmHWM",
+            "memory_margin_live_host_verified": False,
+        }
+    )
+    return write_signed_json(output, corrected)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan-manifest", type=Path, required=True)
@@ -639,12 +720,7 @@ def main() -> int:
                 "seconds_per_run_p95": values[index],
             }
         )
-    protocol_schema = plan.payload.get("protocol_schema_version")
-    schema_version = (
-        "txnopt-local-runtime-calibration-v2"
-        if protocol_schema == "txnopt-level1-protocol-v2"
-        else "txnopt-local-runtime-calibration-v1"
-    )
+    schema_version = _protocol_calibration_schema(plan.protocol_path)
     receipt = {
         "schema_version": schema_version,
         "status": "LOCAL_CALIBRATION_COMPLETE_NOT_LEVEL1_EVIDENCE",

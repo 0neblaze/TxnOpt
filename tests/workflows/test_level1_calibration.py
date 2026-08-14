@@ -13,7 +13,9 @@ from txnopt_evidence.level1_calibration import (
     _execution_python_path,
     _load_calibration_plan,
     _materialize_calibration_plan,
+    _protocol_calibration_schema,
     _run,
+    materialize_attempt27_v2_correction,
 )
 
 
@@ -57,6 +59,62 @@ def test_calibration_preserves_virtualenv_python_launcher(tmp_path: Path) -> Non
 
     assert selected == launcher.absolute()
     assert selected.is_symlink()
+
+
+def test_protocol_v2_selects_attempt27_calibration_schema(tmp_path: Path) -> None:
+    protocol = tmp_path / "protocol-v2.json"
+    protocol.write_text(
+        json.dumps({"schema_version": "txnopt-level1-protocol-v2"}),
+        encoding="utf-8",
+    )
+
+    assert _protocol_calibration_schema(protocol) == "txnopt-local-runtime-calibration-v2"
+
+
+def test_attempt27_v1_receipt_is_corrected_without_overwrite(tmp_path: Path) -> None:
+    protocol = tmp_path / "protocol-v2.json"
+    protocol.write_text(
+        json.dumps({"schema_version": "txnopt-level1-protocol-v2"}),
+        encoding="utf-8",
+    )
+    plan = tmp_path / "formal-plan.json"
+    write_signed_json(plan, {"protocol_path": str(protocol)})
+    source = tmp_path / "attempt27-v1.json"
+    samples = [
+        {
+            "run_peak_rss_bytes": 1_000_000 + ordinal,
+            "review_peak_rss_bytes": 2_000_000 + ordinal,
+            "prefix_safety": "PASS",
+            "aggregate_refinement_replay": "PASS",
+            "fallback_count": 0,
+        }
+        for ordinal in range(96)
+    ]
+    write_signed_json(
+        source,
+        {
+            "schema_version": "txnopt-local-runtime-calibration-v1",
+            "status": "LOCAL_CALIBRATION_COMPLETE_NOT_LEVEL1_EVIDENCE",
+            "build": "Build16",
+            "attempt": 27,
+            "plan_manifest_path": str(plan),
+            "samples": samples,
+            "cloud_purchase_performed": False,
+            "formal_matrix_started": False,
+            "holdout_opened": False,
+        },
+    )
+    corrected_path = tmp_path / "attempt27-v2.json"
+
+    materialize_attempt27_v2_correction(source, corrected_path)
+
+    assert source.exists()
+    corrected = read_signed_json(corrected_path)
+    assert corrected["schema_version"] == "txnopt-local-runtime-calibration-v2"
+    assert corrected["peak_rss_bytes"] == 2_000_095
+    assert corrected["supersedes_calibration_receipt_sha256"] == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
 
 
 def test_attempt27_materialization_cannot_write_attempt26_raw_root(
