@@ -65,11 +65,11 @@ def materialize_tencent_deployment(
         copied.append(_copy_input(artifacts, role=role, source=source, name=name))
         if signed:
             copied.append(
-                _copy_input(
+                _write_rebased_sidecar(
                     artifacts,
                     role=f"{role}_sidecar",
-                    source=source.with_suffix(source.suffix + ".sha256"),
-                    name=f"{name}.sha256",
+                    source=source,
+                    target_name=name,
                 )
             )
 
@@ -321,6 +321,24 @@ def _copy_input(
     return {
         "role": role,
         "relative_path": relative,
+        "sha256": write_exclusive(destination / name, data),
+        "size": len(data),
+    }
+
+
+def _write_rebased_sidecar(
+    destination: Path,
+    *,
+    role: str,
+    source: Path,
+    target_name: str,
+) -> dict[str, object]:
+    digest = verify_sidecar(source)
+    name = f"{target_name}.sha256"
+    data = f"{digest}  {target_name}\n".encode()
+    return {
+        "role": role,
+        "relative_path": f"artifacts/{name}",
         "sha256": write_exclusive(destination / name, data),
         "size": len(data),
     }

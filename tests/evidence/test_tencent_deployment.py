@@ -62,7 +62,7 @@ tencent = [
     uv_lock.write_text("version = 1\n", encoding="utf-8")
     uv_wheel = inputs / "uv-0.12.4-py3-none-manylinux2014_x86_64.whl"
     uv_wheel.write_bytes(b"locked uv wheel")
-    toolchain = inputs / "toolchain-lock.json"
+    toolchain = inputs / "txnopt-toolchain-lock-v1.json"
     write_toolchain_lock(
         toolchain,
         [
