@@ -89,7 +89,7 @@ def _admitted_work(draw: st.DrawFn) -> tuple[tuple[int, ...], int, int, int, int
 
 
 @given(_admitted_work())
-@settings(max_examples=200, deadline=None)
+@settings(max_examples=600, deadline=None)
 def test_t4_atomic_window_bound_holds_for_admitted_work(
     case: tuple[tuple[int, ...], int, int, int, int],
 ) -> None:
@@ -114,7 +114,7 @@ def test_t4_atomic_window_bound_holds_for_admitted_work(
         max_size=20,
     )
 )
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=600, deadline=None)
 def test_cache_conflict_never_publishes_a_stale_transaction(
     current_values: dict[str, int],
 ) -> None:
@@ -131,7 +131,7 @@ def test_cache_conflict_never_publishes_a_stale_transaction(
 
 
 @given(st.lists(st.integers(0, 20), min_size=1, max_size=20))
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=600, deadline=None)
 def test_duplicate_candidate_keys_are_evaluated_once(candidates: list[int]) -> None:
     unique = tuple(dict.fromkeys(candidates))
     oracle = _RecordingOracle()
@@ -156,7 +156,7 @@ def test_duplicate_candidate_keys_are_evaluated_once(candidates: list[int]) -> N
     st.lists(st.integers(1, 100), min_size=2, max_size=20, unique=True),
     st.data(),
 )
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=600, deadline=None)
 def test_insufficient_budget_never_starts_or_caches_a_partial_batch(
     candidates: list[int],
     data: st.DataObject,
@@ -183,7 +183,7 @@ def test_insufficient_budget_never_starts_or_caches_a_partial_batch(
 
 
 @given(st.lists(st.integers(1, 100), min_size=1, max_size=20, unique=True))
-@settings(max_examples=100, deadline=None)
+@settings(max_examples=600, deadline=None)
 def test_late_complete_batch_is_rolled_back(candidates: list[int]) -> None:
     ticks = iter((0, 0, 2))
     cache = InMemoryCacheStore[int]()
