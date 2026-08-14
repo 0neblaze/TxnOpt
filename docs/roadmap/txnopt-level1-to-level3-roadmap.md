@@ -176,8 +176,10 @@ The Level 1 internal artifact identity is:
 - native module: `txnopt._native`;
 - protocols: `txnopt-contract-v1`, `txnopt-native-round-v1`,
   `txnopt-semantic-trace-v1`, and `txnopt-physical-trace-v1`;
-- CLI: `txnopt run`, `txnopt verify`, `txnopt replay`, `txnopt env`, and
-  `txnopt legacy verify`.
+- Public CLI: `txnopt run`, `txnopt verify`, `txnopt plan`, `txnopt preflight`,
+  `txnopt review`, `txnopt archive inventory`, and the explicit
+  `txnopt cloud tencent ...` namespace. Per-run replay is an internal
+  fresh-process reviewer entrypoint rather than a public command.
 
 The root package exports exactly five names:
 

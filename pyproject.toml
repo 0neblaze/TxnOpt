@@ -15,8 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-s3 = [
-  "boto3>=1.35,<2",
+tencent = [
+  "cos-python-sdk-v5==1.9.44",
+  "tencentcloud-sdk-python-common==3.1.156",
+  "tencentcloud-sdk-python-cvm==3.1.156",
 ]
 
 [project.scripts]

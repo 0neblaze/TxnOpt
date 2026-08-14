@@ -61,9 +61,6 @@ The internal CLI surface is:
 txnopt run --config RUN.json
 txnopt verify RAW/manifest.json \
   --expected-identity PLAN/expected-identities/RUN.json
-txnopt replay RAW/manifest.json --output-dir REVIEW \
-  --expected-identity PLAN/expected-identities/RUN.json
-txnopt env
 txnopt plan --protocol PROTOCOL.json --catalog CASE-CATALOG.json \
   --destination PLAN_DIR --raw-output-root RAW_ROOT \
   --build-manifest BUILD.json --fixed-work WORK \
@@ -76,16 +73,33 @@ txnopt review --plan-manifest PLAN/manifest.json \
   --execution-receipt EXECUTION.json --python PYTHON --wheel WHEEL \
   --review-root REVIEW_ROOT --review-receipt REVIEW.json \
   [--review-workers N --per-run-timeout-seconds SECONDS]
+txnopt cloud tencent assess --protocol PROTOCOL.json \
+  --calibration CALIBRATION.json --physical-cores 64 --provider-memory-gb 128
+txnopt cloud tencent spec --output SPEC.json
+txnopt cloud tencent doctor --instance-type SKU \
+  --provider-physical-cores 64 --provider-memory-gb 128 \
+  --expected-peak-rss-bytes BYTES --output HOST-RECEIPT.json
+txnopt cloud tencent dry-run --region REGION --zone ZONE \
+  --instance-type SKU --image-id IMAGE --vpc-id VPC --subnet-id SUBNET \
+  --security-group-id SECURITY-GROUP --provider-memory-gb 128 \
+  --request-output REQUEST.json --receipt-output RECEIPT.json
+txnopt cloud tencent bundle --destination DEPLOYMENT \
+  --build-manifest BUILD16.json --wheel TXNOPT.whl \
+  --source-manifest SOURCE.json --native-attestation NATIVE.json \
+  --uv-lock uv.lock --toolchain-lock TOOLCHAIN.json \
+  --plan-manifest ATTEMPT26.json
+txnopt cloud tencent bundle-verify --manifest DEPLOYMENT/bundle-receipt.json
 txnopt archive inventory SOURCE
-txnopt archive mirror SOURCE --store ARCHIVE --commit-id ATTEMPT
-txnopt archive verify --store ARCHIVE --commit-id ATTEMPT \
-  --commit-sha256 SHA256 --commit-size BYTES
-txnopt archive restore --store ARCHIVE --commit-id ATTEMPT \
-  --commit-sha256 SHA256 --commit-size BYTES --destination DESTINATION
-txnopt archive mirror SOURCE --s3-bucket BUCKET --s3-prefix PREFIX \
-  --s3-region REGION [--s3-endpoint-url https://S3-ENDPOINT] \
-  --commit-id ATTEMPT
-txnopt legacy verify LEGACY_RECEIPT.json
+txnopt cloud tencent cos mirror SOURCE --cos-bucket BUCKET-APPID \
+  --cos-region REGION --cos-prefix PREFIX --commit-id ATTEMPT
+txnopt cloud tencent cos verify --cos-bucket BUCKET-APPID --cos-region REGION \
+  --cos-prefix PREFIX --commit-id ATTEMPT --commit-key KEY \
+  --commit-version-id VERSION --commit-sha256 SHA256 --commit-size BYTES \
+  --commit-retain-until TIMESTAMP
+txnopt cloud tencent cos restore --cos-bucket BUCKET-APPID --cos-region REGION \
+  --cos-prefix PREFIX --commit-id ATTEMPT --commit-key KEY \
+  --commit-version-id VERSION --commit-sha256 SHA256 --commit-size BYTES \
+  --commit-retain-until TIMESTAMP --destination DESTINATION
 ```
 
 Runner output contains raw artifacts only. Readiness decisions must be made by
@@ -100,15 +114,28 @@ Rebuildable local state is tree-scoped outside the repository:
 
 When a local run config omits `output_root`, raw output defaults to the `runs/`
 directory below that tree-scoped state root. Formal evidence always requires an
-explicit governed output root. The internal `ArchiveStore` port has a WSL/Linux
-`LocalFilesystemArchiveStore` and an optional `S3ArchiveStore`. The S3 adapter
-uses boto3's standard credential chain, requires bucket versioning plus a
-minimum COMPLIANCE Object Lock rule, conditionally creates every object, and
-downloads each object to recompute SHA-256 before treating it as verified.
-Install the optional client with `txnopt[s3]`; credentials must not be passed on
-the command line or written to Git. A provider is not admitted for governed
-evidence until its live bucket passes the same contract tests. Native Windows
-archive portability remains unimplemented.
+explicit governed output root. There is no generic `ArchiveStore`, local archive
+adapter, or S3 compatibility layer. `txnopt_evidence.tencent_cos` is a direct
+Tencent COS integration and `txnopt_evidence.archive` only inventories local
+source bytes. COS objects and commit markers bind the exact returned `VersionId`;
+same-name keys are never treated as immutable identities by themselves. The
+bucket must have versioning plus default COMPLIANCE Object Lock for at least 365
+days, and every exact version is downloaded to recompute its SHA-256 before it is
+accepted. Install the optional client with `txnopt[tencent]`. Credentials are read
+only from `TENCENTCLOUD_SECRET_ID`, `TENCENTCLOUD_SECRET_KEY`, optional
+`TENCENTCLOUD_SESSION_TOKEN`, or a CVM CAM role selected by
+`TENCENTCLOUD_USE_CVM_ROLE=1`; they are not CLI arguments and must not be written
+to Git. Native Windows source inventory and atomic restore remain unimplemented.
+
+The Tencent capacity profile means **64 physical cores**, not 64 vCPU. Offline
+assessment cannot prove a cloud instance satisfies that requirement. Before a
+formal run, both the Tencent instance metadata/API and the Linux topology probe
+must show 64 physical cores and one thread per core. The Tencent product/API
+memory specification must be at least 128 GB. Linux `MemTotal` is recorded but
+may be slightly below the product value because of platform reservations; that
+alone is not a failure. The Attempt27 peak RSS must remain below 80% of the
+actual visible memory. Capacity assessment, account configuration, procurement
+authorization, build portability, and formal execution remain separate gates.
 
 ## Evidence and formal verification
 

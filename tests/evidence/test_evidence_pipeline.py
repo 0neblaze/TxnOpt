@@ -505,8 +505,7 @@ def test_cli_replay_runs_in_a_fresh_process_and_writes_signed_review(
         [
             sys.executable,
             "-m",
-            "txnopt_evidence.cli",
-            "replay",
+            "txnopt_evidence.review_cli",
             str(raw.manifest_path),
             "--output-dir",
             str(review_dir),

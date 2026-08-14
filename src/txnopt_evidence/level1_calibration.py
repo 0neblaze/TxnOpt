@@ -38,16 +38,46 @@ def _object(value: object, label: str) -> dict[str, Any]:
     return value
 
 
-def _run(command: list[str]) -> tuple[dict[str, Any], float]:
+def _run(command: list[str]) -> tuple[dict[str, Any], float, int]:
     started = time.perf_counter()
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    peak_rss_bytes = 0
+    while True:
+        peak_rss_bytes = max(peak_rss_bytes, _process_peak_rss_bytes(process.pid))
+        try:
+            stdout, stderr = process.communicate(timeout=0.01)
+            break
+        except subprocess.TimeoutExpired:
+            continue
     elapsed = time.perf_counter() - started
-    if completed.returncode != 0:
+    if process.returncode != 0:
         raise RuntimeError(
-            f"calibration command failed ({completed.returncode}): {completed.stderr.strip()}"
+            f"calibration command failed ({process.returncode}): {stderr.strip()}"
         )
-    output: object = json.loads(completed.stdout)
-    return _object(output, "command output"), elapsed
+    output: object = json.loads(stdout)
+    if peak_rss_bytes <= 0:
+        raise RuntimeError("calibration command peak RSS was not observed")
+    return _object(output, "command output"), elapsed, peak_rss_bytes
+
+
+def _process_peak_rss_bytes(pid: int) -> int:
+    status = Path(f"/proc/{pid}/status")
+    try:
+        lines = status.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return 0
+    for line in lines:
+        if line.startswith("VmHWM:"):
+            fields = line.split()
+            if len(fields) != 3 or fields[2] != "kB":
+                raise RuntimeError("Linux VmHWM has an unexpected format")
+            return int(fields[1]) * 1024
+    return 0
 
 
 def main() -> int:
@@ -123,6 +153,7 @@ def main() -> int:
 
     samples: list[dict[str, object]] = []
     groups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    maximum_peak_rss_bytes = 0
     review_root.mkdir(parents=True, exist_ok=False)
     for ordinal, (
         config_path,
@@ -133,17 +164,16 @@ def main() -> int:
         seed,
         budget,
     ) in enumerate(selected, 1):
-        run_output, elapsed = _run(
+        run_output, elapsed, run_peak_rss_bytes = _run(
             [sys.executable, "-m", "txnopt_evidence.cli", "run", "--config", str(config_path)]
         )
         manifest = Path(str(run_output.get("manifest_path"))).resolve(strict=True)
         review_dir = review_root / str(run_output.get("run_label"))
-        review_output, _review_elapsed = _run(
+        review_output, _review_elapsed, review_peak_rss_bytes = _run(
             [
                 sys.executable,
                 "-m",
-                "txnopt_evidence.cli",
-                "replay",
+                "txnopt_evidence.review_cli",
                 str(manifest),
                 "--output-dir",
                 str(review_dir),
@@ -153,6 +183,11 @@ def main() -> int:
         )
         if review_output.get("status") != "PASS":
             raise RuntimeError("independent calibration replay did not pass")
+        maximum_peak_rss_bytes = max(
+            maximum_peak_rss_bytes,
+            run_peak_rss_bytes,
+            review_peak_rss_bytes,
+        )
         key = (domain, axis, budget)
         groups[key].append(elapsed)
         samples.append(
@@ -164,6 +199,8 @@ def main() -> int:
                 "axis": axis,
                 "budget": budget,
                 "elapsed_seconds": elapsed,
+                "run_peak_rss_bytes": run_peak_rss_bytes,
+                "review_peak_rss_bytes": review_peak_rss_bytes,
                 "raw_manifest_path": str(manifest),
                 "raw_manifest_sha256": str(run_output.get("manifest_sha256")),
                 "review_path": str(review_dir / "review.json"),
@@ -197,8 +234,14 @@ def main() -> int:
                 "seconds_per_run_p95": values[index],
             }
         )
+    protocol_schema = plan.payload.get("protocol_schema_version")
+    schema_version = (
+        "txnopt-local-runtime-calibration-v2"
+        if protocol_schema == "txnopt-level1-protocol-v2"
+        else "txnopt-local-runtime-calibration-v1"
+    )
     receipt = {
-        "schema_version": "txnopt-local-runtime-calibration-v1",
+        "schema_version": schema_version,
         "status": "LOCAL_CALIBRATION_COMPLETE_NOT_LEVEL1_EVIDENCE",
         "plan_manifest_path": str(plan_path),
         "plan_manifest_sha256": plan_sha256,
@@ -207,6 +250,15 @@ def main() -> int:
         "p95_policy": "nearest-rank; six samples per domain-axis-budget group",
         "observations": observations,
         "samples": samples,
+        **(
+            {
+                "peak_rss_bytes": maximum_peak_rss_bytes,
+                "peak_rss_measurement": "Linux /proc/<pid>/status VmHWM",
+                "memory_margin_live_host_verified": False,
+            }
+            if schema_version == "txnopt-local-runtime-calibration-v2"
+            else {}
+        ),
         "cloud_purchase_performed": False,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

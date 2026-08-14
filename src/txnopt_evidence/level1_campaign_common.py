@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
+from txnopt_evidence.level1_protocol import validate_level1_protocol_v2
 
 AXES: dict[str, tuple[str, int, int]] = {
     "serial_1": ("serial", 1, 0),
@@ -163,13 +164,18 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
     protocol_path = _bound_file(plan, "protocol_path", "protocol_sha256")
     protocol_sha256 = sha256_file(protocol_path)
     protocol = _object(json.loads(protocol_path.read_bytes()), "Level 1 protocol")
-    if (
-        protocol.get("schema_version") != "txnopt-level1-protocol-v1"
-        or protocol.get("holdout_opened") is not False
-        or protocol.get("level2_holdout_opened") is not False
-        or protocol.get("level3_holdout_opened") is not False
-    ):
-        raise ValueError("Level 1 protocol or holdout boundary differs")
+    protocol_schema = protocol.get("schema_version")
+    if protocol_schema == "txnopt-level1-protocol-v1":
+        if (
+            protocol.get("holdout_opened") is not False
+            or protocol.get("level2_holdout_opened") is not False
+            or protocol.get("level3_holdout_opened") is not False
+        ):
+            raise ValueError("Level 1 protocol or holdout boundary differs")
+    elif protocol_schema == "txnopt-level1-protocol-v2":
+        validate_level1_protocol_v2(protocol)
+    else:
+        raise ValueError("Level 1 protocol schema differs")
     verify_sidecar(protocol_path)
     catalog_path = _bound_file(plan, "catalog_path", "catalog_sha256")
     catalog = _object(json.loads(catalog_path.read_bytes()), "case catalog")
@@ -246,13 +252,37 @@ def load_campaign_plan(path: Path) -> CampaignPlan:
             raise ValueError("Build14 formal-successor boundary differs")
         surface_gate = "wheel_surface_and_record"
         additional_gates = ()
+    elif run_label == "txnopt_level1_build_attempt16":
+        formal_successor = _object(build.get("formal_successor"), "build formal successor")
+        if (
+            status != "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY"
+            or formal_successor.get("prior_review_binding_status") != "PRIOR_SOURCE_ONLY"
+            or formal_successor.get("successor_status") != "REVIEW_PENDING_BUILD16"
+            or formal_successor.get("independent_successor_review_completed") is not False
+            or formal_successor.get("level1_formal_gate_passed") is not False
+        ):
+            raise ValueError("Build16 Tencent-cloud boundary differs")
+        surface_gate = "wheel_surface_and_record"
+        additional_gates = (
+            "formal_contract_tests",
+            "formal_model_receipt",
+            "native_source_identity",
+            "tencent_interface",
+            "toolchain_lock",
+        )
     else:
         raise ValueError("campaign build identity is not an approved Level 1 producer")
-    if (
-        schema_version == "txnopt-level1-campaign-plan-v2"
-        and run_label != "txnopt_level1_build_attempt14"
-    ):
-        raise ValueError("campaign plan v2 requires the approved Build14 producer")
+    if schema_version == "txnopt-level1-campaign-plan-v2":
+        if (
+            protocol_schema == "txnopt-level1-protocol-v1"
+            and run_label != "txnopt_level1_build_attempt14"
+        ):
+            raise ValueError("campaign plan v2 requires the approved Build14 producer")
+        if (
+            protocol_schema == "txnopt-level1-protocol-v2"
+            and run_label != "txnopt_level1_build_attempt16"
+        ):
+            raise ValueError("campaign protocol v2 requires the approved Build16 producer")
     for gate in (
         "ruff",
         "strict_mypy",
@@ -472,10 +502,15 @@ def load_prebound_expected_identity(entry: CampaignEntry) -> ExpectedEvidenceIde
 
 
 def load_analysis_protocol(path: Path, *, plan: CampaignPlan) -> tuple[dict[str, Any], str]:
-    payload = read_signed_object(
-        path,
-        schema_version="txnopt-level1-analysis-protocol-v1",
-    )
+    payload = read_signed_object(path)
+    analysis_schema = payload.get("schema_version")
+    protocol = _object(json.loads(plan.protocol_path.read_bytes()), "Level 1 protocol")
+    protocol_schema = protocol.get("schema_version")
+    if (analysis_schema, protocol_schema) not in {
+        ("txnopt-level1-analysis-protocol-v1", "txnopt-level1-protocol-v1"),
+        ("txnopt-level1-analysis-protocol-v2", "txnopt-level1-protocol-v2"),
+    }:
+        raise ValueError("analysis protocol version differs from its Level 1 protocol")
     digest = verify_sidecar(path)
     if (
         payload.get("status") != ANALYSIS_STATUS
@@ -512,13 +547,28 @@ def load_analysis_protocol(path: Path, *, plan: CampaignPlan) -> tuple[dict[str,
         }
     ):
         raise ValueError("analysis protocol differs from the exact preregistration")
-    if (
-        resources.get("exclusive_linux_required") is not True
-        or resources.get("maximum_consecutive_window_days") != 14
-        or resources.get("minimum_physical_cores") != 32
-        or resources.get("minimum_memory_gib") != 128
-    ):
-        raise ValueError("analysis resource environment differs from Level 1")
+    if analysis_schema == "txnopt-level1-analysis-protocol-v1":
+        if (
+            resources.get("exclusive_linux_required") is not True
+            or resources.get("maximum_consecutive_window_days") != 14
+            or resources.get("minimum_physical_cores") != 32
+            or resources.get("minimum_memory_gib") != 128
+        ):
+            raise ValueError("analysis resource environment differs from Level 1 v1")
+    elif resources != {
+        "minimum_physical_cores": 64,
+        "minimum_provider_memory_gb": 128,
+        "core_count": 64,
+        "thread_per_core": 1,
+        "region": None,
+        "region_required_live_input": True,
+        "exclusive_linux_required": True,
+        "maximum_consecutive_window_days": 14,
+        "predicted_completion_days_max": 10,
+        "linux_visible_memory_is_admission_gate": False,
+        "attempt27_peak_rss_fraction_max": 0.8,
+    }:
+        raise ValueError("analysis resource environment differs from Level 1 v2")
     return payload, digest
 
 
@@ -555,6 +605,30 @@ def validate_authorization(
         or payload.get("exclusive_linux") is not True
     ):
         raise PermissionError("procurement authorization does not match the exact campaign")
+    protocol = _object(json.loads(plan.protocol_path.read_bytes()), "Level 1 protocol")
+    if protocol.get("schema_version") == "txnopt-level1-protocol-v2":
+        provider = _object(
+            payload.get("tencent_provider_instance"),
+            "Tencent provider instance",
+        )
+        if (
+            not isinstance(provider.get("instance_type"), str)
+            or not provider["instance_type"]
+            or provider.get("physical_cores") != 64
+            or isinstance(provider.get("memory_gb"), bool)
+            or not isinstance(provider.get("memory_gb"), int)
+            or provider["memory_gb"] < 128
+            or not isinstance(provider.get("region"), str)
+            or not provider["region"]
+            or not isinstance(provider.get("zone"), str)
+            or not provider["zone"]
+            or payload.get("cvm_dry_run_passed") is not True
+            or not isinstance(payload.get("cvm_dry_run_receipt_sha256"), str)
+            or len(payload["cvm_dry_run_receipt_sha256"]) != 64
+        ):
+            raise PermissionError(
+                "procurement authorization lacks the exact Tencent CVM live evidence"
+            )
 
 
 def executable_path(path: Path) -> Path:

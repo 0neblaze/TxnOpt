@@ -97,6 +97,27 @@ txnopt -> never cases/evidence/legacy
 - Break cycles by extracting immutable identities, DTOs, or ports. Do not hide
   an architectural cycle behind a local import.
 
+## Tencent Cloud boundary
+
+- The selected cloud provider is Tencent Cloud, but no account, purchase, live
+  bucket, or formal execution is configured yet.
+- The cloud resource gate is at least **64 physical CPU cores** and a Tencent
+  product/API memory specification of at least **128 GB**. A vCPU or
+  logical-thread count is not physical-core evidence. Tencent `CoreCount=64`,
+  `ThreadPerCore=1`, and the in-instance Linux topology probe must all pass.
+  Linux-visible `MemTotal` is observational rather than an admission gate; the
+  Attempt27 peak RSS must remain below 80% of that visible memory.
+- Do not reintroduce a generic `ArchiveStore`, local archive backend, or S3
+  compatibility adapter. The active cloud archive module is the concrete
+  Tencent COS integration; local code may inventory source bytes but is not an
+  evidence archive backend.
+- COS evidence references bind key, SHA-256, size, and exact `VersionId`.
+  Bucket versioning and default COMPLIANCE Object Lock are mandatory. A key,
+  ETag, sidecar, or mutable latest version is never an immutable trust root.
+- COS credentials come only from the process environment or a CVM CAM role.
+  Never accept them as CLI arguments or write them to Git, evidence, logs, or
+  long-term memory.
+
 ## Public API and internal contracts
 
 The root `txnopt` package exports exactly:

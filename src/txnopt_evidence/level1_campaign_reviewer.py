@@ -72,6 +72,7 @@ def review_campaign(
         execution,
         plan,
         analysis_sha256,
+        analysis=analysis,
         expected_runtime_identity=runtime_identity,
     )
     if reviewer_identity["common_tool_sha256"] != runner_identity["common_sha256"]:
@@ -84,6 +85,14 @@ def review_campaign(
     if verify_sidecar(authorization_path) != execution.get("authorization_sha256"):
         raise ValueError("campaign execution authorization digest differs")
     validate_authorization(authorization, plan, analysis_sha256)
+    if analysis.get("schema_version") == "txnopt-level1-analysis-protocol-v2":
+        execution_host = _object(execution.get("host"), "execution host identity")
+        if execution_host.get("provider_instance") != authorization.get(
+            "tencent_provider_instance"
+        ):
+            raise ValueError(
+                "campaign execution provider identity differs from its authorization"
+            )
     review_destination = review_root.resolve()
     if review_destination.exists() or review_destination.is_symlink():
         raise FileExistsError(f"campaign review root already exists: {review_destination}")
@@ -196,8 +205,7 @@ def _review_one(
             str(python),
             "-I",
             "-m",
-            "txnopt_evidence.cli",
-            "replay",
+            "txnopt_evidence.review_cli",
             str(manifest_path),
             "--output-dir",
             str(review_dir),
@@ -618,6 +626,7 @@ def _validate_execution_receipt(
     plan: CampaignPlan,
     analysis_sha256: str,
     *,
+    analysis: dict[str, Any],
     expected_runtime_identity: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     runs = execution.get("runs")
@@ -677,15 +686,17 @@ def _validate_execution_receipt(
     ):
         if runtime_identity.get(key) != expected_runtime_identity.get(key):
             raise ValueError(f"campaign execution runtime identity differs: {key}")
+    analysis_schema = analysis.get("schema_version")
+    minimum_cores = 64 if analysis_schema == "txnopt-level1-analysis-protocol-v2" else 32
     if (
         host.get("system") != "Linux"
         or host.get("exclusive_linux_authorized") is not True
         or isinstance(host.get("physical_cores"), bool)
         or not isinstance(host.get("physical_cores"), int)
-        or host["physical_cores"] < 32
+        or host["physical_cores"] < minimum_cores
         or isinstance(host.get("memory_gib"), bool)
         or not isinstance(host.get("memory_gib"), int)
-        or host["memory_gib"] < 128
+        or host["memory_gib"] <= 0
         or isinstance(host.get("usable_core_tokens"), bool)
         or not isinstance(host.get("usable_core_tokens"), int)
         or host["usable_core_tokens"] <= 0
@@ -694,14 +705,32 @@ def _validate_execution_receipt(
         or not host["kernel_release"]
     ):
         raise ValueError("campaign execution host does not satisfy the resource contract")
+    if analysis_schema == "txnopt-level1-analysis-protocol-v1" and host["memory_gib"] < 128:
+        raise ValueError("campaign execution host does not satisfy the v1 memory contract")
+    if analysis_schema == "txnopt-level1-analysis-protocol-v2":
+        provider = _object(host.get("provider_instance"), "execution Tencent provider instance")
+        if (
+            provider.get("physical_cores") != 64
+            or isinstance(provider.get("memory_gb"), bool)
+            or not isinstance(provider.get("memory_gb"), int)
+            or provider["memory_gb"] < 128
+            or host.get("linux_visible_memory_is_admission_gate") is not False
+            or isinstance(host.get("attempt27_peak_rss_bytes"), bool)
+            or not isinstance(host.get("attempt27_peak_rss_bytes"), int)
+            or host["attempt27_peak_rss_bytes"] < 0
+        ):
+            raise ValueError("campaign execution Tencent resource evidence differs")
     current_host = linux_host_identity(
         physical_cores=physical_core_count(),
         memory_gib=memory_gib(),
         usable_core_tokens=int(host["usable_core_tokens"]),
         exclusive_linux=True,
     )
-    if host != current_host:
-        raise ValueError("campaign execution host identity differs at independent review")
+    for key, value in current_host.items():
+        if host.get(key) != value:
+            raise ValueError(
+                f"campaign execution host identity differs at independent review: {key}"
+            )
     claim_path = Path(str(execution.get("launch_claim_path"))).resolve(strict=True)
     expected_claim_path = campaign_claim_path(plan) / "claim.json"
     if claim_path != expected_claim_path:

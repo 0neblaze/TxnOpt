@@ -1,12 +1,14 @@
 # TxnOpt 云资源边界
 
-审计日期：2026-08-14  
-状态：provider-neutral（供应商中立），未采购
+审计日期：2026-08-15
+状态：腾讯云已选定；64 个物理核心/腾讯商品规格 128 GB 离线容量门；未采购、未接账号
 
 ## 1. 当前可使用的规划事实
 
-- 本地代表性校准所用资源假设约为 32 physical cores（物理核）。
-- 当前 provisional estimate（暂定估计）约 4,092.47 秒，即约 1.14 小时。
+- 本地代表性校准的原容量模型使用 32 physical cores（物理核）、80% scheduler
+  efficiency（调度效率）和 25 个可用 core tokens（核心令牌）。
+- 对同一 Attempt25 p95 observation（第 95 百分位观测）按 64 个物理核心、80% 效率
+  重新计算，得到 51 个可用核心令牌和约 2,051.06 秒，即约 34.18 分钟/0.57 小时。
 - 该数字来自 Build14-bound Attempt25（绑定 Build14 的 Attempt25）本地证据，只能用于
   采购前容量估计；它不是云端运行时间、SLA（服务等级协议）或报价。
 - Build portability（构建可移植性）仍为 **unverified（未验证）**。当前 wheel（轮子）
@@ -15,33 +17,38 @@
 
 ## 2. vCPU 与物理核
 
-云厂商规格中的 vCPU（虚拟处理器）通常是逻辑处理器，不能直接替换 32 physical
-cores。采购前必须记录 CPU 型号、SMT/超线程、NUMA（非统一内存访问）拓扑、实际
-physical-core count（物理核数）、内存、磁盘、镜像和可用区。只满足“64 vCPU”不等于
-满足 TxnOpt 的 32 物理核资源门。
+腾讯云把 vCPU（虚拟处理器）定义为 hyper-thread（超线程／逻辑线程）；一个物理核心
+可对应两个 vCPU。因此本轮门槛是 **64 physical cores**，不是 64 vCPU。采购前必须
+同时保存 CVM API 的 `CoreCount >= 64`、`ThreadPerCore`、CPU 型号、NUMA（非统一内存
+访问）拓扑，以及实例内 Linux 实测的唯一 `(physical id, core id)` 数量。只满足
+“64 vCPU/128 GB”不能通过资源门。
 
-## 3. 可核验的候选规格入口
+## 3. 腾讯云实例准入
 
-以下仅说明官方规格页存在相应 vCPU/内存级别，不代表库存、地域、价格或适配性：
+腾讯云公开实例表给出的数量是 vCPU，不是物理核心。例如 C6 的 64 vCPU 规格同时配
+256 GB 内存；这不能单独证明存在 64 个物理核心。CVM CPU topology API（CPU 拓扑
+接口）提供 `CoreCount` 与 `ThreadPerCore`，采购候选必须以该回执和实例内实测为准。
 
-| 厂商 | 官方静态规格中可见的例子 | 限制 |
-|---|---|---|
-| 阿里云 ECS g8a | 64 vCPU/256 GiB、128 vCPU/512 GiB | 默认超线程；需控制台复核 CPU 与库存 |
-| 腾讯云 CVM SA5 | 64 vCPU/256 GB、128 vCPU/576 GB | 可售地域与实时价格需控制台确认 |
-| 华为云 ECS C7/C7e | 64 vCPU/256 GiB、128 vCPU/512 GiB 级别 | vCPU 不能写成物理核 |
-| 火山引擎 ECS | 官方实例清单提供 64/128 vCPU 级别入口 | 需重新确认具体规格、地域与拓扑 |
-| 百度智能云 BCC | 当前页含 `bcc.c7.c64m128`、`bcc.ca3.c64m128`、`bcc.ca3.c128m256`、`bcc.c6.c128m256` | 旧报告的 `bcc.c7.c64m256` 未在当前 c7 表中出现，已排除 |
+如果普通 CVM 不能提供 `CoreCount >= 64` 的实例，则候选应转为 CBM（黑石物理服务器）
+或腾讯明确给出物理核心拓扑的专用实例。腾讯商品/API 规格内存必须至少 128 GB；
+Linux `MemTotal` 因平台保留略低于 128 GiB 不单独构成失败。真正的内存性能门是
+Attempt27 峰值 RSS 低于目标主机实际可见内存的 80%。公开规格、库存、地域和价格
+都不能替代购买时的带时间戳 API/控制台回执。
 
-官方入口与复核日期记录在
-[Windows salvage source audit](txnopt-windows-salvage-source-audit.md)。静态网页不能代替
-采购时的带时间戳 API/控制台回执。
+官方入口：
+
+- CVM 实例规格：<https://cloud.tencent.com/document/product/213/11518>
+- CPU topology API：<https://cloud.tencent.com/document/api/213/15753>
+- hyper-threading 配置：<https://cloud.tencent.com/document/product/213/103798>
+- CBM 实例规格：<https://cloud.tencent.com/document/product/386/63404>
 
 ## 4. 采购前必须重新验证
 
 1. 在目标镜像上从新 source identity（源码身份）重建 wheel/native extension（原生
    扩展），保存编译器、依赖、CPU feature（CPU 特性）和完整哈希；
-2. 运行 doctor/preflight（环境诊断/预检），验证 Linux、32 物理核、至少 128 GiB
-   内存、独占使用和 process-group cleanup（进程组清理）；
+2. 运行 doctor/preflight（环境诊断/预检），验证 Linux、64 物理核、腾讯商品/API
+   至少 128 GB 内存、Attempt27 RSS 余量、独占使用和 process-group cleanup
+   （进程组清理）；
 3. 先运行小型 portability smoke（可移植性冒烟测试）与独立 replay（重放），不能直接
    启动 2,880-run matrix（2,880 次矩阵）；
 4. 保存地域、可用区、实例类型、CPU 型号、计费粒度、磁盘、网络、quota（配额）、
@@ -53,9 +60,11 @@ physical-core count（物理核数）、内存、磁盘、镜像和可用区。�
 
 - 不保留旧月租数字、月价除以 30 的短租推导或厂商排序；
 - 不把 vCPU 写成 physical core；
-- 不把约 1.14 小时写成云端承诺；
-- 不假装已有任何 cloud ArchiveStore adapter（云归档适配器）；
+- 不把约 0.57 小时写成云端承诺；
+- 不保留通用 `ArchiveStore` 或把 S3 兼容语义冒充腾讯 COS 语义；
 - 不采购、不启动正式矩阵、不删除 E 盘档案。
 
-云厂商确定后，必须另开 implementation slice（实施切片），对其 object store adapter
-（对象存储适配器）运行与本地适配器相同的契约、故障、完整恢复和不可覆盖测试。
+当前已实现腾讯 COS 的离线接口和 fake-client contract tests（伪客户端契约测试），但
+没有账号时无法验证 bucket versioning、COMPLIANCE Object Lock、白名单、实际
+`VersionId`、网络、权限、带宽或恢复。真实账号接入后必须新开 live validation slice
+（真实验证切片）；通过前不得签发云迁移或 Level 1 readiness（Level 1 就绪）结论。

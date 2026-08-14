@@ -23,6 +23,7 @@ from txnopt_evidence.codec import (
     write_sidecar,
 )
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
+from txnopt_evidence.level1_protocol import validate_level1_protocol_v2
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{1,63}")
 _AXES: Mapping[str, tuple[str, int, int]] = {
@@ -69,8 +70,17 @@ def materialize_level1_plan(
     _validate_build_manifest(build_manifest)
     protocol = _object(json.loads(protocol_source.read_bytes()), "protocol")
     catalog = _object(json.loads(catalog_source.read_bytes()), "catalog")
-    if protocol.get("schema_version") != "txnopt-level1-protocol-v1":
+    protocol_schema = protocol.get("schema_version")
+    if protocol_schema not in {
+        "txnopt-level1-protocol-v1",
+        "txnopt-level1-protocol-v2",
+    }:
         raise ValueError("unsupported Level 1 protocol schema")
+    if (
+        protocol_schema == "txnopt-level1-protocol-v2"
+        and build_manifest.get("run_label") != "txnopt_level1_build_attempt16"
+    ):
+        raise ValueError("Level 1 protocol v2 requires the Build16 producer")
     if protocol.get("holdout_opened") is not False:
         raise ValueError("Level 1 planning requires a closed holdout")
     if catalog.get("schema_version") != "txnopt-level1-case-catalog-v1":
@@ -83,6 +93,17 @@ def materialize_level1_plan(
     seeds = tuple(_integers(protocol, "seeds"))
     if not seeds or len(set(seeds)) != len(seeds):
         raise ValueError("Level 1 seeds must be unique")
+    resource_contract: dict[str, Any] | None = None
+    if protocol_schema == "txnopt-level1-protocol-v2":
+        resource_contract = validate_level1_protocol_v2(protocol)
+        if (
+            fixed_work != 1200
+            or fixed_time_seconds != 3
+            or max_rounds != 10
+            or evrptw_max_candidates != 64
+            or rcpsp_max_candidates != 64
+        ):
+            raise ValueError("Level 1 protocol v2 execution arguments differ")
 
     expected = _expected_case_ids(protocol)
     catalog_domains = _object(catalog.get("domains"), "catalog domains")
@@ -209,8 +230,13 @@ def materialize_level1_plan(
         "attempt": attempt,
         "holdout_opened": False,
         "cloud_purchase_authorized": False,
+        "formal_matrix_started": False,
         "entries": entries,
     }
+    if resource_contract is not None:
+        manifest["resource_contract"] = resource_contract
+        manifest["region"] = None
+        manifest["region_required_live_input"] = True
     manifest_path = output / "manifest.json"
     manifest_bytes = canonical_json_bytes(manifest, pretty=True)
     manifest_path.write_bytes(manifest_bytes)

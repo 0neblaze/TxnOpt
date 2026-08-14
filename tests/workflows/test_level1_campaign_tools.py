@@ -719,6 +719,7 @@ def test_review_rejects_an_execution_receipt_without_clean_tool_identity(
             receipt,
             plan,
             analysis_sha256,
+            analysis=json.loads(analysis_path.read_bytes()),
             expected_runtime_identity={},
         )
 

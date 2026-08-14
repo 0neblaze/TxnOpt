@@ -150,8 +150,19 @@ def execute_campaign(
     physical_cores = _physical_core_count()
     memory_gib = _memory_gib()
     minimum_cores = int(resources["minimum_physical_cores"])
-    minimum_memory = int(resources["minimum_memory_gib"])
-    if physical_cores < minimum_cores or memory_gib < minimum_memory:
+    analysis_schema = analysis.get("schema_version")
+    if analysis_schema == "txnopt-level1-analysis-protocol-v1":
+        memory_floor_satisfied = memory_gib >= int(resources["minimum_memory_gib"])
+    else:
+        from txnopt_evidence.tencent_cloud import memory_bytes
+
+        peak_rss = authorization.get("attempt27_peak_rss_bytes")
+        if isinstance(peak_rss, bool) or not isinstance(peak_rss, int) or peak_rss < 0:
+            raise PermissionError("Tencent authorization lacks Attempt27 peak RSS")
+        if peak_rss > memory_bytes() * float(resources["attempt27_peak_rss_fraction_max"]):
+            raise RuntimeError("Attempt27 peak RSS exceeds the visible-memory margin")
+        memory_floor_satisfied = True
+    if physical_cores < minimum_cores or not memory_floor_satisfied:
         raise RuntimeError("host does not satisfy the preregistered physical resource floor")
     if usable_cores > physical_cores:
         raise ValueError("usable-core budget exceeds detected physical cores")
@@ -164,6 +175,13 @@ def execute_campaign(
         usable_core_tokens=usable_cores,
         exclusive_linux=bool(authorization["exclusive_linux"]),
     )
+    if analysis_schema == "txnopt-level1-analysis-protocol-v2":
+        host_identity["provider_instance"] = _object(
+            authorization.get("tencent_provider_instance"),
+            "Tencent provider instance",
+        )
+        host_identity["linux_visible_memory_is_admission_gate"] = False
+        host_identity["attempt27_peak_rss_bytes"] = authorization["attempt27_peak_rss_bytes"]
     started_datetime = datetime.now(UTC)
     started_at = started_datetime.isoformat().replace("+00:00", "Z")
     started_ns = time.monotonic_ns()

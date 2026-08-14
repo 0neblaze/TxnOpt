@@ -42,68 +42,68 @@ cache: ~/.cache/txnopt/<source-tree>/
 cache 推断 formal readiness（正式就绪状态）。`source-tree` 是当前 source identity
 （源码身份）绑定的 Git tree digest（Git 树摘要）；更换源码必须进入新目录。
 
-## 4. ArchiveStore 接缝
+## 4. 腾讯 COS 归档边界
 
-`ArchiveStore` 是 `txnopt_evidence` 内部 provider-neutral port（供应商中立端口），
-不从 `txnopt` 根包导出。`LocalFilesystemArchiveStore` 使用 WSL/Linux 的 POSIX
-no-follow（禁止跟随链接）与原子 no-replace（禁止替换）原语，当前不宣称原生
-Windows portability（可移植性）。`S3ArchiveStore` 是注入 S3 client（客户端）的
-云端 Adapter（适配器），可由 AWS S3 或通过 live contract（真实契约）验证的
-S3-compatible provider（S3 兼容供应商）使用；它不把任何供应商类型泄漏到 port。
+活树不再包含 provider-neutral `ArchiveStore`（供应商中立归档接口）、本地归档
+适配器或 S3 兼容层。当前只有两个深模块：
 
-接口：
+- `txnopt_evidence.archive`：在 WSL/Linux 上逐级拒绝符号链接和非普通文件，生成
+  source inventory（源清单）并在上传前重新核验同一文件；
+- `txnopt_evidence.tencent_cos`：直接实现腾讯 COS bucket contract（存储桶契约）、
+  upload、multipart、commit、verify 与 restore。
 
-```text
-put_blob(source, expected_sha256, expected_size)
-open(ref)
-head(ref)
-publish_commit(commit, expected_absent=True)
-verify_commit(ref)
-```
+COS 开启 versioning（版本控制）后，同一 key（键）可以存在多个版本。因此 key 和
+SHA-256 不能单独构成对象身份。`TencentCosObjectRef` 与 `TencentCosCommitRef` 都必须
+绑定 COS 返回的精确 `VersionId`；所有 HEAD、GET、retention 和恢复请求都使用该版本。
+新 wire schema（线格式）为 `txnopt-tencent-cos-commit-v1`，它只引用现有 evidence
+字节，不升级或重签旧 evidence schema。
 
 不变量：
 
-1. blob 按 SHA-256 content address（内容地址）保存，写入过程中不可见；
-2. 大小或摘要不符时不发布；
-3. 已存在的同摘要 blob 必须重新验证；
-4. `txnopt-archive-commit-v1` 只引用现有字节、路径、大小与摘要，不升级、重签或
-   解释旧 evidence schema（证据模式）；
-5. commit marker（提交标记）最后发布，默认同名冲突即失败；
-6. verify 必须重算 commit 和所有引用 blob；
-7. restore 使用临时目录，目标已存在时拒绝覆盖，完成前不暴露最终目录；
-8. 路径穿越、符号链接、截断写入和摘要漂移均 fail closed（失败即停止）。
-9. mirror（镜像）前后源树摘要必须一致；崩溃遗留的不可见 staging（暂存）文件由
-   下一次持有独占 writer lock（写入锁）的适配器实例清理；
-10. CLI 的 archive store 必须是 Git 工作树外的显式绝对路径，且不得与镜像源重叠。
-11. inventory/mirror（清单/镜像）逐级拒绝源目录符号链接和非普通文件；`open` 在同一
-    文件句柄上先核验大小与 SHA-256，FIFO（命名管道）等对象不得阻塞读取；
-12. verify/restore（验证/恢复）以只读模式打开 store，不创建 root、锁或 staging；恢复
-    目标不得位于 store 内部。
-13. S3 bucket 必须启用 versioning（版本控制）、COMPLIANCE Object Lock（合规对象锁）
-    和不少于声明下限的默认保留期；仅有可重算 sidecar（哈希旁文件）不构成信任根。
-14. S3 blob 与 commit marker 均使用 `If-None-Match: *` 条件创建；同名 key（键）不得
-    被普通 PUT 覆盖。大文件只在 conditional multipart completion（条件分段完成）后
-    可见，失败的未完成分段不属于 evidence。
-15. S3 `open`/`head`/`verify_commit` 下载实际对象并重算字节数与 SHA-256；不能仅信任
-    ETag 或用户 metadata（元数据）。commit marker 仍在所有 blob 后最后发布。
+1. bucket versioning 必须为 `Enabled`；
+2. bucket 必须启用默认 `COMPLIANCE` Object Lock，保留期至少 365 天；
+3. 每次上传必须返回非空 `VersionId`，否则不签发引用；
+4. 每个对象使用 `STANDARD` 存储层和 COS server-side encryption（服务端加密）；
+5. HEAD metadata、精确版本 retention、实际 GET 字节、大小和 SHA-256 必须全部一致；
+6. commit 在所有 blob 上传并验证后最后写入，commit key 同时包含 commit id 和摘要；
+7. mirror 前后 source inventory 必须相同；
+8. restore 写入临时目录并使用 Linux 原子 no-replace 发布，已有目标拒绝覆盖；
+9. AccessKey/SecretKey 不进入 CLI、Git、manifest 或日志，只从进程环境读取；
+10. 未经 live bucket（真实存储桶）契约检查、全量 verify 和恢复演练，不得把接口测试
+    表述成云迁移完成。
 
 统一命令：
 
 ```text
+txnopt cloud tencent assess --protocol <protocol> --calibration <calibration> \
+  --physical-cores 64 --provider-memory-gb 128
+txnopt cloud tencent spec --output <spec>
+txnopt cloud tencent doctor --instance-type <sku> --provider-physical-cores 64 \
+  --provider-memory-gb 128 --expected-peak-rss-bytes <bytes> --output <receipt>
+txnopt cloud tencent bundle --destination <deployment> --build-manifest <build16> \
+  --wheel <wheel> --source-manifest <source> --native-attestation <native> \
+  --uv-lock <uv.lock> --toolchain-lock <toolchain> --plan-manifest <attempt26>
+txnopt cloud tencent bundle-verify --manifest <deployment>/bundle-receipt.json
 txnopt archive inventory <source>
-txnopt archive mirror <source> --store <root> --commit-id <id>
-txnopt archive verify --store <root> --commit-id <id> \
-  --commit-sha256 <sha256> --commit-size <bytes>
-txnopt archive restore --store <root> --commit-id <id> \
-  --commit-sha256 <sha256> --commit-size <bytes> --destination <path>
-txnopt archive mirror <source> --s3-bucket <bucket> --s3-prefix <prefix> \
-  --s3-region <region> [--s3-endpoint-url https://<endpoint>] --commit-id <id>
+txnopt cloud tencent cos mirror <source> --cos-bucket <bucket-appid> \
+  --cos-region <region> \
+  --cos-prefix <prefix> --commit-id <id>
+txnopt cloud tencent cos verify --cos-bucket <bucket-appid> --cos-region <region> \
+  --cos-prefix <prefix> --commit-id <id> --commit-key <key> \
+  --commit-version-id <version> --commit-sha256 <sha256> --commit-size <bytes> \
+  --commit-retain-until <timestamp>
 ```
 
-S3 凭据只从 boto3 standard credential provider chain（标准凭据提供链）读取；CLI 不
-接受 access key（访问密钥）参数。首次云端副本必须使用可即时读取的 storage class
-（存储层）完成全量 verify 与恢复演练；若后续转入 Deep Archive（深度归档），由 bucket
-lifecycle（存储桶生命周期）在验证后执行，不能在对象仍不可读时签发迁移 PASS。
+`txnopt[tencent]` 安装腾讯官方 Python SDK。凭据环境变量仅为
+`TENCENTCLOUD_SECRET_ID`、`TENCENTCLOUD_SECRET_KEY` 和可选
+`TENCENTCLOUD_SESSION_TOKEN`。对象锁是否已由腾讯云开放、bucket 是否可用、
+Build portability（构建可移植性）以及正式矩阵执行都必须等真实账号提供后单独验证。
+
+云主机门要求 **至少 64 个 physical cores（物理核心）**，并要求腾讯商品/API
+明确给出至少 **128 GB** 内存。64 vCPU 不是 64 个物理核心的替代证据；腾讯 API
+必须返回 `CoreCount=64`、`ThreadPerCore=1`，Linux `/proc/cpuinfo` 拓扑也必须达到
+64 个物理核心。Linux 可见 `MemTotal` 只记录、不因平台保留略低于 128 GiB 而失败；
+真正的内存门是 Attempt27 峰值 RSS 低于实际可见内存的 80%。
 
 ## 5. 不可变恢复边界
 

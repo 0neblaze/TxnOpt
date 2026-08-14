@@ -4,23 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import platform
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
-from txnopt_evidence.archive import ArchiveStore
 from txnopt_evidence.codec import read_signed_json
 from txnopt_evidence.identity import ExpectedEvidenceIdentity
 from txnopt_evidence.reviewer import (
-    replay_legacy_manifest,
-    replay_manifest,
     verify_legacy_manifest,
     verify_manifest,
 )
-from txnopt_evidence.workspace import require_governed_external_root
-from txnopt_legacy import LegacyReceiptReader
 
 _VERSION: Final = "0.1.0a1"
 
@@ -38,13 +32,6 @@ def _parser() -> argparse.ArgumentParser:
     verify_identity = verify.add_mutually_exclusive_group()
     verify_identity.add_argument("--expected-identity", type=Path)
     verify_identity.add_argument("--legacy-compatibility", action="store_true")
-
-    replay = commands.add_parser("replay")
-    replay.add_argument("manifest", type=Path)
-    replay.add_argument("--output-dir", type=Path, required=True)
-    replay_identity = replay.add_mutually_exclusive_group()
-    replay_identity.add_argument("--expected-identity", type=Path)
-    replay_identity.add_argument("--legacy-compatibility", action="store_true")
 
     plan = commands.add_parser(
         "plan",
@@ -74,29 +61,69 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_campaign_review_arguments(review)
 
-    commands.add_parser("env")
+    cloud = commands.add_parser("cloud")
+    cloud_providers = cloud.add_subparsers(dest="cloud_provider", required=True)
+    tencent = cloud_providers.add_parser("tencent")
+    tencent_commands = tencent.add_subparsers(dest="tencent_command", required=True)
+    tencent_assess = tencent_commands.add_parser("assess")
+    tencent_assess.add_argument("--protocol", type=Path, required=True)
+    tencent_assess.add_argument("--calibration", type=Path, required=True)
+    tencent_assess.add_argument("--physical-cores", type=int, default=64)
+    tencent_assess.add_argument("--provider-memory-gb", type=int, default=128)
+    tencent_assess.add_argument("--scheduler-efficiency", type=float, default=0.8)
+    tencent_spec = tencent_commands.add_parser("spec")
+    tencent_spec.add_argument("--output", type=Path, required=True)
+    tencent_bundle = tencent_commands.add_parser("bundle")
+    tencent_bundle.add_argument("--destination", type=Path, required=True)
+    tencent_bundle.add_argument("--build-manifest", type=Path, required=True)
+    tencent_bundle.add_argument("--wheel", type=Path, required=True)
+    tencent_bundle.add_argument("--source-manifest", type=Path, required=True)
+    tencent_bundle.add_argument("--native-attestation", type=Path, required=True)
+    tencent_bundle.add_argument("--uv-lock", type=Path, required=True)
+    tencent_bundle.add_argument("--toolchain-lock", type=Path, required=True)
+    tencent_bundle.add_argument("--plan-manifest", type=Path, required=True)
+    tencent_bundle_verify = tencent_commands.add_parser("bundle-verify")
+    tencent_bundle_verify.add_argument("--manifest", type=Path, required=True)
+    tencent_doctor = tencent_commands.add_parser("doctor")
+    tencent_doctor.add_argument("--instance-type", required=True)
+    tencent_doctor.add_argument("--provider-physical-cores", type=int, required=True)
+    tencent_doctor.add_argument("--provider-memory-gb", type=int, required=True)
+    tencent_doctor.add_argument("--minimum-physical-cores", type=int, default=64)
+    tencent_doctor.add_argument("--expected-peak-rss-bytes", type=int)
+    tencent_doctor.add_argument("--work-directory", type=Path, default=Path.cwd())
+    tencent_doctor.add_argument("--output", type=Path, required=True)
+    tencent_dry_run = tencent_commands.add_parser("dry-run")
+    tencent_dry_run.add_argument("--region", required=True)
+    tencent_dry_run.add_argument("--zone", required=True)
+    tencent_dry_run.add_argument("--instance-type", required=True)
+    tencent_dry_run.add_argument("--image-id", required=True)
+    tencent_dry_run.add_argument("--vpc-id", required=True)
+    tencent_dry_run.add_argument("--subnet-id", required=True)
+    tencent_dry_run.add_argument("--security-group-id", required=True)
+    tencent_dry_run.add_argument("--request-output", type=Path, required=True)
+    tencent_dry_run.add_argument("--receipt-output", type=Path, required=True)
+    tencent_cos = tencent_commands.add_parser("cos")
+    tencent_cos_commands = tencent_cos.add_subparsers(
+        dest="tencent_cos_command",
+        required=True,
+    )
+    tencent_cos_mirror = tencent_cos_commands.add_parser("mirror")
+    tencent_cos_mirror.add_argument("source", type=Path)
+    _add_tencent_cos_arguments(tencent_cos_mirror)
+    tencent_cos_mirror.add_argument("--commit-id", required=True)
+
+    tencent_cos_verify = tencent_cos_commands.add_parser("verify")
+    _add_tencent_cos_ref_arguments(tencent_cos_verify)
+
+    tencent_cos_restore = tencent_cos_commands.add_parser("restore")
+    _add_tencent_cos_ref_arguments(tencent_cos_restore)
+    tencent_cos_restore.add_argument("--destination", type=Path, required=True)
 
     archive = commands.add_parser("archive")
     archive_commands = archive.add_subparsers(dest="archive_command", required=True)
     archive_inventory = archive_commands.add_parser("inventory")
     archive_inventory.add_argument("source", type=Path)
 
-    archive_mirror = archive_commands.add_parser("mirror")
-    archive_mirror.add_argument("source", type=Path)
-    _add_archive_store_arguments(archive_mirror)
-    archive_mirror.add_argument("--commit-id", required=True)
-
-    archive_verify = archive_commands.add_parser("verify")
-    _add_archive_ref_arguments(archive_verify)
-
-    archive_restore = archive_commands.add_parser("restore")
-    _add_archive_ref_arguments(archive_restore)
-    archive_restore.add_argument("--destination", type=Path, required=True)
-
-    legacy = commands.add_parser("legacy")
-    legacy_commands = legacy.add_subparsers(dest="legacy_command", required=True)
-    legacy_verify = legacy_commands.add_parser("verify")
-    legacy_verify.add_argument("receipt", type=Path)
     return parser
 
 
@@ -177,19 +204,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_workers=arguments.review_workers,
                 per_run_timeout_seconds=arguments.per_run_timeout_seconds,
             )
-        elif arguments.command == "replay":
-            result = (
-                replay_legacy_manifest(
-                    arguments.manifest,
-                    output_dir=arguments.output_dir,
-                )
-                if arguments.legacy_compatibility
-                else replay_manifest(
-                    arguments.manifest,
-                    output_dir=arguments.output_dir,
-                    expected_identity=_expected_identity(arguments.expected_identity),
-                )
-            )
         elif arguments.command == "verify":
             payload = (
                 verify_legacy_manifest(arguments.manifest)
@@ -206,22 +220,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "run_label": payload.get("run_label", ""),
                 "fallback_count": 0,
             }
-        elif arguments.command == "env":
-            result = {
-                "schema_version": "txnopt-environment-v1",
-                "txnopt_version": _VERSION,
-                "python_version": platform.python_version(),
-                "platform": platform.platform(),
-            }
+        elif arguments.command == "cloud":
+            result = _cloud_command(arguments)
         elif arguments.command == "archive":
             result = _archive_command(arguments)
         else:
-            payload = LegacyReceiptReader().read(arguments.receipt)
-            result = {
-                "schema_version": "txnopt-legacy-verification-v1",
-                "status": "verified",
-                "legacy_schema_version": payload.get("schema_version", ""),
-            }
+            raise ValueError("unsupported TxnOpt command")
     except (ImportError, OSError, RuntimeError, ValueError) as error:
         return _error(str(arguments.command), error)
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -253,120 +257,191 @@ def _add_campaign_review_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--per-run-timeout-seconds", type=float, default=600.0)
 
 
-def _add_archive_ref_arguments(parser: argparse.ArgumentParser) -> None:
-    _add_archive_store_arguments(parser)
+def _add_tencent_cos_ref_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_tencent_cos_arguments(parser)
     parser.add_argument("--commit-id", required=True)
+    parser.add_argument("--commit-key", required=True)
+    parser.add_argument("--commit-version-id", required=True)
     parser.add_argument("--commit-sha256", required=True)
     parser.add_argument("--commit-size", type=int, required=True)
+    parser.add_argument("--commit-retain-until", required=True)
 
 
-def _add_archive_store_arguments(parser: argparse.ArgumentParser) -> None:
-    backend = parser.add_mutually_exclusive_group(required=True)
-    backend.add_argument("--store", type=Path)
-    backend.add_argument("--s3-bucket")
-    parser.add_argument("--s3-prefix", default="txnopt")
-    parser.add_argument("--s3-region")
-    parser.add_argument("--s3-endpoint-url")
-    parser.add_argument("--s3-minimum-retention-days", type=int, default=365)
-    parser.add_argument("--s3-disable-request-checksum", action="store_true")
-    parser.add_argument("--s3-storage-class")
+def _add_tencent_cos_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cos-bucket", required=True)
+    parser.add_argument("--cos-region", required=True)
+    parser.add_argument("--cos-prefix", default="txnopt")
+    parser.add_argument("--cos-minimum-retention-days", type=int, default=365)
 
 
 def _archive_command(arguments: argparse.Namespace) -> object:
-    from txnopt_evidence.archive import (
-        ArchiveCommitRef,
-        inventory_tree,
-        mirror_tree,
-        restore_commit,
-    )
+    from txnopt_evidence.archive import inventory_tree
 
     if arguments.archive_command == "inventory":
         return inventory_tree(arguments.source).to_payload()
-    if arguments.store is not None:
-        _require_explicit_external_archive_root(arguments.store)
-    if arguments.archive_command == "mirror" and arguments.store is not None:
-        _require_separate_archive_source(arguments.source, arguments.store)
-    if arguments.archive_command == "mirror":
-        store: ArchiveStore = _archive_store(arguments, create=True)
-        ref = mirror_tree(arguments.source, store=store, commit_id=arguments.commit_id)
+    raise ValueError("unknown archive command")
+
+
+def _tencent_cos_command(arguments: argparse.Namespace) -> object:
+    from txnopt_evidence.tencent_cos import TencentCosArchive, TencentCosCommitRef
+
+    archive = TencentCosArchive.from_environment(
+        bucket=arguments.cos_bucket,
+        region=arguments.cos_region,
+        prefix=arguments.cos_prefix,
+        minimum_retention_days=arguments.cos_minimum_retention_days,
+    )
+    if arguments.tencent_cos_command == "mirror":
+        ref = archive.mirror_tree(arguments.source, commit_id=arguments.commit_id)
         return {
-            "schema_version": "txnopt-archive-mirror-result-v1",
-            "commit_ref": _archive_ref_payload(ref),
+            "schema_version": "txnopt-tencent-cos-mirror-result-v1",
+            "bucket_contract": _json_dataclass(archive.bucket_receipt),
+            "commit_ref": ref.to_payload(),
         }
-    store = _archive_store(arguments, create=False)
-    ref = ArchiveCommitRef(
+    ref = TencentCosCommitRef(
         commit_id=arguments.commit_id,
+        key=arguments.commit_key,
+        version_id=arguments.commit_version_id,
         sha256=arguments.commit_sha256,
         size=arguments.commit_size,
+        retain_until=arguments.commit_retain_until,
     )
-    if arguments.archive_command == "verify":
-        verification = store.verify_commit(ref)
+    if arguments.tencent_cos_command == "verify":
+        verification = archive.verify_commit(ref)
         return {
-            "schema_version": "txnopt-archive-verification-v1",
-            "commit_ref": _archive_ref_payload(ref),
+            "schema_version": "txnopt-tencent-cos-verification-v1",
+            "commit_ref": ref.to_payload(),
             "object_count": verification.object_count,
             "total_size": verification.total_size,
             "verified": verification.verified,
         }
-    if arguments.archive_command == "restore":
-        restore_receipt = restore_commit(store, ref, destination=arguments.destination)
+    if arguments.tencent_cos_command == "restore":
+        restore_receipt = archive.restore_commit(ref, destination=arguments.destination)
         return {
-            "schema_version": "txnopt-archive-restore-v1",
-            "commit_ref": _archive_ref_payload(ref),
+            "schema_version": "txnopt-tencent-cos-restore-v1",
+            "commit_ref": ref.to_payload(),
             "object_count": restore_receipt.object_count,
             "total_size": restore_receipt.total_size,
             "verified": restore_receipt.verified,
         }
-    raise ValueError("unknown archive command")
+    raise ValueError("unknown Tencent COS command")
 
 
-def _archive_store(arguments: argparse.Namespace, *, create: bool) -> ArchiveStore:
-    from txnopt_evidence.archive import LocalFilesystemArchiveStore
-
-    if arguments.store is not None:
-        return LocalFilesystemArchiveStore(arguments.store, create=create)
-    from txnopt_evidence.archive_s3 import S3ArchiveStore
-
-    return S3ArchiveStore.from_boto3(
-        bucket=arguments.s3_bucket,
-        prefix=arguments.s3_prefix,
-        region_name=arguments.s3_region,
-        endpoint_url=arguments.s3_endpoint_url,
-        minimum_retention_days=arguments.s3_minimum_retention_days,
-        send_checksum_sha256=not arguments.s3_disable_request_checksum,
-        storage_class=arguments.s3_storage_class,
+def _cloud_command(arguments: argparse.Namespace) -> object:
+    from txnopt_evidence.codec import write_signed_json
+    from txnopt_evidence.tencent_cloud import (
+        TencentCvmSelection,
+        TencentProviderInstanceSpec,
+        assess_tencent_capacity,
+        create_tencent_provisioning_spec,
+        execute_cvm_dry_run,
+        inspect_tencent_host,
+        prepare_cvm_dry_run_envelope,
     )
 
+    if arguments.cloud_provider != "tencent":
+        raise ValueError("unsupported cloud provider")
+    if arguments.tencent_command == "cos":
+        return _tencent_cos_command(arguments)
+    if arguments.tencent_command == "assess":
+        return assess_tencent_capacity(
+            read_signed_json(arguments.protocol),
+            read_signed_json(arguments.calibration),
+            physical_cores=arguments.physical_cores,
+            provider_memory_gb=arguments.provider_memory_gb,
+            scheduler_efficiency=arguments.scheduler_efficiency,
+        )
+    if arguments.tencent_command == "spec":
+        digest = write_signed_json(
+            arguments.output,
+            create_tencent_provisioning_spec(),
+        )
+        return {
+            "schema_version": "txnopt-tencent-spec-command-v1",
+            "status": "SPEC_MATERIALIZED_NOT_AUTHORIZED",
+            "spec_path": str(arguments.output),
+            "spec_sha256": digest,
+            "cloud_purchase_authorized": False,
+        }
+    if arguments.tencent_command == "bundle":
+        from txnopt_evidence.tencent_deployment import (
+            TencentDeploymentInputs,
+            materialize_tencent_deployment,
+            verify_tencent_deployment,
+        )
 
-def _require_explicit_external_archive_root(path: Path) -> None:
-    require_governed_external_root(path)
+        manifest = materialize_tencent_deployment(
+            arguments.destination,
+            inputs=TencentDeploymentInputs(
+                build_manifest=arguments.build_manifest,
+                wheel=arguments.wheel,
+                source_manifest=arguments.source_manifest,
+                native_attestation=arguments.native_attestation,
+                uv_lock=arguments.uv_lock,
+                toolchain_lock=arguments.toolchain_lock,
+                plan_manifest=arguments.plan_manifest,
+            ),
+        )
+        return verify_tencent_deployment(manifest)
+    if arguments.tencent_command == "bundle-verify":
+        from txnopt_evidence.tencent_deployment import verify_tencent_deployment
+
+        return verify_tencent_deployment(arguments.manifest)
+    if arguments.tencent_command == "doctor":
+        receipt = inspect_tencent_host(
+            provider_instance=TencentProviderInstanceSpec(
+                instance_type=arguments.instance_type,
+                physical_cores=arguments.provider_physical_cores,
+                memory_gb=arguments.provider_memory_gb,
+            ),
+            minimum_physical_cores=arguments.minimum_physical_cores,
+            expected_peak_rss_bytes=arguments.expected_peak_rss_bytes,
+            work_directory=arguments.work_directory,
+        )
+        digest = write_signed_json(arguments.output, receipt)
+        if receipt["capacity_pass"] is not True:
+            raise RuntimeError(
+                "Tencent host failed its resource contract; "
+                f"signed receipt: {arguments.output} ({digest})"
+            )
+        return receipt
+    if arguments.tencent_command == "dry-run":
+        selection = TencentCvmSelection(
+            region=arguments.region,
+            zone=arguments.zone,
+            instance_type=arguments.instance_type,
+            image_id=arguments.image_id,
+            vpc_id=arguments.vpc_id,
+            subnet_id=arguments.subnet_id,
+            security_group_id=arguments.security_group_id,
+        )
+        request_digest = write_signed_json(
+            arguments.request_output,
+            prepare_cvm_dry_run_envelope(selection),
+        )
+        receipt = execute_cvm_dry_run(selection)
+        receipt_digest = write_signed_json(arguments.receipt_output, receipt)
+        return {
+            "schema_version": "txnopt-tencent-dry-run-command-v1",
+            "status": "DRY_RUN_PASS_NO_INSTANCE_CREATED",
+            "request_path": str(arguments.request_output),
+            "request_sha256": request_digest,
+            "receipt_path": str(arguments.receipt_output),
+            "receipt_sha256": receipt_digest,
+            "submitted": True,
+            "dry_run": True,
+            "instance_created": False,
+            "cloud_purchase_authorized": False,
+        }
+    raise ValueError("unsupported Tencent cloud command")
 
 
-def _require_separate_archive_source(source: Path, store: Path) -> None:
-    source_path = source.expanduser().absolute()
-    store_path = store.expanduser().absolute()
-    if _path_contains(source_path, store_path) or _path_contains(store_path, source_path):
-        raise ValueError("archive source and store roots must not overlap")
+def _json_dataclass(value: object) -> object:
+    from dataclasses import asdict, is_dataclass
 
-
-def _path_contains(parent: Path, candidate: Path) -> bool:
-    try:
-        candidate.relative_to(parent)
-    except ValueError:
-        return False
-    return True
-
-
-def _archive_ref_payload(ref: object) -> dict[str, object]:
-    from txnopt_evidence.archive import ArchiveCommitRef
-
-    if not isinstance(ref, ArchiveCommitRef):
-        raise TypeError("archive commit reference has the wrong type")
-    return {
-        "commit_id": ref.commit_id,
-        "sha256": ref.sha256,
-        "size": ref.size,
-    }
+    if not is_dataclass(value) or isinstance(value, type):
+        raise TypeError("expected a dataclass receipt")
+    return asdict(value)
 
 
 if __name__ == "__main__":

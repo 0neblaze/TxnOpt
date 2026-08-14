@@ -6,6 +6,8 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from txnopt_evidence.level1_protocol import validate_level1_protocol_v2
+
 _AXIS_WORKERS = {"serial_1": 1, "txnopt_1": 1, "txnopt_4": 4, "barrier_4": 4}
 
 
@@ -16,15 +18,28 @@ def estimate_cloud_window(
     physical_cores: int,
     scheduler_efficiency: float,
 ) -> dict[str, object]:
-    if protocol.get("schema_version") != "txnopt-level1-protocol-v1":
+    if protocol.get("schema_version") not in {
+        "txnopt-level1-protocol-v1",
+        "txnopt-level1-protocol-v2",
+    }:
         raise ValueError("unsupported Level 1 protocol schema")
-    if calibration.get("schema_version") != "txnopt-local-runtime-calibration-v1":
+    if protocol.get("schema_version") == "txnopt-level1-protocol-v2":
+        validate_level1_protocol_v2(protocol)
+    if calibration.get("schema_version") not in {
+        "txnopt-local-runtime-calibration-v1",
+        "txnopt-local-runtime-calibration-v2",
+    }:
         raise ValueError("unsupported runtime calibration schema")
     if isinstance(physical_cores, bool) or physical_cores <= 0:
         raise ValueError("physical_cores must be positive")
     if not 0.0 < scheduler_efficiency <= 1.0:
         raise ValueError("scheduler_efficiency must be in (0, 1]")
-    minimum_cores = protocol.get("minimum_physical_cores")
+    resource_contract = protocol.get("resource_contract")
+    minimum_cores = (
+        resource_contract.get("minimum_physical_cores")
+        if isinstance(resource_contract, dict)
+        else protocol.get("minimum_physical_cores")
+    )
     if not isinstance(minimum_cores, int) or physical_cores < minimum_cores:
         raise ValueError("physical core count is below the protocol minimum")
     axes = protocol.get("formal_axes")
