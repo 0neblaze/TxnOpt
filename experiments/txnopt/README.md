@@ -4,18 +4,19 @@ This directory tracks only new protocol definitions, manifests, registries,
 and independently reviewed summaries. Raw run output belongs under ignored
 `results/<run_label>/` or a governed external root.
 
-The current account-independent Tencent closure uses Build18,
-`level1-protocol-v2.json`, external formal plan Attempt28, representative local
-calibration Attempt29, and pre-cloud Attempt08. Attempt28 requires at least 64
+The current account-independent Tencent successor uses Build19,
+`level1-protocol-v2.json`, external formal plan Attempt30, representative local
+calibration Attempt31, and pre-cloud Attempt09. Attempt30 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
-Attempt29 has 96 raw bundles and 96 independent reviews, while the Attempt28
-formal raw root remains absent. The Build18 deployment bundle is offline-only,
+Attempt31 has 96 raw bundles and 96 independent reviews, while the Attempt30
+formal raw root remains absent. The Build19 deployment Attempt02 is offline-only,
 contains no credentials or region, and exposes no `DryRun=false` instance
-creation path. Current status is
-`READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`, not cloud authorization or
-Level 1 readiness.
+creation path. Pre-cloud Attempt09 records the producer-side
+`READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED` decision. Independent Review
+Attempt13 is the authoritative adjudication of that decision; neither receipt
+authorizes cloud access or Level 1 readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
@@ -79,12 +80,13 @@ live host doctor additionally requires the signed Tencent DryRun receipt; SKU
 resources are never accepted from self-reported CLI numbers.
 
 The prior formal identities Attempts18, 21, 23, 24, and 28 remain immutable and
-unexecuted. Attempt28 is the Build18 protocol-v2 predecessor with 2,880
+unexecuted. Attempt30 is the Build19 protocol-v2 successor with 2,880
 prebound expected identities, its own preregistered analysis file, and a fresh
 absent raw root. Structural preflight is read-only.
 
 Build14/Attempt24 and Build18/Attempt28 remain historical, byte-preserved
-predecessor chains. Their preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
+predecessor chains. Build19/Attempt30 is the current unexecuted chain. All three
+preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
 holdouts and cloud purchase remain closed, and no launch claim or raw root
 exists. New execution rejects protocol-v1 plans and any build/attempt pair not
 present in the closed successor registry.

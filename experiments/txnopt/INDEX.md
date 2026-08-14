@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build18/Attempt28/29/Pre-cloud08 are immutable predecessors; Review12 is `NEEDS_WORK`, so a new clean successor build and review are required before account-ready status | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt29 retains 96/96 representative raw/review bundles; Attempt28 has 2,880 configs and prebound identities but its raw root and launch claim are absent | Review12 retains four major findings; Build19, Attempt30/31, Pre-cloud09, and Review13 are the closed successor sequence |
+| `txnopt-level1-protocol-v2` | Build19/Attempt30/31/Pre-cloud09 are the current account-independent successor; Build18/Attempt28/29/Pre-cloud08 and failed Review12 remain immutable predecessors | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt31 retains 96/96 representative raw/review bundles; Attempt30 has 2,880 configs and prebound identities but its raw root and launch claim are absent | Review13 is the authoritative independent adjudication of Pre-cloud09; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -13,22 +13,23 @@ Tencent-resource identity for new Level 1 runs. The unversioned
 materializing either protocol does not authorize cloud purchase, benchmark
 launch, holdout access, or a readiness claim.
 
-The current Tencent-specific successor is Build18 under
-`level1-protocol-v2.json`. External formal plan Attempt28 binds 2,880 configs,
+The current Tencent-specific successor is Build19 under
+`level1-protocol-v2.json`. External formal plan Attempt30 binds 2,880 configs,
 2,880 pre-run expected identities, a 64-physical-core topology, provider-
 reported memory of at least 128 GB, no default region, and an absent formal raw
-root. Local calibration Attempt29 binds 96 raw bundles and 96 independent
+root. Local calibration Attempt31 binds 96 raw bundles and 96 independent
 reviews; all 12 fixed-work semantic/objective groups match, all exact-work Cmax
 and native receipt checks pass, and the 51-token capacity estimate is about
-2,038 seconds. The estimate is representative local evidence, not live 64-core
-scaling proof. The offline Build18 Tencent deployment bundle passes fresh
+2,059 seconds. The estimate is representative local evidence, not live 64-core
+scaling proof. The offline Build19 Tencent deployment Attempt02 passes fresh
 installation and fixture checks without containing credentials or a region.
 Pre-cloud Attempt08 recorded an account-ready candidate but Independent Review
 Attempt12 subsequently found four major gaps, so Attempt08 cannot authorize or
-support a final account-ready claim. It remains immutable evidence and
-authorizes no API call, purchase, instance, COS bucket, formal matrix, holdout,
-Level 1 claim, or release. The successor independent-review receipt is the
-authoritative final decision for the Build19 sequence.
+support a final account-ready claim. Build19 fixes those findings under a new
+source identity; Pre-cloud Attempt09 is its producer-side decision. Review13 is
+the authoritative final decision for the Build19 sequence. None of these
+artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
+holdout, Level 1 claim, or release.
 
 Build13 is retained as a complete but rejected internal artifact. Independent
 Review Attempt10 found one major gap: interrupted or aborted native exact work

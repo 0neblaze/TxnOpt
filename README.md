@@ -133,11 +133,10 @@ must show 64 physical cores and one thread per core. The Tencent product/API
 memory specification must be at least 128 GB. Linux `MemTotal` is recorded but
 may be slightly below the product value because of platform reservations; that
 alone is not a failure. The calibration receipt bound to the selected producer
-(Attempt27 for the immutable Build16 pair, or Attempt29 for the Build18
-successor) must report peak RSS below 80% of actual visible memory. The accepted
-pairings are closed: Build16/Attempt26/Attempt27 and
-Build18/Attempt28/Attempt29. The intermediate Build17 validation candidate is
-not an approved formal producer. Capacity assessment, account configuration,
+must report peak RSS below 80% of actual visible memory. The closed historical
+pairings are Build16/Attempt26/Attempt27 and Build18/Attempt28/Attempt29; the
+current successor is Build19/Attempt30/Attempt31. Intermediate validation
+candidates are not approved formal producers. Capacity assessment, account configuration,
 procurement authorization, build portability, and formal execution remain
 separate gates.
 
