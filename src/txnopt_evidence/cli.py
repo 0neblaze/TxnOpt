@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -87,10 +88,7 @@ def _parser() -> argparse.ArgumentParser:
     tencent_bundle_verify = tencent_commands.add_parser("bundle-verify")
     tencent_bundle_verify.add_argument("--manifest", type=Path, required=True)
     tencent_doctor = tencent_commands.add_parser("doctor")
-    tencent_doctor.add_argument("--instance-type", required=True)
-    tencent_doctor.add_argument("--provider-physical-cores", type=int, required=True)
-    tencent_doctor.add_argument("--provider-memory-gb", type=int, required=True)
-    tencent_doctor.add_argument("--minimum-physical-cores", type=int, default=64)
+    tencent_doctor.add_argument("--provider-receipt", type=Path, required=True)
     tencent_doctor.add_argument("--expected-peak-rss-bytes", type=int)
     tencent_doctor.add_argument("--work-directory", type=Path, default=Path.cwd())
     tencent_doctor.add_argument("--output", type=Path, required=True)
@@ -135,7 +133,7 @@ def _error(command: str, error: Exception) -> int:
         "schema_version": "txnopt-cli-error-v1",
         "command": command,
         "error_type": type(error).__name__,
-        "error": str(error),
+        "error": _redacted_error_text(error),
         "fallback_used": False,
     }
     if isinstance(manifest_path, Path):
@@ -145,6 +143,19 @@ def _error(command: str, error: Exception) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _redacted_error_text(error: Exception) -> str:
+    message = str(error)
+    for variable in (
+        "TENCENTCLOUD_SECRET_ID",
+        "TENCENTCLOUD_SECRET_KEY",
+        "TENCENTCLOUD_SESSION_TOKEN",
+    ):
+        value = os.environ.get(variable)
+        if value:
+            message = message.replace(value, "[REDACTED]")
+    return message
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -333,11 +344,10 @@ def _cloud_command(arguments: argparse.Namespace) -> object:
     from txnopt_evidence.codec import write_signed_json
     from txnopt_evidence.tencent_cloud import (
         TencentCvmSelection,
-        TencentProviderInstanceSpec,
         assess_tencent_capacity,
         create_tencent_provisioning_spec,
         execute_cvm_dry_run,
-        inspect_tencent_host,
+        inspect_tencent_host_from_provider_receipt,
         prepare_cvm_dry_run_envelope,
     )
 
@@ -392,13 +402,8 @@ def _cloud_command(arguments: argparse.Namespace) -> object:
 
         return verify_tencent_deployment(arguments.manifest)
     if arguments.tencent_command == "doctor":
-        receipt = inspect_tencent_host(
-            provider_instance=TencentProviderInstanceSpec(
-                instance_type=arguments.instance_type,
-                physical_cores=arguments.provider_physical_cores,
-                memory_gb=arguments.provider_memory_gb,
-            ),
-            minimum_physical_cores=arguments.minimum_physical_cores,
+        receipt = inspect_tencent_host_from_provider_receipt(
+            arguments.provider_receipt,
             expected_peak_rss_bytes=arguments.expected_peak_rss_bytes,
             work_directory=arguments.work_directory,
         )

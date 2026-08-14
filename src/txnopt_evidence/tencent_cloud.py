@@ -19,7 +19,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from txnopt_evidence.codec import canonical_json_bytes
+from txnopt_evidence.codec import (
+    canonical_json_bytes,
+    read_signed_json,
+    verify_sidecar,
+)
 from txnopt_evidence.level1_campaign_common import (
     linux_host_identity,
     physical_core_count,
@@ -83,6 +87,29 @@ class TencentProviderInstanceSpec:
             raise ValueError("Tencent provider physical-core count must be positive")
         if isinstance(self.memory_gb, bool) or self.memory_gb <= 0:
             raise ValueError("Tencent provider memory must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class TencentProviderApiEvidence:
+    """Provider facts acknowledged by one exact Tencent CVM DryRun receipt."""
+
+    region: str
+    zone: str
+    instance_type: str
+    physical_cores: int
+    thread_per_core: int
+    vcpu: int
+    memory_gb: int
+    describe_request_id: str
+    dry_run_request_id: str
+
+    @property
+    def instance_spec(self) -> TencentProviderInstanceSpec:
+        return TencentProviderInstanceSpec(
+            instance_type=self.instance_type,
+            physical_cores=self.physical_cores,
+            memory_gb=self.memory_gb,
+        )
 
 
 class TencentCvmDryRunClient(Protocol):
@@ -502,6 +529,137 @@ def check_tencent_host(
     raise RuntimeError("Tencent host does not satisfy the recorded resource contract")
 
 
+def inspect_tencent_host_from_provider_receipt(
+    provider_receipt_path: Path,
+    *,
+    expected_peak_rss_bytes: int | None = None,
+    work_directory: Path | None = None,
+) -> dict[str, object]:
+    """Cross-check Linux topology against one signed live Tencent API receipt."""
+
+    provider_receipt_digest = verify_sidecar(provider_receipt_path)
+    provider_receipt = read_signed_json(provider_receipt_path)
+    evidence = _validated_provider_api_evidence(provider_receipt)
+    receipt = inspect_tencent_host(
+        provider_instance=evidence.instance_spec,
+        minimum_physical_cores=64,
+        minimum_provider_memory_gb=128,
+        expected_peak_rss_bytes=expected_peak_rss_bytes,
+        work_directory=work_directory,
+    )
+    failures = receipt.get("failures")
+    if not isinstance(failures, list):
+        raise RuntimeError("Tencent host receipt lacks its failure ledger")
+    receipt["schema_version"] = "txnopt-tencent-host-check-v2"
+    receipt["provider_resource_input_source"] = "signed_live_cvm_dry_run_receipt"
+    receipt["provider_receipt_path"] = str(
+        provider_receipt_path.expanduser().resolve(strict=True)
+    )
+    receipt["provider_receipt_sha256"] = provider_receipt_digest
+    receipt["provider_api_evidence"] = asdict(evidence)
+    receipt["provider_linux_cross_check_pass"] = not any(
+        failure
+        in {
+            "provider_physical_cores_below_64",
+            "linux_physical_cores_below_64",
+            "provider_linux_physical_core_cross_check_failed",
+            "thread_per_core_is_not_one",
+        }
+        for failure in failures
+    )
+    return receipt
+
+
+def _validated_provider_api_evidence(
+    receipt: Mapping[str, Any],
+) -> TencentProviderApiEvidence:
+    expected_fields = {
+        "schema_version",
+        "status",
+        "provider",
+        "region",
+        "instance_type",
+        "provider_instance",
+        "request_id",
+        "dry_run",
+        "instance_created",
+        "cloud_purchase_authorized",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError("Tencent provider receipt field set differs")
+    if (
+        receipt.get("schema_version") != "txnopt-tencent-cvm-dry-run-receipt-v1"
+        or receipt.get("status") != "DRY_RUN_PASS_NO_INSTANCE_CREATED"
+        or receipt.get("provider") != "tencent-cloud"
+        or receipt.get("dry_run") is not True
+        or receipt.get("instance_created") is not False
+        or receipt.get("cloud_purchase_authorized") is not False
+    ):
+        raise ValueError("Tencent provider receipt is not a successful DryRun")
+    region = receipt.get("region")
+    if not isinstance(region, str) or not region or region != region.strip():
+        raise ValueError("Tencent provider receipt region is missing")
+    instance_type = receipt.get("instance_type")
+    if (
+        not isinstance(instance_type, str)
+        or not instance_type
+        or instance_type != instance_type.strip()
+    ):
+        raise ValueError("Tencent provider receipt instance type is missing")
+    dry_run_request_id = receipt.get("request_id")
+    if not isinstance(dry_run_request_id, str) or not dry_run_request_id:
+        raise ValueError("Tencent provider receipt request identity is missing")
+    provider_instance = receipt.get("provider_instance")
+    expected_instance_fields = {
+        "describe_request_id",
+        "zone",
+        "instance_type",
+        "vcpu",
+        "memory_gb",
+        "status",
+        "requested_physical_cores",
+        "requested_thread_per_core",
+    }
+    if (
+        not isinstance(provider_instance, dict)
+        or set(provider_instance) != expected_instance_fields
+    ):
+        raise ValueError("Tencent provider instance receipt field set differs")
+    describe_request_id = provider_instance.get("describe_request_id")
+    if not isinstance(describe_request_id, str) or not describe_request_id:
+        raise ValueError("Tencent provider describe request identity is missing")
+    zone = provider_instance.get("zone")
+    if not isinstance(zone, str) or not zone or zone != zone.strip():
+        raise ValueError("Tencent provider receipt zone is missing")
+    if provider_instance.get("instance_type") != instance_type:
+        raise ValueError("Tencent provider receipt instance type differs")
+    physical_cores = provider_instance.get("requested_physical_cores")
+    thread_per_core = provider_instance.get("requested_thread_per_core")
+    vcpu = provider_instance.get("vcpu")
+    memory_gb = provider_instance.get("memory_gb")
+    if physical_cores != 64 or thread_per_core != 1 or vcpu != 64:
+        raise ValueError(
+            "Tencent provider DryRun must acknowledge 64 physical cores and one thread per core"
+        )
+    if isinstance(memory_gb, bool) or not isinstance(memory_gb, (int, float)):
+        raise ValueError("Tencent provider receipt memory is not numeric")
+    if memory_gb < 128:
+        raise ValueError("Tencent provider receipt memory is below 128 GB")
+    if provider_instance.get("status") != "SELL":
+        raise ValueError("Tencent provider receipt SKU is not sellable")
+    return TencentProviderApiEvidence(
+        region=region,
+        zone=zone,
+        instance_type=instance_type,
+        physical_cores=physical_cores,
+        thread_per_core=thread_per_core,
+        vcpu=vcpu,
+        memory_gb=int(memory_gb),
+        describe_request_id=describe_request_id,
+        dry_run_request_id=dry_run_request_id,
+    )
+
+
 def inspect_tencent_host(
     *,
     provider_instance: TencentProviderInstanceSpec,
@@ -783,12 +941,14 @@ __all__ = [
     "TencentCvmSelection",
     "TencentCloudRequirements",
     "TencentProviderInstanceSpec",
+    "TencentProviderApiEvidence",
     "assess_tencent_capacity",
     "build_cvm_dry_run_payload",
     "check_tencent_host",
     "create_tencent_provisioning_spec",
     "execute_cvm_dry_run",
     "inspect_tencent_host",
+    "inspect_tencent_host_from_provider_receipt",
     "memory_bytes",
     "prepare_cvm_dry_run_envelope",
 ]

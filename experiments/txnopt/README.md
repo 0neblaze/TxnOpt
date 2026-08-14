@@ -33,59 +33,61 @@ separate `txnopt-expected-evidence-identity-v1` derived from the frozen plan,
 exact config bytes, and clean build manifest. V1/v2 replay remains an explicit
 compatibility operation and cannot enter a formal readiness decision.
 
-The exact Level 1 case set, seeds, axes, and cloud envelope are bound by
-`level1-protocol.json` and its sidecar. `INDEX.md` is the current status view;
-it must never infer readiness from runner completion.
+The exact active Level 1 case set, seeds, axes, and Tencent resource envelope
+are bound by `level1-protocol-v2.json` and its sidecar. The unversioned
+`level1-protocol.json` is the immutable protocol-v1 predecessor and must not be
+used for a new plan. `INDEX.md` is the status view; it must never infer
+readiness from runner completion.
 
 Benchmark files are not redistributed. Copy `case-catalog.example.json` to the
 ignored `case-catalog.local.json`, replace every placeholder with an absolute
-Schneider or PSPLIB path, and materialize (but do not run) the matrix with:
+Schneider or PSPLIB path, and materialize a fresh successor plan without
+running it through the installed unified CLI:
 
 ```bash
-python tools/materialize_txnopt_level1.py \
-  --protocol experiments/txnopt/level1-protocol.json \
+txnopt plan \
+  --protocol experiments/txnopt/level1-protocol-v2.json \
   --catalog experiments/txnopt/case-catalog.local.json \
-  --destination /external/txnopt-level1-plan-attempt01 \
-  --raw-output-root /external/txnopt-level1-raw \
-  --build-manifest experiments/txnopt/manifests/txnopt_level1_build_attempt14.json \
-  --fixed-work CALIBRATED_WORK --fixed-time-seconds CALIBRATED_SECONDS \
-  --max-rounds CALIBRATED_ROUNDS \
-  --evrptw-max-candidates 64 --rcpsp-max-candidates 64
+  --destination /governed/txnopt-plans/level1-formal-plan-attemptN \
+  --raw-output-root /governed/txnopt-results/level1-formal-buildN-attemptN \
+  --build-manifest experiments/txnopt/manifests/txnopt_level1_build_attemptN.json \
+  --fixed-work 1200 --fixed-time-seconds 3 --max-rounds 10 \
+  --evrptw-max-candidates 64 --rcpsp-max-candidates 64 --attempt N
 ```
 
-`CALIBRATED_*` values are frozen only after the local pilot. The materializer
-requires an exact catalog, hashes every source instance and generated config,
-refuses overwrite, leaves holdouts closed, and does not execute or procure
-anything. `tools/estimate_txnopt_cloud_window.py` converts the complete local
-p95 calibration into a signed 32/64-core time forecast. Server rental remains
-blocked unless that forecast is at most ten days.
-
-The prior formal identities Attempts18, 21, and 23 remain immutable and
-unexecuted. The current Build14 identity is external plan-v2 Attempt24, with
-2,880 prebound expected identities, its own preregistered analysis file, and a
-fresh absent raw root. Structural preflight is read-only:
-
-Build14 freezes the active solver source as
-`manifests/txnopt_level1_build_attempt14.json`. Build13 and all earlier builds,
-calibrations, plans, and pre-cloud gates remain immutable but cannot authorize
-Build14. Build13 was independently rejected as `NEEDS_WORK` in Attempt10 after
-an interrupted native-work path could omit its receipt. Build14 closes receipt
-coverage for committed, aborted, interrupted, T4-positive, zero-physical, and
-multi-stream failure paths; independent Attempt11 reports
-`PASS_BUILD14_ANCHORED_EVIDENCE_NOT_LEVEL1_READY` with zero findings.
+`N` must be the source registry's next Build/formal-attempt pair; it is not a
+free label. The materializer requires an exact catalog, hashes every source
+instance and generated config, refuses overwrite, leaves holdouts closed, and
+does not execute or procure anything. Structural preflight and the 64-core
+capacity estimate use the same installed command surface:
 
 ```bash
-python -m tools.run_txnopt_level1_campaign preflight \
-  --plan-manifest /home/oneblaze/txnopt-plans/level1-formal-plan-attempt24/manifest.json \
-  --analysis-protocol /home/oneblaze/txnopt-plans/level1-formal-plan-attempt24/analysis-protocol.json \
-  --python /home/oneblaze/txnopt-builds/level1-bec0dd8/formal-venv/bin/python \
-  --wheel /home/oneblaze/txnopt-builds/level1-bec0dd8/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl
+txnopt preflight \
+  --plan-manifest /governed/txnopt-plans/level1-formal-plan-attemptN/manifest.json \
+  --analysis-protocol /governed/txnopt-plans/level1-formal-plan-attemptN/analysis-protocol.json \
+  --python /governed/txnopt-builds/buildN/venv/bin/python \
+  --wheel /governed/txnopt-builds/buildN/wheel/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl
+
+txnopt cloud tencent assess \
+  --protocol experiments/txnopt/level1-protocol-v2.json \
+  --calibration /governed/txnopt-calibration/level1-local-calibration-attemptN.json \
+  --physical-cores 64 --provider-memory-gb 128
 ```
 
-Attempt24 preflight status is `PASS_NOT_AUTHORIZED_TO_EXECUTE`; holdouts and
-cloud purchase remain closed, and no launch claim or raw root exists. Attempt23
-remains permanently unexecuted and unauthorized. Current formal preflight
-intentionally rejects its plan-v1 input.
+Server rental remains blocked unless the estimate is at most ten days. The
+live host doctor additionally requires the signed Tencent DryRun receipt; SKU
+resources are never accepted from self-reported CLI numbers.
+
+The prior formal identities Attempts18, 21, 23, 24, and 28 remain immutable and
+unexecuted. Attempt28 is the Build18 protocol-v2 predecessor with 2,880
+prebound expected identities, its own preregistered analysis file, and a fresh
+absent raw root. Structural preflight is read-only.
+
+Build14/Attempt24 and Build18/Attempt28 remain historical, byte-preserved
+predecessor chains. Their preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
+holdouts and cloud purchase remain closed, and no launch claim or raw root
+exists. New execution rejects protocol-v1 plans and any build/attempt pair not
+present in the closed successor registry.
 Build14-bound local calibration Attempt25 separately retains 96/96 anchored v3
 raw bundles and 96/96 independent reviews. Its representative fixed-work
 geometric-mean speedups are 1.37x for EVRPTW and 2.18x for RCPSP, with maximum

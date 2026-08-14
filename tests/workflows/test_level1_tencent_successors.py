@@ -15,6 +15,7 @@ def _build(number: int) -> dict[str, object]:
     statuses = {
         16: "BUILD_COMPLETE_TENCENT_CLOUD_CUTOVER_NOT_LEVEL1_READY",
         18: "BUILD_COMPLETE_TENCENT_PRE_CLOUD_SUCCESSOR_NOT_LEVEL1_READY",
+        19: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
     }
     return {
         "schema_version": "txnopt-level1-build-manifest-v1",
@@ -31,7 +32,7 @@ def _build(number: int) -> dict[str, object]:
 
 @pytest.mark.parametrize(
     ("build_number", "formal_attempt", "calibration_attempt"),
-    [(16, 26, 27), (18, 28, 29)],
+    [(16, 26, 27), (18, 28, 29), (19, 30, 31)],
 )
 def test_registry_closes_each_build_to_one_formal_and_calibration_attempt(
     build_number: int,

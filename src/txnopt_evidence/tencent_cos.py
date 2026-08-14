@@ -20,11 +20,11 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Protocol, cast
+from typing import Any, BinaryIO, Protocol, TypeVar, cast
 
 from txnopt_evidence.archive import (
     ArchiveError,
@@ -38,6 +38,12 @@ _COMMIT_SCHEMA = "txnopt-tencent-cos-commit-v1"
 _COMMIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _FIVE_GIB = 5 * 1024 * 1024 * 1024
 _ONE_MIB = 1024 * 1024
+_SdkResult = TypeVar("_SdkResult")
+_CREDENTIAL_ENV_VARS = (
+    "TENCENTCLOUD_SECRET_ID",
+    "TENCENTCLOUD_SECRET_KEY",
+    "TENCENTCLOUD_SESSION_TOKEN",
+)
 
 
 class TencentCosError(ArchiveError):
@@ -308,15 +314,22 @@ class TencentCosArchive:
                 raise TencentCosContractError(
                     "Tencent common SDK is required for a CVM CAM role"
                 ) from error
-            config_arguments["CredentialInstance"] = credential_module.CVMRoleCredential()
+            try:
+                config_arguments["CredentialInstance"] = credential_module.CVMRoleCredential()
+            except Exception as error:
+                raise _redacted_sdk_error("CVM CAM role credential", error) from None
         else:
             config_arguments["SecretId"] = secret_id
             config_arguments["SecretKey"] = secret_key
             if token:
                 config_arguments["Token"] = token
-        config = config_factory(**config_arguments)
+        try:
+            config = config_factory(**config_arguments)
+            client = client_factory(config)
+        except Exception as error:
+            raise _redacted_sdk_error("client initialization", error) from None
         return cls(
-            _QcloudCosSdkBridge(client_factory(config)),
+            _QcloudCosSdkBridge(client),
             bucket=bucket,
             region=region,
             prefix=prefix,
@@ -711,38 +724,83 @@ class _QcloudCosSdkBridge:
 
     def __init__(self, client: Any) -> None:
         self._client = client
+        # Keep a private snapshot so later environment cleanup cannot expose a
+        # credential in an SDK failure raised by this already-configured client.
+        self._credential_values = _credential_values_from_environment()
 
     def head_bucket(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.head_bucket(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call("head_bucket", self._client.head_bucket, **kwargs),
+        )
 
     def get_bucket_versioning(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.get_bucket_versioning(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call("get_bucket_versioning", self._client.get_bucket_versioning, **kwargs),
+        )
 
     def get_bucket_object_lock(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.get_bucket_object_lock(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call(
+                "get_bucket_object_lock",
+                self._client.get_bucket_object_lock,
+                **kwargs,
+            ),
+        )
 
     def put_object(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.put_object(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call("put_object", self._client.put_object, **kwargs),
+        )
 
     def create_multipart_upload(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.create_multipart_upload(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call(
+                "create_multipart_upload",
+                self._client.create_multipart_upload,
+                **kwargs,
+            ),
+        )
 
     def upload_part(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.upload_part(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call("upload_part", self._client.upload_part, **kwargs),
+        )
 
     def complete_multipart_upload(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.complete_multipart_upload(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call(
+                "complete_multipart_upload",
+                self._client.complete_multipart_upload,
+                **kwargs,
+            ),
+        )
 
     def abort_multipart_upload(self, **kwargs: object) -> object:
-        return self._client.abort_multipart_upload(**kwargs)
+        return self._call("abort_multipart_upload", self._client.abort_multipart_upload, **kwargs)
 
     def head_object(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.head_object(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call("head_object", self._client.head_object, **kwargs),
+        )
 
     def get_object(self, **kwargs: object) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], self._client.get_object(**kwargs))
+        return cast(
+            Mapping[str, Any],
+            self._call("get_object", self._client.get_object, **kwargs),
+        )
 
     def get_object_retention(self, **kwargs: object) -> Mapping[str, Any]:
+        return self._call("get_object_retention", self._get_object_retention, **kwargs)
+
+    def _get_object_retention(self, **kwargs: object) -> Mapping[str, Any]:
         auth_module = importlib.import_module("qcloud_cos.cos_auth")
         comm_module = importlib.import_module("qcloud_cos.cos_comm")
         bucket = cast(str, kwargs["Bucket"])
@@ -763,11 +821,33 @@ class _QcloudCosSdkBridge:
         try:
             self._client.head_object(**kwargs)
         except Exception as error:
-            status_code = getattr(error, "get_status_code", lambda: None)()
+            try:
+                status_code = getattr(error, "get_status_code", lambda: None)()
+            except Exception as status_error:
+                raise _redacted_sdk_error(
+                    "object_exists status",
+                    status_error,
+                    self._credential_values,
+                ) from None
             if status_code == 404:
                 return False
-            raise
+            raise _redacted_sdk_error(
+                "object_exists",
+                error,
+                self._credential_values,
+            ) from None
         return True
+
+    def _call(
+        self,
+        operation: str,
+        method: Callable[..., _SdkResult],
+        **kwargs: object,
+    ) -> _SdkResult:
+        try:
+            return method(**kwargs)
+        except Exception as error:
+            raise _redacted_sdk_error(operation, error, self._credential_values) from None
 
 
 def encode_tencent_cos_commit(commit: TencentCosCommit) -> bytes:
@@ -870,6 +950,35 @@ def _required_version_id(response: Mapping[str, Any]) -> str:
 
 def _lower_keys(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {str(key).lower(): value for key, value in payload.items()}
+
+
+def _redacted_sdk_error(
+    operation: str,
+    error: Exception,
+    credential_values: tuple[str, ...] = (),
+) -> TencentCosError:
+    """Convert SDK failures to a diagnosable, credential-free COS error."""
+
+    message = str(error)
+    values = tuple(
+        value
+        for value in (*credential_values, *_credential_values_from_environment())
+        if value
+    )
+    for secret in sorted(set(values), key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]")
+    category = f"{type(error).__module__}.{type(error).__qualname__}"
+    if not message:
+        message = "<empty SDK error message>"
+    return TencentCosError(f"Tencent COS SDK {operation} failed [{category}]: {message}")
+
+
+def _credential_values_from_environment() -> tuple[str, ...]:
+    return tuple(
+        value
+        for variable in _CREDENTIAL_ENV_VARS
+        if (value := os.environ.get(variable))
+    )
 
 
 def _required_mapping(value: object, name: str) -> Mapping[str, Any]:

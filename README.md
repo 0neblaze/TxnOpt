@@ -76,12 +76,11 @@ txnopt review --plan-manifest PLAN/manifest.json \
 txnopt cloud tencent assess --protocol PROTOCOL.json \
   --calibration CALIBRATION.json --physical-cores 64 --provider-memory-gb 128
 txnopt cloud tencent spec --output SPEC.json
-txnopt cloud tencent doctor --instance-type SKU \
-  --provider-physical-cores 64 --provider-memory-gb 128 \
+txnopt cloud tencent doctor --provider-receipt DRY-RUN-RECEIPT.json \
   --expected-peak-rss-bytes BYTES --output HOST-RECEIPT.json
 txnopt cloud tencent dry-run --region REGION --zone ZONE \
   --instance-type SKU --image-id IMAGE --vpc-id VPC --subnet-id SUBNET \
-  --security-group-id SECURITY-GROUP --provider-memory-gb 128 \
+  --security-group-id SECURITY-GROUP \
   --request-output REQUEST.json --receipt-output RECEIPT.json
 txnopt cloud tencent bundle --destination DEPLOYMENT \
   --build-manifest BUILD.json --wheel TXNOPT.whl \

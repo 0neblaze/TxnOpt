@@ -1,0 +1,117 @@
+{
+  "schema_version": "txnopt-tencent-precloud-independent-review-v1",
+  "run_label": "txnopt_tencent_precloud_review_attempt12",
+  "status": "NEEDS_WORK",
+  "completed_at_utc": "2026-08-14T21:57:49Z",
+  "review_scope": {
+    "reviewed_revision": "88d0fbca7b3b139e9edd2ef4cac620a7be0e5538",
+    "reviewed_tree": "bca49cc0ae579afc09d8109434394863e41a1424",
+    "review_checkout": "/home/oneblaze/txnopt-recovery/tencent-precloud-88d0fbc",
+    "review_environment": "/home/oneblaze/txnopt-audits/tencent-precloud-review-attempt12",
+    "producer_build": "Build18",
+    "formal_plan_attempt": 28,
+    "local_calibration_attempt": 29,
+    "precloud_attempt": 8,
+    "cloud_account_used": false,
+    "live_cloud_request_sent": false
+  },
+  "independent_evidence": {
+    "artifact_audit_path": "/home/oneblaze/txnopt-audits/tencent-precloud-review-attempt12/artifact-audit-summary.json",
+    "artifact_audit_sha256": "ed3a8e69c7bb671ed262b96e6e6794a5549cfefbdcfa59b27a4c941ca8474660",
+    "independent_replay_path": "/home/oneblaze/txnopt-audits/tencent-precloud-review-attempt12/independent-replay-summary.json",
+    "independent_replay_sha256": "bac1d9e604975da2163dc29bd305245b29d55c7ce816b137e0fa150debfd028c",
+    "independent_replay_pass_count": 96,
+    "independent_replay_expected_count": 96,
+    "formal_live_rerun_path": "/home/oneblaze/txnopt-audits/tencent-precloud-review-attempt12/formal-live-rerun.json",
+    "formal_live_rerun_sha256": "17cc04639dd84fae413abe2a4dea537e897e9dbd1a643793d7019d5571b5b4f2",
+    "formal_state_counts": {
+      "primary": {"generated": 75, "distinct": 22},
+      "pluscal": {"generated": 36402, "distinct": 8134},
+      "t3_quotient": {"generated": 5, "distinct": 5}
+    },
+    "validation_summary_path": "/home/oneblaze/txnopt-audits/tencent-precloud-review-attempt12/validation-summary.json",
+    "validation_summary_sha256": "401b9efce1b582b8f86d32f358f253a0968a26083391a4f7779540087b3598b3",
+    "full_test_result": "346 passed, 0 skipped",
+    "ruff_result": "PASS",
+    "strict_mypy_result": "PASS (59 source files)",
+    "git_diff_check_result": "PASS"
+  },
+  "standards_axis": {
+    "status": "NEEDS_WORK",
+    "summary": "The implementation and evidence hashes pass, but the active roadmap and experiment operator documentation still identify superseded 32-core and Build11/Build14 workflows as current.",
+    "finding_counts": {"critical": 0, "major": 2, "minor": 0},
+    "findings": [
+      {
+        "id": "STANDARDS-01",
+        "severity": "MAJOR",
+        "path": "docs/roadmap/txnopt-level1-to-level3-roadmap.md",
+        "line": 320,
+        "reviewed_sha256": "f2fa03c90f115baa5b5ab714673185d4500a06011404fdab220912ab29c8db59",
+        "title": "The authoritative roadmap still describes the superseded 32-core Build11 gate",
+        "impact": "The repository-designated active roadmap contradicts the 64-physical-core Build18, Attempt28, Attempt29, and Precloud Attempt08 identity and can direct later work to an invalid resource contract."
+      },
+      {
+        "id": "STANDARDS-02",
+        "severity": "MAJOR",
+        "path": "experiments/txnopt/README.md",
+        "line": 36,
+        "related_path": "experiments/txnopt/INDEX.md",
+        "related_line": 10,
+        "reviewed_sha256": "a9605c88ca669713292862c2642384e21ebbe06e0da8b68fe07309478960c494",
+        "related_reviewed_sha256": "15e7749b6a0b9393abd00fbe91ad23dfefc467238ad11593ea12a5fcf3d78074",
+        "title": "Current experiment instructions point to protocol v1 and deleted tools",
+        "impact": "An operator can be led back to the immutable Build14/Attempt24 predecessor and commands that no longer exist instead of the unified TxnOpt protocol-v2 workflow."
+      }
+    ]
+  },
+  "spec_axis": {
+    "status": "NEEDS_WORK",
+    "summary": "The plan, calibration, deployment, and offline contracts pass, but the live-host doctor does not bind provider facts to an API receipt and COS SDK errors are not guaranteed to redact credential values.",
+    "finding_counts": {"critical": 0, "major": 2, "minor": 0},
+    "findings": [
+      {
+        "id": "SPEC-01",
+        "severity": "MAJOR",
+        "path": "src/txnopt_evidence/cli.py",
+        "line": 89,
+        "related_line": 394,
+        "reviewed_sha256": "1d53a082cf031ea598e84c065d522fd01bd07d5a789188c9cf1068327f5559d0",
+        "title": "Tencent doctor trusts self-reported provider resources",
+        "impact": "The command accepts physical cores and provider memory from CLI arguments rather than a signed Tencent DryRun/API receipt containing region, SKU, and request identities, so provider and Linux evidence are not independently cross-confirmed."
+      },
+      {
+        "id": "SPEC-02",
+        "severity": "MAJOR",
+        "path": "src/txnopt_evidence/tencent_cos.py",
+        "line": 709,
+        "related_path": "src/txnopt_evidence/cli.py",
+        "related_line": 132,
+        "reviewed_sha256": "d8d660d5d4e4580ab83d2144ee258e16fa33330d9dbe0d163102e1f4cc8158d6",
+        "title": "Tencent COS SDK exceptions can expose credential values",
+        "impact": "COS SDK exceptions are propagated to a CLI error object through str(error) without the credential-value redaction already used by the CVM bridge."
+      }
+    ]
+  },
+  "finding_counts": {
+    "critical": 0,
+    "major": 4,
+    "minor": 0
+  },
+  "claim_boundary": {
+    "independent_review_completed": true,
+    "account_independent_work_complete": false,
+    "ready_for_tencent_account_input": false,
+    "tencent_account_configured": false,
+    "live_dry_run_completed": false,
+    "cloud_purchase_authorized": false,
+    "instance_creation_authorized": false,
+    "cos_live_operation_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "public_release_authorized": false,
+    "e_drive_deletion_authorized": false
+  },
+  "next_action": "Preserve this failed review, fix all four major findings under a new source identity, then issue a fresh independent Review Attempt13 without overwriting Attempt12."
+}

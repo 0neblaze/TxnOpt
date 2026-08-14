@@ -10,7 +10,7 @@ import pytest
 
 import txnopt_evidence.tencent_cloud as tencent_cloud
 from txnopt_evidence.cli import main
-from txnopt_evidence.codec import read_signed_json, write_signed_json
+from txnopt_evidence.codec import read_signed_json, sha256_file, write_signed_json
 from txnopt_evidence.tencent_cloud import (
     TencentCvmSelection,
     TencentProviderInstanceSpec,
@@ -600,6 +600,168 @@ def test_cli_tencent_spec_and_offline_dry_run_request(
     }
     assert "SecretId" not in json.dumps(request)
     assert read_signed_json(receipt_path)["request_id"] == "offline-fixture-request"
+
+
+def test_cli_tencent_error_receipt_redacts_environment_credentials(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {
+        "TENCENTCLOUD_SECRET_ID": "secret-id-value",
+        "TENCENTCLOUD_SECRET_KEY": "secret-key-value",
+        "TENCENTCLOUD_SESSION_TOKEN": "session-token-value",
+    }
+    for variable, value in secrets.items():
+        monkeypatch.setenv(variable, value)
+
+    def fail_with_sdk_message() -> dict[str, object]:
+        raise RuntimeError("SDK rejected " + " ".join(secrets.values()))
+
+    monkeypatch.setattr(
+        tencent_cloud,
+        "create_tencent_provisioning_spec",
+        fail_with_sdk_message,
+    )
+
+    assert main(
+        [
+            "cloud",
+            "tencent",
+            "spec",
+            "--output",
+            str(tmp_path / "unused.json"),
+        ]
+    ) == 2
+    error_payload = json.loads(capsys.readouterr().err)
+    serialized = json.dumps(error_payload, sort_keys=True)
+    assert "[REDACTED]" in serialized
+    assert all(value not in serialized for value in secrets.values())
+
+
+def test_cli_tencent_doctor_binds_provider_facts_to_signed_dry_run_receipt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_linux_host(
+        monkeypatch,
+        physical_cores=64,
+        logical_processors=64,
+        visible_memory_gib=120,
+    )
+    provider_receipt_path = tmp_path / "dry-run-receipt.json"
+    write_signed_json(
+        provider_receipt_path,
+        {
+            "schema_version": "txnopt-tencent-cvm-dry-run-receipt-v1",
+            "status": "DRY_RUN_PASS_NO_INSTANCE_CREATED",
+            "provider": "tencent-cloud",
+            "region": "ap-test",
+            "instance_type": "TEST.64CORE128GB",
+            "provider_instance": {
+                "describe_request_id": "describe-request-id",
+                "zone": "ap-test-1",
+                "instance_type": "TEST.64CORE128GB",
+                "vcpu": 64,
+                "memory_gb": 128,
+                "status": "SELL",
+                "requested_physical_cores": 64,
+                "requested_thread_per_core": 1,
+            },
+            "request_id": "dry-run-request-id",
+            "dry_run": True,
+            "instance_created": False,
+            "cloud_purchase_authorized": False,
+        },
+    )
+    host_receipt_path = tmp_path / "host-receipt.json"
+
+    assert main(
+        [
+            "cloud",
+            "tencent",
+            "doctor",
+            "--provider-receipt",
+            str(provider_receipt_path),
+            "--expected-peak-rss-bytes",
+            str(64 * 1024**2),
+            "--work-directory",
+            str(tmp_path),
+            "--output",
+            str(host_receipt_path),
+        ]
+    ) == 0
+
+    command_result = json.loads(capsys.readouterr().out)
+    signed_receipt = read_signed_json(host_receipt_path)
+    assert command_result["capacity_pass"] is True
+    assert signed_receipt["provider_api_evidence"] == {
+        "describe_request_id": "describe-request-id",
+        "dry_run_request_id": "dry-run-request-id",
+        "instance_type": "TEST.64CORE128GB",
+        "memory_gb": 128,
+        "physical_cores": 64,
+        "region": "ap-test",
+        "thread_per_core": 1,
+        "vcpu": 64,
+        "zone": "ap-test-1",
+    }
+    assert signed_receipt["provider_receipt_sha256"] == sha256_file(provider_receipt_path)
+    assert signed_receipt["provider_linux_cross_check_pass"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_fragment"),
+    [
+        ({"request_id": ""}, "request identity"),
+        ({"region": ""}, "region"),
+        ({"dry_run": False}, "DryRun"),
+    ],
+)
+def test_cli_tencent_doctor_rejects_unanchored_provider_receipt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    mutation: dict[str, object],
+    error_fragment: str,
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": "txnopt-tencent-cvm-dry-run-receipt-v1",
+        "status": "DRY_RUN_PASS_NO_INSTANCE_CREATED",
+        "provider": "tencent-cloud",
+        "region": "ap-test",
+        "instance_type": "TEST.64CORE128GB",
+        "provider_instance": {
+            "describe_request_id": "describe-request-id",
+            "zone": "ap-test-1",
+            "instance_type": "TEST.64CORE128GB",
+            "vcpu": 64,
+            "memory_gb": 128,
+            "status": "SELL",
+            "requested_physical_cores": 64,
+            "requested_thread_per_core": 1,
+        },
+        "request_id": "dry-run-request-id",
+        "dry_run": True,
+        "instance_created": False,
+        "cloud_purchase_authorized": False,
+    }
+    payload.update(mutation)
+    provider_receipt_path = tmp_path / "dry-run-receipt.json"
+    write_signed_json(provider_receipt_path, payload)
+
+    assert main(
+        [
+            "cloud",
+            "tencent",
+            "doctor",
+            "--provider-receipt",
+            str(provider_receipt_path),
+            "--output",
+            str(tmp_path / "host-receipt.json"),
+        ]
+    ) == 2
+    assert error_fragment in capsys.readouterr().err
 
 
 def test_cli_tencent_cos_fails_closed_without_credentials(

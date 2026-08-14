@@ -13,6 +13,8 @@ from txnopt_evidence.archive import ArchiveIntegrityError
 from txnopt_evidence.tencent_cos import (
     TencentCosArchive,
     TencentCosContractError,
+    TencentCosError,
+    _QcloudCosSdkBridge,
 )
 
 
@@ -149,6 +151,18 @@ class _FakeTencentCosClient:
         return self.objects[(key, version_id)], version_id
 
 
+class _ExplodingSdkError(RuntimeError):
+    """Synthetic SDK failure carrying every credential form."""
+
+
+class _ExplodingSdkClient:
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def head_bucket(self, **_kwargs: object) -> dict[str, Any]:
+        raise _ExplodingSdkError(self._message)
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -182,6 +196,39 @@ def test_tencent_cos_requires_versioning_and_compliance_object_lock() -> None:
     client.retention_days = 30
     with pytest.raises(TencentCosContractError, match="shorter"):
         _archive(client)
+
+
+def test_tencent_cos_sdk_errors_redact_environment_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_id = "AKID-cos-test-secret-id"
+    secret_key = "cos-test-secret-key-value"
+    session_token = "cos-test-session-token-value"
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secret_id)
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", secret_key)
+    monkeypatch.setenv("TENCENTCLOUD_SESSION_TOKEN", session_token)
+    sdk_message = (
+        "request rejected for "
+        f"{secret_id}, {secret_key}, and {session_token}"
+    )
+    client = _ExplodingSdkClient(sdk_message)
+    bridge = _QcloudCosSdkBridge(client)
+    monkeypatch.delenv("TENCENTCLOUD_SECRET_ID")
+    monkeypatch.delenv("TENCENTCLOUD_SECRET_KEY")
+    monkeypatch.delenv("TENCENTCLOUD_SESSION_TOKEN")
+
+    with pytest.raises(TencentCosError) as raised:
+        TencentCosArchive(
+            bridge,
+            bucket="txnopt-evidence-1250000000",
+            region="ap-guangzhou",
+        )
+
+    message = str(raised.value)
+    assert "_ExplodingSdkError" in message
+    assert secret_id not in message
+    assert secret_key not in message
+    assert session_token not in message
 
 
 def test_tencent_cos_binds_every_read_to_exact_version_id() -> None:

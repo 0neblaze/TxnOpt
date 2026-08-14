@@ -2,14 +2,16 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build18 clean build and Tencent account-independent gates pass; Attempt28 preflight passes; account input, live DryRun, purchase, and formal matrix remain unauthorized | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt29 retains 96/96 representative raw/review bundles; Attempt28 has 2,880 configs and prebound identities but its raw root and launch claim are absent | Attempt29 aggregate verification Attempt02 passes; pre-cloud Attempt08 is `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`; Independent Review Attempt12 remains the final local review gate |
+| `txnopt-level1-protocol-v2` | Build18/Attempt28/29/Pre-cloud08 are immutable predecessors; Review12 is `NEEDS_WORK`, so a new clean successor build and review are required before account-ready status | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt29 retains 96/96 representative raw/review bundles; Attempt28 has 2,880 configs and prebound identities but its raw root and launch claim are absent | Review12 retains four major findings; Build19, Attempt30/31, Pre-cloud09, and Review13 are the closed successor sequence |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
 
-`level1-protocol.json` and its SHA-256 sidecar are the immutable case-set
-identity for new Level 1 runs. Creating the protocol does not authorize cloud
-purchase, benchmark launch, holdout access, or a readiness claim.
+`level1-protocol-v2.json` and its SHA-256 sidecar are the active case-set and
+Tencent-resource identity for new Level 1 runs. The unversioned
+`level1-protocol.json` is the immutable protocol-v1 predecessor. Creating or
+materializing either protocol does not authorize cloud purchase, benchmark
+launch, holdout access, or a readiness claim.
 
 The current Tencent-specific successor is Build18 under
 `level1-protocol-v2.json`. External formal plan Attempt28 binds 2,880 configs,
@@ -21,9 +23,12 @@ and native receipt checks pass, and the 51-token capacity estimate is about
 2,038 seconds. The estimate is representative local evidence, not live 64-core
 scaling proof. The offline Build18 Tencent deployment bundle passes fresh
 installation and fixture checks without containing credentials or a region.
-Pre-cloud Attempt08 permits only later Tencent account and live-selection input;
-it authorizes no API call, purchase, instance, COS bucket, formal matrix,
-holdout, Level 1 claim, or release.
+Pre-cloud Attempt08 recorded an account-ready candidate but Independent Review
+Attempt12 subsequently found four major gaps, so Attempt08 cannot authorize or
+support a final account-ready claim. It remains immutable evidence and
+authorizes no API call, purchase, instance, COS bucket, formal matrix, holdout,
+Level 1 claim, or release. The successor independent-review receipt is the
+authoritative final decision for the Build19 sequence.
 
 Build13 is retained as a complete but rejected internal artifact. Independent
 Review Attempt10 found one major gap: interrupted or aborted native exact work

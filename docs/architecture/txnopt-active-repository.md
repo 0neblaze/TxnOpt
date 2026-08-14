@@ -78,8 +78,8 @@ SHA-256 不能单独构成对象身份。`TencentCosObjectRef` 与 `TencentCosCo
 txnopt cloud tencent assess --protocol <protocol> --calibration <calibration> \
   --physical-cores 64 --provider-memory-gb 128
 txnopt cloud tencent spec --output <spec>
-txnopt cloud tencent doctor --instance-type <sku> --provider-physical-cores 64 \
-  --provider-memory-gb 128 --expected-peak-rss-bytes <bytes> --output <receipt>
+txnopt cloud tencent doctor --provider-receipt <signed-dry-run-receipt> \
+  --expected-peak-rss-bytes <bytes> --output <host-receipt>
 txnopt cloud tencent bundle --destination <deployment> --build-manifest <build> \
   --wheel <wheel> --source-manifest <source> --native-attestation <native> \
   --uv-lock <uv.lock> --toolchain-lock <toolchain> --plan-manifest <formal-plan>

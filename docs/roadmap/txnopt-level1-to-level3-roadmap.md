@@ -29,6 +29,15 @@ cloud purchase, public alpha, or manuscript submission.
 
 ## 2. Current verified baseline
 
+- The latest completed producer chain is Build18 with protocol-v2 formal plan
+  Attempt28, representative calibration Attempt29, and Pre-cloud Attempt08.
+  Their signed artifacts remain immutable, the 2,880-run raw root is absent,
+  and no Tencent account, purchase, instance, COS bucket, holdout, or formal
+  execution has been authorized.
+- Independent Review Attempt12 is retained as `NEEDS_WORK` with four major
+  findings. The Build18 chain therefore cannot be the final account-ready
+  decision. The closed successor sequence is Build19, Attempt30, Attempt31,
+  Pre-cloud Attempt09, and Independent Review Attempt13.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -66,7 +75,7 @@ cloud purchase, public alpha, or manuscript submission.
   100,000-round resource gates pass. Build09, Attempt17, and formal-plan
   Attempt18 remain immutable evidence but are not successor evidence for this
   implementation; Build10's additive refinement review remains pending.
-- Clean Build11 freezes the current producer and adds the hash-chained
+- Retained historical Build11 adds the hash-chained
   `txnopt-evidence-lifecycle-v1` contract. New v2 raw/failure bundles bind
   `PLANNED -> RUNNING -> SEALED`; independent replay appends `REVIEWED` while
   Build10 v1 bundles remain readable and unchanged. Build11 passes its wheel,
@@ -318,33 +327,34 @@ The fixed Level 1 matrix is 12 EVRPTW and 24 RCPSP instances, ten seeds each:
 - no Level 2 or Level 3 holdout access.
 
 Cloud procurement is blocked until local semantic, fault, build, and runtime
-estimation gates pass. The formal environment is exclusive Linux with at least
-32 physical cores and 128 GB RAM. The run window is at most 14 consecutive
-days; the predicted formal matrix must fit in ten days with four days reserved
-for failed reruns. Sixty-four cores are used only if total cost is lower.
+estimation gates pass. The current Tencent resource contract requires exclusive
+Linux, at least 64 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and a
+provider/API-reported SKU memory of at least 128 GB. Linux-visible memory is an
+observation rather than a 128-GiB admission threshold; the calibration peak RSS
+must instead remain below 80% of the live host's visible memory. The run window
+is at most 14 consecutive days, and the predicted formal matrix must fit in ten
+days with four days reserved for failed reruns. Region, zone, SKU, image, VPC,
+subnet, and security group have no defaults and remain live inputs.
 
-Current gate status: **Build11 local build, semantic, representative
-performance, fault/prefix, and runtime-estimate gates are complete; the Build11
-review packet is machine-verified, but the external independent
-evidence-lifecycle/formal-successor decision remains pending; purchase and
-execution are unauthorized**. Attempt22 is the current local calibration,
-Attempt03 is the current local fault receipt, static Attempt01 closes the local
-identity/import/naming predicates, and review-packet Attempt08 is machine-only
-evidence. Formal plan Attempt23 freezes 2,880 Build11-bound configs
-with a fresh absent raw root and passes structural preflight. Pre-cloud Attempt06
-supersedes Attempt05 and remains
-`BLOCKED_BUILD11_INDEPENDENT_REVIEW_PENDING`; no procurement or execution
-authority is implied, and full-scope confidence intervals remain post-run
-Level 1 completion evidence.
+Build18, formal plan Attempt28, representative calibration Attempt29, and
+Pre-cloud Attempt08 are immutable predecessor evidence. Independent Review
+Attempt12 retained four major findings: the active documentation still exposed
+superseded identities, the host doctor accepted self-reported provider facts,
+and COS/CLI exception handling did not close credential-value leakage. Those
+findings invalidate Attempt08 as a final account-ready decision without
+rewriting it. The next source-bound sequence is Build19, formal plan Attempt30,
+representative calibration Attempt31, Pre-cloud Attempt09, and Independent
+Review Attempt13. Each step is append-only and must be backed by its own signed
+manifest before the next step may claim completion.
 
-Completion audit Attempt01 classifies all 16 Level 1 predicates. Static and
-local runtime predicates pass; representative semantic, quality, overhead,
-speedup, replay, fallback, and waste results remain explicitly scoped to local
-evidence. The two completion predicates that cannot yet be proven are the
-full-scope 95% confidence-interval bounds and zero unresolved Build11 findings.
-They require, respectively, the unstarted formal matrix and a separately
-identified external review decision. No further local implementation gap is
-known, but this is not a Level 1 readiness claim.
+The only account-independent terminal state is
+`READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`. It authorizes no Tencent API
+call, purchase, instance, COS bucket, formal execution, holdout access, Level 1
+claim, or release. A signed provider DryRun receipt must bind region, zone, SKU,
+request identities, 64/1 CPU topology, and provider memory before the Linux host
+doctor can cross-check topology. Full-scope 95% confidence intervals and
+measured full-scope Cmax remain outputs of the unstarted formal matrix and are
+post-run Level 1 completion gates.
 
 The prior formal matrix is frozen separately as external plan Attempt18: 2,880 unique
 configs, config tree

@@ -557,7 +557,19 @@ def test_level1_completion_audit_distinguishes_local_passes_from_missing_evidenc
         "INCOMPLETE_EXTERNAL_REVIEW_AND_UNAUTHORIZED_FORMAL_MATRIX"
     )
     roadmap = ROOT / audit["roadmap_identity"]["path"]
-    assert hashlib.sha256(roadmap.read_bytes()).hexdigest() == (
+    assert audit["roadmap_identity"]["sha256"] == (
+        "f2fa03c90f115baa5b5ab714673185d4500a06011404fdab220912ab29c8db59"
+    )
+    assert hashlib.sha256(roadmap.read_bytes()).hexdigest() != (
+        audit["roadmap_identity"]["sha256"]
+    )
+    review12 = json.loads(
+        (
+            ROOT
+            / "formal/reviews/txnopt_tencent_precloud_review_attempt12.json"
+        ).read_bytes()
+    )
+    assert review12["standards_axis"]["findings"][0]["reviewed_sha256"] == (
         audit["roadmap_identity"]["sha256"]
     )
     assert audit["evidence_bindings"]["legacy_freeze"][
