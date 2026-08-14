@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,6 +32,41 @@ def test_host_activity_scan_excludes_doctor_process_ancestry() -> None:
 
     assert os.getpid() in ancestry
     assert all(pid > 1 for pid in ancestry)
+
+
+def test_host_activity_scan_ignores_unowned_static_lock_files(tmp_path: Path) -> None:
+    (tmp_path / "uv.lock").write_text("locked dependencies\n", encoding="utf-8")
+    (tmp_path / ".lock").write_text("inactive cache marker\n", encoding="utf-8")
+
+    observation = tencent_cloud._active_host_observations(tmp_path)
+
+    assert observation["lease_count"] == 0
+    assert observation["lease_paths"] == []
+
+
+def test_host_activity_scan_reports_an_open_lease_owner(tmp_path: Path) -> None:
+    lease = tmp_path / "writer.lock"
+    script = (
+        "import pathlib,sys,time; "
+        "handle=pathlib.Path(sys.argv[1]).open('w'); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(lease)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+
+        observation = tencent_cloud._active_host_observations(tmp_path)
+
+        assert observation["lease_count"] == 1
+        assert observation["lease_paths"] == [str(lease)]
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
 
 
 def _protocol() -> dict[str, object]:

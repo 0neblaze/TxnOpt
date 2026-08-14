@@ -706,10 +706,13 @@ def _active_host_observations(work_directory: Path) -> dict[str, object]:
                 shared_memory_pids.add(pid)
     lease_paths = tuple(
         sorted(
-            str(path)
-            for pattern in ("*.lock", "*.lease", "writer.lock")
-            for path in work_directory.rglob(pattern)
-            if path.is_file()
+            {
+                path
+                for paths in open_paths.values()
+                for path in paths
+                if Path(path).name == "writer.lock"
+                or Path(path).name.endswith((".lock", ".lease"))
+            }
         )
     )
     return {
