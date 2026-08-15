@@ -147,9 +147,12 @@ representative calibration passed, but Independent Review15 found that the
 redacted SDK exception still retained credential material through Python
 `__context__`. Build22 is retained as a failed build attempt because its first
 offline build incorrectly bound an empty UV cache; the failure log and receipt
-are not overwritten. The required successor identifiers are Build23, formal
-Attempt38, representative calibration Attempt39, Deployment05, Pre-cloud12,
-and Independent Review16. Only a zero-finding Review16 may reach the
+are not overwritten. Build23, formal Attempt38, representative calibration
+Attempt39, Deployment05, and producer-side Pre-cloud12 now form the completed
+account-independent successor chain. Attempt38 remains unexecuted; Attempt39
+retains 96 raw bundles and 96 byte-identical independent replays; Deployment05
+passes fresh offline installation and the expected local 12-physical-core
+doctor rejection. Only a zero-finding Independent Review16 may accept the
 account-input state.
 Intermediate validation candidates are not approved formal producers. Capacity
 assessment, account configuration, procurement authorization, build

@@ -1,0 +1,96 @@
+{
+  "calibration": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt39.json",
+    "fallback_count": 0,
+    "fixed_work_parity_group_count": 12,
+    "formal_level1_evidence": false,
+    "independent_review_pass_count": 96,
+    "p95_observation_group_count": 16,
+    "peak_rss_bytes": 244068352,
+    "raw_run_count": 96,
+    "representative_cases": {
+      "evrptw": [
+        "c101C5",
+        "c101_21"
+      ],
+      "rcpsp": [
+        "j1201_1",
+        "j1206_4"
+      ]
+    },
+    "seeds": [
+      2014,
+      2015,
+      2016
+    ],
+    "sha256": "caa1dc3ab6631c05336524ab03b3875a6938284d9d092de17350e75f840d3922"
+  },
+  "calibration_plan": {
+    "config_count": 96,
+    "config_tree_sha256": "07ffd6587571e16e48c8b1811e7ba4005029f9b0b6dc3464ea9b9c920d11cb87",
+    "expected_identity_count": 96,
+    "expected_identity_tree_sha256": "3aaff6d5469031703f9bc8ffa23c4a8ac3ef14cc06289cb915a479672ca18a60",
+    "external_path": "/home/oneblaze/txnopt-plans/level1-local-calibration-plan-attempt39/manifest.json",
+    "sha256": "376c7ca5a9a61eb74406de871eff43b21916514287485e4cc0dfff812768c62c"
+  },
+  "capacity": {
+    "external_path": "/home/oneblaze/txnopt-calibration/tencent-capacity-assessment-attempt39.json",
+    "live_host_verified": false,
+    "maximum_consecutive_window_days": 14,
+    "memory_margin_live_host_verified": false,
+    "minimum_physical_cores": 64,
+    "minimum_provider_memory_gb": 128,
+    "predicted_completion_days_max": 10,
+    "predicted_matrix_days": 0.02390998983481394,
+    "predicted_matrix_seconds": 2065.8231217279244,
+    "scheduler_efficiency": 0.8,
+    "sha256": "4318ae4093718686d5f10ab9a3078aa1f7c997d12222fc1a667d2897c36f5a93",
+    "status": "CAPACITY_ESTIMATE_PASS_LIVE_HOST_NOT_VERIFIED",
+    "usable_core_tokens": 51
+  },
+  "claim_boundary": {
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "live_64_physical_core_host_verified": false,
+    "public_release_authorized": false,
+    "representative_local_calibration_verified": true
+  },
+  "created_at_utc": "2026-08-15T05:44:15Z",
+  "formal_plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt38/manifest.json",
+    "formal_raw_root_absent": true,
+    "sha256": "8f8e6f4feeaafb589565a1211563079334256edecf0062ff240a0b4f6c16c1d3",
+    "tracked_index_path": "experiments/txnopt/manifests/txnopt_level1_formal_plan_attempt38.json"
+  },
+  "independent_evidence_audit": {
+    "all_fixed_work_semantic_and_objective_groups_match": true,
+    "all_prefix_safety_and_refinement_pass": true,
+    "independent_review_hash_match_count": 96,
+    "native_round_observation_count": 163,
+    "native_round_observation_run_count": 48,
+    "physical_event_count": 259,
+    "positive_run_cmax_count": 96,
+    "raw_manifest_hash_match_count": 96,
+    "review_byte_identical_count": 96,
+    "reviewed_lifecycle_count": 96,
+    "semantic_event_count": 4044,
+    "semantic_exact_work_run_count": 92,
+    "sidecar_match_count": 576,
+    "t4_waste_event_count": 0
+  },
+  "producer_build": {
+    "build": "Build23",
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt23.json",
+    "manifest_sha256": "4b6dfe14084be8df2a8db4f24c5303f1a14ccec8cf6641ffcce51cd4777ae04e",
+    "native_sha256": "44b2e2c89e41487773eac4ef8934f9aaa0828b1b360abc437afe8c0e708444da",
+    "source_manifest_sha256": "b486a25960c631acbf79e1774388a0048d2e7974fc8f67ff0c2196a77aa9a5f5",
+    "source_revision": "328a81a10f76b66929973254eed43e5e8aea3efa",
+    "source_tree": "20b376ecfd011738732a806285ddd9573f83c38a",
+    "wheel_sha256": "99a6b90c6aa70012d73e046d7613af481fa27b10dec6a661473b21130f29446e"
+  },
+  "run_label": "txnopt_level1_local_calibration_attempt39",
+  "schema_version": "txnopt-level1-local-calibration-manifest-v2",
+  "status": "LOCAL_CALIBRATION_COMPLETE_REPRESENTATIVE_ONLY_NOT_LEVEL1_READY"
+}

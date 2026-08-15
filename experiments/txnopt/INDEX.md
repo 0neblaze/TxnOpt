@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23 is the clean producer for Attempts38/39 and Pre-cloud12 | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt38 binds 2,880 configs/identities and remains unexecuted; Attempt39 is the next representative local evidence | Review16 is the next authoritative adjudication; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23 is the clean producer for Attempts38/39 and Pre-cloud12 | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt38 binds 2,880 configs/identities and remains unexecuted; Attempt39 retains 96/96 representative raw/review bundles; Deployment05 passes offline validation | Review16 is the next authoritative adjudication; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -47,8 +47,11 @@ public CVM/COS error from both `__cause__` and `__context__`; its 368
 installed-wheel tests, five property suites, sanitizers, 100,000-round soak,
 and live TLC pass. Attempt38 now binds 2,880 configs and expected identities,
 passes structural preflight, and retains an absent raw root and launch claim.
-The remaining successor chain is Attempt39, Deployment05, Pre-cloud12, and
-Review16. None of these
+Attempt39 retains 96 raw bundles and 96 byte-identical independent reviews,
+with all 12 fixed-work parity groups matching and a 51-token estimate of about
+2,066 seconds. Deployment05 passes fresh offline installation and replay;
+producer-side Pre-cloud12 passes. Review16 remains the final account-independent
+adjudication. None of these
 artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
 holdout, Level 1 claim, or release.
 

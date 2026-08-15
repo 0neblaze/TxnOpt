@@ -20,15 +20,19 @@ bound an empty UV cache. Build23 is the clean successor: its wheel surface,
 smokes, 100,000-round soak, credential-context adversarial tests, and live TLC
 all pass. External formal plan Attempt38 now binds 2,880 configs and 2,880
 pre-run expected identities, passes structural preflight, and keeps its raw
-root and launch claim absent. The remaining successor sequence is
-representative calibration Attempt39, deployment Attempt05, Pre-cloud12, and
-Independent Review16. Attempt38 requires at least 64
+root and launch claim absent. Representative calibration Attempt39 now retains
+96 raw bundles and 96 independent reviews, all 12 fixed-work parity groups
+match, and its 51-token capacity estimate is about 2,066 seconds. Deployment
+Attempt05 passes fresh offline installation, 368 zero-skip tests, byte-identical
+replay, and the expected local 12-physical-core doctor rejection. Producer-side
+Pre-cloud12 passes; Independent Review16 remains the sole account-independent
+adjudication. Attempt38 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
-Attempt35 retains 96 raw bundles and 96 independent reviews, while the Attempt34
-formal raw root and launch claim remain absent. The Build21 deployment Attempt04
-is offline-only and records the expected local 12-physical-core doctor failure.
+Attempt35 retains its rejected predecessor evidence, while the Attempt34 formal
+raw root and launch claim remain absent. The Build21 deployment Attempt04 is
+offline-only and records the expected local 12-physical-core doctor failure.
 Only a zero-finding Review16 may accept the Build23 successor; none of these
 artifacts authorizes cloud access or Level 1 readiness.
 

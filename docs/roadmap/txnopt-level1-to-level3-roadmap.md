@@ -48,8 +48,10 @@ cloud purchase, public alpha, or manuscript submission.
   its wheel, full test, property, sanitizer, soak, credential-context, and live
   TLC gates. Attempt38 now binds 2,880 configs and 2,880 pre-run expected
   identities, passes structural preflight, and retains an absent raw root and
-  launch claim. The remaining successor sequence is Attempt39, Deployment05,
-  Pre-cloud Attempt12, and Independent Review Attempt16.
+  launch claim. Attempt39 now retains 96/96 representative raw/review evidence;
+  Deployment05 passes fresh offline installation and replay; producer-side
+  Pre-cloud Attempt12 passes. Independent Review Attempt16 remains the final
+  account-independent adjudication.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -368,9 +370,9 @@ Attempt04 passes fresh offline installation and replay, but Independent Review
 Attempt15 records one major `__context__` credential-retention finding. Build22
 then failed before producing a wheel because its offline build bound an empty
 UV cache; that failure receipt remains append-only. Build23 is the completed
-clean producer. Attempt38 is the completed unexecuted formal plan; the
-remaining successor sequence is
-Attempt39/Deployment05/Pre-cloud12/Independent Review16. The
+clean producer. Attempt38 is the completed unexecuted formal plan; Attempt39,
+Deployment05, and producer-side Pre-cloud12 complete the account-independent
+producer sequence. Independent Review16 remains pending. The
 signed Review16 receipt, rather than this roadmap prose, controls acceptance.
 
 The only account-independent terminal state is
