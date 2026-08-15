@@ -1,11 +1,17 @@
 # TxnOpt
 
-TxnOpt is an auditable ordered-transaction runtime for state-dependent
-optimization. The active internal alpha is `0.1.0a1`; it has not been released
-to PyPI, Zenodo, or as a public software release. Recovery branches and tags on
-the existing Git remote are not a release claim.
+> [!IMPORTANT]
+> **Archived historical snapshot — 2026-08-16.** This repository is retained
+> read-only for provenance, research handoff, and audit. It is no longer under
+> active development, and its installation and execution instructions are not
+> maintained compatibility guarantees. The internal alpha `0.1.0a1` was never
+> released to PyPI, Zenodo, or as a public software release.
 
-The Level 1 implementation provides:
+TxnOpt was developed as an auditable ordered-transaction runtime for
+state-dependent optimization. Recovery branches and tags on the existing Git
+remote preserve history; they are not release claims.
+
+The implemented Level 1 candidate provides:
 
 - one state owner, `TxnRuntime`, with serial, deterministic barrier, and ordered
   transaction execution;
@@ -22,8 +28,53 @@ The Level 1 implementation provides:
 
 The public roadmap is
 [`docs/roadmap/txnopt-level1-to-level3-roadmap.md`](docs/roadmap/txnopt-level1-to-level3-roadmap.md).
-Level 2 and Level 3 remain mandatory gated stages; Level 1 alone is not a
-publication result.
+It is retained as the historical plan. TxnOpt did not reach the Level 1 Ready
+gate, and Level 2 and Level 3 were not completed.
+
+## Final archived status
+
+[Independent Review18](formal/reviews/txnopt_tencent_precloud_review_attempt18.json)
+returned `PASS` with zero critical, major, or minor findings for reviewed
+revision `2125477ed75f2a55e60bf368d599ca6fd984018a`. Its terminal status is:
+
+```text
+READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED
+```
+
+That result means the account-independent pre-cloud work was complete and ready
+to receive separately authorized Tencent account inputs. It does **not** mean
+that Level 1 completed or that live cloud execution occurred. The following
+were never completed or authorized:
+
+- Tencent account or credential input and live SKU selection;
+- an online `RunInstances DryRun=true` request, cloud purchase, or instance
+  creation;
+- live COS mirroring, exact-version restore, or retention validation;
+- the 2,880-run formal matrix or access to the final holdout;
+- a public alpha, PyPI/Zenodo release, DOI archive, or paper submission;
+- deletion or rewriting of the governed E-drive evidence archive.
+
+Review18 remains an immutable receipt for its exact reviewed revision and tree.
+The later research-handoff, WSL-invocation, and archival README commits are
+documentation-only successors; they are not a new independent review or a new
+evidence-ready source identity.
+
+## What this snapshot preserves
+
+- the generic runtime, EVRPTW and RCPSP adapters, native kernels, and formal
+  models under `src/`, `cpp/`, and `formal/`;
+- protocol, manifest, review, and lifecycle material under
+  `experiments/txnopt/` and `formal/reviews/`;
+- the frozen pre-TxnOpt boundary at `stage052-legacy-freeze-v1` and the
+  pre-refactor recovery point at `txnopt-pre-refactor-v1`;
+- the
+  [COR research handoff](docs/research/txnopt-cor-research-handoff-2026-08-16.md),
+  whose research judgments remain explicitly marked `UNVERIFIED`.
+
+Large raw experiment evidence is retained in governed external storage and is
+not part of this GitHub repository. Repository-local `results/` is ignored and
+was not uploaded during archival publication. This snapshot therefore preserves
+the tracked source and audit trail, not a complete raw experiment bundle.
 
 ## Public API
 
@@ -44,9 +95,11 @@ The formal EVRPTW objective remains lexicographic:
 
 Its only active implementation is `txnopt_cases.evrptw.objective`.
 
-## Install and verify
+## Archived installation and verification reference
 
-Python 3.13 and [uv](https://docs.astral.sh/uv/) are required.
+At the time of archival, the project used Python 3.13 and
+[uv](https://docs.astral.sh/uv/). The commands below record the last maintained
+workflow; they are not a promise of compatibility with future toolchains.
 
 ```bash
 uv sync --frozen --all-groups
@@ -55,7 +108,7 @@ uv run mypy
 uv run pytest -q
 ```
 
-The internal CLI surface is:
+The archived internal CLI surface is:
 
 ```text
 txnopt run --config RUN.json
@@ -128,45 +181,25 @@ to Git. Third-party COS/CVM SDK exception bodies are discarded at the adapter
 boundary; only the local operation name and exception type may enter CLI output.
 Native Windows source inventory and atomic restore remain unimplemented.
 
-The Tencent capacity profile means **64 physical cores**, not 64 vCPU. Offline
-assessment cannot prove a cloud instance satisfies that requirement. Before a
-formal run, both the Tencent instance metadata/API and the Linux topology probe
-must show 64 physical cores and one thread per core. The Tencent product/API
-memory specification must be at least 128 GB. Linux `MemTotal` is recorded but
-may be slightly below the product value because of platform reservations; that
-alone is not a failure. The calibration receipt bound to the selected producer
-must report peak RSS below 80% of actual visible memory. The closed historical
-pairings are Build16/Attempt26/Attempt27, Build18/Attempt28/Attempt29, and the
-rejected Build19/Attempt30/Attempt31 chain. Independent Review13 found three
-major account-independent gaps. Build20, formal plan Attempt32, representative
-calibration Attempt33, and producer-side Pre-cloud10 are retained as the next
-rejected chain: Independent Review14 found one remaining CVM credential-
-acquisition exception leak. Build21/Attempt34/Attempt35 is the next retained
-rejected chain: its clean build, 2,880-config unexecuted formal plan, and 96/96
-representative calibration passed, but Independent Review15 found that the
-redacted SDK exception still retained credential material through Python
-`__context__`. Build22 is retained as a failed build attempt because its first
-offline build incorrectly bound an empty UV cache; the failure log and receipt
-are not overwritten. Build23, formal Attempt38, representative calibration
-Attempt39, Deployment05, and producer-side Pre-cloud12 are retained as the next
-rejected chain. Independent Review16 found two major account-independent gaps:
-COS response-stream lifecycle exceptions escaped the credential-redaction
-boundary, and active operating documents retained superseded identities and
-output guidance. Build24 with formal Attempt40, representative calibration
-Attempt41, Deployment06, and Pre-cloud13 then completed its local producer
-gates. Independent Review17 retained one major active-document cutover finding
-without invalidating those artifacts. Review17 remains immutable; the
-account-input state remains unaccepted until a zero-finding Independent
-Review18 passes.
-Intermediate validation candidates are not approved formal producers. Capacity
-assessment, account configuration, procurement authorization, build
-portability, and formal execution remain separate gates.
+The archived Tencent capacity contract requires **64 physical cores**, not 64
+vCPU, plus a provider memory specification of at least 128 GB. A qualifying
+formal host would also have needed `CoreCount=64`, `ThreadPerCore=1`, a matching
+Linux topology probe, and calibration peak RSS below 80% of Linux-visible
+memory. Offline assessment alone cannot establish those conditions.
 
-## Evidence and formal verification
+The final retained pre-cloud chain is Build24, formal plan Attempt40,
+representative calibration Attempt41, Deployment06, Pre-cloud13, and
+Independent Review18. Attempt40 contains 2,880 planned configurations but has
+no formal raw root and was never launched. Earlier rejected and failed builds,
+plans, calibrations, deployments, pre-cloud gates, and Reviews13--17 remain
+preserved as append-only evidence; Review18 did not rewrite them. Intermediate
+validation candidates are not approved formal producers.
 
-New protocol definitions and indexes live under `experiments/txnopt/`; new raw
-output must use a governed external root. Repository-local `results/` is legacy
-or rebuildable state, not the default destination and not formal evidence.
+## Archived evidence and formal verification
+
+Protocol definitions and indexes are preserved under `experiments/txnopt/`.
+Formal raw output was required to use a governed external root.
+Repository-local `results/` is legacy or rebuildable state, not formal evidence.
 
 The bounded formal receipt is re-run with:
 
@@ -179,13 +212,12 @@ python -m txnopt_evidence.formal_verify \
 Model-check success is not presented as a complete mathematical proof or an
 independent review.
 
-Level 1 plan, preflight, raw execution, independent review, calibration,
-cloud-window estimation, and native resource-soak implementations live in
-`txnopt_evidence`. Plan materialization, fail-closed preflight, and independent
-review are exposed through the unified CLI. Formal execution still requires a
-separate signed authorization and is not implied by any of those commands.
-Historical Build11 gate executors remain recoverable from the frozen Git tags
-and are not shipped in the active wheel.
+Level 1 planning, preflight, raw execution, independent review, calibration,
+cloud-window estimation, and native resource-soak implementations are preserved
+in `txnopt_evidence`. Plan materialization, fail-closed preflight, and
+independent review remain exposed through the unified CLI. The formal matrix was
+never authorized or started. Historical Build11 gate executors remain
+recoverable from the frozen Git tags and are not shipped in the archived wheel.
 
 ## Frozen EVRPTW history
 
@@ -212,6 +244,7 @@ papers, and solvers remain under their own licenses; see
 
 ## License and citation
 
-Original code and documentation are licensed under Apache-2.0. The internal
-alpha is not an archival release and has no DOI. See [CITATION.cff](CITATION.cff)
-for the current software citation metadata.
+Original code and documentation are licensed under Apache-2.0. This read-only
+GitHub snapshot is not a software release or DOI archive; the internal alpha
+`0.1.0a1` was never published. See [CITATION.cff](CITATION.cff) for the preserved
+software citation metadata.
