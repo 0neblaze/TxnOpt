@@ -44,9 +44,10 @@ cloud purchase, public alpha, or manuscript submission.
   calibration, and offline deployment passed, but Independent Review Attempt15
   found that the redacted SDK exception retained its credential-bearing
   `__context__`. Build22 is retained as a failed build because its first offline
-  invocation bound an empty UV cache. The required successor sequence is
-  Build23, Attempt38, Attempt39, Deployment05, Pre-cloud Attempt12, and
-  Independent Review Attempt16.
+  invocation bound an empty UV cache. Build23 is the clean successor and passes
+  its wheel, full test, property, sanitizer, soak, credential-context, and live
+  TLC gates. The remaining successor sequence is Attempt38, Attempt39,
+  Deployment05, Pre-cloud Attempt12, and Independent Review Attempt16.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -364,8 +365,9 @@ unexecuted, Attempt35 retains 96/96 raw/review evidence, and deployment
 Attempt04 passes fresh offline installation and replay, but Independent Review
 Attempt15 records one major `__context__` credential-retention finding. Build22
 then failed before producing a wheel because its offline build bound an empty
-UV cache; that failure receipt remains append-only. The required successor is
-Build23/Attempt38/Attempt39/Deployment05/Pre-cloud12/Independent Review16. The
+UV cache; that failure receipt remains append-only. Build23 is the completed
+clean producer; the remaining successor sequence is
+Attempt38/Attempt39/Deployment05/Pre-cloud12/Independent Review16. The
 signed Review16 receipt, rather than this roadmap prose, controls acceptance.
 
 The only account-independent terminal state is

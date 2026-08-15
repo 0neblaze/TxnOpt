@@ -15,9 +15,12 @@ representative calibration Attempt35, deployment Attempt04, and Pre-cloud11 are
 also retained as rejected evidence: Independent Review15 found that redacted
 SDK errors still retained credential material through Python `__context__`.
 Build22 is retained as a failed build because its first offline invocation
-bound an empty UV cache. The required successor is Build23, external formal
-plan Attempt38, representative calibration Attempt39, deployment Attempt05,
-Pre-cloud12, and Independent Review16. Attempt38 requires at least 64
+bound an empty UV cache. Build23 is the clean successor: its wheel surface,
+368 installed-wheel tests, five fixed-seed property suites, both sanitizer
+smokes, 100,000-round soak, credential-context adversarial tests, and live TLC
+all pass. The remaining successor sequence is external formal plan Attempt38,
+representative calibration Attempt39, deployment Attempt05, Pre-cloud12, and
+Independent Review16. Attempt38 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
@@ -95,9 +98,11 @@ absent raw root. Structural preflight is read-only.
 
 Build14/Attempt24, Build18/Attempt28, and Build19/Attempt30 remain historical,
 byte-preserved predecessor chains. Build20/Attempt32 is also retained and
-unexecuted after failed Review14. Build21/Attempt34 is the current formal chain;
-its structural preflight passes while its raw root and launch claim remain
-absent.
+unexecuted after failed Review14. Build21/Attempt34 remains a rejected formal
+predecessor; its structural preflight passes while its raw root and launch
+claim remain absent. Build23 is the current clean producer, but no Attempt38
+raw root or launch claim may exist before its plan is materialized and
+independently preflighted.
 All four predecessor
 preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
 holdouts and cloud purchase remain closed, and no launch claim or raw root

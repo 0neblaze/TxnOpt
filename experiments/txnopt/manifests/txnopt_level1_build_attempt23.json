@@ -1,0 +1,296 @@
+{
+  "artifacts": {
+    "build_execution": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/build-execution-attempt23.json",
+      "sha256": "57eb90f07e1314e32ac329c93b51f71c3a636a6ef2ffa2b7f9c03ab20cbd38fb",
+      "status": "PASS"
+    },
+    "native_extension": {
+      "attestation_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/native-build-attestation-attempt23.json",
+      "attestation_sha256": "08d80386308a5787e2dc88689fc8499264941eb36f3e8c97b7b6ba6b703c6982",
+      "prepared_receipt_trace": "txnopt-physical-trace-v1",
+      "protocol": "txnopt-native-round-v1",
+      "sha256": "44b2e2c89e41487773eac4ef8934f9aaa0828b1b360abc437afe8c0e708444da",
+      "wheel_entry": "txnopt/_native.cpython-313-x86_64-linux-gnu.so"
+    },
+    "resource_soak": {
+      "completed_rounds": 100000,
+      "external_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/resource-soak-attempt23.json",
+      "fallback_count": 0,
+      "native_round_call_count": 101000,
+      "sha256": "d13ab1114bc7e52bfda97f3cdcb8c57ca5abbb85bd4bd4b1eaa2707b405d7302",
+      "status": "PASS",
+      "warmup_rounds": 1000
+    },
+    "source_archive": {
+      "entry_count": 344,
+      "external_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/txnopt-0.1.0a1-source.tar.gz",
+      "sha256": "5b01913bcfc65531990b46c084f32db93b53b43be944452095d41e58bd4c9ed5"
+    },
+    "source_manifest": {
+      "external_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/source-manifest-attempt23.json",
+      "file_sha256": "dfa7e77983b72e45006f10ab55c51e45afd7cc914ffa665b030cbd214ac8bdc4",
+      "source_manifest_sha256": "b486a25960c631acbf79e1774388a0048d2e7974fc8f67ff0c2196a77aa9a5f5"
+    },
+    "toolchain_lock": {
+      "external_path": "/home/oneblaze/txnopt-toolchains/tencent-precloud-v1/txnopt-toolchain-lock-v1.json",
+      "sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d",
+      "status": "TOOLCHAIN_COMPLETE"
+    },
+    "wheel": {
+      "entry_count": 71,
+      "external_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/wheel/txnopt-0.1.0a1-cp313-cp313-linux_x86_64.whl",
+      "installed_non_record_bytes_compared": 70,
+      "record_row_count": 71,
+      "sha256": "99a6b90c6aa70012d73e046d7613af481fa27b10dec6a661473b21130f29446e",
+      "verification_status": "PASS"
+    }
+  },
+  "claim_boundary": {
+    "build_complete": true,
+    "build_manifest_push_authorized": true,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "holdout_opened": false,
+    "independent_review_completed": false,
+    "level1_ready": false,
+    "pending_gates": [
+      "materialize and independently verify Attempt38 without starting its raw root",
+      "complete Attempt39 representative local calibration and independent review",
+      "materialize and verify the credential-free Build23 Tencent deployment bundle Attempt05",
+      "complete Precloud Attempt12 and Independent Review Attempt16",
+      "obtain separate Tencent account, live selection, DryRun, COS, purchase, and formal-matrix authorization"
+    ],
+    "public_release_authorized": false,
+    "publication_ready": false,
+    "source_push_completed": true
+  },
+  "created_at_utc": "2026-08-15T05:06:27Z",
+  "formal_successor": {
+    "independent_successor_review_completed": false,
+    "level1_formal_gate_passed": false,
+    "live_verification_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/formal-live-verification-attempt23.json",
+    "live_verification_sha256": "6b8ab63321e3a0f142eb2a34e01c940de335591f09c327eae17122a61e8eb21a",
+    "model_check_receipt_path": "formal/model-check-receipt.json",
+    "model_check_receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+    "prior_independent_review_path": "formal/reviews/txnopt_tencent_precloud_review_attempt15.json",
+    "prior_independent_review_sha256": "0be396b33e19efbf7b72a53f9e94e6f00ab8b6558303c58ec5fe5e9f849f6e84",
+    "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+    "prior_review_status": "NEEDS_WORK",
+    "successor_status": "REVIEW_PENDING_BUILD23"
+  },
+  "predecessor_disposition": {
+    "build21_manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt21.json",
+    "build21_manifest_sha256": "0d27bb45812352bca6a7ab0acb1acc81eaf3d553cca2dd7944accde7a3d12d03",
+    "build21_status": "RETAINED_REJECTED_BY_REVIEW15_NOT_REWRITTEN",
+    "build22_failure_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt22_failure.json",
+    "build22_failure_sha256": "307512ce32ce82f5ca05c1027d113e0372b52500160e3f10461bee7345bcb4c7",
+    "build22_status": "BUILD_FAILED_RETAINED_NOT_REWRITTEN",
+    "review15_path": "formal/reviews/txnopt_tencent_precloud_review_attempt15.json",
+    "review15_sha256": "0be396b33e19efbf7b72a53f9e94e6f00ab8b6558303c58ec5fe5e9f849f6e84",
+    "review15_status": "NEEDS_WORK_RETAINED_NOT_REWRITTEN"
+  },
+  "producer": {
+    "compiler_id": "GNU",
+    "compiler_version": "13.3.0",
+    "cpp_source_kind": "git_blob_snapshot",
+    "development_override": false,
+    "git_tree": "20b376ecfd011738732a806285ddd9573f83c38a",
+    "performance_profile": "portable-o3",
+    "revision": "328a81a10f76b66929973254eed43e5e8aea3efa",
+    "source_dirty": false,
+    "source_manifest_sha256": "b486a25960c631acbf79e1774388a0048d2e7974fc8f67ff0c2196a77aa9a5f5",
+    "tracked_file_count": 309
+  },
+  "run_label": "txnopt_level1_build_attempt23",
+  "runtime_change": {
+    "campaign_plan_schema": "txnopt-level1-campaign-plan-v2",
+    "components": [
+      "txnopt_evidence.tencent_cloud",
+      "txnopt_evidence.tencent_cos",
+      "txnopt_evidence.level1_tencent_successors"
+    ],
+    "failure_artifact_schema": "txnopt-failure-artifact-v3",
+    "fallback_count": 0,
+    "lifecycle_schema": "txnopt-evidence-lifecycle-v1",
+    "physical_trace_changed": false,
+    "properties": [
+      "Build21, Build22 failure, Attempt34, Attempt35, Precloud Attempt11, and Review15 remain immutable predecessors",
+      "Build23 is the only approved successor bound to formal Attempt38 and calibration Attempt39",
+      "credential acquisition and SDK failures are redacted and re-raised outside active exception handlers",
+      "public CVM and COS failures expose neither secret bytes nor original secret-bearing __cause__ or __context__ objects",
+      "Tencent doctor still requires a signed provider DryRun receipt with region, SKU, RequestId, 64 physical cores, ThreadPerCore equal to one, and at least 128 GB provider memory",
+      "operator-supplied core or memory counts cannot authorize the host",
+      "runner produces raw evidence only and reviewer remains an independent process",
+      "generic ArchiveStore and local or S3 archive backends remain absent"
+    ],
+    "protocol_schema": "txnopt-level1-protocol-v2",
+    "raw_artifact_schema": "txnopt-raw-artifact-v3",
+    "review_artifact_schema": "txnopt-independent-review-v3",
+    "semantic_trace_changed": false
+  },
+  "schema_version": "txnopt-level1-build-manifest-v1",
+  "status": "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
+  "successor_of": "txnopt_level1_build_attempt22_failure",
+  "validation": {
+    "asan_ubsan": {
+      "ctest_passed": 1,
+      "ctest_total": 1,
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/asan-ubsan.xml",
+      "log_sha256": "c45794b64282a47b2bf83834d6481ba0df8e23a20dd3904ae357af4c734afd41",
+      "status": "PASS"
+    },
+    "diff_check": {
+      "exit_code": 0,
+      "status": "PASS"
+    },
+    "formal_contract_tests": {
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/formal-contract.xml",
+      "log_sha256": "e63de07106c8c5af13ba354d9766a2e17ad91824e33072d5ab7f22c0da08f14d",
+      "passed": 15,
+      "status": "PASS"
+    },
+    "formal_model_receipt": {
+      "exit_code": 0,
+      "live_verification_sha256": "6b8ab63321e3a0f142eb2a34e01c940de335591f09c327eae17122a61e8eb21a",
+      "pluscal_distinct_states": 8134,
+      "pluscal_generated_states": 36402,
+      "primary_distinct_states": 22,
+      "primary_generated_states": 75,
+      "receipt_sha256": "f30a9952db6d97473cff38e9a930f6d6ed0008b59e4a1265b734df8064f5d4e5",
+      "status": "PASS",
+      "t3_distinct_states": 5,
+      "t3_generated_states": 5
+    },
+    "historical_protected_paths": {
+      "attempt07_sha256": "ebd3a95f4318ce609d431dedef64a082e6d94828287bfcc7f3d60a7da5390839",
+      "attempt24_analysis_sha256": "ea726847648c241db15beeecee81f22668eeddd47d53ad03353e09f6256c86d1",
+      "attempt24_manifest_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+      "attempt25_sha256": "3251a1b31b9def18cf99e210449eedac04401a09178e4948cccc1eb170c524b5",
+      "build14_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+      "build15_candidate_sha256": "7154be88afae294901959ea0b4d08bfa387ed55d5d2df0c049fd210dc2ec74ab",
+      "build16_sha256": "702aa53e07eaf8171498cc233ea416dcd2d31a38717409a47645187b29dffe7c",
+      "build18_sha256": "0ce681854d45f065bd6b05065531903537249a32dd1be92613be0e4909fc47d8",
+      "build19_sha256": "88b5efceceab240068e5f523a05926e90596cc13f5dbac62ae9afd3d146d0cf0",
+      "build20_sha256": "2baea987e6591e4670ce77768739329918960888f38fc71a57f3ff04426ea8a4",
+      "build21_sha256": "0d27bb45812352bca6a7ab0acb1acc81eaf3d553cca2dd7944accde7a3d12d03",
+      "build22_failure_sha256": "307512ce32ce82f5ca05c1027d113e0372b52500160e3f10461bee7345bcb4c7",
+      "e_drive_registry_sha256": "15b9eb5eae6e67cf5124985c36289fb349649a64ce919dc8f2796b3088544fc4",
+      "exit_code": 0,
+      "review11_sha256": "37270d49fd31b2e71fadfd706be18b043b482908d11cd74af08ca46da41b0c9b",
+      "review12_sha256": "4f505414ee197f76a3757d89cd4bf1b14f59bfb2a164740c0f80af50b3686e11",
+      "review13_sha256": "d810378c595d1a4f9aaab1e12ab8d2f072c23c13fdf36e76a63108ec443ebae9",
+      "review14_sha256": "1483a90c8d3e6aaf4de827778012ea130662d55f5cb09ecab5376c55d528fdcc",
+      "review15_sha256": "0be396b33e19efbf7b72a53f9e94e6f00ab8b6558303c58ec5fe5e9f849f6e84",
+      "status": "UNCHANGED"
+    },
+    "legacy_verify": {
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/legacy.xml",
+      "log_sha256": "6882c4128b21ca02700c2d26d43fb404b81b658eb5eba9b8359f2908f631e399",
+      "passed": 7,
+      "status": "PASS"
+    },
+    "native_source_identity": {
+      "attestation_sha256": "08d80386308a5787e2dc88689fc8499264941eb36f3e8c97b7b6ba6b703c6982",
+      "exit_code": 0,
+      "native_receipt_presence_and_work_coverage_enforced": true,
+      "phase_trace_match": true,
+      "revision_and_tree_match": true,
+      "status": "PASS"
+    },
+    "property_based_tests": {
+      "examples_per_function": 600,
+      "exit_code": 0,
+      "hypothesis_seeds": [
+        20260833,
+        20260834,
+        20260835,
+        20260836,
+        20260837
+      ],
+      "log_sha256": [
+        "ef745b8275709d8133c2e77e58c69480ae4c0a31674ec0e32142224730ac2919",
+        "7fd97147d472eaa006be192c8012c55b06c9e9276328a666072601b62fdba6d3",
+        "f5e71a691e14a176fcc571968e944ba389d693e2e7c7196f29579bc4ac78e123",
+        "ec048db27e3282639f8fac058e9900c7597db1b2cbff552f37fff97e6a030861",
+        "d04c50bf1c01d3e647b1d244654ad0c4c66b3eec2c82b15907020c725c98171e"
+      ],
+      "passed_test_invocations": 25,
+      "status": "PASS",
+      "test_functions": 5
+    },
+    "pytest_wheel_installed": {
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/pytest-installed.xml",
+      "log_sha256": "3e510139f2549aa5fd16ef2efe7e10e2129572e497d373f040339adff581b9ee",
+      "passed": 368,
+      "product_modules_loaded_from_installed_wheel": true,
+      "skipped": 0,
+      "status": "PASS"
+    },
+    "resource_soak": {
+      "completed_rounds": 100000,
+      "exit_code": 0,
+      "fallback_count": 0,
+      "status": "PASS",
+      "warmup_rounds": 1000
+    },
+    "ruff": {
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/ruff.json",
+      "log_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "status": "PASS"
+    },
+    "strict_mypy": {
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/mypy.xml",
+      "log_sha256": "b524d775775a50df5d5c653c8cef7b4604c22c2fcef20b2db4728ad8600e2cd9",
+      "source_file_count": 60,
+      "status": "PASS"
+    },
+    "tencent_interface": {
+      "exit_code": 0,
+      "live_account_used": false,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/tencent-interface.xml",
+      "log_sha256": "c5972fc4c56dae60ca252097faf8af8723d92b33fee979f6a3eb7fe8ec1c95b8",
+      "passed": 60,
+      "run_instances_false_surface_present": false,
+      "skipped": 0,
+      "status": "PASS"
+    },
+    "toolchain_lock": {
+      "exit_code": 0,
+      "lock_sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d",
+      "schema_version": "txnopt-toolchain-lock-v1",
+      "status": "PASS"
+    },
+    "tsan": {
+      "ctest_passed": 1,
+      "ctest_total": 1,
+      "exit_code": 0,
+      "log_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/logs/tsan.xml",
+      "log_sha256": "d82baf62fb8d420d23237c9503e1d8d74f8c3b9b087ea5140a43edc40629eb1b",
+      "status": "PASS"
+    },
+    "wheel_surface_and_record": {
+      "exit_code": 0,
+      "fallback_count": 0,
+      "installed_non_record_bytes_compared": 70,
+      "receipt_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/installed-wheel-verification-attempt23.json",
+      "receipt_sha256": "8db09887afd96ebff429f63f5e51e68d8f3a18a19e2222624aec07a50637d1ab",
+      "record_row_count": 71,
+      "status": "PASS",
+      "wheel_entry_count": 71,
+      "wheel_verification_receipt_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/wheel-verification-attempt23.json",
+      "wheel_verification_receipt_sha256": "b50f14b9785b7f98a7df321ce16f9046540fcc3d32747a7a4ad196a9881c7554"
+    }
+  },
+  "validation_harness_diagnostics": {
+    "external_path": "/home/oneblaze/txnopt-builds/level1-328a81a-build23/validation-harness-diagnostics-attempt23.json",
+    "sha256": "50938973e4f506d7413d35ac0a84c0d17764c8ef03630ce035c30d8393f73262",
+    "status": "CORRECTED_SAME_SOURCE_IDENTITY"
+  }
+}
