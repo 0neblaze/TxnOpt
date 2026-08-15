@@ -138,9 +138,10 @@ alone is not a failure. The calibration receipt bound to the selected producer
 must report peak RSS below 80% of actual visible memory. The closed historical
 pairings are Build16/Attempt26/Attempt27, Build18/Attempt28/Attempt29, and the
 rejected Build19/Attempt30/Attempt31 chain. Independent Review13 found three
-major account-independent gaps. The closed next identity is
-Build20/Attempt32/Attempt33; it cannot support account input until Pre-cloud10
-and Independent Review14 report zero findings. Intermediate validation
+major account-independent gaps. Build20, formal plan Attempt32, representative
+calibration Attempt33, and producer-side Pre-cloud10 now form the closed
+successor identity; Independent Review14 controls whether it may support the
+account-input state and must report zero findings. Intermediate validation
 candidates are not approved formal producers. Capacity assessment, account
 configuration, procurement authorization, build portability, and formal
 execution remain separate gates.

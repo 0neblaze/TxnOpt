@@ -21,9 +21,10 @@ The earlier local EVRPTW roadmap remains ignored historical planning input.
   retained, but Independent Review13 rejected its account-ready claim with
   three major findings: stale operator guidance and an SDK exception boundary
   that could expose temporary CAM-role credentials.
-- The next closed source identity is Build20 with formal plan Attempt32 and
-  representative calibration Attempt33. Pre-cloud10 and Independent Review14
-  must report zero findings before the repository may reach
+- Build20 with formal plan Attempt32, representative calibration Attempt33,
+  and producer-side Pre-cloud10 is the completed account-independent successor
+  sequence. Independent Review14 must report zero findings before the
+  repository may reach
   `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`.
 - The corrected aggregate T1/T2 and conditional T3/T4 package remains bounded
   formal evidence. The 2,880-run formal matrix, holdout, Tencent API access,

@@ -7,18 +7,20 @@ and independently reviewed summaries. Raw run output belongs under ignored
 The retained Build19 Tencent chain uses `level1-protocol-v2.json`, external
 formal plan Attempt30, representative local calibration Attempt31, and
 Pre-cloud Attempt09. Independent Review13 rejected its final account-ready
-claim with three major findings. The closed next chain is Build20, external
-formal plan Attempt32, representative calibration Attempt33, Pre-cloud10, and
-Independent Review14. Attempt32 requires at least 64
+claim with three major findings. Build20, external formal plan Attempt32,
+representative calibration Attempt33, and producer-side Pre-cloud10 are now the
+closed successor chain; Independent Review14 is its acceptance gate. Attempt32
+requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
-Attempt31 has 96 raw bundles and 96 independent reviews, while the Attempt30
-formal raw root remains absent. The Build19 deployment Attempt02 is offline-only,
-contains no credentials or region, and exposes no `DryRun=false` instance
-creation path. Pre-cloud Attempt09 records a producer-side candidate decision,
-but Review13 is `NEEDS_WORK`; neither receipt authorizes cloud access or Level 1
-readiness. Only a zero-finding Review14 may accept the Build20 successor.
+Attempt33 has 96 raw bundles and 96 independent reviews, while the Attempt32
+formal raw root remains absent. The Build20 deployment Attempt03 is offline-only,
+contains no credentials or region, exposes no `DryRun=false` instance-creation
+path, and records the expected local 12-physical-core doctor failure. Pre-cloud
+Attempt10 records a producer-side candidate decision only. Only a zero-finding
+Review14 may accept the Build20 successor; none of these artifacts authorizes
+cloud access or Level 1 readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
@@ -87,7 +89,7 @@ prebound expected identities, its own preregistered analysis file, and a fresh
 absent raw root. Structural preflight is read-only.
 
 Build14/Attempt24, Build18/Attempt28, and Build19/Attempt30 remain historical,
-byte-preserved predecessor chains. Build20/Attempt32 is the next unexecuted
+byte-preserved predecessor chains. Build20/Attempt32 is the current unexecuted
 chain. All four
 preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
 holdouts and cloud purchase remain closed, and no launch claim or raw root

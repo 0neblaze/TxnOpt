@@ -347,8 +347,9 @@ rewriting it. Build19, formal plan Attempt30, representative calibration
 Attempt31, and Pre-cloud Attempt09 are immutable rejected successor evidence.
 Independent Review Attempt13 records three major findings without rewriting
 them. Build20, formal plan Attempt32, representative calibration Attempt33,
-and Pre-cloud Attempt10 are the next append-only sequence. Independent Review
-Attempt14 is the next account-independent adjudication; its signed receipt,
+and producer-side Pre-cloud Attempt10 are the completed append-only successor
+sequence. Independent Review Attempt14 is the account-independent adjudication;
+its signed receipt,
 rather than this roadmap prose, controls acceptance.
 
 The only account-independent terminal state is

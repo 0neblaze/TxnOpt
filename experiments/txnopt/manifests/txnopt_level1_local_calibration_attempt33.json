@@ -1,0 +1,84 @@
+{
+  "schema_version": "txnopt-level1-local-calibration-manifest-v2",
+  "run_label": "txnopt_level1_local_calibration_attempt33",
+  "status": "LOCAL_CALIBRATION_COMPLETE_REPRESENTATIVE_ONLY_NOT_LEVEL1_READY",
+  "created_at_utc": "2026-08-15T00:42:47Z",
+  "producer_build": {
+    "build": "Build20",
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt20.json",
+    "manifest_sha256": "2baea987e6591e4670ce77768739329918960888f38fc71a57f3ff04426ea8a4",
+    "source_revision": "2a3ac6cf8f526f2eb56c7fe3ba8176de022d4cb6",
+    "source_tree": "296042135312b6d34709ea51977e594dccd620b7",
+    "source_manifest_sha256": "2d26bdc07e64e56cff33ae3bddcc7e4b7ae9e07f4e059a9084f3a88964985645",
+    "wheel_sha256": "dc18eff63b007633b5e87fc0a7e9f4e7e7db07b6f634030966a80fd99f2a54dc",
+    "native_sha256": "881a659a1039bdf27e0087e046d14488e4cf29ecbeaed578374bc11351a0af68"
+  },
+  "formal_plan": {
+    "tracked_index_path": "experiments/txnopt/manifests/txnopt_level1_formal_plan_attempt32.json",
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt32/manifest.json",
+    "sha256": "64374e684a79cf084d166c1ccfe6579e2e7c94a06fa75697e4f98731a012ee0c",
+    "formal_raw_root_absent": true
+  },
+  "calibration_plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-local-calibration-plan-attempt33/manifest.json",
+    "sha256": "4812ba9c14df80bfd9fee7bd76f372c4654a25d0bb134a43f93d4f84dc7488df",
+    "config_count": 96,
+    "expected_identity_count": 96,
+    "config_tree_sha256": "7721302cf34c75b28c216f8483ef2f438403201e0a771fe9e2f6295414fb59a1",
+    "expected_identity_tree_sha256": "51aa8ae499125885a4e64f782d2df9e6cb1eed1fa5ddbc3a8e0f3dc496911398"
+  },
+  "calibration": {
+    "external_path": "/home/oneblaze/txnopt-calibration/level1-local-calibration-attempt33.json",
+    "sha256": "1126029e89a021b56aa79dfce4cf8f3a4c6cf312c2442a38484b3a1003a2556b",
+    "representative_cases": {
+      "evrptw": ["c101C5", "c101_21"],
+      "rcpsp": ["j1201_1", "j1206_4"]
+    },
+    "seeds": [2014, 2015, 2016],
+    "raw_run_count": 96,
+    "independent_review_pass_count": 96,
+    "fixed_work_parity_group_count": 12,
+    "p95_observation_group_count": 16,
+    "peak_rss_bytes": 243142656,
+    "fallback_count": 0,
+    "formal_level1_evidence": false
+  },
+  "independent_evidence_audit": {
+    "sidecar_match_count": 576,
+    "raw_manifest_hash_match_count": 96,
+    "independent_review_hash_match_count": 96,
+    "reviewed_lifecycle_count": 96,
+    "positive_run_cmax_count": 96,
+    "native_round_observation_count": 164,
+    "native_round_observation_run_count": 48,
+    "semantic_event_count": 4050,
+    "physical_event_count": 260,
+    "t4_waste_event_count": 0,
+    "all_fixed_work_semantic_and_objective_groups_match": true,
+    "all_prefix_safety_and_refinement_pass": true
+  },
+  "capacity": {
+    "external_path": "/home/oneblaze/txnopt-calibration/tencent-capacity-assessment-attempt33.json",
+    "sha256": "90ffbbe293eb50a3cf869c65e72ec594a33bb93bc885b17de27fc7acfdbe8e5e",
+    "status": "CAPACITY_ESTIMATE_PASS_LIVE_HOST_NOT_VERIFIED",
+    "minimum_physical_cores": 64,
+    "minimum_provider_memory_gb": 128,
+    "scheduler_efficiency": 0.8,
+    "usable_core_tokens": 51,
+    "predicted_matrix_seconds": 2045.4834455899036,
+    "predicted_matrix_days": 0.02367457691654981,
+    "predicted_completion_days_max": 10,
+    "maximum_consecutive_window_days": 14,
+    "live_host_verified": false,
+    "memory_margin_live_host_verified": false
+  },
+  "claim_boundary": {
+    "representative_local_calibration_verified": true,
+    "live_64_physical_core_host_verified": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "public_release_authorized": false
+  }
+}
