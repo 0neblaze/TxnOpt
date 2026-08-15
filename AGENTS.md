@@ -15,6 +15,13 @@ TxnOpt code.
   `/home/oneblaze/work/Reproducible-EVRPTW` is a compatibility symlink only;
   historical evidence containing that absolute path must not be rewritten. A
   Windows checkout or old worktree is not authoritative by proximity.
+- The Windows path `D:\UserData\Documents\GitHub\TxnOpt` is a host-side
+  symlink into the authoritative WSL checkout, not a valid inherited working
+  directory for `wsl.exe`. Windows-to-WSL commands must run from the direct UNC
+  checkout or pass
+  `wsl.exe -d Ubuntu --cd /home/oneblaze/work/TxnOpt -- <command>`. Serialize
+  WSL status probes or batch them into one WSL process; do not fan out
+  concurrent `wsl.exe` launches for repository inspection.
 - The active roadmap is
   `docs/roadmap/txnopt-level1-to-level3-roadmap.md`. The ignored private
   appendix is `docs/roadmap/txnopt-research-strategy.local.md`.
