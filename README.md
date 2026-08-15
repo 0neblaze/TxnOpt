@@ -152,10 +152,12 @@ Attempt39, Deployment05, and producer-side Pre-cloud12 are retained as the next
 rejected chain. Independent Review16 found two major account-independent gaps:
 COS response-stream lifecycle exceptions escaped the credential-redaction
 boundary, and active operating documents retained superseded identities and
-output guidance. The required successor is Build24 with formal Attempt40,
-representative calibration Attempt41, Deployment06, Pre-cloud13, and a zero-
-finding Independent Review17. The account-input state remains unaccepted until
-that review passes.
+output guidance. Build24 with formal Attempt40, representative calibration
+Attempt41, Deployment06, and Pre-cloud13 then completed its local producer
+gates. Independent Review17 retained one major active-document cutover finding
+without invalidating those artifacts. Review17 remains immutable; the
+account-input state remains unaccepted until a zero-finding Independent
+Review18 passes.
 Intermediate validation candidates are not approved formal producers. Capacity
 assessment, account configuration, procurement authorization, build
 portability, and formal execution remain separate gates.

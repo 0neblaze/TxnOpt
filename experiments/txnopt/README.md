@@ -1,8 +1,10 @@
 # TxnOpt experiments
 
 This directory tracks only new protocol definitions, manifests, registries,
-and independently reviewed summaries. Raw run output belongs under ignored
-`results/<run_label>/` or a governed external root.
+and independently reviewed summaries. New formal raw output belongs only under
+an explicit governed external root. Local scratch uses the tree-scoped XDG
+state root; repository-local `results/` is legacy or rebuildable state and is
+never formal evidence.
 
 The retained Build19 Tencent chain uses `level1-protocol-v2.json`, external
 formal plan Attempt30, representative local calibration Attempt31, and
@@ -21,17 +23,19 @@ independent review bundles, Deployment05 passes offline validation, and
 producer-side Pre-cloud12 passes. Independent Review16 nevertheless rejects
 that chain with two major findings: COS response-stream exceptions escaped the
 credential-redaction boundary, and active documentation retained superseded
-operating identities. Build24/Attempt40/Attempt41, Deployment06, Pre-cloud13,
-and Independent Review17 are the required successor sequence. Attempt40
-requires at least 64
+operating identities. Build24/Attempt40/Attempt41, Deployment06, and
+producer-side Pre-cloud13 then completed their local gates. Independent
+Review17 retained one major active-document cutover finding without
+invalidating those producer artifacts. Attempt40 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
-Attempt35 retains its rejected predecessor evidence, while the Attempt34 formal
-raw root and launch claim remain absent. The Build21 deployment Attempt04 is
-offline-only and records the expected local 12-physical-core doctor failure.
-Only a zero-finding Review17 may accept the Build24 successor; none of these
-artifacts authorizes cloud access or Level 1 readiness.
+Attempt40 remains unexecuted with its raw root and launch claim absent;
+Attempt41 retains 96/96 raw and independent review bundles, and Deployment06
+passes offline validation while correctly rejecting the local 12-core host.
+Review17 is immutable; only a zero-finding Review18 may accept the Build24
+successor. None of these artifacts authorizes cloud access or Level 1
+readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.

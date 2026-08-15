@@ -48,9 +48,12 @@ cloud purchase, public alpha, or manuscript submission.
   Attempts38/39, Deployment05, and producer-side Pre-cloud12 completed, but
   Independent Review16 rejected that chain with two major findings: an unsafe
   COS response-stream exception boundary and active-document chronology drift.
-  The required successor is Build24 with unexecuted formal Attempt40,
-  representative calibration Attempt41, Deployment06, Pre-cloud13, and a
-  zero-finding Independent Review17.
+  Build24, unexecuted formal Attempt40, representative calibration Attempt41,
+  Deployment06, and producer-side Pre-cloud13 then completed their local
+  gates. Independent Review17 retained one major active-document cutover
+  finding without invalidating those producer artifacts. The required next
+  adjudication is a zero-finding Independent Review18 after the operator
+  documentation correction.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -198,8 +201,9 @@ The Level 1 internal artifact identity is:
 - native module: `txnopt._native`;
 - protocols: `txnopt-contract-v1`, `txnopt-native-round-v1`,
   `txnopt-semantic-trace-v1`, and `txnopt-physical-trace-v1`;
-- CLI: `txnopt run`, `txnopt verify`, `txnopt replay`, `txnopt env`, and
-  `txnopt legacy verify`.
+- CLI: `txnopt run`, `txnopt verify`, `txnopt plan`, `txnopt preflight`,
+  `txnopt review`, `txnopt archive inventory`, and the provider-specific
+  `txnopt cloud tencent ...` command family.
 
 The root package exports exactly five names:
 
@@ -371,9 +375,12 @@ then failed before producing a wheel because its offline build bound an empty
 UV cache; that failure receipt remains append-only. Build23, the unexecuted
 formal Attempt38, representative Attempt39, Deployment05, and producer-side
 Pre-cloud12 are complete but rejected: Independent Review16 records two major
-findings. Build24/Attempt40/Attempt41, Deployment06, Pre-cloud13, and
-Independent Review17 are the required successor sequence. The signed Review17
-receipt, rather than this roadmap prose, controls acceptance.
+findings. Build24/Attempt40/Attempt41, Deployment06, and Pre-cloud13 completed
+the required producer sequence. Independent Review17 preserves one major
+active-document cutover finding; it is not rewritten. After the corrections
+recorded in this roadmap, Independent Review18 is the required successor
+adjudication. The signed Review18 receipt, rather than this roadmap prose,
+controls acceptance.
 
 The only account-independent terminal state is
 `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`. It authorizes no Tencent API

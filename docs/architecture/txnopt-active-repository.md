@@ -115,9 +115,11 @@ Attempt35 已保留 96/96 raw/review，部署 Attempt04 已通过全新离线安
 凭据原文。Build22 因首次离线构建错误绑定空 UV cache 而作为失败构建收据保留，
 其外部根和日志不得覆盖。Build23/Attempt38/Attempt39、Deployment05 与
 Pre-cloud12 已被 Independent Review16 以两个 major finding 拒绝并保持不可变。
-下一组闭合身份必须是 Build24/Attempt40/Attempt41、Deployment06、Pre-cloud13
-与 Independent Review17；只有 Review17 零 finding 才能进入账号输入阶段。Build17
-validation candidate（验证候选）未闭合正式计划入口，不能作为正式 producer。
+Build24/Attempt40/Attempt41、Deployment06 与 Pre-cloud13 已完成本地 producer
+门，但 Independent Review17 保留一个 active-document cutover（活文档切换）
+major finding。Review17 不得改写；文档修复后只有 Independent Review18 零
+finding 才能进入账号输入阶段。Build17 validation candidate（验证候选）未闭合
+正式计划入口，不能作为正式 producer。
 
 ## 5. 不可变恢复边界
 

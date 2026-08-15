@@ -31,9 +31,10 @@ The earlier local EVRPTW roadmap remains ignored historical planning input.
   Build22 is retained as a failed build because its first offline invocation
   bound an empty UV cache. Build23, Attempt38, Attempt39, Deployment05 and
   Pre-cloud12 are retained as rejected by Independent Review16 for two major
-  findings. The required successor sequence is Build24, Attempt40, Attempt41,
-  Deployment06, Pre-cloud13, and Independent Review17. Only a zero-finding
-  Review17 may reach
+  findings. Build24, Attempt40, Attempt41, Deployment06, and Pre-cloud13 then
+  completed their local producer gates, but Independent Review17 retained one
+  major active-document cutover finding. Review17 remains immutable; only a
+  zero-finding Independent Review18 may reach
   `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`.
 - The corrected aggregate T1/T2 and conditional T3/T4 package remains bounded
   formal evidence. The 2,880-run formal matrix, holdout, Tencent API access,

@@ -5,17 +5,19 @@
 
 ## 1. 当前可使用的规划事实
 
-- 最近完成的本地代表性校准是 Build23-bound Attempt39（绑定 Build23 的 Attempt39）。
+- 最近完成的本地代表性校准是 Build24-bound Attempt41（绑定 Build24 的 Attempt41）。
   它使用 64 physical cores（物理核）、80% scheduler efficiency（调度效率）对应的
   51 个可用 core tokens（核心令牌），预测 2,880-run matrix（2,880 次矩阵）约需
-  `2065.8231217279244` 秒，即约 34.43 分钟/0.57 小时。
-- Attempt39 的观测峰值 RSS 为 `244068352` 字节；真实主机仍必须用其 Linux 可见内存
+  `1922.0775291141763` 秒，即约 32.03 分钟/0.53 小时。
+- Attempt41 的观测峰值 RSS 为 `245575680` 字节；真实主机仍必须用其 Linux 可见内存
   重新计算 80% 余量门。
-- 这些数字来自被 Review16 拒绝的 Build23/Attempt39 前驱链，只能作为下一后继构建的
-  规划基线；它们不是云端运行时间、SLA（服务等级协议）、报价或账号接入授权。
+- 这些数字来自已完成本地 producer gate（生产器门）的 Build24/Attempt41 链，并由
+  Review17 独立重算一致；Review17 因本文件及其他活文档未切换而拒绝最终账号输入
+  状态，不否定该校准字节。它们仍不是云端运行时间、SLA（服务等级协议）、报价或
+  账号接入授权。
 - Build portability（构建可移植性）仍为 **unverified（未验证）**。当前 wheel（轮子）
   在绑定环境可用，不代表能在另一 CPU、镜像、glibc、Python 或编译器组合上运行。
-- Attempt38 formal matrix（正式矩阵）未启动，raw root（原始结果根）与 launch claim
+- Attempt40 formal matrix（正式矩阵）未启动，raw root（原始结果根）与 launch claim
   （启动声明）均不存在；本文件不授权采购或执行。Attempt24 保持为不可变的
   Build14/protocol-v1 前驱，不能作为当前正式入口。
 
@@ -38,9 +40,10 @@
 Linux `MemTotal` 因平台保留略低于 128 GiB 不单独构成失败。真正的内存性能门是
 与所选正式 producer 绑定的校准峰值 RSS 必须低于目标主机实际可见内存的 80%。
 历史 Build16/Attempt27、Build18/Attempt29 以及 Build23/Attempt39 均保持各自绑定，
-不得交叉重绑。Review16 拒绝 Build23 后，任何修复都必须使用新的 Build24、formal
-Attempt40 和 calibration Attempt41 身份。公开规格、库存、地域和价格都不能替代
-购买时的带时间戳 API/控制台回执。
+不得交叉重绑。Build24、formal Attempt40 和 calibration Attempt41 是当前本地
+producer 链；Review17 作为 active-document cutover failure（活文档切换失败）保持
+不可变，文档修复后由 Review18 重新裁决账号输入状态。公开规格、库存、地域和价格
+都不能替代购买时的带时间戳 API/控制台回执。
 
 官方入口：
 

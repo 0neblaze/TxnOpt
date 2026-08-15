@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23/Attempts38–39/Pre-cloud12 are rejected by Review16; Build24 is the required successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt38 remains an immutable unexecuted predecessor; the next identities are Attempt40 formal and Attempt41 representative | Review17 is the next authoritative adjudication; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23/Attempts38–39/Pre-cloud12 are rejected by Review16; the Build24 producer chain is complete but Review17 retained one active-document finding | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt40 is the current immutable unexecuted formal plan; Attempt41 retains 96/96 representative raw/review bundles | Review17 is immutable `NEEDS_WORK`; zero-finding Review18 is required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -51,11 +51,15 @@ Attempt39 retains 96 raw bundles and 96 byte-identical independent reviews,
 with all 12 fixed-work parity groups matching and a 51-token estimate of about
 2,066 seconds. Deployment05 passes fresh offline installation and replay;
 producer-side Pre-cloud12 passes. Review16 rejects that chain for the COS
-response-stream exception boundary and active-document chronology drift. The
-required successor is Build24/Attempt40/Attempt41, Deployment06, Pre-cloud13,
-and Independent Review17. None of these
-artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
-holdout, Level 1 claim, or release.
+response-stream exception boundary and active-document chronology drift.
+Build24/Attempt40/Attempt41, Deployment06, and producer-side Pre-cloud13 then
+completed their local gates. Attempt40 remains unexecuted, Attempt41 retains
+96/96 raw and byte-identical independent reviews with a 51-token estimate of
+about 1,922 seconds, and Deployment06 passes offline validation. Review17
+preserves one major active-document cutover finding; after this documentation
+correction, zero-finding Review18 is the next authoritative adjudication. None
+of these artifacts authorizes an API call, purchase, instance, COS bucket,
+formal matrix, holdout, Level 1 claim, or release.
 
 Build13 is retained as a complete but rejected internal artifact. Independent
 Review Attempt10 found one major gap: interrupted or aborted native exact work

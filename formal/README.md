@@ -14,7 +14,7 @@ binds all model inputs, the generated PlusCal translation, the exact
 Re-run the receipt with:
 
 ```bash
-python tools/verify_txnopt_formal.py \
+python -m txnopt_evidence.formal_verify \
   --java /path/to/java \
   --tla2tools /path/to/tla2tools.jar
 ```
