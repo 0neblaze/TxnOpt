@@ -1,0 +1,66 @@
+{
+  "schema_version": "txnopt-level1-formal-plan-index-v1",
+  "run_label": "txnopt_level1_formal_plan_attempt34",
+  "status": "PLANNED_NOT_STARTED_NOT_AUTHORIZED",
+  "created_at_utc": "2026-08-15T02:21:21Z",
+  "producer_build": {
+    "build": "Build21",
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt21.json",
+    "manifest_sha256": "0d27bb45812352bca6a7ab0acb1acc81eaf3d553cca2dd7944accde7a3d12d03",
+    "source_revision": "70bf8c3fc5f1ee3df2c108e29478fcccc966a07a",
+    "source_tree": "a376a9efc74ec149f4a962bf028b56e4f597c06b",
+    "source_manifest_sha256": "f137fb0281aa0f47153ff036a234c3cd4571f83e3659c4e82d28343746ba51cb",
+    "wheel_sha256": "3cdcbf90b3bd86212c9a686573bacc60e3d4434634515f61a279d21c35792569",
+    "native_sha256": "36080cc2f4c5c0225f49a3e389b10e48ac2f6f189bd85268e5fb30c86e35091c"
+  },
+  "protocol": {
+    "path": "experiments/txnopt/level1-protocol-v2.json",
+    "sha256": "593299c4c4fe2f9160844777097f4cf21ee803a6614e6270d5aadff53f7fccd2",
+    "schema_version": "txnopt-level1-protocol-v2"
+  },
+  "plan": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt34/manifest.json",
+    "sha256": "056656ed4b11819661b103e334812fc44b58ed9f2da975e738b25121bcb0b694",
+    "schema_version": "txnopt-level1-campaign-plan-v2",
+    "attempt": 34,
+    "config_count": 2880,
+    "expected_identity_count": 2880,
+    "config_tree_sha256": "26256b1c3e4b4231a89201f6fa36af03fc666d42a5fc85818f89a13cbb25f413",
+    "expected_identity_tree_sha256": "5beb7415e59dd8d3d5d06d6278745bd0d0b4bc97aeaded13f16ade62df333a01",
+    "analysis_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt34/analysis-protocol.json",
+    "analysis_sha256": "691a2ab60ff49650b862ed714d3056c9c75e912ef602f5ffeea93486dc30a4ef",
+    "analysis_schema_version": "txnopt-level1-analysis-protocol-v2",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build21-attempt34"
+  },
+  "resource_contract": {
+    "minimum_physical_cores": 64,
+    "minimum_provider_memory_gb": 128,
+    "core_count": 64,
+    "thread_per_core": 1,
+    "linux_visible_memory_is_admission_gate": false,
+    "attempt35_peak_rss_fraction_max": 0.8,
+    "exclusive_linux_required": true,
+    "maximum_consecutive_window_days": 14,
+    "predicted_completion_days_max": 10,
+    "region": null,
+    "region_required_live_input": true
+  },
+  "preflight": {
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt34/preflight.json",
+    "sha256": "b9249855fef2691d02e5ad79600188e52e1f8710611bd2092a64087b6f8737de",
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE",
+    "active_target_process_count": 0,
+    "raw_output_root_absent": true,
+    "atomic_launch_claim_absent": true
+  },
+  "claim_boundary": {
+    "cloud_account_configured": false,
+    "region_selected": false,
+    "live_dry_run_completed": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false
+  }
+}

@@ -39,8 +39,10 @@ cloud purchase, public alpha, or manuscript submission.
   found three major gaps in the Build19 sequence. Build20, Attempt32, Attempt33,
   and Pre-cloud Attempt10 are retained after Independent Review Attempt14 found
   one remaining CVM credential-acquisition exception leak. The next closed
-  sequence is Build21, Attempt34, Attempt35, and Pre-cloud Attempt11;
-  Independent Review Attempt15 must report zero findings before account input.
+  sequence is Build21, Attempt34, Attempt35, and Pre-cloud Attempt11. Its clean
+  build, unexecuted 2,880-config plan, 96-run representative calibration, and
+  offline deployment evidence are complete; Independent Review Attempt15 must
+  report zero findings before account input.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -352,8 +354,10 @@ them. Build20, formal plan Attempt32, representative calibration Attempt33,
 and producer-side Pre-cloud Attempt10 are immutable rejected successor evidence.
 Independent Review Attempt14 records one major CVM credential-acquisition
 exception leak without rewriting them. Build21, formal plan Attempt34,
-representative calibration Attempt35, and Pre-cloud Attempt11 are the next
-append-only sequence. Independent Review Attempt15 is the next account-
+representative calibration Attempt35, and Pre-cloud Attempt11 are the current
+append-only sequence. Attempt34 remains unexecuted, Attempt35 retains 96/96
+raw/review evidence, and deployment Attempt04 passes fresh offline installation
+and replay. Independent Review Attempt15 is the next account-
 independent adjudication; its signed receipt,
 rather than this roadmap prose, controls acceptance.
 

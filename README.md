@@ -141,9 +141,11 @@ rejected Build19/Attempt30/Attempt31 chain. Independent Review13 found three
 major account-independent gaps. Build20, formal plan Attempt32, representative
 calibration Attempt33, and producer-side Pre-cloud10 are retained as the next
 rejected chain: Independent Review14 found one remaining CVM credential-
-acquisition exception leak. The closed successor is Build21/Attempt34/Attempt35;
-Pre-cloud11 and Independent Review15 must report zero findings before the
-account-input state. Intermediate validation
+acquisition exception leak. The closed successor is Build21/Attempt34/Attempt35.
+Build21 passes the clean build gates, Attempt34 is a 2,880-config unexecuted
+formal plan, and Attempt35 retains 96 raw bundles plus 96 independent reviews.
+Pre-cloud11 records the producer-side candidate; Independent Review15 must
+report zero findings before the account-input state. Intermediate validation
 candidates are not approved formal producers. Capacity assessment, account
 configuration, procurement authorization, build portability, and formal
 execution remain separate gates.

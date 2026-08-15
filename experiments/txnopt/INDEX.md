@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19 and Build20 chains plus failed Reviews13/14 are immutable predecessors; Build21/Attempt34/35/Pre-cloud11 is the closed successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt33 retains 96/96 representative raw/review bundles; Attempt32 remains unexecuted; Attempt34/35 require fresh Build21 evidence | Review15 is the next authoritative adjudication; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19 and Build20 chains plus failed Reviews13/14 are immutable predecessors; Build21/Attempt34/35/Pre-cloud11 is the closed successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt35 retains 96/96 representative raw/review bundles; Attempt34 remains unexecuted with no launch claim or raw root | Review15 is the next authoritative adjudication; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -32,8 +32,14 @@ also retained: Review14 found one remaining CVM credential-acquisition exception
 leak. Attempt33
 retains 96 raw bundles and 96 independent reviews, all 12 fixed-work parity
 groups match, and its 51-token capacity estimate is about 2,045 seconds.
-Attempt32 remains unexecuted with no launch claim or raw root. Build21 with
-Attempt34/35 and Pre-cloud11 is the next closed source identity; Review15 is its
+Attempt32 remains unexecuted with no launch claim or raw root. Build21 passes
+363 installed-wheel tests, five fixed-seed property suites, both sanitizer
+smokes, the 100,000-round soak, and live TLC. Attempt34 binds 2,880 configs and
+2,880 expected identities and remains unexecuted; Attempt35 retains 96 raw
+bundles and 96 independent reviews, all 12 fixed-work parity groups match, and
+its 51-token estimate is about 2,024 seconds. Deployment Attempt04 passes fresh
+offline installation and replay, while the local 12-core host is correctly
+rejected. Pre-cloud11 is the producer-side candidate; Review15 is its
 authoritative decision. None of these
 artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
 holdout, Level 1 claim, or release.

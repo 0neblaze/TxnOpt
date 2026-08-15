@@ -16,13 +16,15 @@ Pre-cloud11, and Independent Review15. Attempt34 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
-Attempt33 retains 96 raw bundles and 96 independent reviews, while the Attempt32
-formal raw root remains absent. The Build20 deployment Attempt03 is offline-only,
-contains no credentials or region, exposes no `DryRun=false` instance-creation
-path, and records the expected local 12-physical-core doctor failure. Pre-cloud
-Attempt10 records a rejected producer-side candidate decision only. Only a zero-
-finding Review15 may accept the Build21 successor; none of these artifacts
-authorizes cloud access or Level 1 readiness.
+Attempt35 retains 96 raw bundles and 96 independent reviews, while the Attempt34
+formal raw root and launch claim remain absent. The Build21 deployment Attempt04
+is offline-only, contains no credentials or region, exposes no `DryRun=false`
+instance-creation path, installs the locked wheel in a fresh directory, passes
+363 tests without skips, reproduces one independent review byte-for-byte, and
+records the expected local 12-physical-core doctor failure. Pre-cloud Attempt11
+is the producer-side candidate decision. Only a zero-finding Review15 may accept
+the Build21 successor; none of these artifacts authorizes cloud access or Level
+1 readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
@@ -92,7 +94,9 @@ absent raw root. Structural preflight is read-only.
 
 Build14/Attempt24, Build18/Attempt28, and Build19/Attempt30 remain historical,
 byte-preserved predecessor chains. Build20/Attempt32 is also retained and
-unexecuted after failed Review14. Build21/Attempt34 is the next formal chain.
+unexecuted after failed Review14. Build21/Attempt34 is the current formal chain;
+its structural preflight passes while its raw root and launch claim remain
+absent.
 All four predecessor
 preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
 holdouts and cloud purchase remain closed, and no launch claim or raw root

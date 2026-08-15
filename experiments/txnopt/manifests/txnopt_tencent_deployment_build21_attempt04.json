@@ -1,0 +1,92 @@
+{
+  "schema_version": "txnopt-tencent-deployment-index-v1",
+  "run_label": "txnopt_tencent_deployment_build21_attempt04",
+  "status": "BUNDLE_VERIFIED_NOT_AUTHORIZED",
+  "created_at_utc": "2026-08-15T02:21:21Z",
+  "materialization_harness_diagnostics": [
+    {
+      "classification": "WRONG_SOURCE_MANIFEST_INPUT",
+      "bundle_root_created": false,
+      "formal_attempt_started": false,
+      "reason": "the first harness invocation supplied the human-readable source summary instead of the complete Git-blob source manifest; the corrected invocation used the pre-existing Build21 source-files manifest and did not overwrite a deployment bundle"
+    }
+  ],
+  "bundle": {
+    "external_root": "/home/oneblaze/txnopt-deployments/tencent-build21-attempt04",
+    "receipt_path": "/home/oneblaze/txnopt-deployments/tencent-build21-attempt04/bundle-receipt.json",
+    "receipt_sha256": "ad8c7630bb701bcb872a9e8adf326174db98050e9f9d09eb5a85ed659ab3e777",
+    "schema_version": "txnopt-tencent-deployment-bundle-v2",
+    "build": "Build21",
+    "formal_attempt": 34,
+    "file_count": 18,
+    "file_tree_sha256": "f665dde9443148613fd3c92f1d06064478810b46cadbb5d3518131bba420a3f8",
+    "archive_path": "/home/oneblaze/txnopt-deployments/tencent-build21-attempt04.tar",
+    "archive_sha256": "1a0ec55d8e1e0c59e2c5c7568dcc0dbd781f316234c9a070327eb71fd7469646",
+    "build_manifest_sha256": "0d27bb45812352bca6a7ab0acb1acc81eaf3d553cca2dd7944accde7a3d12d03",
+    "wheel_sha256": "3cdcbf90b3bd86212c9a686573bacc60e3d4434634515f61a279d21c35792569",
+    "source_manifest_sha256": "f137fb0281aa0f47153ff036a234c3cd4571f83e3659c4e82d28343746ba51cb",
+    "plan_manifest_sha256": "056656ed4b11819661b103e334812fc44b58ed9f2da975e738b25121bcb0b694",
+    "toolchain_lock_sha256": "8868542fdb8014e4a22574e092358d6b8c4471ee8689c8a4291c39ddcfd60a9d"
+  },
+  "offline_validation": {
+    "fresh_root": "/home/oneblaze/txnopt-deployments/tencent-build21-attempt04-offline-verify-v2",
+    "receipt_path": "/home/oneblaze/txnopt-deployments/tencent-build21-attempt04-offline-verify-v2/offline-verification-receipt.json",
+    "receipt_sha256": "2ee4fffedd875ab6ba666066a1f16dcc4264028597a2e0dd00b89be4c077e40f",
+    "preinstall_bundle_verification_sha256": "466dfb1c7958e1bca8407bb0fa9d288e152476d11063469efdf4bc63a5efce4d",
+    "postinstall_bundle_verification_sha256": "466dfb1c7958e1bca8407bb0fa9d288e152476d11063469efdf4bc63a5efce4d",
+    "bundle_verification_status": "BUNDLE_VERIFIED_NOT_AUTHORIZED",
+    "locked_bootstrap_completed": true,
+    "installed_package_origins_verified": true,
+    "installed_package_origin_sha256": "1faa812ddeb1b46f89cf242ebdb428eb148e55c077805ad256195ab077639466",
+    "fresh_wheel_test_count": 363,
+    "fresh_wheel_skipped_count": 0,
+    "fresh_wheel_junit_sha256": "912cae25286fe85d395e06d746c188cc0d0cff75c579b43007080f4ed1380f6d",
+    "independent_replay_run_label": "txnopt_level1_evrptw_c101_21_2014_barrier_4_fixed_work_attempt35",
+    "independent_replay_review_sha256": "8ce55e0b5865d8747432396d954b4031d255a4b6415c4ed5a219e5fd7c2e94f3",
+    "independent_replay_byte_identical": true,
+    "local_doctor_expected_failure_path": "/home/oneblaze/txnopt-deployments/tencent-build21-attempt04-offline-verify-v2/local-doctor-expected-fail.json",
+    "local_doctor_expected_failure_sha256": "933a7ccb43493a03ac8a0e78b13638391e8657728f2bb1d98dd0c361040de9d8",
+    "local_doctor_exit_code": 1,
+    "local_doctor_status": "HOST_CAPACITY_FAIL",
+    "local_doctor_observed_physical_cores": 12,
+    "local_doctor_observed_logical_processors": 24,
+    "local_doctor_observed_memory_bytes": 25196941312,
+    "local_doctor_visible_memory_was_admission_gate": false,
+    "local_doctor_peak_rss_within_visible_memory_fraction": true,
+    "local_doctor_expected_failure_reasons": [
+      "linux_physical_cores_below_64",
+      "provider_linux_physical_core_cross_check_failed",
+      "thread_per_core_is_not_one"
+    ],
+    "offline_provider_fixture_is_live_api_evidence": false,
+    "credentials_included": false
+  },
+  "cvm_contract": {
+    "dry_run_only": true,
+    "core_count": 64,
+    "thread_per_core": 1,
+    "minimum_provider_memory_gb": 128,
+    "region": null,
+    "region_required_live_input": true,
+    "instance_creation_interface_included": false
+  },
+  "cos_contract": {
+    "provider": "tencent-cos",
+    "versioning_required": "Enabled",
+    "object_lock_mode_required": "COMPLIANCE",
+    "minimum_retention_days": 365,
+    "version_id_required": true,
+    "credentials_included": false,
+    "live_bucket_verified": false
+  },
+  "claim_boundary": {
+    "cloud_account_configured": false,
+    "credentials_included": false,
+    "region_selected": false,
+    "live_dry_run_completed": false,
+    "cloud_purchase_authorized": false,
+    "instance_created": false,
+    "formal_matrix_started": false,
+    "live_cos_used": false
+  }
+}

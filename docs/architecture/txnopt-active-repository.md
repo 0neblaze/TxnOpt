@@ -109,7 +109,9 @@ Build portability（构建可移植性）以及正式矩阵执行都必须等真
 拒绝最终云前状态。Build20/Attempt32/Attempt33 及 producer-side Pre-cloud10
 也被 Independent Review14 以一个 CVM credential-acquisition exception leak
 （云服务器凭据获取异常泄漏）拒绝。修复后的闭合后继身份是
-Build21/Attempt34/Attempt35，且只有 Pre-cloud11 与 Independent Review15 零 finding
+Build21/Attempt34/Attempt35：Attempt34 的 2,880-run 正式 raw root 与 launch
+claim 保持不存在，Attempt35 已保留 96/96 raw/review，部署 Attempt04 已通过
+全新离线安装与独立重放。只有 Pre-cloud11 与 Independent Review15 零 finding
 才能进入账号输入阶段。Build17
 validation candidate（验证候选）未闭合正式计划入口，不能作为正式 producer。
 
