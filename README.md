@@ -145,9 +145,12 @@ acquisition exception leak. Build21/Attempt34/Attempt35 is the next retained
 rejected chain: its clean build, 2,880-config unexecuted formal plan, and 96/96
 representative calibration passed, but Independent Review15 found that the
 redacted SDK exception still retained credential material through Python
-`__context__`. The required successor identifiers are Build22, formal Attempt36,
-representative calibration Attempt37, Deployment05, Pre-cloud12, and Independent
-Review16. Only a zero-finding Review16 may reach the account-input state.
+`__context__`. Build22 is retained as a failed build attempt because its first
+offline build incorrectly bound an empty UV cache; the failure log and receipt
+are not overwritten. The required successor identifiers are Build23, formal
+Attempt38, representative calibration Attempt39, Deployment05, Pre-cloud12,
+and Independent Review16. Only a zero-finding Review16 may reach the
+account-input state.
 Intermediate validation candidates are not approved formal producers. Capacity
 assessment, account configuration, procurement authorization, build
 portability, and formal execution remain separate gates.

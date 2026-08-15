@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22/Attempt36/37/Pre-cloud12 is the required successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt35 retains 96/96 rejected-predecessor raw/review bundles; Attempt34 remains unexecuted; successor evidence must use Attempts36/37 | Review16 is the next authoritative adjudication; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23/Attempt38/39/Pre-cloud12 is the required successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt35 retains 96/96 rejected-predecessor raw/review bundles; Attempt34 remains unexecuted; successor evidence must use Attempts38/39 | Review16 is the next authoritative adjudication; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -41,8 +41,9 @@ its 51-token estimate is about 2,024 seconds. Deployment Attempt04 passes fresh
 offline installation and replay, while the local 12-core host is correctly
 rejected. Pre-cloud11 is the producer-side candidate, but Review15 rejects it
 because the safe outer SDK error retains the credential-bearing original via
-`__context__`. The required successor chain is Build22, Attempt36/37,
-Deployment05, Pre-cloud12, and Review16. None of these
+`__context__`. Build22 then failed before producing a wheel because its offline
+build bound an empty UV cache. The required successor chain is Build23,
+Attempt38/39, Deployment05, Pre-cloud12, and Review16. None of these
 artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
 holdout, Level 1 claim, or release.
 

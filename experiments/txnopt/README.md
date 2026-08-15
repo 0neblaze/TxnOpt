@@ -14,16 +14,17 @@ credential-acquisition exception leak. Build21, external formal plan Attempt34,
 representative calibration Attempt35, deployment Attempt04, and Pre-cloud11 are
 also retained as rejected evidence: Independent Review15 found that redacted
 SDK errors still retained credential material through Python `__context__`.
-The required successor is Build22, external formal plan Attempt36,
-representative calibration Attempt37, deployment Attempt05, Pre-cloud12, and
-Independent Review16. Attempt36 requires at least 64
+Build22 is retained as a failed build because its first offline invocation
+bound an empty UV cache. The required successor is Build23, external formal
+plan Attempt38, representative calibration Attempt39, deployment Attempt05,
+Pre-cloud12, and Independent Review16. Attempt38 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
 Attempt35 retains 96 raw bundles and 96 independent reviews, while the Attempt34
 formal raw root and launch claim remain absent. The Build21 deployment Attempt04
 is offline-only and records the expected local 12-physical-core doctor failure.
-Only a zero-finding Review16 may accept the Build22 successor; none of these
+Only a zero-finding Review16 may accept the Build23 successor; none of these
 artifacts authorizes cloud access or Level 1 readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw

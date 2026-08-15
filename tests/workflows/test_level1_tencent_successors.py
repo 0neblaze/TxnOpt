@@ -18,7 +18,7 @@ def _build(number: int) -> dict[str, object]:
         19: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
         20: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
         21: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
-        22: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
+        23: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
     }
     return {
         "schema_version": "txnopt-level1-build-manifest-v1",
@@ -41,7 +41,7 @@ def _build(number: int) -> dict[str, object]:
         (19, 30, 31),
         (20, 32, 33),
         (21, 34, 35),
-        (22, 36, 37),
+        (23, 38, 39),
     ],
 )
 def test_registry_closes_each_build_to_one_formal_and_calibration_attempt(
@@ -69,6 +69,25 @@ def test_registry_rejects_unapproved_build17_candidate() -> None:
                 "formal_successor": {
                     "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
                     "successor_status": "REVIEW_PENDING_BUILD17",
+                    "independent_successor_review_completed": False,
+                    "level1_formal_gate_passed": False,
+                },
+            }
+        )
+
+
+def test_registry_rejects_failed_build22_candidate() -> None:
+    with pytest.raises(ValueError, match="approved Tencent pre-cloud successor"):
+        successor_from_build_manifest(
+            {
+                "schema_version": "txnopt-level1-build-manifest-v1",
+                "run_label": "txnopt_level1_build_attempt22",
+                "status": (
+                    "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY"
+                ),
+                "formal_successor": {
+                    "prior_review_binding_status": "PRIOR_SOURCE_ONLY",
+                    "successor_status": "REVIEW_PENDING_BUILD22",
                     "independent_successor_review_completed": False,
                     "level1_formal_gate_passed": False,
                 },
