@@ -19,6 +19,7 @@ def _build(number: int) -> dict[str, object]:
         20: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
         21: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
         23: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
+        24: "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY",
     }
     return {
         "schema_version": "txnopt-level1-build-manifest-v1",
@@ -42,6 +43,7 @@ def _build(number: int) -> dict[str, object]:
         (20, 32, 33),
         (21, 34, 35),
         (23, 38, 39),
+        (24, 40, 41),
     ],
 )
 def test_registry_closes_each_build_to_one_formal_and_calibration_attempt(

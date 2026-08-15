@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23 is the clean producer for Attempts38/39 and Pre-cloud12 | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt38 binds 2,880 configs/identities and remains unexecuted; Attempt39 retains 96/96 representative raw/review bundles; Deployment05 passes offline validation | Review16 is the next authoritative adjudication; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19–Build21 and failed Reviews13–15 are immutable predecessors; Build22 is a retained build failure; Build23/Attempts38–39/Pre-cloud12 are rejected by Review16; Build24 is the required successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt38 remains an immutable unexecuted predecessor; the next identities are Attempt40 formal and Attempt41 representative | Review17 is the next authoritative adjudication; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -50,8 +50,10 @@ passes structural preflight, and retains an absent raw root and launch claim.
 Attempt39 retains 96 raw bundles and 96 byte-identical independent reviews,
 with all 12 fixed-work parity groups matching and a 51-token estimate of about
 2,066 seconds. Deployment05 passes fresh offline installation and replay;
-producer-side Pre-cloud12 passes. Review16 remains the final account-independent
-adjudication. None of these
+producer-side Pre-cloud12 passes. Review16 rejects that chain for the COS
+response-stream exception boundary and active-document chronology drift. The
+required successor is Build24/Attempt40/Attempt41, Deployment06, Pre-cloud13,
+and Independent Review17. None of these
 artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
 holdout, Level 1 claim, or release.
 
@@ -303,13 +305,15 @@ dependencies, zero active `evrptw` imports or new `stage05.2` schemas, no Level
 adds this exact local evidence while retaining the external-review blocker and
 all purchase/execution boundaries.
 
-Completion audit Attempt01 maps every Level 1 predicate to its exact evidence.
-It records all local implementation and pre-cloud gates complete, but keeps
-Level 1 incomplete: full-scope confidence intervals and raw replay do not exist
-because Attempt23 has not started, and Attempt09 proves that zero unresolved
-Build11 findings is false. The only current implementation action is the
-anchored evidence-identity correction followed by a new clean build and a new
-independent review; procurement and formal execution remain unauthorized.
+Historical Completion Audit Attempt01 mapped the then-current Build11 Level 1
+predicates to their exact evidence. At that checkpoint it recorded the local
+implementation and pre-cloud gates while keeping Level 1 incomplete: full-scope
+confidence intervals and raw replay did not exist because Attempt23 had not
+started, and Attempt09 showed unresolved Build11 findings. Its then-current
+implementation action was the anchored evidence-identity correction followed
+by a new clean build and independent review. This paragraph is a historical
+record, not current operating guidance; the live successor chain is defined at
+the top of this index. Procurement and formal execution remain unauthorized.
 
 The first 100,000-round resource soak exposed an unbounded task-receipt queue
 and failed before its original harness could write a receipt. The exact error

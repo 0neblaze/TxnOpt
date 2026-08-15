@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import sys
+import traceback
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from typing import Any, BinaryIO, cast
 import pytest
 
 from txnopt_evidence.archive import ArchiveIntegrityError
+from txnopt_evidence.cli import main
 from txnopt_evidence.tencent_cos import (
     TencentCosArchive,
     TencentCosContractError,
@@ -162,6 +164,32 @@ class _ExplodingSdkClient:
 
     def head_bucket(self, **_kwargs: object) -> dict[str, Any]:
         raise _ExplodingSdkError(self._message)
+
+
+class _ExplodingResponseStream:
+    def __init__(self, stage: str, secrets: tuple[str, ...]) -> None:
+        self._stage = stage
+        self._secrets = secrets
+
+    def read(self, _size: int) -> bytes:
+        if self._stage == "read":
+            _raise_nested_sdk_secret(*self._secrets)
+        return b""
+
+    def close(self) -> None:
+        if self._stage == "close":
+            _raise_nested_sdk_secret(*self._secrets)
+
+
+class _ExplodingResponseBody:
+    def __init__(self, stage: str, secrets: tuple[str, ...]) -> None:
+        self._stage = stage
+        self._secrets = secrets
+
+    def get_raw_stream(self) -> _ExplodingResponseStream:
+        if self._stage == "get_raw_stream":
+            _raise_nested_sdk_secret(*self._secrets)
+        return _ExplodingResponseStream(self._stage, self._secrets)
 
 
 def _raise_nested_sdk_secret(*secrets: str) -> None:
@@ -339,6 +367,117 @@ def test_tencent_cos_credential_initialization_detaches_secret_exception_context
     assert all(secret not in serialized for secret in secrets)
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("stage", ["get_raw_stream", "read", "close"])
+def test_tencent_cos_response_stream_failures_are_safe(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = (
+        "old-cos-secret-id",
+        "rotated-cos-secret-id",
+        "rotated-cos-secret-key",
+        "cam-role-session-token",
+    )
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secrets[0])
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", secrets[2])
+    monkeypatch.setenv("TENCENTCLOUD_SESSION_TOKEN", secrets[3])
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secrets[1])
+    client, archive = _archive()
+    payload = b"stream lifecycle payload"
+    ref = archive.put_blob(
+        io.BytesIO(payload), expected_sha256=_sha256(payload), expected_size=len(payload)
+    )
+
+    def get_object(**_kwargs: object) -> dict[str, object]:
+        return {
+            "Body": _ExplodingResponseBody(stage, secrets),
+            "x-cos-version-id": ref.version_id,
+        }
+
+    monkeypatch.setattr(client, "get_object", get_object)
+
+    with pytest.raises(TencentCosError) as raised:
+        archive.verify_object(ref)
+
+    error = raised.value
+    serialized = "".join(
+        (
+            str(error),
+            repr(error),
+            "".join(traceback.format_exception(error)),
+        )
+    )
+    assert all(secret not in serialized for secret in secrets)
+    assert "Tencent COS SDK response_body" in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_cli_tencent_cos_response_stream_failure_does_not_serialize_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secrets = (
+        "old-cli-cos-secret-id",
+        "rotated-cli-cos-secret-id",
+        "rotated-cli-cos-secret-key",
+        "cam-role-cli-session-token",
+    )
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secrets[0])
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", secrets[2])
+    monkeypatch.setenv("TENCENTCLOUD_SESSION_TOKEN", secrets[3])
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secrets[1])
+    client, archive = _archive()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "evidence.json").write_text("{}\n", encoding="utf-8")
+    ref = archive.mirror_tree(source, commit_id="stream-secret-cli-probe")
+
+    def get_object(**_kwargs: object) -> dict[str, object]:
+        return {
+            "Body": _ExplodingResponseBody("read", secrets),
+            "x-cos-version-id": ref.version_id,
+        }
+
+    monkeypatch.setattr(client, "get_object", get_object)
+    monkeypatch.setattr(
+        TencentCosArchive,
+        "from_environment",
+        classmethod(lambda _class, **_kwargs: archive),
+    )
+
+    exit_code = main(
+        [
+            "cloud",
+            "tencent",
+            "cos",
+            "verify",
+            "--cos-bucket",
+            "txnopt-evidence-1250000000",
+            "--cos-region",
+            "ap-guangzhou",
+            "--commit-id",
+            ref.commit_id,
+            "--commit-key",
+            ref.key,
+            "--commit-version-id",
+            ref.version_id,
+            "--commit-sha256",
+            ref.sha256,
+            "--commit-size",
+            str(ref.size),
+            "--commit-retain-until",
+            ref.retain_until,
+        ]
+    )
+
+    error_text = capsys.readouterr().err
+    assert exit_code == 2
+    assert all(secret not in error_text for secret in secrets)
+    assert "response_body.read" in error_text
 
 
 def test_tencent_cos_binds_every_read_to_exact_version_id() -> None:

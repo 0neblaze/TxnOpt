@@ -148,12 +148,14 @@ redacted SDK exception still retained credential material through Python
 `__context__`. Build22 is retained as a failed build attempt because its first
 offline build incorrectly bound an empty UV cache; the failure log and receipt
 are not overwritten. Build23, formal Attempt38, representative calibration
-Attempt39, Deployment05, and producer-side Pre-cloud12 now form the completed
-account-independent successor chain. Attempt38 remains unexecuted; Attempt39
-retains 96 raw bundles and 96 byte-identical independent replays; Deployment05
-passes fresh offline installation and the expected local 12-physical-core
-doctor rejection. Only a zero-finding Independent Review16 may accept the
-account-input state.
+Attempt39, Deployment05, and producer-side Pre-cloud12 are retained as the next
+rejected chain. Independent Review16 found two major account-independent gaps:
+COS response-stream lifecycle exceptions escaped the credential-redaction
+boundary, and active operating documents retained superseded identities and
+output guidance. The required successor is Build24 with formal Attempt40,
+representative calibration Attempt41, Deployment06, Pre-cloud13, and a zero-
+finding Independent Review17. The account-input state remains unaccepted until
+that review passes.
 Intermediate validation candidates are not approved formal producers. Capacity
 assessment, account configuration, procurement authorization, build
 portability, and formal execution remain separate gates.

@@ -113,9 +113,10 @@ Build portability（构建可移植性）以及正式矩阵执行都必须等真
 Attempt35 已保留 96/96 raw/review，部署 Attempt04 已通过全新离线安装与独立
 重放，但 Independent Review15 发现脱敏异常仍通过 Python `__context__` 保留
 凭据原文。Build22 因首次离线构建错误绑定空 UV cache 而作为失败构建收据保留，
-其外部根和日志不得覆盖。下一组闭合身份必须是 Build23/Attempt38/Attempt39、
-Deployment05、Pre-cloud12 与 Independent Review16；只有 Review16 零 finding
-才能进入账号输入阶段。Build17
+其外部根和日志不得覆盖。Build23/Attempt38/Attempt39、Deployment05 与
+Pre-cloud12 已被 Independent Review16 以两个 major finding 拒绝并保持不可变。
+下一组闭合身份必须是 Build24/Attempt40/Attempt41、Deployment06、Pre-cloud13
+与 Independent Review17；只有 Review17 零 finding 才能进入账号输入阶段。Build17
 validation candidate（验证候选）未闭合正式计划入口，不能作为正式 producer。
 
 ## 5. 不可变恢复边界

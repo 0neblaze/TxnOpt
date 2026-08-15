@@ -44,14 +44,13 @@ cloud purchase, public alpha, or manuscript submission.
   calibration, and offline deployment passed, but Independent Review Attempt15
   found that the redacted SDK exception retained its credential-bearing
   `__context__`. Build22 is retained as a failed build because its first offline
-  invocation bound an empty UV cache. Build23 is the clean successor and passes
-  its wheel, full test, property, sanitizer, soak, credential-context, and live
-  TLC gates. Attempt38 now binds 2,880 configs and 2,880 pre-run expected
-  identities, passes structural preflight, and retains an absent raw root and
-  launch claim. Attempt39 now retains 96/96 representative raw/review evidence;
-  Deployment05 passes fresh offline installation and replay; producer-side
-  Pre-cloud Attempt12 passes. Independent Review Attempt16 remains the final
-  account-independent adjudication.
+  invocation bound an empty UV cache. Build23 passed its producer gates, and
+  Attempts38/39, Deployment05, and producer-side Pre-cloud12 completed, but
+  Independent Review16 rejected that chain with two major findings: an unsafe
+  COS response-stream exception boundary and active-document chronology drift.
+  The required successor is Build24 with unexecuted formal Attempt40,
+  representative calibration Attempt41, Deployment06, Pre-cloud13, and a
+  zero-finding Independent Review17.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -369,11 +368,12 @@ unexecuted, Attempt35 retains 96/96 raw/review evidence, and deployment
 Attempt04 passes fresh offline installation and replay, but Independent Review
 Attempt15 records one major `__context__` credential-retention finding. Build22
 then failed before producing a wheel because its offline build bound an empty
-UV cache; that failure receipt remains append-only. Build23 is the completed
-clean producer. Attempt38 is the completed unexecuted formal plan; Attempt39,
-Deployment05, and producer-side Pre-cloud12 complete the account-independent
-producer sequence. Independent Review16 remains pending. The
-signed Review16 receipt, rather than this roadmap prose, controls acceptance.
+UV cache; that failure receipt remains append-only. Build23, the unexecuted
+formal Attempt38, representative Attempt39, Deployment05, and producer-side
+Pre-cloud12 are complete but rejected: Independent Review16 records two major
+findings. Build24/Attempt40/Attempt41, Deployment06, Pre-cloud13, and
+Independent Review17 are the required successor sequence. The signed Review17
+receipt, rather than this roadmap prose, controls acceptance.
 
 The only account-independent terminal state is
 `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`. It authorizes no Tencent API

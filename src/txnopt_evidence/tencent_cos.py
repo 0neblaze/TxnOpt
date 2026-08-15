@@ -676,9 +676,15 @@ class TencentCosArchive:
         digest = hashlib.sha256()
         size = 0
         collected = bytearray() if collect else None
+        read_error: TencentCosError | None = None
+        close_error: TencentCosError | None = None
         try:
             while True:
-                chunk = stream.read(1024 * 1024)
+                try:
+                    chunk = stream.read(1024 * 1024)
+                except Exception as error:
+                    read_error = _redacted_sdk_error("response_body.read", error)
+                    break
                 if chunk in {b"", ""}:
                     break
                 if not isinstance(chunk, bytes):
@@ -692,9 +698,16 @@ class TencentCosArchive:
                     if written != len(chunk):
                         raise OSError("Tencent COS restore write was incomplete")
         finally:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                close()
+            try:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+            except Exception as error:
+                close_error = _redacted_sdk_error("response_body.close", error)
+        if read_error is not None:
+            raise read_error
+        if close_error is not None:
+            raise close_error
         if size != ref.size or digest.hexdigest() != ref.sha256:
             raise ArchiveIntegrityError(
                 "Tencent COS object bytes differ from their exact version reference"
@@ -946,9 +959,23 @@ def _commit_from_payload(payload: object) -> TencentCosCommit:
 
 def _response_stream(response: Mapping[str, Any]) -> BinaryIO:
     body = response.get("Body")
-    raw_factory = getattr(body, "get_raw_stream", None)
-    stream = raw_factory() if callable(raw_factory) else body
-    if stream is None or not callable(getattr(stream, "read", None)):
+    stream: object = None
+    sdk_error: TencentCosError | None = None
+    try:
+        raw_factory = getattr(body, "get_raw_stream", None)
+        stream = raw_factory() if callable(raw_factory) else body
+    except Exception as error:
+        sdk_error = _redacted_sdk_error("response_body.get_raw_stream", error)
+    if sdk_error is not None:
+        raise sdk_error
+    readable = False
+    try:
+        readable = callable(getattr(stream, "read", None))
+    except Exception as error:
+        sdk_error = _redacted_sdk_error("response_body.read", error)
+    if sdk_error is not None:
+        raise sdk_error
+    if stream is None or not readable:
         raise ArchiveIntegrityError("Tencent COS response lacks a readable body")
     return cast(BinaryIO, stream)
 

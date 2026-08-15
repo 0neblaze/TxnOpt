@@ -5,15 +5,19 @@
 
 ## 1. 当前可使用的规划事实
 
-- 本地代表性校准的原容量模型使用 32 physical cores（物理核）、80% scheduler
-  efficiency（调度效率）和 25 个可用 core tokens（核心令牌）。
-- 对同一 Attempt25 p95 observation（第 95 百分位观测）按 64 个物理核心、80% 效率
-  重新计算，得到 51 个可用核心令牌和约 2,051.06 秒，即约 34.18 分钟/0.57 小时。
-- 该数字来自 Build14-bound Attempt25（绑定 Build14 的 Attempt25）本地证据，只能用于
-  采购前容量估计；它不是云端运行时间、SLA（服务等级协议）或报价。
+- 最近完成的本地代表性校准是 Build23-bound Attempt39（绑定 Build23 的 Attempt39）。
+  它使用 64 physical cores（物理核）、80% scheduler efficiency（调度效率）对应的
+  51 个可用 core tokens（核心令牌），预测 2,880-run matrix（2,880 次矩阵）约需
+  `2065.8231217279244` 秒，即约 34.43 分钟/0.57 小时。
+- Attempt39 的观测峰值 RSS 为 `244068352` 字节；真实主机仍必须用其 Linux 可见内存
+  重新计算 80% 余量门。
+- 这些数字来自被 Review16 拒绝的 Build23/Attempt39 前驱链，只能作为下一后继构建的
+  规划基线；它们不是云端运行时间、SLA（服务等级协议）、报价或账号接入授权。
 - Build portability（构建可移植性）仍为 **unverified（未验证）**。当前 wheel（轮子）
   在绑定环境可用，不代表能在另一 CPU、镜像、glibc、Python 或编译器组合上运行。
-- Attempt24 formal matrix（正式矩阵）未启动；本文件不授权采购或执行。
+- Attempt38 formal matrix（正式矩阵）未启动，raw root（原始结果根）与 launch claim
+  （启动声明）均不存在；本文件不授权采购或执行。Attempt24 保持为不可变的
+  Build14/protocol-v1 前驱，不能作为当前正式入口。
 
 ## 2. vCPU 与物理核
 
@@ -33,8 +37,10 @@
 或腾讯明确给出物理核心拓扑的专用实例。腾讯商品/API 规格内存必须至少 128 GB；
 Linux `MemTotal` 因平台保留略低于 128 GiB 不单独构成失败。真正的内存性能门是
 与所选正式 producer 绑定的校准峰值 RSS 必须低于目标主机实际可见内存的 80%。
-历史 Build16 对应 Attempt27；后继 Build18 对应 Attempt29，两者不得交叉重绑。公开
-规格、库存、地域和价格都不能替代购买时的带时间戳 API/控制台回执。
+历史 Build16/Attempt27、Build18/Attempt29 以及 Build23/Attempt39 均保持各自绑定，
+不得交叉重绑。Review16 拒绝 Build23 后，任何修复都必须使用新的 Build24、formal
+Attempt40 和 calibration Attempt41 身份。公开规格、库存、地域和价格都不能替代
+购买时的带时间戳 API/控制台回执。
 
 官方入口：
 

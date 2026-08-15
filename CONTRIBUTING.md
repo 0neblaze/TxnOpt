@@ -5,10 +5,13 @@ evidence contracts.
 
 ## Before changing code
 
-1. Read `AGENTS.md` and the relevant stage protocol.
+1. Read `AGENTS.md` and the active TxnOpt protocol. Use a frozen Stage protocol
+   only when performing an explicitly read-only historical replay.
 2. Do not edit frozen baselines, accepted raw evidence, or historical hashes.
 3. Use a new canonical run label for every failed, repeated, or superseding run.
-4. Keep large generated output under ignored `results/`.
+4. Keep formal output under an explicit governed external root. Local scratch
+   output belongs under the tree-scoped XDG state root, never repository-local
+   `results/`.
 5. Add tests at a public behavior boundary before changing formal behavior.
 
 ## Local checks
@@ -21,8 +24,10 @@ uv run mypy
 git diff --check
 ```
 
-Run the complete test suite only after supplying the external Schneider data
-and historical comparison input documented in the relevant test or stage.
+The active TxnOpt test suite is self-contained and must run with zero skipped
+tests in the locked build environment. Historical compatibility checks use
+their frozen fixtures and may not turn external Stage data into an active
+runtime dependency.
 
 ## Pull requests
 

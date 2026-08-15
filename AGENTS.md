@@ -106,7 +106,9 @@ txnopt -> never cases/evidence/legacy
   logical-thread count is not physical-core evidence. Tencent `CoreCount=64`,
   `ThreadPerCore=1`, and the in-instance Linux topology probe must all pass.
   Linux-visible `MemTotal` is observational rather than an admission gate; the
-  Attempt27 peak RSS must remain below 80% of that visible memory.
+  peak RSS from the calibration attempt bound to the selected producer must
+  remain below 80% of that visible memory. Never reuse a predecessor build's
+  RSS receipt for a successor build.
 - Do not reintroduce a generic `ArchiveStore`, local archive backend, or S3
   compatibility adapter. The active cloud archive module is the concrete
   Tencent COS integration; local code may inventory source bytes but is not an

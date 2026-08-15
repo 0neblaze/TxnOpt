@@ -15,25 +15,22 @@ representative calibration Attempt35, deployment Attempt04, and Pre-cloud11 are
 also retained as rejected evidence: Independent Review15 found that redacted
 SDK errors still retained credential material through Python `__context__`.
 Build22 is retained as a failed build because its first offline invocation
-bound an empty UV cache. Build23 is the clean successor: its wheel surface,
-368 installed-wheel tests, five fixed-seed property suites, both sanitizer
-smokes, 100,000-round soak, credential-context adversarial tests, and live TLC
-all pass. External formal plan Attempt38 now binds 2,880 configs and 2,880
-pre-run expected identities, passes structural preflight, and keeps its raw
-root and launch claim absent. Representative calibration Attempt39 now retains
-96 raw bundles and 96 independent reviews, all 12 fixed-work parity groups
-match, and its 51-token capacity estimate is about 2,066 seconds. Deployment
-Attempt05 passes fresh offline installation, 368 zero-skip tests, byte-identical
-replay, and the expected local 12-physical-core doctor rejection. Producer-side
-Pre-cloud12 passes; Independent Review16 remains the sole account-independent
-adjudication. Attempt38 requires at least 64
+bound an empty UV cache. Build23 passed its producer gates; external formal
+Attempt38 remains unexecuted, representative Attempt39 retains 96/96 raw and
+independent review bundles, Deployment05 passes offline validation, and
+producer-side Pre-cloud12 passes. Independent Review16 nevertheless rejects
+that chain with two major findings: COS response-stream exceptions escaped the
+credential-redaction boundary, and active documentation retained superseded
+operating identities. Build24/Attempt40/Attempt41, Deployment06, Pre-cloud13,
+and Independent Review17 are the required successor sequence. Attempt40
+requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
 Attempt35 retains its rejected predecessor evidence, while the Attempt34 formal
 raw root and launch claim remain absent. The Build21 deployment Attempt04 is
 offline-only and records the expected local 12-physical-core doctor failure.
-Only a zero-finding Review16 may accept the Build23 successor; none of these
+Only a zero-finding Review17 may accept the Build24 successor; none of these
 artifacts authorizes cloud access or Level 1 readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
@@ -106,11 +103,10 @@ Build14/Attempt24, Build18/Attempt28, and Build19/Attempt30 remain historical,
 byte-preserved predecessor chains. Build20/Attempt32 is also retained and
 unexecuted after failed Review14. Build21/Attempt34 remains a rejected formal
 predecessor; its structural preflight passes while its raw root and launch
-claim remain absent. Build23/Attempt38 is the current clean formal identity;
-Attempt38 has been materialized and independently preflighted, while its raw
+claim remain absent. Build23/Attempt38 is a retained rejected formal identity;
+Attempt38 was materialized and independently preflighted, while its raw
 root and launch claim remain absent.
-All four predecessor
-preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
+All retained predecessor preflights are `PASS_NOT_AUTHORIZED_TO_EXECUTE`;
 holdouts and cloud purchase remain closed, and no launch claim or raw root
 exists. New execution rejects protocol-v1 plans and any build/attempt pair not
 present in the closed successor registry.
