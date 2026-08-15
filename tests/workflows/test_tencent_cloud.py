@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +30,37 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class _CamRoleSdkError(RuntimeError):
     """Synthetic Tencent SDK failure containing non-environment credentials."""
+
+
+def _raise_nested_credential_error(*secrets: str) -> None:
+    try:
+        raise _CamRoleSdkError("nested credential material " + " ".join(secrets))
+    except _CamRoleSdkError as nested:
+        raise _CamRoleSdkError(
+            "outer credential material " + " ".join(reversed(secrets))
+        ) from nested
+
+
+def _failing_credential_module(stage: str, secrets: tuple[str, ...]) -> object:
+    class Credential:
+        def __init__(self, *_args: object) -> None:
+            if stage == "environment_constructor":
+                _raise_nested_credential_error(*secrets)
+
+    class CVMRoleCredential:
+        def __init__(self) -> None:
+            if stage == "role_constructor":
+                _raise_nested_credential_error(*secrets)
+
+        def get_credential(self) -> object:
+            if stage == "role_fetch":
+                _raise_nested_credential_error(*secrets)
+            return object()
+
+    return SimpleNamespace(
+        Credential=Credential,
+        CVMRoleCredential=CVMRoleCredential,
+    )
 
 
 def test_host_activity_scan_excludes_doctor_process_ancestry() -> None:
@@ -650,6 +682,107 @@ def test_tencent_cvm_sdk_errors_drop_untrusted_cam_role_message() -> None:
 
     assert "_CamRoleSdkError" in message
     assert cam_role_secret not in message
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["environment_constructor", "role_constructor", "role_fetch"],
+)
+def test_tencent_cvm_credential_acquisition_drops_untrusted_sdk_body(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = (
+        "synthetic-cvm-secret-id",
+        "synthetic-cvm-secret-key",
+        "synthetic-cvm-session-token",
+    )
+    monkeypatch.setattr(
+        tencent_cloud.importlib.metadata,
+        "version",
+        lambda _distribution: "3.1.156",
+    )
+    monkeypatch.setattr(
+        tencent_cloud.importlib,
+        "import_module",
+        lambda _module: _failing_credential_module(stage, secrets),
+    )
+    for variable in (
+        "TENCENTCLOUD_SECRET_ID",
+        "TENCENTCLOUD_SECRET_KEY",
+        "TENCENTCLOUD_SESSION_TOKEN",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    if stage == "environment_constructor":
+        monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secrets[0])
+        monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", secrets[1])
+        monkeypatch.setenv("TENCENTCLOUD_SESSION_TOKEN", secrets[2])
+
+    with pytest.raises(RuntimeError) as caught:
+        tencent_cloud._TencentCvmSdkBridge.from_environment_or_cvm_role()
+
+    serialized = str(caught.value)
+    assert "_CamRoleSdkError" in serialized
+    assert all(secret not in serialized for secret in secrets)
+    assert caught.value.__cause__ is None
+
+
+def test_cli_drops_untrusted_cvm_credential_acquisition_body(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = (
+        "synthetic-role-secret-id",
+        "synthetic-role-secret-key",
+        "synthetic-role-session-token",
+    )
+    monkeypatch.setattr(
+        tencent_cloud.importlib.metadata,
+        "version",
+        lambda _distribution: "3.1.156",
+    )
+    monkeypatch.setattr(
+        tencent_cloud.importlib,
+        "import_module",
+        lambda _module: _failing_credential_module("role_fetch", secrets),
+    )
+    for variable in (
+        "TENCENTCLOUD_SECRET_ID",
+        "TENCENTCLOUD_SECRET_KEY",
+        "TENCENTCLOUD_SESSION_TOKEN",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    assert main(
+        [
+            "cloud",
+            "tencent",
+            "dry-run",
+            "--region",
+            "ap-test",
+            "--zone",
+            "ap-test-1",
+            "--instance-type",
+            "TEST.64CORE128GB",
+            "--image-id",
+            "img-test",
+            "--vpc-id",
+            "vpc-test",
+            "--subnet-id",
+            "subnet-test",
+            "--security-group-id",
+            "sg-test",
+            "--request-output",
+            str(tmp_path / "request.json"),
+            "--receipt-output",
+            str(tmp_path / "receipt.json"),
+        ]
+    ) == 2
+
+    serialized = capsys.readouterr().err
+    assert "_CamRoleSdkError" in serialized
+    assert all(secret not in serialized for secret in secrets)
 
 
 def test_cli_does_not_serialize_untrusted_cvm_sdk_message(

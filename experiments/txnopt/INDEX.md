@@ -2,7 +2,7 @@
 
 | Protocol | Status | Scope | Raw evidence | Independent review |
 | --- | --- | --- | --- | --- |
-| `txnopt-level1-protocol-v2` | Build19/Attempt30/31/Pre-cloud09 and failed Review13 are immutable predecessors; Build20/Attempt32/33/Pre-cloud10 is the completed producer-side successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt33 retains 96/96 representative raw/review bundles; Attempt32 remains unexecuted and its raw root is absent | Review14 is the authoritative adjudication; zero findings are required before account input |
+| `txnopt-level1-protocol-v2` | Build19 and Build20 chains plus failed Reviews13/14 are immutable predecessors; Build21/Attempt34/35/Pre-cloud11 is the closed successor | 12 EVRPTW + 24 RCPSP, 10 seeds; minimum 64 physical cores and provider-reported 128 GB | Attempt33 retains 96/96 representative raw/review bundles; Attempt32 remains unexecuted; Attempt34/35 require fresh Build21 evidence | Review15 is the next authoritative adjudication; zero findings are required before account input |
 | `txnopt-level1-protocol-v1` | Immutable Build14 / Attempt24 predecessor | 12 EVRPTW + 24 RCPSP, 10 seeds | Attempt25 retains 96/96 representative raw/review bundles; Attempt24 remains unexecuted | Attempt11 and pre-cloud Attempt07 remain immutable prior decisions and do not authorize Build18 |
 | Level 2 | gated | unopened | none | none |
 | Level 3 | gated | unopened | none | none |
@@ -27,11 +27,14 @@ Pre-cloud Attempt08 recorded an account-ready candidate but Independent Review
 Attempt12 subsequently found four major gaps, so Attempt08 cannot authorize or
 support a final account-ready claim. Build19 fixed those four findings, but
 Review13 found three further major gaps and rejected Pre-cloud09. Build20 with
-Attempt32/33, offline deployment Attempt03, and producer-side Pre-cloud10 is the
-closed successor identity; Review14 is its authoritative decision. Attempt33
+Attempt32/33, offline deployment Attempt03, and producer-side Pre-cloud10 is
+also retained: Review14 found one remaining CVM credential-acquisition exception
+leak. Attempt33
 retains 96 raw bundles and 96 independent reviews, all 12 fixed-work parity
 groups match, and its 51-token capacity estimate is about 2,045 seconds.
-Attempt32 remains unexecuted with no launch claim or raw root. None of these
+Attempt32 remains unexecuted with no launch claim or raw root. Build21 with
+Attempt34/35 and Pre-cloud11 is the next closed source identity; Review15 is its
+authoritative decision. None of these
 artifacts authorizes an API call, purchase, instance, COS bucket, formal matrix,
 holdout, Level 1 claim, or release.
 

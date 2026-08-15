@@ -272,13 +272,22 @@ class _TencentCvmSdkBridge:
         token = os.environ.get("TENCENTCLOUD_SESSION_TOKEN")
         dynamic = cast(Any, credential_module)
         if secret_id and secret_key:
-            credential = dynamic.Credential(secret_id, secret_key, token)
+            operation = "environment credential construction"
         elif secret_id or secret_key or token:
             raise RuntimeError("Tencent credential environment is incomplete")
         else:
-            credential = dynamic.CVMRoleCredential().get_credential()
-            if credential is None:
-                raise RuntimeError("Tencent environment credentials and CVM CAM role are absent")
+            operation = "CVM CAM role credential acquisition"
+        try:
+            if secret_id and secret_key:
+                credential = dynamic.Credential(secret_id, secret_key, token)
+            else:
+                credential = dynamic.CVMRoleCredential().get_credential()
+        except Exception as error:
+            raise RuntimeError(
+                _redacted_sdk_error(error, operation=operation)
+            ) from None
+        if credential is None:
+            raise RuntimeError("Tencent environment credentials and CVM CAM role are absent")
         return cls(credential)
 
     def run_instances(

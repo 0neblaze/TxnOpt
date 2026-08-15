@@ -139,9 +139,11 @@ must report peak RSS below 80% of actual visible memory. The closed historical
 pairings are Build16/Attempt26/Attempt27, Build18/Attempt28/Attempt29, and the
 rejected Build19/Attempt30/Attempt31 chain. Independent Review13 found three
 major account-independent gaps. Build20, formal plan Attempt32, representative
-calibration Attempt33, and producer-side Pre-cloud10 now form the closed
-successor identity; Independent Review14 controls whether it may support the
-account-input state and must report zero findings. Intermediate validation
+calibration Attempt33, and producer-side Pre-cloud10 are retained as the next
+rejected chain: Independent Review14 found one remaining CVM credential-
+acquisition exception leak. The closed successor is Build21/Attempt34/Attempt35;
+Pre-cloud11 and Independent Review15 must report zero findings before the
+account-input state. Intermediate validation
 candidates are not approved formal producers. Capacity assessment, account
 configuration, procurement authorization, build portability, and formal
 execution remain separate gates.
