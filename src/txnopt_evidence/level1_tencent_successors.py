@@ -68,6 +68,14 @@ _SUCCESSORS = {
                 "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY"
             ),
         ),
+        TencentLevel1Successor(
+            build_number=22,
+            formal_attempt=36,
+            calibration_attempt=37,
+            build_status=(
+                "BUILD_COMPLETE_TENCENT_PRECLOUD_REVIEW_SUCCESSOR_NOT_LEVEL1_READY"
+            ),
+        ),
     )
 }
 

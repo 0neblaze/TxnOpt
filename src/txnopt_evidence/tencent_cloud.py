@@ -277,15 +277,19 @@ class _TencentCvmSdkBridge:
             raise RuntimeError("Tencent credential environment is incomplete")
         else:
             operation = "CVM CAM role credential acquisition"
+        credential: object | None = None
+        credential_error: RuntimeError | None = None
         try:
             if secret_id and secret_key:
                 credential = dynamic.Credential(secret_id, secret_key, token)
             else:
                 credential = dynamic.CVMRoleCredential().get_credential()
         except Exception as error:
-            raise RuntimeError(
+            credential_error = RuntimeError(
                 _redacted_sdk_error(error, operation=operation)
-            ) from None
+            )
+        if credential_error is not None:
+            raise credential_error
         if credential is None:
             raise RuntimeError("Tencent environment credentials and CVM CAM role are absent")
         return cls(credential)
@@ -297,6 +301,8 @@ class _TencentCvmSdkBridge:
         request: dict[str, object],
     ) -> Mapping[str, object]:
         _validate_dry_run_payload(request)
+        payload: object = None
+        request_error: RuntimeError | None = None
         try:
             cvm_client = cast(
                 Any,
@@ -313,9 +319,11 @@ class _TencentCvmSdkBridge:
             )
             payload = json.loads(response.to_json_string())
         except Exception as error:
-            raise RuntimeError(
+            request_error = RuntimeError(
                 _redacted_sdk_error(error, operation="RunInstances DryRun")
-            ) from None
+            )
+        if request_error is not None:
+            raise request_error
         if not isinstance(payload, dict):
             raise RuntimeError("Tencent CVM DryRun response is not a JSON object")
         return cast(dict[str, object], payload)
@@ -327,6 +335,8 @@ class _TencentCvmSdkBridge:
         zone: str,
         instance_type: str,
     ) -> Mapping[str, object]:
+        payload: object = None
+        request_error: RuntimeError | None = None
         try:
             cvm_client = cast(
                 Any,
@@ -354,12 +364,14 @@ class _TencentCvmSdkBridge:
             ).DescribeZoneInstanceConfigInfos(sdk_request)
             payload = json.loads(response.to_json_string())
         except Exception as error:
-            raise RuntimeError(
+            request_error = RuntimeError(
                 _redacted_sdk_error(
                     error,
                     operation="DescribeZoneInstanceConfigInfos",
                 )
-            ) from None
+            )
+        if request_error is not None:
+            raise request_error
         if not isinstance(payload, dict):
             raise RuntimeError("Tencent CVM instance-config response is not a JSON object")
         items = payload.get("InstanceTypeQuotaSet")

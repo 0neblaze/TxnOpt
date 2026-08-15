@@ -108,11 +108,13 @@ Build portability（构建可移植性）以及正式矩阵执行都必须等真
 只允许 Attempt30/31，但其 Independent Review13 以三个 major finding（重大问题）
 拒绝最终云前状态。Build20/Attempt32/Attempt33 及 producer-side Pre-cloud10
 也被 Independent Review14 以一个 CVM credential-acquisition exception leak
-（云服务器凭据获取异常泄漏）拒绝。修复后的闭合后继身份是
-Build21/Attempt34/Attempt35：Attempt34 的 2,880-run 正式 raw root 与 launch
-claim 保持不存在，Attempt35 已保留 96/96 raw/review，部署 Attempt04 已通过
-全新离线安装与独立重放。只有 Pre-cloud11 与 Independent Review15 零 finding
-才能进入账号输入阶段。Build17
+（云服务器凭据获取异常泄漏）拒绝。Build21/Attempt34/Attempt35 也作为不可变
+拒绝链保留：Attempt34 的 2,880-run 正式 raw root 与 launch claim 保持不存在，
+Attempt35 已保留 96/96 raw/review，部署 Attempt04 已通过全新离线安装与独立
+重放，但 Independent Review15 发现脱敏异常仍通过 Python `__context__` 保留
+凭据原文。下一组闭合身份必须是 Build22/Attempt36/Attempt37、Deployment05、
+Pre-cloud12 与 Independent Review16；只有 Review16 零 finding 才能进入账号输入
+阶段。Build17
 validation candidate（验证候选）未闭合正式计划入口，不能作为正式 producer。
 
 ## 5. 不可变恢复边界

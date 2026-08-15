@@ -5,6 +5,7 @@ import io
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO, cast
 
 import pytest
@@ -163,6 +164,39 @@ class _ExplodingSdkClient:
         raise _ExplodingSdkError(self._message)
 
 
+def _raise_nested_sdk_secret(*secrets: str) -> None:
+    try:
+        raise _ExplodingSdkError("nested credential material " + " ".join(secrets))
+    except _ExplodingSdkError as nested:
+        raise _ExplodingSdkError(
+            "outer credential material " + " ".join(reversed(secrets))
+        ) from nested
+
+
+def _failing_cos_modules(stage: str, secrets: tuple[str, ...]) -> dict[str, object]:
+    class CosConfig:
+        def __init__(self, **_kwargs: object) -> None:
+            if stage in {"environment_config", "role_config"}:
+                _raise_nested_sdk_secret(*secrets)
+
+    class CosS3Client:
+        def __init__(self, _config: object) -> None:
+            raise AssertionError("the failing COS config must not create a client")
+
+    class CVMRoleCredential:
+        def __init__(self) -> None:
+            if stage == "role_constructor":
+                _raise_nested_sdk_secret(*secrets)
+
+    return {
+        "qcloud_cos": SimpleNamespace(CosConfig=CosConfig, CosS3Client=CosS3Client),
+        "qcloud_cos.version": SimpleNamespace(__version__="5.1.9.44"),
+        "tencentcloud.common.credential": SimpleNamespace(
+            CVMRoleCredential=CVMRoleCredential
+        ),
+    }
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -229,6 +263,8 @@ def test_tencent_cos_sdk_errors_redact_environment_credentials(
     assert secret_id not in message
     assert secret_key not in message
     assert session_token not in message
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_tencent_cos_sdk_errors_drop_untrusted_cam_role_message() -> None:
@@ -245,6 +281,64 @@ def test_tencent_cos_sdk_errors_drop_untrusted_cam_role_message() -> None:
     message = str(raised.value)
     assert "_ExplodingSdkError" in message
     assert cam_role_secret not in message
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("stage", "use_cvm_role"),
+    [
+        ("environment_config", False),
+        ("role_constructor", True),
+        ("role_config", True),
+    ],
+)
+def test_tencent_cos_credential_initialization_detaches_secret_exception_context(
+    stage: str,
+    use_cvm_role: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = (
+        "synthetic-cos-secret-id",
+        "synthetic-cos-secret-key",
+        "synthetic-cos-session-token",
+    )
+    modules = _failing_cos_modules(stage, secrets)
+    monkeypatch.setattr(
+        "txnopt_evidence.tencent_cos.importlib.metadata.version",
+        lambda _distribution: "1.9.44"
+        if _distribution == "cos-python-sdk-v5"
+        else "3.1.156",
+    )
+    monkeypatch.setattr(
+        "txnopt_evidence.tencent_cos.importlib.import_module",
+        lambda module: modules[module],
+    )
+    for variable in (
+        "TENCENTCLOUD_SECRET_ID",
+        "TENCENTCLOUD_SECRET_KEY",
+        "TENCENTCLOUD_SESSION_TOKEN",
+        "TENCENTCLOUD_USE_CVM_ROLE",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    if use_cvm_role:
+        monkeypatch.setenv("TENCENTCLOUD_USE_CVM_ROLE", "1")
+    else:
+        monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", secrets[0])
+        monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", secrets[1])
+        monkeypatch.setenv("TENCENTCLOUD_SESSION_TOKEN", secrets[2])
+
+    with pytest.raises(TencentCosError) as raised:
+        TencentCosArchive.from_environment(
+            bucket="txnopt-evidence-1250000000",
+            region="ap-test",
+        )
+
+    serialized = str(raised.value)
+    assert "_ExplodingSdkError" in serialized
+    assert all(secret not in serialized for secret in secrets)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_tencent_cos_binds_every_read_to_exact_version_id() -> None:

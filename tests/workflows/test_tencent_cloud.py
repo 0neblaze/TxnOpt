@@ -725,6 +725,7 @@ def test_tencent_cvm_credential_acquisition_drops_untrusted_sdk_body(
     assert "_CamRoleSdkError" in serialized
     assert all(secret not in serialized for secret in secrets)
     assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_cli_drops_untrusted_cvm_credential_acquisition_body(

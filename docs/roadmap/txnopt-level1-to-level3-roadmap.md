@@ -38,11 +38,13 @@ cloud purchase, public alpha, or manuscript submission.
   findings. Independent Review Attempt13 is also retained as `NEEDS_WORK`: it
   found three major gaps in the Build19 sequence. Build20, Attempt32, Attempt33,
   and Pre-cloud Attempt10 are retained after Independent Review Attempt14 found
-  one remaining CVM credential-acquisition exception leak. The next closed
-  sequence is Build21, Attempt34, Attempt35, and Pre-cloud Attempt11. Its clean
-  build, unexecuted 2,880-config plan, 96-run representative calibration, and
-  offline deployment evidence are complete; Independent Review Attempt15 must
-  report zero findings before account input.
+  one remaining CVM credential-acquisition exception leak. Build21, Attempt34,
+  Attempt35, and Pre-cloud Attempt11 are also retained as rejected evidence:
+  their clean build, unexecuted 2,880-config plan, 96-run representative
+  calibration, and offline deployment passed, but Independent Review Attempt15
+  found that the redacted SDK exception retained its credential-bearing
+  `__context__`. The required successor sequence is Build22, Attempt36,
+  Attempt37, Deployment05, Pre-cloud Attempt12, and Independent Review Attempt16.
 - Legacy source freeze commit: `3b0cf371759f3465c7264b85894d090004f3cf43`.
 - Legacy freeze tag: `stage052-legacy-freeze-v1`.
 - The label deliberately says `freeze`, not `correctness`: the historical
@@ -354,12 +356,14 @@ them. Build20, formal plan Attempt32, representative calibration Attempt33,
 and producer-side Pre-cloud Attempt10 are immutable rejected successor evidence.
 Independent Review Attempt14 records one major CVM credential-acquisition
 exception leak without rewriting them. Build21, formal plan Attempt34,
-representative calibration Attempt35, and Pre-cloud Attempt11 are the current
-append-only sequence. Attempt34 remains unexecuted, Attempt35 retains 96/96
-raw/review evidence, and deployment Attempt04 passes fresh offline installation
-and replay. Independent Review Attempt15 is the next account-
-independent adjudication; its signed receipt,
-rather than this roadmap prose, controls acceptance.
+representative calibration Attempt35, deployment Attempt04, and Pre-cloud
+Attempt11 form the next immutable rejected sequence. Attempt34 remains
+unexecuted, Attempt35 retains 96/96 raw/review evidence, and deployment
+Attempt04 passes fresh offline installation and replay, but Independent Review
+Attempt15 records one major `__context__` credential-retention finding. The
+required append-only successor is Build22/Attempt36/Attempt37/Deployment05/
+Pre-cloud12/Independent Review16. The signed Review16 receipt, rather than this
+roadmap prose, controls acceptance.
 
 The only account-independent terminal state is
 `READY_FOR_TENCENT_ACCOUNT_INPUT_NOT_AUTHORIZED`. It authorizes no Tencent API

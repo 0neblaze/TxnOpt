@@ -310,20 +310,32 @@ class TencentCosArchive:
                 raise TencentCosContractError(
                     "Tencent common SDK is required for a CVM CAM role"
                 ) from error
+            credential_instance: object | None = None
+            credential_error: TencentCosError | None = None
             try:
-                config_arguments["CredentialInstance"] = credential_module.CVMRoleCredential()
+                credential_instance = credential_module.CVMRoleCredential()
             except Exception as error:
-                raise _redacted_sdk_error("CVM CAM role credential", error) from None
+                credential_error = _redacted_sdk_error(
+                    "CVM CAM role credential",
+                    error,
+                )
+            if credential_error is not None:
+                raise credential_error
+            config_arguments["CredentialInstance"] = credential_instance
         else:
             config_arguments["SecretId"] = secret_id
             config_arguments["SecretKey"] = secret_key
             if token:
                 config_arguments["Token"] = token
+        client: Any = None
+        client_error: TencentCosError | None = None
         try:
             config = config_factory(**config_arguments)
             client = client_factory(config)
         except Exception as error:
-            raise _redacted_sdk_error("client initialization", error) from None
+            client_error = _redacted_sdk_error("client initialization", error)
+        if client_error is not None:
+            raise client_error
         return cls(
             _QcloudCosSdkBridge(client),
             bucket=bucket,
@@ -811,23 +823,29 @@ class _QcloudCosSdkBridge:
         return cast(Mapping[str, Any], comm_module.xml_to_dict(response.content))
 
     def object_exists(self, **kwargs: object) -> bool:
+        exists = True
+        sdk_error: TencentCosError | None = None
         try:
             self._client.head_object(**kwargs)
         except Exception as error:
+            status_code: object = None
+            status_sdk_error: TencentCosError | None = None
             try:
                 status_code = getattr(error, "get_status_code", lambda: None)()
             except Exception as status_error:
-                raise _redacted_sdk_error(
+                status_sdk_error = _redacted_sdk_error(
                     "object_exists status",
                     status_error,
-                ) from None
-            if status_code == 404:
-                return False
-            raise _redacted_sdk_error(
-                "object_exists",
-                error,
-            ) from None
-        return True
+                )
+            if status_sdk_error is not None:
+                sdk_error = status_sdk_error
+            elif status_code == 404:
+                exists = False
+            else:
+                sdk_error = _redacted_sdk_error("object_exists", error)
+        if sdk_error is not None:
+            raise sdk_error
+        return exists
 
     def _call(
         self,
@@ -835,10 +853,15 @@ class _QcloudCosSdkBridge:
         method: Callable[..., _SdkResult],
         **kwargs: object,
     ) -> _SdkResult:
+        result: _SdkResult | None = None
+        sdk_error: TencentCosError | None = None
         try:
-            return method(**kwargs)
+            result = method(**kwargs)
         except Exception as error:
-            raise _redacted_sdk_error(operation, error) from None
+            sdk_error = _redacted_sdk_error(operation, error)
+        if sdk_error is not None:
+            raise sdk_error
+        return cast(_SdkResult, result)
 
 
 def encode_tencent_cos_commit(commit: TencentCosCommit) -> bytes:

@@ -10,21 +10,21 @@ Pre-cloud Attempt09. Independent Review13 rejected its final account-ready
 claim with three major findings. Build20, external formal plan Attempt32,
 representative calibration Attempt33, deployment Attempt03, and producer-side
 Pre-cloud10 are retained after Independent Review14 found one remaining CVM
-credential-acquisition exception leak. The closed successor is Build21,
-external formal plan Attempt34, representative calibration Attempt35,
-Pre-cloud11, and Independent Review15. Attempt34 requires at least 64
+credential-acquisition exception leak. Build21, external formal plan Attempt34,
+representative calibration Attempt35, deployment Attempt04, and Pre-cloud11 are
+also retained as rejected evidence: Independent Review15 found that redacted
+SDK errors still retained credential material through Python `__context__`.
+The required successor is Build22, external formal plan Attempt36,
+representative calibration Attempt37, deployment Attempt05, Pre-cloud12, and
+Independent Review16. Attempt36 requires at least 64
 physical cores, `CoreCount=64`, `ThreadPerCore=1`, and provider-reported memory
 of at least 128 GB; Linux-visible memory is observational rather than a 128-GiB
 admission threshold. Region has no default and remains a mandatory live input.
 Attempt35 retains 96 raw bundles and 96 independent reviews, while the Attempt34
 formal raw root and launch claim remain absent. The Build21 deployment Attempt04
-is offline-only, contains no credentials or region, exposes no `DryRun=false`
-instance-creation path, installs the locked wheel in a fresh directory, passes
-363 tests without skips, reproduces one independent review byte-for-byte, and
-records the expected local 12-physical-core doctor failure. Pre-cloud Attempt11
-is the producer-side candidate decision. Only a zero-finding Review15 may accept
-the Build21 successor; none of these artifacts authorizes cloud access or Level
-1 readiness.
+is offline-only and records the expected local 12-physical-core doctor failure.
+Only a zero-finding Review16 may accept the Build22 successor; none of these
+artifacts authorizes cloud access or Level 1 readiness.
 
 Level 1 holdout access is forbidden. Every failed attempt keeps its raw
 evidence under a fresh TxnOpt run label; no historical Stage label is reused.
