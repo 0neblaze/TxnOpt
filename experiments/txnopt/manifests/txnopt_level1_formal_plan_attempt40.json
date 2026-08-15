@@ -1,0 +1,66 @@
+{
+  "claim_boundary": {
+    "cloud_account_configured": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "live_dry_run_completed": false,
+    "region_selected": false
+  },
+  "created_at_utc": "2026-08-15T07:45:54Z",
+  "plan": {
+    "analysis_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt40/analysis-protocol.json",
+    "analysis_schema_version": "txnopt-level1-analysis-protocol-v2",
+    "analysis_sha256": "a9ff24a4f9c1662232e48ab1f7b327f594b81207395a5c31d16dc3a814cd2e15",
+    "attempt": 40,
+    "config_count": 2880,
+    "config_tree_sha256": "8807056dfcac805123a8f6324963536001d5b4911518ada98ba870acb4e8c0de",
+    "expected_identity_count": 2880,
+    "expected_identity_tree_sha256": "1c04524f5266eed60e8ab8d3de9f8e8c8e325c48f666e59ccbe8fae41de3dd6e",
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt40/manifest.json",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build24-attempt40",
+    "schema_version": "txnopt-level1-campaign-plan-v2",
+    "sha256": "bfeafc89926b3f6d664a930f4c153fc28cab6350bf92e1109ac9d1b965b0d574"
+  },
+  "preflight": {
+    "active_target_process_count": 0,
+    "atomic_launch_claim_absent": true,
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt40/preflight.json",
+    "raw_output_root_absent": true,
+    "sha256": "d656c8d5914ddd0bd5a8467656d363b410217e63b152e2e0821d19836a3f0a43",
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE"
+  },
+  "producer_build": {
+    "build": "Build24",
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt24.json",
+    "manifest_sha256": "4642ff97f41f4425331631ed617eca927e5e47cdd6c16556a0137bbbc4708e43",
+    "native_sha256": "de598275f37e4788c2ceb540fa1de5b655ee1f6b34f93de49afd959599ba8788",
+    "source_manifest_sha256": "c79a96085016737ba05e33107624b5a2727b5c58dfe5d5fd57be2703909180a3",
+    "source_revision": "d1939e2b327e2d83e0c2bada809ae508b0153338",
+    "source_tree": "6a40471fc2b36218dc47e5f810dcc961fc644ef8",
+    "wheel_sha256": "8527b5c65f88832fd8c5dcfb37660c78f9a3fee7c5660375f0aa7ca3572d15d3"
+  },
+  "protocol": {
+    "path": "experiments/txnopt/level1-protocol-v2.json",
+    "schema_version": "txnopt-level1-protocol-v2",
+    "sha256": "593299c4c4fe2f9160844777097f4cf21ee803a6614e6270d5aadff53f7fccd2"
+  },
+  "resource_contract": {
+    "attempt41_peak_rss_fraction_max": 0.8,
+    "core_count": 64,
+    "exclusive_linux_required": true,
+    "linux_visible_memory_is_admission_gate": false,
+    "maximum_consecutive_window_days": 14,
+    "minimum_physical_cores": 64,
+    "minimum_provider_memory_gb": 128,
+    "predicted_completion_days_max": 10,
+    "region": null,
+    "region_required_live_input": true,
+    "thread_per_core": 1
+  },
+  "run_label": "txnopt_level1_formal_plan_attempt40",
+  "schema_version": "txnopt-level1-formal-plan-index-v1",
+  "status": "PLANNED_NOT_STARTED_NOT_AUTHORIZED"
+}
