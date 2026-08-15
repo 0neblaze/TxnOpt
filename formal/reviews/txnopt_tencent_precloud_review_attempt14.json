@@ -1,0 +1,141 @@
+{
+  "schema_version": "txnopt-tencent-precloud-independent-review-v1",
+  "run_label": "txnopt_tencent_precloud_review_attempt14",
+  "status": "NEEDS_WORK",
+  "completed_at_utc": "2026-08-15T01:20:05Z",
+  "review_scope": {
+    "reviewed_revision": "d9fd1f24ef5655f570f3f551e91b9592efe4ab87",
+    "reviewed_tree": "d80b183c741a755d8009d070e30c2bbec7b58fe8",
+    "standards_review_checkout": "/home/oneblaze/txnopt-audits/review14-standards-d9fd1f2-fresh",
+    "spec_review_checkout": "/home/oneblaze/txnopt-review14-spec-1786755265146/repo",
+    "producer_build": "Build20",
+    "formal_plan_attempt": 32,
+    "local_calibration_attempt": 33,
+    "precloud_attempt": 10,
+    "deployment_attempt": 3,
+    "cloud_account_used": false,
+    "live_cloud_request_sent": false,
+    "e_drive_written_or_deleted": false
+  },
+  "reviewer_independence": {
+    "standards_axis_agent": "review13_standards",
+    "spec_axis_agent": "review13_spec",
+    "fixed_fresh_clone_per_axis": true,
+    "independent_venv_per_axis": true,
+    "producer_process_reused": false,
+    "mutable_producer_cache_reused": false,
+    "reviewer_imports_runner": false,
+    "review_artifact_written_by_axis_agents": false
+  },
+  "independent_evidence": {
+    "build20_git_blob_count": 283,
+    "build20_git_blob_mismatch_count": 0,
+    "wheel_entry_count": 71,
+    "wheel_record_row_count": 71,
+    "formal_plan_config_count": 2880,
+    "formal_plan_expected_identity_count": 2880,
+    "formal_plan_tree_recomputation": "PASS",
+    "formal_raw_root_absent": true,
+    "atomic_launch_claim_absent": true,
+    "calibration_raw_count": 96,
+    "calibration_review_count": 96,
+    "calibration_sidecar_match_count": 576,
+    "independent_replay_process_count": 96,
+    "independent_replay_byte_identical_count": 96,
+    "fixed_work_parity_group_count": 12,
+    "prefix_safety_pass_count": 96,
+    "refinement_pass_count": 96,
+    "native_round_observation_count": 164,
+    "positive_cmax_count": 96,
+    "fallback_count": 0,
+    "peak_rss_bytes": 243142656,
+    "capacity_predicted_seconds": 2045.4834455899036,
+    "capacity_usable_core_tokens": 51,
+    "deployment_declared_file_count": 18,
+    "deployment_tree_sha256": "2de849b6abd8a829350b757298170d8b10f748f759e681f7f3535838686130a1",
+    "local_doctor_expected_failure_physical_cores": 12,
+    "standards_targeted_tests_passed": 60,
+    "spec_full_tests_passed": 358,
+    "spec_tencent_tests_passed": 54,
+    "ruff_result": "PASS",
+    "strict_mypy_result": "PASS (60 source files)",
+    "formal_state_counts": {
+      "primary": {"generated": 75, "distinct": 22},
+      "pluscal": {"generated": 36402, "distinct": 8134},
+      "t3_quotient": {"generated": 5, "distinct": 5}
+    }
+  },
+  "standards_axis": {
+    "status": "PASS",
+    "finding_counts": {
+      "critical": 0,
+      "major": 0,
+      "minor": 0
+    },
+    "findings": []
+  },
+  "spec_axis": {
+    "status": "NEEDS_WORK",
+    "finding_counts": {
+      "critical": 0,
+      "major": 1,
+      "minor": 0
+    },
+    "findings": [
+      {
+        "id": "SPEC-14-01",
+        "severity": "MAJOR",
+        "path": "src/txnopt_evidence/tencent_cloud.py",
+        "lines": [275, 279],
+        "title": "CVM credential acquisition remains outside the safe SDK exception boundary",
+        "impact": "Credential construction from environment variables and credential retrieval from a CVM CAM role can raise third-party exceptions whose untrusted bodies contain temporary credential material; the CLI can serialize that text to stderr.",
+        "adversarial_probe": {
+          "cos_untrusted_body_dropped": true,
+          "cvm_safe_formatter_drops_body": true,
+          "cvm_cam_role_factory_exception_leaks": true,
+          "cli_serializes_cam_role_factory_secret": true,
+          "cvm_environment_credential_constructor_exception_leaks": true
+        },
+        "required_fix": "Put Credential construction, CVMRoleCredential construction, and get_credential inside the same safe SDK error boundary used by CVM requests; add environment, CAM-role, nested-exception, rotation, and CLI regression tests under a new source identity."
+      }
+    ]
+  },
+  "finding_counts": {
+    "critical": 0,
+    "major": 1,
+    "minor": 0
+  },
+  "protected_history": {
+    "build14_sha256": "49d23f1a42c502ef78b86c4f36606ce849df63e961bf4cfd7be41e6535291414",
+    "build16_sha256": "702aa53e07eaf8171498cc233ea416dcd2d31a38717409a47645187b29dffe7c",
+    "build18_sha256": "0ce681854d45f065bd6b05065531903537249a32dd1be92613be0e4909fc47d8",
+    "build19_sha256": "88b5efceceab240068e5f523a05926e90596cc13f5dbac62ae9afd3d146d0cf0",
+    "build20_sha256": "2baea987e6591e4670ce77768739329918960888f38fc71a57f3ff04426ea8a4",
+    "attempt24_sha256": "4b60f676dd7e9b6cf6c6e32bd881f9aefd7f14bea9b5f1fd4f46096d2847c660",
+    "attempt25_sha256": "3251a1b31b9def18cf99e210449eedac04401a09178e4948cccc1eb170c524b5",
+    "precloud07_sha256": "ebd3a95f4318ce609d431dedef64a082e6d94828287bfcc7f3d60a7da5390839",
+    "review12_sha256": "4f505414ee197f76a3757d89cd4bf1b14f59bfb2a164740c0f80af50b3686e11",
+    "review13_sha256": "d810378c595d1a4f9aaab1e12ab8d2f072c23c13fdf36e76a63108ec443ebae9",
+    "precloud10_sha256": "8ed07800b00b452a03ac487035a108c93fc862697712da40bd6f6b40dfb11e4b",
+    "e_drive_registry_sha256": "15b9eb5eae6e67cf5124985c36289fb349649a64ce919dc8f2796b3088544fc4",
+    "historical_bytes_rewritten": false,
+    "e_drive_written_or_deleted": false
+  },
+  "claim_boundary": {
+    "independent_review_completed": true,
+    "account_independent_work_complete": false,
+    "ready_for_tencent_account_input": false,
+    "tencent_account_configured": false,
+    "live_dry_run_completed": false,
+    "cloud_purchase_authorized": false,
+    "instance_creation_authorized": false,
+    "cos_live_operation_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "public_release_authorized": false,
+    "e_drive_deletion_authorized": false
+  },
+  "next_action": "Preserve this failed Review14, fix SPEC-14-01 under a new source identity, create Build21 with formal Attempt34 and local calibration Attempt35, then issue Precloud Attempt11 and a fresh Independent Review Attempt15 without overwriting Build20, Attempts32/33, Deployment03, Precloud10, or Review14."
+}
