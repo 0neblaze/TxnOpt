@@ -1,0 +1,80 @@
+{
+  "claim_boundary": {
+    "cloud_account_configured": false,
+    "cloud_purchase_authorized": false,
+    "formal_matrix_authorized": false,
+    "formal_matrix_started": false,
+    "holdout_opened": false,
+    "level1_ready": false,
+    "live_dry_run_completed": false,
+    "region_selected": false
+  },
+  "created_at_utc": "2026-08-15T05:13:40Z",
+  "plan": {
+    "analysis_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt38/analysis-protocol.json",
+    "analysis_schema_version": "txnopt-level1-analysis-protocol-v2",
+    "analysis_sha256": "6b913784c785d96d7e758bf99823af543fa199f8d75f923ae549ca68a5687cc9",
+    "attempt": 38,
+    "config_count": 2880,
+    "config_tree_sha256": "3e295736e5d5904be88a126c2b2f4a7f3245dc218d9cb1860bc77d4a03c75158",
+    "expected_identity_count": 2880,
+    "expected_identity_tree_sha256": "7e0b4921f7d92f9e126b12eeb1d4b940dbbd52579a732ecbd1869ae74a679d06",
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt38/manifest.json",
+    "raw_output_root": "/home/oneblaze/txnopt-results/level1-formal-build23-attempt38",
+    "schema_version": "txnopt-level1-campaign-plan-v2",
+    "sha256": "8f8e6f4feeaafb589565a1211563079334256edecf0062ff240a0b4f6c16c1d3"
+  },
+  "preflight": {
+    "active_target_process_count": 0,
+    "atomic_launch_claim_absent": true,
+    "external_path": "/home/oneblaze/txnopt-plans/level1-formal-plan-attempt38/preflight.json",
+    "raw_output_root_absent": true,
+    "sha256": "2a10c77676b956ad89d6614fec1d4bcad4a78ec37fac38b888f427c003595a66",
+    "status": "PASS_NOT_AUTHORIZED_TO_EXECUTE"
+  },
+  "producer_build": {
+    "build": "Build23",
+    "manifest_path": "experiments/txnopt/manifests/txnopt_level1_build_attempt23.json",
+    "manifest_sha256": "4b6dfe14084be8df2a8db4f24c5303f1a14ccec8cf6641ffcce51cd4777ae04e",
+    "native_sha256": "44b2e2c89e41487773eac4ef8934f9aaa0828b1b360abc437afe8c0e708444da",
+    "source_manifest_sha256": "b486a25960c631acbf79e1774388a0048d2e7974fc8f67ff0c2196a77aa9a5f5",
+    "source_revision": "328a81a10f76b66929973254eed43e5e8aea3efa",
+    "source_tree": "20b376ecfd011738732a806285ddd9573f83c38a",
+    "wheel_sha256": "99a6b90c6aa70012d73e046d7613af481fa27b10dec6a661473b21130f29446e"
+  },
+  "protocol": {
+    "path": "experiments/txnopt/level1-protocol-v2.json",
+    "schema_version": "txnopt-level1-protocol-v2",
+    "sha256": "593299c4c4fe2f9160844777097f4cf21ee803a6614e6270d5aadff53f7fccd2"
+  },
+  "resource_contract": {
+    "attempt39_peak_rss_fraction_max": 0.8,
+    "core_count": 64,
+    "exclusive_linux_required": true,
+    "linux_visible_memory_is_admission_gate": false,
+    "maximum_consecutive_window_days": 14,
+    "minimum_physical_cores": 64,
+    "minimum_provider_memory_gb": 128,
+    "predicted_completion_days_max": 10,
+    "region": null,
+    "region_required_live_input": true,
+    "thread_per_core": 1
+  },
+  "run_label": "txnopt_level1_formal_plan_attempt38",
+  "schema_version": "txnopt-level1-formal-plan-index-v1",
+  "status": "PLANNED_NOT_STARTED_NOT_AUTHORIZED",
+  "validation_harness_diagnostics": {
+    "events": [
+      {
+        "classification": "MISSING_ANALYSIS_PROTOCOL_PATH",
+        "reason": "the first read-only preflight invocation referenced an analysis file before the plan-bound v2 analysis receipt had been materialized; no run, raw root, or claim was created"
+      },
+      {
+        "classification": "INDEPENDENT_SUMMARY_ATTRIBUTE_ERROR",
+        "reason": "a supplementary inventory script queried CampaignEntry.budget_kind instead of CampaignEntry.budget after the valid preflight receipt was written; the corrected full inventory replayed all 2,880 entries without changing the plan"
+      }
+    ],
+    "raw_or_claim_written": false,
+    "status": "CORRECTED_BEFORE_EXECUTION"
+  }
+}
